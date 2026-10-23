@@ -18,6 +18,15 @@ function isAllowed(raw, userId) {
     .includes(String(userId));
 }
 
+async function telegramApi(env, method, body) {
+  const res = await fetch(`${TG_API}/bot${env.TG_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  return await res.json();
+}
+
 async function sendMessage(env, chatId, text) {
   try {
     await fetch(`${TG_API}/bot${env.TG_TOKEN}/sendMessage`, {
@@ -89,6 +98,36 @@ export default {
         })(),
       );
       return new Response("ok");
+    }
+
+    if (pathname === "/setup") {
+      if (request.method !== "POST") {
+        return new Response("method not allowed", { status: 405 });
+      }
+
+      const key = request.headers.get("X-Setup-Key") ?? "";
+      if (!env.TG_SECRET || !safeEqual(key, env.TG_SECRET)) {
+        return new Response("unauthorized", { status: 401 });
+      }
+
+      let json;
+      try {
+        if (new URL(request.url).searchParams.get("info") === "1") {
+          json = await telegramApi(env, "getWebhookInfo");
+        } else {
+          json = await telegramApi(env, "setWebhook", {
+            url: new URL(request.url).origin + "/telegram",
+            secret_token: env.TG_SECRET,
+            allowed_updates: ["message"],
+            drop_pending_updates: true,
+          });
+        }
+      } catch (err) {
+        console.error("telegram api call failed");
+        json = { ok: false, error: "telegram request failed" };
+      }
+
+      return Response.json(json);
     }
 
     return new Response("not found", { status: 404 });

@@ -38,6 +38,19 @@ node scripts/set-webhook.mjs https://my-agent.<subdomain>.workers.dev/telegram
 node scripts/set-webhook.mjs --info   # بررسی وضعیت وبهوک
 ```
 
+## ثبت وبهوک از داخل ورکر (شبکه‌های فیلترشده)
+
+اگر شبکه‌ات به `api.telegram.org` دسترسی ندارد، خود Worker می‌تواند وبهوک را ثبت کند:
+
+```bash
+curl -X POST -H "X-Setup-Key: <همان TG_SECRET>" https://my-agent.<subdomain>.workers.dev/setup
+curl -X POST -H "X-Setup-Key: <همان TG_SECRET>" "https://my-agent.<subdomain>.workers.dev/setup?info=1"
+```
+
+- `POST /setup` وبهوک را روی `<origin>/telegram` با همان `TG_SECRET` ثبت می‌کند و جواب JSON تلگرام را برمی‌گرداند.
+- `?info=1` وضعیت وبهوک را نشان می‌دهد.
+- `scripts/set-webhook.mjs` فقط برای شبکه‌هایی است که مستقیم به تلگرام دسترسی دارند.
+
 ## آی‌دی من را چطور پیدا کنم؟
 
 به بات پیام `/id` بده؛ آی‌دی عددی خودت را جواب می‌دهد (این دستور برای همه باز است و فقط یک بار لازم است). آی‌دی را در `ALLOWED_TG_IDS` بگذار.
