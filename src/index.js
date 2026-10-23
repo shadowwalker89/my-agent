@@ -66,9 +66,8 @@ async function handleUpdate(env, update) {
   }
 }
 
-export default {
-  async fetch(request, env, ctx) {
-    const { pathname } = new URL(request.url);
+async function route(request, env, ctx) {
+  const { pathname } = new URL(request.url);
 
     if (request.method === "GET" && pathname === "/") {
       return new Response("ok");
@@ -131,5 +130,16 @@ export default {
     }
 
     return new Response("not found", { status: 404 });
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      return await route(request, env, ctx);
+    } catch (err) {
+      console.error("handler threw:", err);
+      const detail = err && (err.stack || err.message) || String(err);
+      return new Response("ERR: " + detail, { status: 500 });
+    }
   },
 };
