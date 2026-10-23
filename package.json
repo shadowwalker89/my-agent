@@ -1,0 +1,13 @@
+{
+  "name": "my-agent",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "node --check src/index.js && node --check scripts/set-webhook.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
