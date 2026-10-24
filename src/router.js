@@ -1,39 +1,98 @@
 import { PROVIDERS } from "./providers.js";
-import { COMBOS } from "./combos.js";
+import { RULES, pickModels, interleaveByProvider, compilePrefer, scoreModel } from "./combos.js";
+import { loadCatalog } from "./catalog.js";
+import { getOverrides, resolvePins } from "./overrides.js";
+import { getUnhealthyProviders, isModelHealthy, markFailure } from "./health.js";
 
 const DEADLINE_MS = 25000;
 const PER_TARGET_TIMEOUT_MS = 20000;
+const MAX_HEALTH_CHECKS = 20;
 
 function truncate(text) {
   const s = String(text ?? "");
   return s.length > 200 ? s.slice(0, 200) : s;
 }
 
-function resolveTargets(nameOrProviderModel) {
-  const targets = COMBOS[nameOrProviderModel];
-  if (targets) return { name: nameOrProviderModel, targets };
-
-  const slash = String(nameOrProviderModel).indexOf("/");
-  if (slash > 0) {
-    const provider = String(nameOrProviderModel).slice(0, slash);
-    const model = String(nameOrProviderModel).slice(slash + 1);
-    if (PROVIDERS[provider] && model) {
-      return { name: nameOrProviderModel, targets: [{ provider, model }] };
-    }
-  }
-  return null;
+function errorFor(target, cause) {
+  const entry =
+    typeof cause === "number"
+      ? { target, status: cause }
+      : { target, reason: truncate(cause) };
+  return entry;
 }
 
-async function tryTarget(env, target, body, usedModel, perTargetTimeoutMs) {
-  const provider = PROVIDERS[target.provider];
+export async function getComboTargets(env, name) {
+  const rule = RULES[name];
+  if (!rule) return { error: `unknown combo: ${name}` };
+
+  const [catalog, ov, unhealthyProviders] = await Promise.all([
+    loadCatalog(env),
+    getOverrides(env),
+    getUnhealthyProviders(env),
+  ]);
+  if (!catalog.length) {
+    return {
+      error: "catalog is empty - run /refresh (or POST /admin/refresh) first, then retry",
+    };
+  }
+
+  const preferPatterns = ov.prefer?.[name] ?? null;
+  const compiled = compilePrefer(preferPatterns ?? rule.prefer);
+  const pins = resolvePins(ov.pins?.[name], catalog)
+    .map((m) => ({ ...m, score: scoreModel(m, compiled) }))
+    .filter((m) => !unhealthyProviders[m.provider]);
+  const pinKeys = new Set(pins.map((m) => `${m.provider}/${m.id}`.toLowerCase()));
+  const scored = pickModels(catalog, rule, {
+    prefer: preferPatterns,
+    bans: ov.bans ?? [],
+  })
+    .filter((m) => !pinKeys.has(`${m.provider}/${m.id}`.toLowerCase()))
+    .filter((m) => !unhealthyProviders[m.provider]);
+
+  const need = Math.max(0, rule.maxTargets - pins.length);
+  const healthy = [];
+  let checks = 0;
+  for (const m of scored) {
+    if (healthy.length >= need || checks >= MAX_HEALTH_CHECKS) break;
+    checks++;
+    if (await isModelHealthy(env, `${m.provider}/${m.id}`)) healthy.push(m);
+  }
+
+  const ordered = interleaveByProvider(
+    pins.map((m) => ({ ...m, pinned: true })),
+    healthy,
+    rule.maxTargets,
+  );
+  return {
+    name,
+    targets: ordered.map((m) => ({
+      provider: m.provider,
+      model: m.id,
+      score: m.score,
+      pinned: Boolean(m.pinned),
+    })),
+  };
+}
+
+function resolveDirect(nameOrProviderModel) {
+  const s = String(nameOrProviderModel);
+  const slash = s.indexOf("/");
+  if (slash <= 0) return null;
+  const provider = s.slice(0, slash);
+  const model = s.slice(slash + 1);
+  if (!PROVIDERS[provider] || !model) return null;
+  return { provider, model };
+}
+
+async function tryTarget(env, providerName, model, body, timeoutMs) {
+  const provider = PROVIDERS[providerName];
+  if (!provider) return { skipReason: `unknown provider: ${providerName}` };
   const key = env[provider.keyEnv];
   if (!key) return { skipReason: `missing ${provider.keyEnv}` };
 
+  const used = `${providerName}/${model}`;
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort("timeout"),
-    perTargetTimeoutMs,
-  );
+  const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
   let res;
   try {
     res = await fetch(`${provider.baseUrl}/chat/completions`, {
@@ -44,22 +103,20 @@ async function tryTarget(env, target, body, usedModel, perTargetTimeoutMs) {
         authorization: `Bearer ${key}`,
         ...(provider.extraHeaders ?? {}),
       },
-      body: JSON.stringify({ ...body, model: usedModel }),
+      body: JSON.stringify({ ...body, model }),
     });
   } catch (err) {
     return {
-      error: { target: usedModel, reason: truncate(err?.reason === "timeout" ? "timeout" : `network: ${err && err.message}`) },
+      error: errorFor(used, err?.reason === "timeout" ? "timeout" : `network: ${err && err.message}`),
+      cause: err?.reason === "timeout" ? "timeout" : "network error",
     };
   } finally {
     clearTimeout(timer);
   }
 
   if (!res.ok) {
-    return {
-      error: { target: usedModel, status: res.status },
-    };
+    return { error: errorFor(used, res.status), cause: res.status };
   }
-
   return { res };
 }
 
@@ -69,80 +126,90 @@ export async function runCombo(
   body,
   { deadlineMs = DEADLINE_MS, perTargetTimeoutMs = PER_TARGET_TIMEOUT_MS, stream = false } = {},
 ) {
-  const resolved = resolveTargets(comboNameOrProviderModel);
-  if (!resolved) {
-    return {
-      ok: false,
-      errors: [
-        { target: String(comboNameOrProviderModel), reason: truncate(`unknown combo or provider/model: ${comboNameOrProviderModel}`) },
-      ],
-    };
+  const wanted = String(comboNameOrProviderModel);
+  let targets;
+  if (RULES[wanted]) {
+    const sel = await getComboTargets(env, wanted);
+    if (sel.error) {
+      return { ok: false, errors: [{ target: wanted, reason: truncate(sel.error) }] };
+    }
+    targets = sel.targets;
+  } else {
+    const direct = resolveDirect(wanted);
+    if (!direct) {
+      return {
+        ok: false,
+        errors: [{ target: truncate(wanted), reason: `unknown combo or provider/model: ${truncate(wanted)}` }],
+      };
+    }
+    targets = [{ ...direct, score: 0, pinned: false }];
   }
 
   const started = Date.now();
   const errors = [];
 
-  for (const target of resolved.targets) {
+  for (const t of targets) {
+    const usedModel = `${t.provider}/${t.model}`;
     const remaining = deadlineMs - (Date.now() - started);
     if (remaining <= 0) {
-      errors.push({ target: usedName(target), reason: "deadline exceeded" });
+      errors.push({ target: usedModel, reason: "deadline exceeded" });
       break;
     }
-    const timeout = Math.min(perTargetTimeoutMs, remaining);
-    const usedModel = `${target.provider}/${target.model}`;
 
-    if (target.model.startsWith("PLACEHOLDER")) {
-      errors.push({
-        target: usedModel,
-        reason: "placeholder model id — replace it in src/combos.js with a real id from /admin/models",
-      });
+    if (t.model.startsWith("PLACEHOLDER")) {
+      errors.push({ target: usedModel, reason: "placeholder model id" });
       continue;
     }
 
-    const attempt = await tryTarget(env, target, body, usedModel, timeout);
+    const attempt = await tryTarget(env, t.provider, t.model, body, Math.min(perTargetTimeoutMs, remaining));
     if (attempt.skipReason) {
       errors.push({ target: usedModel, reason: attempt.skipReason });
-      continue;
-    }
-    if (attempt.error) {
+    } else if (attempt.error) {
       errors.push(attempt.error);
-      continue;
-    }
-
-    const { res } = attempt;
-
-    if (stream) {
+      if (env.STATE) {
+        try {
+          await markFailure(env, usedModel, attempt.cause);
+        } catch (err) {
+          console.error("markFailure failed:", err && err.message);
+        }
+      }
+    } else if (stream) {
+      const res = attempt.res;
       if (res.body) {
-        return { ok: true, stream: res.body, contentType: res.headers.get("content-type"), used: usedModel };
+        return {
+          ok: true,
+          stream: res.body,
+          contentType: res.headers.get("content-type"),
+          used: usedModel,
+        };
       }
       errors.push({ target: usedModel, reason: "no stream body" });
-      continue;
-    }
+      await markFailure(env, usedModel, "no stream body");
+    } else {
+      const res = attempt.res;
+      let data;
+      try {
+        data = await res.json();
+      } catch (err) {
+        errors.push({ target: usedModel, reason: truncate(`bad json: ${err && err.message}`) });
+        await markFailure(env, usedModel, "bad json response");
+        continue;
+      }
 
-    let data;
-    try {
-      data = await res.json();
-    } catch (err) {
-      errors.push({ target: usedModel, reason: truncate(`bad json: ${err && err.message}`) });
-      continue;
-    }
+      const message = data?.choices?.[0]?.message?.content;
+      const empty =
+        !message ||
+        (typeof message === "string" && !message.trim()) ||
+        (Array.isArray(message) && message.length === 0);
+      if (empty) {
+        errors.push({ target: usedModel, reason: "empty assistant message" });
+        await markFailure(env, usedModel, "empty assistant message");
+        continue;
+      }
 
-    const message = data?.choices?.[0]?.message?.content;
-    const empty =
-      !message ||
-      (typeof message === "string" && !message.trim()) ||
-      (Array.isArray(message) && message.length === 0);
-    if (empty) {
-      errors.push({ target: usedModel, reason: "empty assistant message" });
-      continue;
+      return { ok: true, data, used: usedModel };
     }
-
-    return { ok: true, data, used: usedModel };
   }
 
   return { ok: false, errors };
-}
-
-function usedName(target) {
-  return `${target.provider}/${target.model}`;
 }

@@ -7,7 +7,8 @@
 - Worker: `https://my-agent.nova-02aa82bffef8.workers.dev`
 - روی **حساب دوم** Cloudflare اجرا می‌شود (حساب اول مشکل ۱۱۰۱ داشت — پایین بخوان).
 - وبهوک از مسیر `POST /setup` داخل خود Worker ثبت شده است. قدم ۱ تمام است.
-- قدم ۲ (مدل‌روتر) کدش تمام است؛ فقط باید جای `PLACEHOLDER-...` در `src/combos.js` آی‌دی مدل واقعی گذاشت (پایین بخوان).
+- قدم ۲ (مدل‌روتر) تمام است. قدم ۲ب: کاتالوگ پویا + comboهای قانون‌محور + کنترل از تلگرام —
+  آی‌دی‌های combo دیگر دستی نیستند؛ از کاتالوگ کش‌شده در KV ساخته می‌شوند (پایین بخوان).
 
 ## تاریخچه و مشکل ۱۱۰۱
 
@@ -58,26 +59,75 @@ Telegram → Cloudflare Worker (src/index.js) → مدل‌روتر (nvidia/open
 
 فایل‌ها:
 
-- `src/providers.js` — تعریف providerها (baseUrl، نام راز کلید، هدرهای اضافی).
-- `src/combos.js` — comboها: `chat`، `code`، `vision`، `fast`. هر combo یک آرایه‌ی ترتیبی از
-  `{ provider, model }` است؛ روتتر به همان ترتیب امتحان می‌کند (fallback).
-- `src/router.js` — منطق اجرا: `runCombo(env, combo_or_provider_model, body, opts)`.
+- `src/providers.js` — تعریف providerها (baseUrl، نام راز کلید، هدرهای اضافی) و
+  `listFreeModels(env, provider)` برای کشف مدل‌های رایگان هر کدام.
+- `src/combos.js` — قانون هر combo (`chat`، `code`، `vision`، `fast`) + امتیازدهی
+  (`pickModels`، `interleaveByProvider`، ثابت `WEIGHTS`).
+- `src/catalog.js` — سینک کاتالوگ در KV و اعلان مدل‌های جدید.
+- `src/overrides.js` — KV ابزارهای pin/ban/prefer.
+- `src/health.js` — سلامت هر هدف در KV کوچک با TTL.
+- `src/router.js` — `runCombo` و حل کردن هدف‌های هر combo.
+- `src/index.js` — همه‌ی endpointها، scheduled و دستورهای تلگرام.
 
-### پر کردن PLACEHOLDERها
+### کاتالوگ پویا (قدم ۲ب)
 
-تا وقتی آی‌دی واقعی نگذاشته باشم، هدف‌هایی که `model`شان با `PLACEHOLDER` شروع شود
-روتر می‌پرد و خطای واضح می‌دهد. برای دیدن آی‌دی‌های واقعی:
+لیست مدل‌های رایگان مدام عوض می‌شود؛ پس دیگر آی‌دی‌ای در `src/combos.js` نیست.
+ساختار کار:
 
-```
-GET /admin/models?provider=nvidia
-GET /admin/models?provider=openrouter                # فقط مدل‌های :free
-GET /admin/models?provider=openrouter&all=1&q=gpt    # همه + فیلتر زیررشته
-GET /admin/models?provider=xkiro                     # فقط مدل‌های :free
-```
+1. **کشف:** هر provider از `GET /models` خودش لیست مدل‌های رایگان را می‌گیرد
+   (`listFreeModels`); خروجی فقط `{ id, provider, context, vision, created }`.
+   - openrouter/xkiro: فقط آی‌دی‌های `:free`.
+   - nvidia: همه‌ی آی‌دی‌ها (رایگان‌اند) ولی مدل‌های غیرچت (embed/reward/asr/...) با regex حذف می‌شوند.
+2. **سینک:** `syncProvider(env, provider)` نتیجه را در کلید KV `catalog:<provider>`
+   می‌نویسد و با لیست قبلی مقایسه می‌کند؛ لیست «اضافه‌شده‌ها» را در یک پیام تلگرام
+   (حداکثر ۱۵ آی‌دی، با پیشوند provider و سرنخ «/models برای مرور») به همه‌ی
+   `ALLOWED_TG_IDS` می‌فرستد. اولین سینک اعلان نمی‌دهد.
+3. **کرون:** سه cron در `wrangler.jsonc`: هر ۶ ساعت — دقیقه‌ی 0 = openrouter،
+   دقیقه‌ی 10 = nvidia، دقیقه‌ی 20 = xkiro (هر اجرای scheduled فقط یک provider؛
+   سقف subrequest/CPU پلن رایگان).
+4. **انتخاب combo:** `getComboTargets` از کاتالوگِ flat + overrideها + سلامت،
+   لیست ترتیبی هدف‌ها را می‌سازد: pinها اول، بعد کاندیدهای امتیازدهی‌شده با
+   interleave تا حداکثر دو هدف پشت‌سرهم از یک provider نباشد، بریده به `maxTargets`.
+   اگر کاتالوگ خالی باشد خطای واضح می‌دهد: اول `/refresh` را بزن.
 
-- (اول هدر `X-Setup-Key: <TG_SECRET>` را بده.) خروجی فقط `{ id }` است (برای openrouter/xkiro
-  وقتی در پاسخ provider موجود باشد، اضافه‌ی `context_length` و `vision`)، مرتب بر اساس id.
-- آی‌دی‌ها را در `src/combos.js` جای `PLACEHOLDER-...` بگذار و deploy کن.
+### KV
+
+binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛ اگر نساخت، دستی بساز).
+کلیدها:
+
+- `catalog:nvidia` / `catalog:openrouter` / `catalog:xkiro` — لیست مدل‌ها + `updatedAt`.
+- `overrides:v1` — `{ pins: { combo: [...] }, bans: [...], prefer: { combo: [...] } }`.
+- `health:<provider>/<model>` — کوoldown هدف (TTL خودکار: 24h برای 404/410/400،
+  10 دقیقه برای 429/5xx/timeout/empty)؛ کلید موجود = ناسالم.
+- `health:provider:<name>` — خطای 401/403 کل provider را ۱ ساعت می‌بندد.
+
+### تنظیم با تلگرام (کاربرهای allowlist)
+
+- `/models [combo]` — هدف‌های برتر combo با امتیاز (📌 = pin).
+- `/refresh [provider|all]` — سینک دستی؛ جواب کوتاه `+added -removed` برای هر provider
+  (یکی‌یکی پردازش می‌شوند؛ اگر یکی شکست بخورد بقیه ادامه می‌یابند).
+- `/pin <combo> <provider/model>` و `/unpin <combo> <provider/model>` — pin اول combo می‌آید.
+- `/ban <provider/model>` و `/unban <provider/model>` — بن همیشگی از همه‌ی comboها.
+- `/prefer <combo> <rx1,rx2,...>` و `/prefer <combo> reset` — جایگزینی لیست prefer آن combo.
+- `/status` — تعداد مدل کش‌شده‌ی هر provider، آخرین زمان سینک، تعداد بن/pin.
+- `/start`، `/ping`، `/id` مثل قبل؛ `/id` برای همه باز است. دستور ناشناس = راهنمای کوتاه فارسی.
+
+### امتیازدهی (heuristic!)
+
+کیفیت مدل را کسی به‌صورت خودکار نمی‌داند؛ رتبه‌بندی صرفاً هیوریستیک است:
+امتیاز = مجموع وزن الگوهای prefer (اول‌تر = بیشتر) + بونوس کانتکست بزرگ‌تر +
+بونوس `created` تازه‌تر − جریمه‌ی preview/beta (وقتی prefer نخورده). همه‌ی عددها
+در ثابت `WEIGHTS` بالای `src/combos.js` است — برای تنظیم فقط همان‌جا را تغییر بده.
+قانون `prefer/exclude/minContext/needsVision/maxTargets` هر combo هم همان فایل است.
+تست آفلاین (بدون شبکه) با کاتالوگ ساختگی: `node scripts/test-combos.mjs`.
+
+### Endpointها برای خودم
+
+- `POST /admin/refresh?provider=<name|all>` (هدر `X-Setup-Key: <TG_SECRET>`) —
+  سینک ترتیبی و برگرداندن `{ provider: { added, removed } }`.
+- `GET /admin/catalog?combo=<name>` — لیست حل‌شده‌ی هدف‌ها با امتیاز و وضعیت سلامت (بدون راز).
+- `GET /admin/models?provider=<name>` — همان کاتالوگ زنده با فیلتر `q`/`all=1`
+  (فقط `{ id }` و برای openrouter/xkiro `context_length`/`vision` در صورت وجود).
 
 ### Endpoint سازگار با OpenAI
 
@@ -85,16 +135,19 @@ GET /admin/models?provider=xkiro                     # فقط مدل‌های :f
   (مقایسه‌ی constant-time؛ بدون کلید ۴۰۱، اگر `ROUTER_KEY` ست نشده ۵۰۰ با نام راز جاافتاده).
   `body.model` یا نام combo است (مثلاً `"chat"`) یا `provider/model` مستقیم (مثلاً `"nvidia/<id>"`).
   `stream: true` = پاس‌اس‌اس‌ئی مستقیم از provider؛ `stream: false` = JSON کامل.
-  هدر پاسخ `X-Router-Used` می‌گوید کدام هدف جواب داده.
+  هدر پاسخ `X-Router-Used` می‌گوید کدام هدف جواب داده (قید فووتر پیام تلگرام با
+  `SHOW_MODEL=1` هم همین کار را می‌کند).
 - `GET /v1/models` با همان احراز هویت؛ آی‌دی‌ها همان نام comboها هستند.
 - در شکست کامل: ۵۰۲ با لیست `{ target, status|reason }` — هرگز کلید یا بدنه‌ای که ممکن است
   راز برگرداند، متن‌ها تا ۲۰۰ حرف بریده می‌شوند.
 
-### رفتار fallback
+### رفتار fallback و سلامت
 
 رفتن به هدف بعدی روی: خطای شبکه/timeout (per-target پیش‌فرض ۲۰ ثانیه)، HTTP
 408/429/5xx، 400/404 (مدل پشتیبانی نمی‌شود)، 401/403 (ثبت به‌عنوان خطای کانفیگ و ادامه)،
-یا پیام assistant خالی. کل تلاش‌ها با روزشده‌ی کلی `deadlineMs` (پیش‌فرض ۲۵ ثانیه) محدود می‌شوند.
+یا پیام assistant خالی. ست هر شکست در `health:*` ثبت می‌شود تا دفعه‌ی بعد آن هدف
+(یا کل provider روی 401/403) خودکار رد شود. کل تلاش‌ها با روزشده‌ی کلی `deadlineMs`
+(پیش‌فرض ۲۵ ثانیه) محدود می‌شوند.
 
 ### ربات تلگرام
 
@@ -106,8 +159,18 @@ GET /admin/models?provider=xkiro                     # فقط مدل‌های :f
 چرا روزشده‌ی ۲۵ ثانیه؟ چون endpoint تلگرام بعد از `ctx.waitUntil` نباید منتظر بماند؛
 `waitFor_url`/waitUntil حدود ۳۰ ثانیه سقف دارد و بعد پاسخ تلگرام از دست می‌رود؛ ۲۵ ثانیه حاشیه‌ی امن می‌گذارد.
 
-دستورهای تلگرام: `/start`، `/ping`، `/id` (و `/id` برای همه باز است). دستور ناشناس =
+دستورهای تلگرام: همه در بخش «تنظیم با تلگرام»؛ `/id` برای همه باز است. دستور ناشناس =
 متن راهنمای کوتاه فارسی با لیست همین دستورها.
+
+### محدودیت‌های پلن رایگان (ریسک معلوم)
+
+سیاق پلن رایگان: حدود ۱۰ms CPU در هر فراخوانی و ۵۰ زیردرخواست. به همین دلیل هر اجرای
+`scheduled` فقط یک provider را سینک می‌کند (سه cron جدا در فاصله‌ی ۱۰ دقیقه) و صرفه‌جویی
+subrequest در حل زدن روتتر هم انجام شده (حداکثر ۲۰ چک سلامت، pinها جدا حساب می‌شوند).
+ریسک معلوم: پارس لیست خیلی بزرگ کاتالوگ (مثلاً JSON چندصدهزاربایتی openrouter) CPU می‌کشد؛
+اگر اجرای cron خطای CPU quota خورد، کار را با `/refresh <provider>` (یا
+`POST /admin/refresh?provider=<name>`) دستی و یکی‌یکی per provider تقسیم کن — هر فراخوانی
+فقط یک provider را کامل می‌کند.
 
 ### چرا AgentRouter و Kiro در روتر ابری نیستند؟
 
@@ -126,7 +189,7 @@ GET /admin/models?provider=xkiro                     # فقط مدل‌های :f
 ## نقشه راه
 
 - [x] Telegram echo Worker با allowlist و /setup
-- [~] مدل‌روتر / combo مدل‌ها داخل Worker — **قدم ۲ در جریان**: روتتر و endpoint سازگار با OpenAI آماده؛ comboها همچنان PLACEHOLDER دارند تا آی‌دی واقعی از /admin/models گذاشته شود
+- [x] مدل‌روتر / combo مدل‌ها داخل Worker (قدم ۲: روتتر + endpoint سازگار با OpenAI، قدم ۲ب: کاتالوگ پویا، combo قانون‌محور، کنترل تلگرام — رتبه‌بندی کیفیت هیوریستیک است)
 - [ ] GitHub Actions + OpenCode برای کارهای کدنویسی
 - [ ] صدا و عکس با Workers AI
 - [ ] بله (Bale)

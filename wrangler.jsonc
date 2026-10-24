@@ -4,5 +4,7 @@
   "compatibility_date": "2026-09-01",
   "workers_dev": true,
   "observability": { "enabled": true },
-  "vars": { "SHOW_MODEL": "1" }
+  "vars": { "SHOW_MODEL": "1" },
+  "kv_namespaces": [{ "binding": "STATE" }],
+  "triggers": { "crons": ["0 */6 * * *", "10 */6 * * *", "20 */6 * * *"] }
 }

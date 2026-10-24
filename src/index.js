@@ -1,11 +1,29 @@
-import { PROVIDERS } from "./providers.js";
-import { COMBOS } from "./combos.js";
-import { runCombo } from "./router.js";
+import { PROVIDERS, listFreeModels } from "./providers.js";
+import { RULES } from "./combos.js";
+import { runCombo, getComboTargets } from "./router.js";
+import { syncProvider } from "./catalog.js";
+import {
+  getOverrides,
+  addPin,
+  removePin,
+  addBan,
+  removeBan,
+  setPrefer,
+  validatePattern,
+} from "./overrides.js";
+import { tgApi, tgSend, tgBroadcast } from "./telegram.js";
 
-const TG_API = "https://api.telegram.org";
+const TG_ERROR_LIMIT = 120;
 
 const CHAT_SYSTEM_PROMPT =
   "You are a concise, helpful personal assistant. Reply in the user's language (Persian if they write Persian).";
+
+// هر cron به یک provider: 0 → openrouter، 10 → nvidia، 20 → xkiro
+const CRON_PROVIDER = {
+  "0 */6 * * *": "openrouter",
+  "10 */6 * * *": "nvidia",
+  "20 */6 * * *": "xkiro",
+};
 
 function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
@@ -39,27 +57,6 @@ function isAllowed(raw, userId) {
     .includes(String(userId));
 }
 
-async function telegramApi(env, method, body) {
-  const res = await fetch(`${TG_API}/bot${env.TG_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body ?? {}),
-  });
-  return await res.json();
-}
-
-async function sendMessage(env, chatId, text) {
-  try {
-    await fetch(`${TG_API}/bot${env.TG_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text }),
-    });
-  } catch (err) {
-    console.error("sendMessage failed:", err && err.message);
-  }
-}
-
 function routerAuth(request, env) {
   if (!env.ROUTER_KEY) {
     return Response.json(
@@ -84,7 +81,7 @@ function splitMessage(text) {
 }
 
 async function answerChatText(env, chatId, text) {
-  await telegramApi(env, "sendChatAction", { chat_id: chatId, action: "typing" });
+  await tgApi(env, "sendChatAction", { chat_id: chatId, action: "typing" });
 
   const result = await runCombo(
     env,
@@ -103,7 +100,7 @@ async function answerChatText(env, chatId, text) {
     const lines = result.errors
       .map((e) => `${e.target}: ${e.status ?? e.reason}`)
       .join("\n");
-    await sendMessage(env, chatId, `همه‌ی مدل‌ها شکست خوردند 🙁\n${lines}`);
+    await tgSend(env, chatId, `همه‌ی مدل‌ها شکست خوردند 🙁\n${lines}`);
     return;
   }
 
@@ -115,13 +112,155 @@ async function answerChatText(env, chatId, text) {
         ? content.map((p) => p?.text ?? "").join("")
         : "";
   if (!answer.trim()) {
-    await sendMessage(env, chatId, "پاسخ خالی بود 🙁");
+    await tgSend(env, chatId, "پاسخ خالی بود 🙁");
     return;
   }
   if (env.SHOW_MODEL === "1") answer += `\n— ${result.used}`;
   for (const chunk of splitMessage(answer)) {
-    await sendMessage(env, chatId, chunk);
+    await tgSend(env, chatId, chunk);
   }
+}
+
+const HELP_TEXT =
+  "دستورها: /models [combo] /refresh [provider] /pin <combo> <provider/model> " +
+  "/unpin <combo> <provider/model> /ban <provider/model> /unban <provider/model> " +
+  "/prefer <combo> <rx1,rx2,...|reset> /status /ping /start — برای چت، متن ساده بفرست.";
+
+async function tgModels(env, chatId, combo) {
+  if (!RULES[combo]) {
+    await tgSend(env, chatId, `combo ناشناس: ${combo}\ncomboها: ${Object.keys(RULES).join(", ")}`);
+    return;
+  }
+  const sel = await getComboTargets(env, combo);
+  if (sel.error) {
+    const msg = sel.error.startsWith("catalog is empty")
+      ? "کاتالوگ خالی است؛ اول /refresh بزن 🙏"
+      : sel.error;
+    await tgSend(env, chatId, msg);
+    return;
+  }
+  const lines = sel.targets
+    .slice(0, 8)
+    .map(
+      (t, i) =>
+        `${i + 1}. ${t.provider}/${t.model} — ${t.score}${t.pinned ? " 📌" : ""}`,
+    );
+  await tgSend(env, chatId, `combo «${combo}»:\n${lines.join("\n")}`);
+}
+
+async function tgRefresh(env, chatId, provider) {
+  const list =
+    provider === "all" || !provider
+      ? Object.keys(PROVIDERS)
+      : PROVIDERS[provider]
+        ? [provider]
+        : null;
+  if (!list) {
+    await tgSend(env, chatId, `provider ناشناس: ${provider}\nproviderها: ${Object.keys(PROVIDERS).join(", ")}`);
+    return;
+  }
+  const lines = [];
+  for (const p of list) {
+    try {
+      const r = await syncProvider(env, p, { notify: false });
+      lines.push(`${p}: +${r.added.length} -${r.removed.length}`);
+    } catch (err) {
+      lines.push(`${p}: شکست (${String(err && err.message).slice(0, TG_ERROR_LIMIT)})`);
+    }
+  }
+  await tgSend(env, chatId, `بروزرسانی کاتالوگ:\n${lines.join("\n")}`);
+}
+
+const TARGET_RE = /^[^/\s]+\/\S+$/;
+
+async function tgCommand(env, chatId, text) {
+  const parts = text.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+  const args = parts.slice(1);
+
+  if (cmd === "/models") {
+    return tgModels(env, chatId, args[0] ?? "chat");
+  }
+  if (cmd === "/refresh") {
+    return tgRefresh(env, chatId, args[0] ?? "all");
+  }
+  if (cmd === "/pin" || cmd === "/unpin") {
+    const [combo, target] = args;
+    if (!RULES[combo] || !TARGET_RE.test(target ?? "")) {
+      await tgSend(env, chatId, "فرمت: /pin <combo> <provider/model>  (مثال: /pin chat openrouter/qwen3-coder:free)");
+      return;
+    }
+    if (cmd === "/pin") await addPin(env, combo, target);
+    else await removePin(env, combo, target);
+    await tgSend(env, chatId, cmd === "/pin" ? `📌 ${combo}: ${target}` : `✅ حذف pin ${combo}: ${target}`);
+    return;
+  }
+  if (cmd === "/ban" || cmd === "/unban") {
+    const target = args[0];
+    if (!TARGET_RE.test(target ?? "")) {
+      await tgSend(env, chatId, "فرمت: /ban <provider/model>");
+      return;
+    }
+    if (cmd === "/ban") await addBan(env, target);
+    else await removeBan(env, target);
+    await tgSend(env, chatId, cmd === "/ban" ? `🚫 بن شد: ${target}` : `✅ بن برداشته شد: ${target}`);
+    return;
+  }
+  if (cmd === "/prefer") {
+    const [combo, rest] = args;
+    if (!RULES[combo] || rest === undefined) {
+      await tgSend(env, chatId, "فرمت: /prefer <combo> <rx1,rx2,...> یا /prefer <combo> reset");
+      return;
+    }
+    if (rest.toLowerCase() === "reset") {
+      await setPrefer(env, combo, null);
+      await tgSend(env, chatId, `✅ prefer پیش‌فرض ${combo} برگشت`);
+      return;
+    }
+    const patterns = rest.split(",").map((p) => p.trim()).filter(Boolean);
+    const bad = patterns.find((p) => !validatePattern(p));
+    if (bad) {
+      await tgSend(env, chatId, `regex نامعتبر: ${bad.slice(0, 60)}`);
+      return;
+    }
+    await setPrefer(env, combo, patterns);
+    await tgSend(env, chatId, `✅ prefer ${combo}: ${patterns.join(", ")}`);
+    return;
+  }
+  if (cmd === "/status") {
+    await tgStatus(env, chatId);
+    return;
+  }
+  await tgSend(env, chatId, "دستور ناشناس!\n" + HELP_TEXT);
+}
+
+async function tgStatus(env, chatId) {
+  if (!env.STATE) {
+    await tgSend(env, chatId, "KV (STATE) در دسترس نیست.");
+    return;
+  }
+  const [nv, or_, xk, ov] = await Promise.all([
+    env.STATE.get("catalog:nvidia", "json"),
+    env.STATE.get("catalog:openrouter", "json"),
+    env.STATE.get("catalog:xkiro", "json"),
+    getOverrides(env),
+  ]);
+  const pinnedTotal = Object.values(ov.pins).reduce((n, l) => n + l.length, 0);
+  const lines = [
+    `nvidia: ${nv?.models?.length ?? 0} مدل${nv?.updatedAt ? ` — آخرین sync: ${ageString(nv.updatedAt)}` : " — هنوز sync نشده"}`,
+    `openrouter: ${or_?.models?.length ?? 0} مدل${or_?.updatedAt ? ` — آخرین sync: ${ageString(or_.updatedAt)}` : ""}`,
+    `xkiro: ${xk?.models?.length ?? 0} مدل${xk?.updatedAt ? ` — آخرین sync: ${ageString(xk.updatedAt)}` : ""}`,
+    `بن‌شده: ${ov.bans.length} | pin‌شده: ${pinnedTotal}`,
+  ];
+  await tgSend(env, chatId, lines.join("\n"));
+}
+
+function ageString(iso) {
+  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (!Number.isFinite(mins) || mins < 0) return iso;
+  if (mins < 60) return `${mins} دقیقه پیش`;
+  if (mins < 1440) return `${Math.round(mins / 60)} ساعت پیش`;
+  return `${Math.round(mins / 1440)} روز پیش`;
 }
 
 async function handleUpdate(env, update) {
@@ -131,27 +270,23 @@ async function handleUpdate(env, update) {
   const text = typeof msg.text === "string" ? msg.text.trim() : undefined;
 
   if (text === "/id") {
-    await sendMessage(env, msg.chat.id, String(msg.from.id));
+    await tgSend(env, msg.chat.id, String(msg.from.id));
     return;
   }
 
   if (!isAllowed(env.ALLOWED_TG_IDS, msg.from.id)) return;
 
   if (!text) {
-    await sendMessage(env, msg.chat.id, "فعلاً فقط پیام متنی پشتیبانی می‌شود 🙏");
+    await tgSend(env, msg.chat.id, "فعلاً فقط پیام متنی پشتیبانی می‌شود 🙏");
     return;
   }
 
   if (text === "/start") {
-    await sendMessage(env, msg.chat.id, "سلام! من ایجنت شخصی تو هستم ✅ فعلاً هر متنی بفرستی، برمی‌گردانمش.");
+    await tgSend(env, msg.chat.id, "سلام! من ایجنت شخصی تو هستم ✅ هر متنی بفرستی، مدل‌روتر جواب می‌دهد. لیست دستورها: /models");
   } else if (text === "/ping") {
-    await sendMessage(env, msg.chat.id, "pong");
+    await tgSend(env, msg.chat.id, "pong");
   } else if (text.startsWith("/")) {
-    await sendMessage(
-      env,
-      msg.chat.id,
-      "دستور ناشناس! دستورهای فعلی: /start /ping /id — برای چت، متن ساده بفرست.",
-    );
+    await tgCommand(env, msg.chat.id, text);
   } else {
     await answerChatText(env, msg.chat.id, text);
   }
@@ -189,44 +324,14 @@ async function chatCompletions(request, env) {
     });
   }
 
-  return Response.json(
-    { ok: false, errors: result.errors },
-    { status: 502 },
-  );
+  return Response.json({ ok: false, errors: result.errors }, { status: 502 });
 }
 
 function comboModels() {
   return {
     object: "list",
-    data: Object.keys(COMBOS).map((name) => ({ id: name, object: "model" })),
+    data: Object.keys(RULES).map((name) => ({ id: name, object: "model" })),
   };
-}
-
-function firstNumber(obj, keys) {
-  for (const k of keys) {
-    if (typeof obj?.[k] === "number") return obj[k];
-  }
-  if (typeof obj?.architecture?.context_length === "number") {
-    return obj.architecture.context_length;
-  }
-  return undefined;
-}
-
-function imageInput(m) {
-  if (Array.isArray(m?.architecture?.input_modalities)) {
-    return m.architecture.input_modalities.includes("image");
-  }
-  if (Array.isArray(m?.modalities)) {
-    return m.modalities.some((x) => typeof x === "string" && x.toLowerCase().includes("image"));
-  }
-  const caps = m?.capabilities;
-  if (Array.isArray(caps)) {
-    return caps.some((x) => typeof x === "string" && /imag|vision/i.test(x));
-  }
-  if (caps && typeof caps === "object") {
-    return Object.entries(caps).some(([k, v]) => /imag|vision/i.test(k) && v === true);
-  }
-  return undefined;
 }
 
 async function adminModels(request, env) {
@@ -237,67 +342,89 @@ async function adminModels(request, env) {
 
   const url = new URL(request.url);
   const providerName = url.searchParams.get("provider") ?? "";
-  const provider = PROVIDERS[providerName];
-  if (!provider) {
+  if (!PROVIDERS[providerName]) {
     return Response.json(
       { ok: false, error: "provider must be nvidia, openrouter or xkiro" },
       { status: 400 },
     );
   }
-  const apiKey = env[provider.keyEnv];
-  if (!apiKey) {
+
+  let models;
+  try {
+    models = await listFreeModels(env, providerName);
+  } catch (err) {
     return Response.json(
-      { ok: false, error: `missing secret: ${provider.keyEnv}` },
-      { status: 500 },
+      { ok: false, error: String(err && err.message).slice(0, 200) },
+      { status: 502 },
     );
   }
 
   const q = (url.searchParams.get("q") ?? "").toLowerCase();
   const all = url.searchParams.get("all") === "1";
+  let out = models;
+  if (providerName !== "nvidia" && !all) {
+    out = out.filter((m) => m.id.endsWith(":free"));
+  }
+  if (q) out = out.filter((m) => m.id.toLowerCase().includes(q));
+  out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
-  let json;
-  try {
-    const res = await fetch(`${provider.baseUrl}/models`, {
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        ...(provider.extraHeaders ?? {}),
-      },
-    });
-    if (!res.ok) {
-      return Response.json(
-        { ok: false, error: `provider returned ${res.status}` },
-        { status: 502 },
-      );
+  out = out.map((m) => {
+    const entry = { id: m.id };
+    if (providerName !== "nvidia") {
+      if (m.context !== null) entry.context_length = m.context;
+      if (m.vision !== null) entry.vision = m.vision;
     }
-    json = await res.json();
-  } catch (err) {
-    console.error("provider models fetch failed:", err && err.message);
-    return Response.json({ ok: false, error: "provider request failed" }, { status: 502 });
+    return entry;
+  });
+  return Response.json(out);
+}
+
+async function adminRefresh(request, env) {
+  const key = request.headers.get("X-Setup-Key") ?? "";
+  if (!safeEqual(key, env.TG_SECRET)) {
+    return new Response("unauthorized", { status: 401 });
   }
 
-  const list = Array.isArray(json) ? json : Array.isArray(json?.data) ? json.data : [];
-  const gated = providerName === "openrouter" || providerName === "xkiro";
-  let models = list
-    .filter((m) => m && typeof m.id === "string")
-    .map((m) => {
-      if (!gated) return { id: m.id };
-      const entry = { id: m.id };
-      const contextLength = firstNumber(m, ["context_length", "contextLength", "context_size", "contextSize"]);
-      if (contextLength !== undefined) entry.context_length = contextLength;
-      const vision = imageInput(m);
-      if (vision !== undefined) entry.vision = vision;
-      return entry;
-    });
-
-  if (gated && !all) {
-    models = models.filter((m) => m.id.endsWith(":free"));
+  const provider = new URL(request.url).searchParams.get("provider") ?? "all";
+  const list = provider === "all" ? Object.keys(PROVIDERS) : [provider];
+  if (provider !== "all" && !PROVIDERS[provider]) {
+    return Response.json(
+      { ok: false, error: "provider must be nvidia, openrouter, xkiro or all" },
+      { status: 400 },
+    );
   }
-  if (q) {
-    models = models.filter((m) => m.id.toLowerCase().includes(q));
-  }
-  models.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
-  return Response.json(models);
+  const result = {};
+  for (const p of list) {
+    try {
+      const r = await syncProvider(env, p);
+      result[p] = { added: r.added.length, removed: r.removed.length };
+    } catch (err) {
+      result[p] = { error: String(err && err.message).slice(0, 200) };
+    }
+  }
+  return Response.json(result);
+}
+
+async function adminCatalog(request, env) {
+  const key = request.headers.get("X-Setup-Key") ?? "";
+  if (!safeEqual(key, env.TG_SECRET)) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  const combo = new URL(request.url).searchParams.get("combo") ?? "chat";
+  const sel = await getComboTargets(env, combo);
+  if (sel.error) {
+    return Response.json({ ok: false, error: sel.error }, { status: 400 });
+  }
+  return Response.json({
+    combo,
+    targets: sel.targets.map((t) => ({
+      target: `${t.provider}/${t.model}`,
+      score: t.score,
+      pinned: t.pinned,
+      healthy: true,
+    })),
+  });
 }
 
 async function route(request, env, ctx) {
@@ -318,8 +445,18 @@ async function route(request, env, ctx) {
   }
 
   if (request.method === "GET" && pathname === "/admin/models") {
-    if (!env.TG_SECRET) return missingSecretResponse(env);
+    if (missingSecretName(env)) return missingSecretResponse(env);
     return adminModels(request, env);
+  }
+
+  if (request.method === "POST" && pathname === "/admin/refresh") {
+    if (missingSecretName(env)) return missingSecretResponse(env);
+    return adminRefresh(request, env);
+  }
+
+  if (request.method === "GET" && pathname === "/admin/catalog") {
+    if (missingSecretName(env)) return missingSecretResponse(env);
+    return adminCatalog(request, env);
   }
 
   if (request.method === "POST" && pathname === "/telegram") {
@@ -365,9 +502,9 @@ async function route(request, env, ctx) {
     let json;
     try {
       if (new URL(request.url).searchParams.get("info") === "1") {
-        json = await telegramApi(env, "getWebhookInfo");
+        json = await tgApi(env, "getWebhookInfo");
       } else {
-        json = await telegramApi(env, "setWebhook", {
+        json = await tgApi(env, "setWebhook", {
           url: new URL(request.url).origin + "/telegram",
           secret_token: env.TG_SECRET,
           allowed_updates: ["message"],
@@ -393,5 +530,18 @@ export default {
       console.error("handler error:", err && err.message);
       return Response.json({ ok: false, error: "internal error" }, { status: 500 });
     }
+  },
+  async scheduled(event, env, ctx) {
+    const provider = CRON_PROVIDER[event.cron];
+    if (!provider) return;
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await syncProvider(env, provider);
+        } catch (err) {
+          console.error(`syncProvider(${provider}) failed:`, err && err.message);
+        }
+      })(),
+    );
   },
 };
