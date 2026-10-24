@@ -33,7 +33,7 @@ HTTP 500 با `error code: 1101` می‌دادند و `wrangler tail` هم هی�
 ## معماری
 
 ```
-Telegram → Cloudflare Worker (src/index.js) → مدل‌روتر (nvidia/openrouter) → بعداً: GitHub Actions + OpenCode، بله، upload.am
+Telegram → Cloudflare Worker (src/index.js) → مدل‌روتر (nvidia/openrouter/xkiro) → بعداً: GitHub Actions + OpenCode، بله، upload.am
 ```
 
 ## رازها
@@ -41,6 +41,10 @@ Telegram → Cloudflare Worker (src/index.js) → مدل‌روتر (nvidia/open
 - `TG_TOKEN`، `TG_SECRET`، `ALLOWED_TG_IDS` — رازهای تلگرام (قدم ۱).
 - `NVIDIA_API_KEY` — کلید `https://integrate.api.nvidia.com/v1`.
 - `OPENROUTER_API_KEY` — کلید `https://openrouter.ai/api/v1`.
+- `XKIRO_API_KEY` — کلید `https://api.xkiro.com/v1`. طبق سایتش، آی‌دی مدل‌های رایگانش به
+  `:free` ختم می‌شود و بعد از تأیید تلگرام سقف مصرف روزانه‌ی رایگان حدود ۱ میلیون توکن است.
+  هشدار مهم: هر gateway رایگان شخص ثالث فقط برای مدل‌های عمومی است — هرگز راز یا
+  کد خصوصی کلاینت به آن نفرست.
 - `ROUTER_KEY` — کلید Bearer برای Endpoint سازگار با OpenAI داخل Worker.
 
 هر کدام فقط اینجاها هستند:
@@ -68,10 +72,11 @@ Telegram → Cloudflare Worker (src/index.js) → مدل‌روتر (nvidia/open
 GET /admin/models?provider=nvidia
 GET /admin/models?provider=openrouter                # فقط مدل‌های :free
 GET /admin/models?provider=openrouter&all=1&q=gpt    # همه + فیلتر زیررشته
+GET /admin/models?provider=xkiro                     # فقط مدل‌های :free
 ```
 
-- (اول هدر `X-Setup-Key: <TG_SECRET>` را بده.) خروجی فقط `{ id }` است (برای openrouter
-  اضافه‌ی `context_length` و `vision`)، مرتب بر اساس id.
+- (اول هدر `X-Setup-Key: <TG_SECRET>` را بده.) خروجی فقط `{ id }` است (برای openrouter/xkiro
+  وقتی در پاسخ provider موجود باشد، اضافه‌ی `context_length` و `vision`)، مرتب بر اساس id.
 - آی‌دی‌ها را در `src/combos.js` جای `PLACEHOLDER-...` بگذار و deploy کن.
 
 ### Endpoint سازگار با OpenAI

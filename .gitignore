@@ -3,3 +3,7 @@ node_modules
 .env
 .wrangler
 .DS_Store
+probe/
+or-models.json
+nv-models.json
+xk-models.json

@@ -8,4 +8,8 @@ export const PROVIDERS = {
     keyEnv: "OPENROUTER_API_KEY",
     extraHeaders: { "X-Title": "my-agent" },
   },
+  xkiro: {
+    baseUrl: "https://api.xkiro.com/v1",
+    keyEnv: "XKIRO_API_KEY",
+  },
 };

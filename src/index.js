@@ -202,6 +202,33 @@ function comboModels() {
   };
 }
 
+function firstNumber(obj, keys) {
+  for (const k of keys) {
+    if (typeof obj?.[k] === "number") return obj[k];
+  }
+  if (typeof obj?.architecture?.context_length === "number") {
+    return obj.architecture.context_length;
+  }
+  return undefined;
+}
+
+function imageInput(m) {
+  if (Array.isArray(m?.architecture?.input_modalities)) {
+    return m.architecture.input_modalities.includes("image");
+  }
+  if (Array.isArray(m?.modalities)) {
+    return m.modalities.some((x) => typeof x === "string" && x.toLowerCase().includes("image"));
+  }
+  const caps = m?.capabilities;
+  if (Array.isArray(caps)) {
+    return caps.some((x) => typeof x === "string" && /imag|vision/i.test(x));
+  }
+  if (caps && typeof caps === "object") {
+    return Object.entries(caps).some(([k, v]) => /imag|vision/i.test(k) && v === true);
+  }
+  return undefined;
+}
+
 async function adminModels(request, env) {
   const key = request.headers.get("X-Setup-Key") ?? "";
   if (!safeEqual(key, env.TG_SECRET)) {
@@ -213,7 +240,7 @@ async function adminModels(request, env) {
   const provider = PROVIDERS[providerName];
   if (!provider) {
     return Response.json(
-      { ok: false, error: "provider must be nvidia or openrouter" },
+      { ok: false, error: "provider must be nvidia, openrouter or xkiro" },
       { status: 400 },
     );
   }
@@ -249,20 +276,20 @@ async function adminModels(request, env) {
   }
 
   const list = Array.isArray(json) ? json : Array.isArray(json?.data) ? json.data : [];
+  const gated = providerName === "openrouter" || providerName === "xkiro";
   let models = list
     .filter((m) => m && typeof m.id === "string")
     .map((m) => {
+      if (!gated) return { id: m.id };
       const entry = { id: m.id };
-      if (providerName === "openrouter") {
-        entry.context_length = typeof m.context_length === "number" ? m.context_length : null;
-        entry.vision = Array.isArray(m.architecture?.input_modalities)
-          ? m.architecture.input_modalities.includes("image")
-          : false;
-      }
+      const contextLength = firstNumber(m, ["context_length", "contextLength", "context_size", "contextSize"]);
+      if (contextLength !== undefined) entry.context_length = contextLength;
+      const vision = imageInput(m);
+      if (vision !== undefined) entry.vision = vision;
       return entry;
     });
 
-  if (providerName === "openrouter" && !all) {
+  if (gated && !all) {
     models = models.filter((m) => m.id.endsWith(":free"));
   }
   if (q) {
