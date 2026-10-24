@@ -62,7 +62,7 @@ Telegram → Cloudflare Worker (src/index.js) → مدل‌روتر (nvidia/open
 - `src/providers.js` — تعریف providerها (baseUrl، نام راز کلید، هدرهای اضافی) و
   `listFreeModels(env, provider)` برای کشف مدل‌های رایگان هر کدام.
 - `src/combos.js` — قانون هر combo (`chat`، `code`، `vision`، `fast`) + امتیازدهی
-  (`pickModels`، `interleaveByProvider`، ثابت `WEIGHTS`).
+  (`pickModels`، `diversify`، ثابت `WEIGHTS`) و هیوریستیک‌های اندازه/نسخه/نسل قدیمی.
 - `src/catalog.js` — سینک کاتالوگ در KV و اعلان مدل‌های جدید.
 - `src/overrides.js` — KV ابزارهای pin/ban/prefer.
 - `src/health.js` — سلامت هر هدف در KV کوچک با TTL.
@@ -87,8 +87,9 @@ Telegram → Cloudflare Worker (src/index.js) → مدل‌روتر (nvidia/open
    سقف subrequest/CPU پلن رایگان).
 4. **انتخاب combo:** `getComboTargets` از کاتالوگِ flat + overrideها + سلامت،
    لیست ترتیبی هدف‌ها را می‌سازد: pinها اول، بعد کاندیدهای امتیازدهی‌شده با
-   interleave تا حداکثر دو هدف پشت‌سرهم از یک provider نباشد، بریده به `maxTargets`.
-   اگر کاتالوگ خالی باشد خطای واضح می‌دهد: اول `/refresh` را بزن.
+   `diversify`: هرگز سه هدف پشت‌سرهم از یک provider نمی‌آید و وقتی بیش از یک
+   provider کاندید دارد، سه هدف اول حداقل یکی از هر provider را دارد. بریده به
+   `maxTargets`. اگر کاتالوگ خالی باشد خطای واضح می‌دهد: اول `/refresh` را بزن.
 
 ### KV
 
@@ -106,6 +107,9 @@ binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛
 - `/models [combo]` — هدف‌های برتر combo با امتیاز (📌 = pin).
 - `/refresh [provider|all]` — سینک دستی؛ جواب کوتاه `+added -removed` برای هر provider
   (یکی‌یکی پردازش می‌شوند؛ اگر یکی شکست بخورد بقیه ادامه می‌یابند).
+- `/test <provider/model>` — یک chat completion کوچک (`max_tokens: 20`، روزشده‌ی ۲۰ ثانیه)
+  مستقیم به همان provider (بدون فیلتر سلامت) و جواب کوتاه فارسی: وضعیت HTTP،
+  تأخیر بر حسب ms و اسنیپت ۲۰۰ نویسه‌ای رازپاک‌شده از جواب/خطا.
 - `/pin <combo> <provider/model>` و `/unpin <combo> <provider/model>` — pin اول combo می‌آید.
 - `/ban <provider/model>` و `/unban <provider/model>` — بن همیشگی از همه‌ی comboها.
 - `/prefer <combo> <rx1,rx2,...>` و `/prefer <combo> reset` — جایگزینی لیست prefer آن combo.
@@ -114,18 +118,46 @@ binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛
 
 ### امتیازدهی (heuristic!)
 
-کیفیت مدل را کسی به‌صورت خودکار نمی‌داند؛ رتبه‌بندی صرفاً هیوریستیک است:
-امتیاز = مجموع وزن الگوهای prefer (اول‌تر = بیشتر) + بونوس کانتکست بزرگ‌تر +
-بونوس `created` تازه‌تر − جریمه‌ی preview/beta (وقتی prefer نخورده). همه‌ی عددها
-در ثابت `WEIGHTS` بالای `src/combos.js` است — برای تنظیم فقط همان‌جا را تغییر بده.
-قانون `prefer/exclude/minContext/needsVision/maxTargets` هر combo هم همان فایل است.
-تست آفلاین (بدون شبکه) با کاتالوگ ساختگی: `node scripts/test-combos.mjs`.
+کیفیت مدل را کسی به‌صورت خودکار نمی‌داند؛ رتبه‌بندی صرفاً **هیوریستیک** است:
+
+- امتیاز پایه = مجموع وزن الگوهای prefer (اول‌تر = بیشتر) + بونوس کانتکست بزرگ‌تر +
+  بونوس `created` تازه‌تر − جریمه‌ی preview/beta (وقتی prefer نخورده).
+- **جریمه‌ی اندازه:** بزرگ‌ترین توکن `<عدد>b` در نام مدل (مؤلفه‌ی MoE مثل `a12b` نمی‌شمارد؛
+  بزرگ‌ترین عدد مبناست): ≤14B جریمه‌ی سنگین، 15B–40B جریمه‌ی ملایم، ≥100B بونوس.
+- **جریمه‌ی نسل قدیمی:** llama-3.0/3.1، mixtral، gemma-2/3، mistral-7b/nemo،
+  minitron، nemotron-4/51b/70b، palmyra، codestral و مشابه‌ها جریمه می‌گیرند.
+- الگوی `coder` فقط وقتی اعمال می‌شود که جریمه‌ی اندازه نخورده باشد —(coderهای خیلی
+  کوچک به combo کدنویسی کمک نمی‌کنند).
+- **بونوس نسخه:** درون یک provider + خانواده (کلید خانواده = بخش نام مدل تا اولین رقم،
+  مثل `qwen3.8-max` → `qwen`)، نسخه‌ی بالاتر بونوس کوچک می‌گیرد تا نسل جدیدترِ همان
+  خانواده اول بیاید. این هم صرفاً هیوریستیک است.
+- **خطای upstream در کشف مدل:** شکست `GET /models` جواب امن برمی‌گرداند:
+  `{ ok:false, provider, status, snippet }` — snippet اولین ۳۰۰ نویسه‌ی بدنه با
+  پاک‌سازی هر چیزی شبیه راز (مقدار کلید provider و توکن‌های `sk-…`/`nvapi-…`).
+  درخواست‌های کشف مدل هدر User-Agent مرورگرمانند دارند (`Mozilla/5.0 (compatible; my-agent/1.0)`)
+  و هدرها هرگز لاگ/بازگردانده نمی‌شوند.
+- **رد شدن در سطح provider:** 401/403 از یک provider در یک فراخوانی `runCombo` یعنی
+  بقیه‌ی مدل‌های همان provider در همان درخواست رد می‌شوند و فقط یک پیام
+  `provider X: key rejected (401)` برمی‌گردد؛ provider هم در KV یک ساعت منع می‌شود.
+
+همه‌ی عددها در ثابت `WEIGHTS` بالای `src/combos.js` است — برای تنظیم فقط همان‌جا را
+تغییر بده. قانون `prefer/exclude/minContext/needsVision/maxTargets` هر combo هم
+همان فایل است.
+
+تست آفلاین (بدون شبکه/KV/راز): `npm run test:offline`. فایل‌های فیکسچرِ آی‌دی عمومی
+`xk-models.json`، `nv-models.json`، `or-models.json` را از ریشه می‌خواند (gitignored،
+هرگز کامیت نمی‌شوند؛ فایل نبود یا object خطا بود رد می‌شود با پیام)، top-8 هر combo را
+با امتیاز چاپ می‌کند و چند assert ساده (تنوع، نبود مدل embed/guard/… و حاضر بودن
+مدل‌های اصلی در code) دارد؛ شکست = exit code 1.
 
 ### Endpointها برای خودم
 
 - `POST /admin/refresh?provider=<name|all>` (هدر `X-Setup-Key: <TG_SECRET>`) —
   سینک ترتیبی و برگرداندن `{ provider: { added, removed } }`.
 - `GET /admin/catalog?combo=<name>` — لیست حل‌شده‌ی هدف‌ها با امتیاز و وضعیت سلامت (بدون راز).
+- `GET /admin/test?target=<provider/model>` (هدر `X-Setup-Key: <TG_SECRET>`) —
+  همان `/test` تلگرام: `{ ok, provider, model, status, latencyMs, snippet }`
+  (snippet رازپاک‌شده).
 - `GET /admin/models?provider=<name>` — همان کاتالوگ زنده با فیلتر `q`/`all=1`
   (فقط `{ id }` و برای openrouter/xkiro `context_length`/`vision` در صورت وجود).
 
@@ -146,7 +178,9 @@ binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛
 رفتن به هدف بعدی روی: خطای شبکه/timeout (per-target پیش‌فرض ۲۰ ثانیه)، HTTP
 408/429/5xx، 400/404 (مدل پشتیبانی نمی‌شود)، 401/403 (ثبت به‌عنوان خطای کانفیگ و ادامه)،
 یا پیام assistant خالی. ست هر شکست در `health:*` ثبت می‌شود تا دفعه‌ی بعد آن هدف
-(یا کل provider روی 401/403) خودکار رد شود. کل تلاش‌ها با روزشده‌ی کلی `deadlineMs`
+(یا کل provider روی 401/403) خودکار رد شود. 401/403 در همان درخواست یعنی بقیه‌ی
+مدل‌های همان provider هم رد می‌شوند و فقط یک پیام `provider X: key rejected (401)`
+در لیست خطاها می‌آید. کل تلاش‌ها با روزشده‌ی کلی `deadlineMs`
 (پیش‌فرض ۲۵ ثانیه) محدود می‌شوند.
 
 ### ربات تلگرام

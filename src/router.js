@@ -1,5 +1,5 @@
-import { PROVIDERS } from "./providers.js";
-import { RULES, pickModels, interleaveByProvider, compilePrefer, scoreModel } from "./combos.js";
+import { PROVIDERS, redact } from "./providers.js";
+import { RULES, pickModels, diversify, compilePrefer, scoreModel } from "./combos.js";
 import { loadCatalog } from "./catalog.js";
 import { getOverrides, resolvePins } from "./overrides.js";
 import { getUnhealthyProviders, isModelHealthy, markFailure } from "./health.js";
@@ -58,7 +58,7 @@ export async function getComboTargets(env, name) {
     if (await isModelHealthy(env, `${m.provider}/${m.id}`)) healthy.push(m);
   }
 
-  const ordered = interleaveByProvider(
+  const ordered = diversify(
     pins.map((m) => ({ ...m, pinned: true })),
     healthy,
     rule.maxTargets,
@@ -115,7 +115,13 @@ async function tryTarget(env, providerName, model, body, timeoutMs) {
   }
 
   if (!res.ok) {
-    return { error: errorFor(used, res.status), cause: res.status };
+    const raw = await res.text().catch(() => "");
+    return {
+      error: errorFor(used, res.status),
+      cause: res.status,
+      status: res.status,
+      raw: redact(raw, [key], 200),
+    };
   }
   return { res };
 }
@@ -147,8 +153,13 @@ export async function runCombo(
 
   const started = Date.now();
   const errors = [];
+  // اگر کلید یک provider رد شد (401/403)، بقیه‌ی هدف‌های همان provider در این
+  // فراخوانی بی‌خیال می‌شوند — فقط یک پیام «key rejected» برمی‌گردد و provider
+  // یک ساعت در health منع می‌شود (markFailure خودش این را ثبت می‌کند).
+  const rejectedProviders = new Set();
 
   for (const t of targets) {
+    if (rejectedProviders.has(t.provider)) continue;
     const usedModel = `${t.provider}/${t.model}`;
     const remaining = deadlineMs - (Date.now() - started);
     if (remaining <= 0) {
@@ -165,7 +176,12 @@ export async function runCombo(
     if (attempt.skipReason) {
       errors.push({ target: usedModel, reason: attempt.skipReason });
     } else if (attempt.error) {
-      errors.push(attempt.error);
+      if (attempt.cause === 401 || attempt.cause === 403) {
+        rejectedProviders.add(t.provider);
+        errors.push({ target: usedModel, reason: `provider ${t.provider}: key rejected (${attempt.cause})` });
+      } else {
+        errors.push(attempt.error);
+      }
       if (env.STATE) {
         try {
           await markFailure(env, usedModel, attempt.cause);
@@ -212,4 +228,45 @@ export async function runCombo(
   }
 
   return { ok: false, errors };
+}
+
+// فراخوانی مستقیم یک هدف (همان کد مسیر روتتر؛ بدون فیلتر سلامت) برای /test.
+// خروجی امن است: فقط status، تأخیر و اسنیپت رازپاک‌شده.
+export async function directCall(env, providerName, model, body, { timeoutMs = 20000 } = {}) {
+  const provider = PROVIDERS[providerName];
+  if (!provider) {
+    return { ok: false, status: null, latencyMs: 0, snippet: `unknown provider: ${providerName}` };
+  }
+  const key = env[provider.keyEnv];
+  if (!key) {
+    return { ok: false, status: null, latencyMs: 0, snippet: `missing ${provider.keyEnv}` };
+  }
+  const started = Date.now();
+  const attempt = await tryTarget(env, providerName, model, body, timeoutMs);
+  const latencyMs = Date.now() - started;
+  if (attempt.skipReason) {
+    return { ok: false, status: null, latencyMs, snippet: attempt.skipReason };
+  }
+  if (attempt.error) {
+    return {
+      ok: false,
+      status: attempt.status ?? null,
+      latencyMs,
+      snippet: attempt.raw || `http ${attempt.status}`,
+    };
+  }
+  let data;
+  try {
+    data = await attempt.res.json();
+  } catch (err) {
+    return { ok: false, status: attempt.res.status, latencyMs, snippet: `bad json: ${err && err.message}` };
+  }
+  const content = data?.choices?.[0]?.message?.content;
+  const text =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? content.map((p) => p?.text ?? "").join("")
+        : JSON.stringify(data ?? {});
+  return { ok: true, status: attempt.res.status, latencyMs, snippet: redact(text, [key], 200) };
 }

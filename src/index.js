@@ -1,6 +1,6 @@
 import { PROVIDERS, listFreeModels } from "./providers.js";
 import { RULES } from "./combos.js";
-import { runCombo, getComboTargets } from "./router.js";
+import { runCombo, getComboTargets, directCall } from "./router.js";
 import { syncProvider } from "./catalog.js";
 import {
   getOverrides,
@@ -122,7 +122,7 @@ async function answerChatText(env, chatId, text) {
 }
 
 const HELP_TEXT =
-  "دستورها: /models [combo] /refresh [provider] /pin <combo> <provider/model> " +
+  "دستورها: /models [combo] /refresh [provider] /test <provider/model> /pin <combo> <provider/model> " +
   "/unpin <combo> <provider/model> /ban <provider/model> /unban <provider/model> " +
   "/prefer <combo> <rx1,rx2,...|reset> /status /ping /start — برای چت، متن ساده بفرست.";
 
@@ -165,10 +165,46 @@ async function tgRefresh(env, chatId, provider) {
       const r = await syncProvider(env, p, { notify: false });
       lines.push(`${p}: +${r.added.length} -${r.removed.length}`);
     } catch (err) {
-      lines.push(`${p}: شکست (${String(err && err.message).slice(0, TG_ERROR_LIMIT)})`);
+      const info = err?.info;
+      if (info) {
+        lines.push(`${p}: شکست (HTTP ${info.status ?? "?"}) — ${info.snippet || "بدون پاسخ"}`);
+      } else {
+        lines.push(`${p}: شکست (${String(err && err.message).slice(0, TG_ERROR_LIMIT)})`);
+      }
     }
   }
   await tgSend(env, chatId, `بروزرسانی کاتالوگ:\n${lines.join("\n")}`);
+}
+
+const TEST_BODY = {
+  messages: [{ role: "user", content: "Reply with exactly: OK" }],
+  max_tokens: 20,
+};
+
+async function runTestTarget(env, target) {
+  const slash = target.indexOf("/");
+  const provider = target.slice(0, slash);
+  const model = target.slice(slash + 1);
+  return {
+    provider,
+    model,
+    ...(await directCall(env, provider, model, TEST_BODY, { timeoutMs: 20000 })),
+  };
+}
+
+async function tgTest(env, chatId, target) {
+  if (!PROVIDERS[target.slice(0, target.indexOf("/"))] || !TARGET_RE.test(target)) {
+    await tgSend(env, chatId, "فرمت: /test <provider/model>  (مثال: /test nvidia/z-ai/glm-5.3)");
+    return;
+  }
+  await tgSend(env, chatId, `⏳ تست ${target}...`);
+  const r = await runTestTarget(env, target);
+  const status = r.status ?? "—";
+  await tgSend(
+    env,
+    chatId,
+    `${r.ok ? "✅" : "❌"} ${r.provider}/${r.model} — ${status}، ${r.latencyMs}ms\n${r.snippet || "(بدون متن)"}`,
+  );
 }
 
 const TARGET_RE = /^[^/\s]+\/\S+$/;
@@ -183,6 +219,9 @@ async function tgCommand(env, chatId, text) {
   }
   if (cmd === "/refresh") {
     return tgRefresh(env, chatId, args[0] ?? "all");
+  }
+  if (cmd === "/test") {
+    return tgTest(env, chatId, (args[0] ?? "").trim());
   }
   if (cmd === "/pin" || cmd === "/unpin") {
     const [combo, target] = args;
@@ -353,6 +392,7 @@ async function adminModels(request, env) {
   try {
     models = await listFreeModels(env, providerName);
   } catch (err) {
+    if (err?.info) return Response.json(err.info, { status: 502 });
     return Response.json(
       { ok: false, error: String(err && err.message).slice(0, 200) },
       { status: 502 },
@@ -400,10 +440,36 @@ async function adminRefresh(request, env) {
       const r = await syncProvider(env, p);
       result[p] = { added: r.added.length, removed: r.removed.length };
     } catch (err) {
-      result[p] = { error: String(err && err.message).slice(0, 200) };
+      result[p] =
+        err?.info ??
+        { ok: false, provider: p, status: null, snippet: String(err && err.message).slice(0, 300) };
     }
   }
   return Response.json(result);
+}
+
+async function adminTest(request, env) {
+  const key = request.headers.get("X-Setup-Key") ?? "";
+  if (!safeEqual(key, env.TG_SECRET)) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  const target = new URL(request.url).searchParams.get("target") ?? "";
+  const slash = target.indexOf("/");
+  if (slash <= 0 || !PROVIDERS[target.slice(0, slash)] || !target.slice(slash + 1)) {
+    return Response.json(
+      { ok: false, error: "target must be provider/model" },
+      { status: 400 },
+    );
+  }
+  const r = await runTestTarget(env, target);
+  return Response.json({
+    ok: r.ok,
+    provider: r.provider,
+    model: r.model,
+    status: r.status ?? null,
+    latencyMs: r.latencyMs,
+    snippet: r.snippet,
+  });
 }
 
 async function adminCatalog(request, env) {
@@ -452,6 +518,11 @@ async function route(request, env, ctx) {
   if (request.method === "POST" && pathname === "/admin/refresh") {
     if (missingSecretName(env)) return missingSecretResponse(env);
     return adminRefresh(request, env);
+  }
+
+  if (request.method === "GET" && pathname === "/admin/test") {
+    if (missingSecretName(env)) return missingSecretResponse(env);
+    return adminTest(request, env);
   }
 
   if (request.method === "GET" && pathname === "/admin/catalog") {
