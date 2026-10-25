@@ -63,11 +63,14 @@ export const WEIGHTS = {
   sizeMidPenalty: 5,    // 15B تا 40B — مرزی
   sizeHugeBonus: 5,     // ≥100B — مدل بزرگ، معمولاً خانواده‌ی قوی‌تر
   legacyPenalty: 15,    // نسل‌های قدیمی: llama2/3.0/3.1، mixtral، gemma-2/3، ...
+  vlOmniPenalty: 12,    // vision/vl/omni در comboهای غیر از vision (برای کدنویسی بد هستند)
 };
 
 const NOVELTY_RE = /preview|beta|alpha|exp|-rc\d/i;
 const LEGACY_RE =
   /llama-3\.[01]|llama3-|mixtral|mistral-7b|mistral-nemo|gemma-2|gemma-3-|phi-3|yi-large|dbrx|jamba-1|granite|arctic|zamba|recurrentgemma|palmyra|codestral|minitron|chatqa|nemotron-4|nemotron-51b|nemotron-70b/i;
+// مدل‌های چندوجهی (vision/vl/omni) برای چت متنیِ سبک و کدنویسی گزینه‌ی خوبی نیستند
+const VL_OMNI_RE = /vision|\bvl\b|omni/i;
 
 function compileSafe(pattern, flags) {
   try {
@@ -148,7 +151,7 @@ export function applyVersionBonus(scored) {
   }
 }
 
-export function scoreModel(m, compiledPrefer) {
+export function scoreModel(m, compiledPrefer, { skipVlPenalty = false } = {}) {
   const name = namePartOf(m.id);
   const sizeAdj = sizeAdjust(sizeBOf(name));
   let score = sizeAdj;
@@ -161,6 +164,8 @@ export function scoreModel(m, compiledPrefer) {
       score += Math.max(0, WEIGHTS.preferBase - i * WEIGHTS.preferStep);
     }
   });
+  // مدل‌های ویژن/omni در همه‌ی comboها به‌جز خودِ vision جریمه می‌شوند
+  if (!skipVlPenalty && VL_OMNI_RE.test(name)) score -= WEIGHTS.vlOmniPenalty;
   if (typeof m.context === "number" && m.context > 0) {
     score += Math.min(WEIGHTS.contextCap, (m.context / 100000) * WEIGHTS.contextPer100k);
   }
@@ -185,7 +190,11 @@ export function pickModels(catalog, rule, { prefer = null, bans = [] } = {}) {
     if (rule.needsVision && m.vision !== true) return false;
     return true;
   });
-  const scored = eligible.map((m) => ({ ...m, score: scoreModel(m, compiledPrefer) }));
+  // جریمه‌ی vl/omni فقط وقتی combo خودش vision است معلق می‌شود
+  const scored = eligible.map((m) => ({
+    ...m,
+    score: scoreModel(m, compiledPrefer, { skipVlPenalty: rule.needsVision === true }),
+  }));
   applyVersionBonus(scored);
   scored.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
   return scored;

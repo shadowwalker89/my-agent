@@ -1,43 +1,24 @@
 // سلامت هر هدف در KV: کلید "health:<provider>/<model>" با expirationTtl.
 // اگر کلید موجود باشد یعنی هدف ناسالم است؛ با پایان TTL خوانده نمی‌شود و سالم حساب می‌شود.
 // خطای احراز هویت (401/403) کل provider را در "health:provider:<name>" می‌بندد (۱ ساعت).
+// طبقه‌بندی شکست در classifyFailure داخل src/router.js تمرکز دارد — اینجا فقط نمایش.
 
-const GONE_TTL = 86400; // 24h — مدل دیگر وجود ندارد / پشتیبانی نمی‌شود
-const TRANSIENT_TTL = 600; // 10 min — 429، 5xx، timeout، empty
-const AUTH_TTL = 3600; // 1h — 401/403 در سطح provider
-
-export function classifyFailure(cause) {
-  if (typeof cause === "number") {
-    if (cause === 401 || cause === 403) return "auth";
-    if (cause === 404 || cause === 410 || cause === 400) return "gone";
-    return "transient";
-  }
-  return "transient";
-}
-
-function reasonOf(cause) {
-  return (typeof cause === "number" ? `http ${cause}` : String(cause ?? "unknown")).slice(0, 200);
-}
-
-export async function markFailure(env, target, cause) {
-  if (!env.STATE) return;
-  const cls = classifyFailure(cause);
-  const value = JSON.stringify({ cls, reason: reasonOf(cause) });
-  if (cls === "auth") {
-    const provider = String(target).split("/")[0];
-    const key = `health:provider:${provider}`;
-    const old = await env.STATE.get(key, "json");
-    if (old?.cls !== cls) {
-      await env.STATE.put(key, value, { expirationTtl: AUTH_TTL });
-    }
-    return;
-  }
-  const key = `health:${target}`;
-  const old = await env.STATE.get(key, "json");
-  if (old?.cls !== cls) {
-    await env.STATE.put(key, value, {
-      expirationTtl: cls === "gone" ? GONE_TTL : TRANSIENT_TTL,
-    });
+// ثبت شکست بر پایه‌ی همان طبقه‌بندی classifyFailure؛ put هر بار TTL را تازه می‌کند
+// تا شکست‌های تکراری، سردی را طولانی نکنند و همیشه old را هم بخوانیم (صرفه‌جویی نوشتن).
+export async function markFailure(env, target, classification, reasonText) {
+  if (!env.STATE || !classification) return;
+  const key =
+    classification.scope === "provider"
+      ? `health:provider:${String(target).split("/")[0]}`
+      : `health:${target}`;
+  const value = JSON.stringify({
+    cls: classification.scope,
+    label: classification.label ?? null,
+    reason: String(reasonText ?? "").slice(0, 200),
+  });
+  const old = await env.STATE.get(key);
+  if (old !== value) {
+    await env.STATE.put(key, value, { expirationTtl: Math.max(60, classification.cooldownSec) });
   }
 }
 
@@ -57,4 +38,26 @@ export async function getUnhealthyProviders(env) {
 export async function isModelHealthy(env, target) {
   if (!env.STATE) return true;
   return !(await env.STATE.get(`health:${target}`));
+}
+
+// تعداد هدف‌های سردِ فعلی به تفکیک provider — از کلیدهای موجود health:*
+// (کلیدهای "health:provider:*" جدا شمرده می‌شوند: منع کل provider).
+export async function healthCounts(env) {
+  const counts = { nvidia: 0, openrouter: 0, xkiro: 0 };
+  const providerBlocked = [];
+  if (!env.STATE) return { counts, providerBlocked };
+  let cursor;
+  do {
+    const page = await env.STATE.list({ prefix: "health:", cursor });
+    for (const k of page.keys) {
+      if (k.name.startsWith("health:provider:")) {
+        providerBlocked.push(k.name.slice("health:provider:".length));
+        continue;
+      }
+      const p = k.name.slice("health:".length).split("/")[0];
+      counts[p] = (counts[p] ?? 0) + 1;
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return { counts, providerBlocked };
 }

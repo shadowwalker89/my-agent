@@ -5,8 +5,9 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { RULES, pickModels, diversify } from "../src/combos.js";
+import { RULES, pickModels, diversify, WEIGHTS } from "../src/combos.js";
 import { mapNvidia, mapXkiro, mapOpenRouter } from "../src/providers.js";
+import { classifyFailure } from "../src/router.js";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -78,6 +79,51 @@ function show(label, entries) {
 function check(cond, msg) {
   if (!cond) failures.push(msg);
 }
+
+// ── فیکسچرهای classifyFailure (طبقه‌بندی شکست upstream) ────────────────────
+function checkCls(name, out, scope, cooldownSec, label) {
+  let ok = out.scope === scope && out.cooldownSec === cooldownSec;
+  if (label !== undefined) ok &&= out.label === label;
+  // برچسب هرگز «http undefined» نمی‌شود
+  ok &&= !/undefined/.test(String(out.label));
+  check(ok, `classifyFailure ${name}: خروجی ${JSON.stringify(out)}`);
+}
+
+const fn404 =
+  "Function qwen3-30b-a3b-instruct with id abc not found for account 123";
+checkCls("404 function-not-found", classifyFailure(404, fn404, false), "model", 86400);
+checkCls(
+  "404 plain-page",
+  classifyFailure(404, "404 page not found", false),
+  "model",
+  86400,
+  "model not available (http 404)",
+);
+checkCls("timeout", classifyFailure(null, "", true), "model", 600, "timeout");
+checkCls("503", classifyFailure(503, "", false), "model", 900, "http 503");
+checkCls("429", classifyFailure(429, "", false), "model", 900);
+checkCls("401", classifyFailure(401, "", false), "provider", 3600, "key rejected");
+checkCls("no-status", classifyFailure(null, "", false), "model", 600, "upstream error");
+
+// ── جریمه‌ی vl/omni در code — در vision معلق می‌شود ────────────────────────
+const DAY = 86400;
+const now = Date.now() / 1000;
+const twinBase = { provider: "xkiro", context: 262144, created: now - 10 * DAY };
+const twinPlus = { id: "qwen/qwen3.9-plus:free", ...twinBase, vision: true };
+const twinOmni = { id: "qwen/qwen3.9-omni-flash:free", ...twinBase, vision: true };
+const scoreOf = (m, rule) => pickModels([twinPlus, twinOmni], rule, {}).find((x) => x.id === m.id).score;
+const codePlus = scoreOf(twinPlus, RULES.code);
+const codeOmni = scoreOf(twinOmni, RULES.code);
+check(
+  Math.abs(codePlus - codeOmni - WEIGHTS.vlOmniPenalty) < 0.51,
+  `code: جریمه‌ی vl/omni اعمال نشد (${codePlus} مقابل ${codeOmni})`,
+);
+const visPlus = scoreOf(twinPlus, RULES.vision);
+const visOmni = scoreOf(twinOmni, RULES.vision);
+check(
+  Math.abs(visPlus - visOmni) < 0.51,
+  `vision: جریمه‌ی vl/omni نباید اعمال می‌شد (${visPlus} مقابل ${visOmni})`,
+);
 
 const asserts = {
   code: (targets) => {

@@ -13,12 +13,35 @@ function truncate(text) {
   return s.length > 200 ? s.slice(0, 200) : s;
 }
 
-function errorFor(target, cause) {
-  const entry =
-    typeof cause === "number"
-      ? { target, status: cause }
-      : { target, reason: truncate(cause) };
-  return entry;
+// طبقه‌بندی شکست upstream — تک‌نقطه‌ی تصمیم برای دامنه و مدت سردی:
+// scope "model" = فقط همین مدل سرد می‌شود؛ scope "provider" = کل provider.
+// برچسب فقط از status عددی ساخته می‌شود؛ هیچ‌وقت چیزی مثل "http undefined" نمی‌شود.
+export function classifyFailure(status, bodySnippet, isTimeout) {
+  if (isTimeout) return { scope: "model", cooldownSec: 600, label: "timeout" };
+  if (status === 401 || status === 403) {
+    return { scope: "provider", cooldownSec: 3600, label: "key rejected" };
+  }
+  const body = String(bodySnippet ?? "");
+  if (status === 404) {
+    const matched =
+      /Function .* Not found for account/i.test(body) || body.includes("404 page not found");
+    return {
+      scope: "model",
+      cooldownSec: 86400,
+      label: matched ? "model not available (http 404)" : "http 404",
+    };
+  }
+  if (status === 400 || status === 410) {
+    return { scope: "model", cooldownSec: 86400, label: `http ${status}` };
+  }
+  if (typeof status === "number" && (status === 429 || status >= 500)) {
+    return { scope: "model", cooldownSec: 900, label: `http ${status}` };
+  }
+  return {
+    scope: "model",
+    cooldownSec: 600,
+    label: typeof status === "number" ? `http ${status}` : "upstream error",
+  };
 }
 
 export async function getComboTargets(env, name) {
@@ -39,7 +62,10 @@ export async function getComboTargets(env, name) {
   const preferPatterns = ov.prefer?.[name] ?? null;
   const compiled = compilePrefer(preferPatterns ?? rule.prefer);
   const pins = resolvePins(ov.pins?.[name], catalog)
-    .map((m) => ({ ...m, score: scoreModel(m, compiled) }))
+    .map((m) => ({
+      ...m,
+      score: scoreModel(m, compiled, { skipVlPenalty: rule.needsVision === true }),
+    }))
     .filter((m) => !unhealthyProviders[m.provider]);
   const pinKeys = new Set(pins.map((m) => `${m.provider}/${m.id}`.toLowerCase()));
   const scored = pickModels(catalog, rule, {
@@ -106,9 +132,13 @@ async function tryTarget(env, providerName, model, body, timeoutMs) {
       body: JSON.stringify({ ...body, model }),
     });
   } catch (err) {
+    const isTimeout = err?.reason === "timeout";
     return {
-      error: errorFor(used, err?.reason === "timeout" ? "timeout" : `network: ${err && err.message}`),
-      cause: err?.reason === "timeout" ? "timeout" : "network error",
+      error: {
+        target: used,
+        reason: isTimeout ? "timeout" : truncate(`network: ${err && err.message}`),
+      },
+      cause: isTimeout ? "timeout" : `network: ${err && err.message}`,
     };
   } finally {
     clearTimeout(timer);
@@ -176,15 +206,33 @@ export async function runCombo(
     if (attempt.skipReason) {
       errors.push({ target: usedModel, reason: attempt.skipReason });
     } else if (attempt.error) {
-      if (attempt.cause === 401 || attempt.cause === 403) {
+      const isTimeout = attempt.cause === "timeout";
+      const cls = classifyFailure(
+        typeof attempt.cause === "number" ? attempt.cause : null,
+        attempt.raw,
+        isTimeout,
+      );
+      if (cls.scope === "provider") {
         rejectedProviders.add(t.provider);
-        errors.push({ target: usedModel, reason: `provider ${t.provider}: key rejected (${attempt.cause})` });
+        errors.push({
+          target: usedModel,
+          reason: `provider ${t.provider}: key rejected (${attempt.cause})`,
+        });
       } else {
-        errors.push(attempt.error);
+        const entry = { target: usedModel };
+        if (typeof attempt.cause === "number") {
+          entry.reason = cls.label;
+          entry.status = attempt.cause;
+        } else if (isTimeout) {
+          entry.reason = cls.label;
+        } else {
+          entry.reason = truncate(attempt.cause);
+        }
+        errors.push(entry);
       }
       if (env.STATE) {
         try {
-          await markFailure(env, usedModel, attempt.cause);
+          await markFailure(env, usedModel, cls, isTimeout ? "timeout" : truncate(attempt.cause));
         } catch (err) {
           console.error("markFailure failed:", err && err.message);
         }
@@ -248,11 +296,18 @@ export async function directCall(env, providerName, model, body, { timeoutMs = 2
     return { ok: false, status: null, latencyMs, snippet: attempt.skipReason };
   }
   if (attempt.error) {
+    const isTimeout = attempt.cause === "timeout";
+    const snippet = isTimeout
+      ? `timeout بعد از ${Math.max(1, Math.round(timeoutMs / 1000))}s`
+      : attempt.raw ||
+        (typeof attempt.cause === "string" && attempt.cause !== "timeout"
+          ? truncate(attempt.cause)
+          : `http ${attempt.status ?? ""}`.trim());
     return {
       ok: false,
       status: attempt.status ?? null,
       latencyMs,
-      snippet: attempt.raw || `http ${attempt.status}`,
+      snippet,
     };
   }
   let data;

@@ -12,6 +12,7 @@ import {
   validatePattern,
 } from "./overrides.js";
 import { tgApi, tgSend, tgBroadcast } from "./telegram.js";
+import { healthCounts } from "./health.js";
 
 const TG_ERROR_LIMIT = 120;
 
@@ -127,25 +128,38 @@ const HELP_TEXT =
   "/prefer <combo> <rx1,rx2,...|reset> /status /ping /start — برای چت، متن ساده بفرست.";
 
 async function tgModels(env, chatId, combo) {
-  if (!RULES[combo]) {
-    await tgSend(env, chatId, `combo ناشناس: ${combo}\ncomboها: ${Object.keys(RULES).join(", ")}`);
-    return;
-  }
-  const sel = await getComboTargets(env, combo);
-  if (sel.error) {
-    const msg = sel.error.startsWith("catalog is empty")
-      ? "کاتالوگ خالی است؛ اول /refresh بزن 🙏"
-      : sel.error;
-    await tgSend(env, chatId, msg);
-    return;
-  }
-  const lines = sel.targets
-    .slice(0, 8)
-    .map(
-      (t, i) =>
-        `${i + 1}. ${t.provider}/${t.model} — ${t.score}${t.pinned ? " 📌" : ""}`,
+  try {
+    if (!RULES[combo]) {
+      await tgSend(env, chatId, `combo ناشناس: ${combo}\ncomboها: ${Object.keys(RULES).join(", ")}`);
+      return;
+    }
+    const sel = await getComboTargets(env, combo);
+    if (sel.error) {
+      const msg = sel.error.startsWith("catalog is empty")
+        ? "کاتالوگ خالی است؛ اول /refresh بزن 🙏"
+        : sel.error;
+      await tgSend(env, chatId, msg);
+      return;
+    }
+    const lines = sel.targets
+      .slice(0, 8)
+      .map(
+        (t, i) =>
+          `${i + 1}. ${t.provider}/${t.model} — ${t.score}${t.pinned ? " 📌" : ""}`,
+      );
+    // پانویس: تعداد هدف‌های سردِ فعلی هر provider از کلیدهای موجود health:*
+    const counts = await healthCounts(env);
+    const footer = Object.keys(PROVIDERS)
+      .map((p) => `${p}: ${counts.counts[p] ?? 0}`)
+      .join(" | ");
+    await tgSend(env, chatId, `combo «${combo}»:\n${lines.join("\n")}\n❄ کول‌داونِ فعلی — ${footer}`);
+  } catch (err) {
+    await tgSend(
+      env,
+      chatId,
+      `❌ نمایش مدل‌ها شکست خورد: ${String(err && err.name).slice(0, 40)}`,
     );
-  await tgSend(env, chatId, `combo «${combo}»:\n${lines.join("\n")}`);
+  }
 }
 
 async function tgRefresh(env, chatId, provider) {
@@ -285,11 +299,16 @@ async function tgStatus(env, chatId) {
     getOverrides(env),
   ]);
   const pinnedTotal = Object.values(ov.pins).reduce((n, l) => n + l.length, 0);
+  const counts = await healthCounts(env);
+  const cooldownLine = Object.keys(PROVIDERS)
+    .map((p) => `${p}: ${counts.counts[p] ?? 0}`)
+    .join(" | ");
   const lines = [
     `nvidia: ${nv?.models?.length ?? 0} مدل${nv?.updatedAt ? ` — آخرین sync: ${ageString(nv.updatedAt)}` : " — هنوز sync نشده"}`,
     `openrouter: ${or_?.models?.length ?? 0} مدل${or_?.updatedAt ? ` — آخرین sync: ${ageString(or_.updatedAt)}` : ""}`,
     `xkiro: ${xk?.models?.length ?? 0} مدل${xk?.updatedAt ? ` — آخرین sync: ${ageString(xk.updatedAt)}` : ""}`,
     `بن‌شده: ${ov.bans.length} | pin‌شده: ${pinnedTotal}`,
+    `❄ کول‌داونِ فعلی — ${cooldownLine}${counts.providerBlocked.length ? `\nمنع کل provider: ${counts.providerBlocked.join(", ")}` : ""}`,
   ];
   await tgSend(env, chatId, lines.join("\n"));
 }
