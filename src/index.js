@@ -1,4 +1,13 @@
-import { PROVIDERS, listFreeModels } from "./providers.js";
+import { redact } from "./providers.js";
+import {
+  getConfig,
+  getProviderCtx,
+  upsertProvider,
+  removeProvider,
+  upsertCombo,
+  removeCombo,
+} from "./config.js";
+import { listProviderModels } from "./providers.js";
 import { RULES } from "./combos.js";
 import { runCombo, getComboTargets, directCall } from "./router.js";
 import { syncProvider } from "./catalog.js";
@@ -123,14 +132,35 @@ async function answerChatText(env, chatId, text) {
 }
 
 const HELP_TEXT =
-  "دستورها: /models [combo] /refresh [provider] /test <provider/model> /pin <combo> <provider/model> " +
+  "دستورها: /models [combo] /combos /refresh [provider] /test <provider/model> /pin <combo> <provider/model> " +
   "/unpin <combo> <provider/model> /ban <provider/model> /unban <provider/model> " +
   "/prefer <combo> <rx1,rx2,...|reset> /status /ping /start — برای چت، متن ساده بفرست.";
 
+async function providerIds(env) {
+  const cfg = await getConfig(env);
+  return cfg.providers.map((p) => p.id);
+}
+
+async function tgCombos(env, chatId) {
+  const cfg = await getConfig(env);
+  if (!cfg.combos.length) {
+    await tgSend(env, chatId, "کامبوی دستی نداری. با POST /admin/api/combos بساز.");
+    return;
+  }
+  const lines = cfg.combos.map(
+    (c) =>
+      `• ${c.name} — ${c.strategy}، ${c.targets.length} هدف، timeout ${c.timeoutMs}ms، retries ${c.retries}`,
+  );
+  await tgSend(env, chatId, `comboهای دستی:\n${lines.join("\n")}`);
+}
+
 async function tgModels(env, chatId, combo) {
   try {
-    if (!RULES[combo]) {
-      await tgSend(env, chatId, `combo ناشناس: ${combo}\ncomboها: ${Object.keys(RULES).join(", ")}`);
+    const cfg = await getConfig(env);
+    const isManual = cfg.combos.some((c) => c.name === combo);
+    if (!RULES[combo] && !isManual) {
+      const names = [...Object.keys(RULES), ...cfg.combos.map((c) => c.name)];
+      await tgSend(env, chatId, `combo ناشناس: ${combo}\ncomboها: ${[...new Set(names)].join(", ")}`);
       return;
     }
     const sel = await getComboTargets(env, combo);
@@ -149,7 +179,7 @@ async function tgModels(env, chatId, combo) {
       );
     // پانویس: تعداد هدف‌های سردِ فعلی هر provider از کلیدهای موجود health:*
     const counts = await healthCounts(env);
-    const footer = Object.keys(PROVIDERS)
+    const footer = (await providerIds(env))
       .map((p) => `${p}: ${counts.counts[p] ?? 0}`)
       .join(" | ");
     await tgSend(env, chatId, `combo «${combo}»:\n${lines.join("\n")}\n❄ کول‌داونِ فعلی — ${footer}`);
@@ -163,14 +193,10 @@ async function tgModels(env, chatId, combo) {
 }
 
 async function tgRefresh(env, chatId, provider) {
-  const list =
-    provider === "all" || !provider
-      ? Object.keys(PROVIDERS)
-      : PROVIDERS[provider]
-        ? [provider]
-        : null;
+  const ids = await providerIds(env);
+  const list = provider === "all" || !provider ? ids : ids.includes(provider) ? [provider] : null;
   if (!list) {
-    await tgSend(env, chatId, `provider ناشناس: ${provider}\nproviderها: ${Object.keys(PROVIDERS).join(", ")}`);
+    await tgSend(env, chatId, `provider ناشناس: ${provider}\nproviderها: ${ids.join(", ")}`);
     return;
   }
   const lines = [];
@@ -207,7 +233,9 @@ async function runTestTarget(env, target) {
 }
 
 async function tgTest(env, chatId, target) {
-  if (!PROVIDERS[target.slice(0, target.indexOf("/"))] || !TARGET_RE.test(target)) {
+  const provider = target.slice(0, target.indexOf("/"));
+  const okFormat = TARGET_RE.test(target) && (await getProviderCtx(env, provider));
+  if (!okFormat) {
     await tgSend(env, chatId, "فرمت: /test <provider/model>  (مثال: /test nvidia/z-ai/glm-5.3)");
     return;
   }
@@ -230,6 +258,9 @@ async function tgCommand(env, chatId, text) {
 
   if (cmd === "/models") {
     return tgModels(env, chatId, args[0] ?? "chat");
+  }
+  if (cmd === "/combos") {
+    return tgCombos(env, chatId);
   }
   if (cmd === "/refresh") {
     return tgRefresh(env, chatId, args[0] ?? "all");
@@ -292,24 +323,28 @@ async function tgStatus(env, chatId) {
     await tgSend(env, chatId, "KV (STATE) در دسترس نیست.");
     return;
   }
-  const [nv, or_, xk, ov] = await Promise.all([
-    env.STATE.get("catalog:nvidia", "json"),
-    env.STATE.get("catalog:openrouter", "json"),
-    env.STATE.get("catalog:xkiro", "json"),
-    getOverrides(env),
-  ]);
-  const pinnedTotal = Object.values(ov.pins).reduce((n, l) => n + l.length, 0);
+  const cfg = await getConfig(env);
+  const [ov] = await Promise.all([getOverrides(env)]);
   const counts = await healthCounts(env);
-  const cooldownLine = Object.keys(PROVIDERS)
-    .map((p) => `${p}: ${counts.counts[p] ?? 0}`)
+  const lines = [];
+  for (const p of cfg.providers) {
+    const r = await env.STATE.get(`catalog:${p.id}`, "json");
+    lines.push(
+      `${p.id}${p.enabled === false ? " (خاموش)" : ""}: ${r?.models?.length ?? 0} مدل${
+        r?.updatedAt ? ` — آخرین sync: ${ageString(r.updatedAt)}` : " — هنوز sync نشده"
+      }`,
+    );
+  }
+  const pinnedTotal = Object.values(ov.pins).reduce((n, l) => n + l.length, 0);
+  const cooldownLine = cfg.providers
+    .map((p) => `${p.id}: ${counts.counts[p.id] ?? 0}`)
     .join(" | ");
-  const lines = [
-    `nvidia: ${nv?.models?.length ?? 0} مدل${nv?.updatedAt ? ` — آخرین sync: ${ageString(nv.updatedAt)}` : " — هنوز sync نشده"}`,
-    `openrouter: ${or_?.models?.length ?? 0} مدل${or_?.updatedAt ? ` — آخرین sync: ${ageString(or_.updatedAt)}` : ""}`,
-    `xkiro: ${xk?.models?.length ?? 0} مدل${xk?.updatedAt ? ` — آخرین sync: ${ageString(xk.updatedAt)}` : ""}`,
-    `بن‌شده: ${ov.bans.length} | pin‌شده: ${pinnedTotal}`,
-    `❄ کول‌داونِ فعلی — ${cooldownLine}${counts.providerBlocked.length ? `\nمنع کل provider: ${counts.providerBlocked.join(", ")}` : ""}`,
-  ];
+  lines.push(`بن‌شده: ${ov.bans.length} | pin‌شده: ${pinnedTotal}`);
+  lines.push(
+    `❄ کول‌داونِ فعلی — ${cooldownLine}${
+      counts.providerBlocked.length ? `\nمنع کل provider: ${counts.providerBlocked.join(", ")}` : ""
+    }`,
+  );
   await tgSend(env, chatId, lines.join("\n"));
 }
 
@@ -385,10 +420,13 @@ async function chatCompletions(request, env) {
   return Response.json({ ok: false, errors: result.errors }, { status: 502 });
 }
 
-function comboModels() {
+async function comboModels(env) {
+  const cfg = await getConfig(env);
+  const manualNames = cfg.combos.map((c) => c.name);
+  const names = [...manualNames, ...Object.keys(RULES).filter((n) => !manualNames.includes(n))];
   return {
     object: "list",
-    data: Object.keys(RULES).map((name) => ({ id: name, object: "model" })),
+    data: names.map((name) => ({ id: name, object: "model" })),
   };
 }
 
@@ -400,16 +438,17 @@ async function adminModels(request, env) {
 
   const url = new URL(request.url);
   const providerName = url.searchParams.get("provider") ?? "";
-  if (!PROVIDERS[providerName]) {
+  const pctx = await getProviderCtx(env, providerName);
+  if (!pctx) {
     return Response.json(
-      { ok: false, error: "provider must be nvidia, openrouter or xkiro" },
+      { ok: false, error: `unknown provider: ${providerName}` },
       { status: 400 },
     );
   }
 
   let models;
   try {
-    models = await listFreeModels(env, providerName);
+    models = await listProviderModels(env, pctx);
   } catch (err) {
     if (err?.info) return Response.json(err.info, { status: 502 });
     return Response.json(
@@ -421,7 +460,7 @@ async function adminModels(request, env) {
   const q = (url.searchParams.get("q") ?? "").toLowerCase();
   const all = url.searchParams.get("all") === "1";
   let out = models;
-  if (providerName !== "nvidia" && !all) {
+  if (pctx.id !== "nvidia" && pctx.builtin && !all) {
     out = out.filter((m) => m.id.endsWith(":free"));
   }
   if (q) out = out.filter((m) => m.id.toLowerCase().includes(q));
@@ -429,7 +468,7 @@ async function adminModels(request, env) {
 
   out = out.map((m) => {
     const entry = { id: m.id };
-    if (providerName !== "nvidia") {
+    if (!pctx.builtin || pctx.id !== "nvidia") {
       if (m.context !== null) entry.context_length = m.context;
       if (m.vision !== null) entry.vision = m.vision;
     }
@@ -445,10 +484,11 @@ async function adminRefresh(request, env) {
   }
 
   const provider = new URL(request.url).searchParams.get("provider") ?? "all";
-  const list = provider === "all" ? Object.keys(PROVIDERS) : [provider];
-  if (provider !== "all" && !PROVIDERS[provider]) {
+  const ids = await providerIds(env);
+  const list = provider === "all" ? ids : [provider];
+  if (provider !== "all" && !ids.includes(provider)) {
     return Response.json(
-      { ok: false, error: "provider must be nvidia, openrouter, xkiro or all" },
+      { ok: false, error: `unknown provider: ${provider}` },
       { status: 400 },
     );
   }
@@ -474,7 +514,8 @@ async function adminTest(request, env) {
   }
   const target = new URL(request.url).searchParams.get("target") ?? "";
   const slash = target.indexOf("/");
-  if (slash <= 0 || !PROVIDERS[target.slice(0, slash)] || !target.slice(slash + 1)) {
+  const providerOk = slash > 0 && Boolean(await getProviderCtx(env, target.slice(0, slash)));
+  if (!providerOk || !target.slice(slash + 1)) {
     return Response.json(
       { ok: false, error: "target must be provider/model" },
       { status: 400 },
@@ -512,6 +553,176 @@ async function adminCatalog(request, env) {
   });
 }
 
+// ── Admin JSON API (/admin/api/*) ──────────────────────────────────────────
+// احراز هویت: هدر X-Setup-Key یا کوکی امضاشده admin_session — مقایسه constant-time.
+// JSON فقط؛ مقادیر secret هرگز برایند نمی‌شوند.
+
+function json(data, status = 200) {
+  return Response.json(data, { status });
+}
+
+const SESSION_TTL_MS = 7 * 86400 * 1000;
+
+async function signSessionToken(env, exp) {
+  const enc = new TextEncoder();
+  const macKey = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(env.TG_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await crypto.subtle.sign("HMAC", macKey, enc.encode(String(exp)));
+  const hex = [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${exp}.${hex}`;
+}
+
+async function adminApiAuthorized(request, env) {
+  const key = request.headers.get("X-Setup-Key") ?? "";
+  if (key && safeEqual(key, env.TG_SECRET)) return true;
+  const cookie = request.headers.get("Cookie") ?? "";
+  const m = /(?:^|;\s*)admin_session=([^;\s]+)/.exec(cookie);
+  if (!m) return false;
+  let val;
+  try {
+    val = decodeURIComponent(m[1]);
+  } catch {
+    return false;
+  }
+  const dot = val.indexOf(".");
+  if (dot <= 0) return false;
+  const exp = Number(val.slice(0, dot));
+  if (!Number.isFinite(exp) || exp < Date.now() || exp > Date.now() + SESSION_TTL_MS) return false;
+  const expected = await signSessionToken(env, exp);
+  return safeEqual(val, expected);
+}
+
+async function readJsonBody(request) {
+  try {
+    const body = await request.json();
+    return body && typeof body === "object" ? body : null;
+  } catch {
+    return null;
+  }
+}
+
+async function adminApiListModels(request, env) {
+  const url = new URL(request.url);
+  const provider = url.searchParams.get("provider") ?? "";
+  const ctx = await getProviderCtx(env, provider);
+  if (!ctx) return json({ ok: false, error: `unknown provider: ${provider}` }, 400);
+  const cat = await env.STATE.get(`catalog:${provider}`, "json");
+  const q = (url.searchParams.get("q") ?? "").toLowerCase();
+
+  const [ov] = await Promise.all([getOverrides(env)]);
+  const banSet = new Set((ov.bans ?? []).map((b) => String(b).toLowerCase()));
+  const cooled = new Set(
+    (await env.STATE.list({ prefix: `health:${provider}/` })).keys.map((k) => k.name),
+  );
+  const out = (cat?.models ?? [])
+    .filter((m) => !q || m.id.toLowerCase().includes(q))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    .map((m) => {
+      const target = `${provider}/${m.id}`.toLowerCase();
+      const status = banSet.has(target) ? "banned" : cooled.has(`health:${target}`) ? "cooldown" : "ok";
+      return { id: m.id, status };
+    });
+  return json({ ok: true, provider, models: out });
+}
+
+async function adminApiTest(request, env) {
+  const body = await readJsonBody(request);
+  if (!body || !body.provider || !body.model) {
+    return json({ ok: false, error: "provider and model are required" }, 400);
+  }
+  const ctx = await getProviderCtx(env, String(body.provider));
+  if (!ctx) return json({ ok: false, error: `unknown provider: ${body.provider}` }, 400);
+  const r = await directCall(env, String(body.provider), String(body.model), TEST_BODY, {
+    timeoutMs: 20000,
+  });
+  return json({
+    ok: r.ok,
+    provider: String(body.provider),
+    model: String(body.model),
+    status: r.status ?? null,
+    latencyMs: r.latencyMs,
+    snippet: r.snippet,
+  });
+}
+
+// بدون mutation خطرناک: خطای apiError → 400 با پیام کوتاه؛ بقیه ۵۰۰ با نام خطا
+async function adminApi(request, env, method, pathname) {
+  const parts = pathname.split("/").filter(Boolean); // ["admin","api",...]
+  const kind = parts[2];
+  const id = parts[3] ?? "";
+  const sub = parts[4] ?? "";
+
+  try {
+    if (method === "GET" && kind === "config") {
+      const cfg = await getConfig(env);
+      // فقط نام راز (secretName) — مقدار هرگز
+      return json({ ok: true, providers: cfg.providers, combos: cfg.combos });
+    }
+
+    if (kind === "models" && method === "GET") return await adminApiListModels(request, env);
+    if (kind === "test" && method === "POST") return await adminApiTest(request, env);
+
+    if (kind === "providers") {
+      if (method === "POST" && !id && !sub) {
+        const body = await readJsonBody(request);
+        if (!body) return json({ ok: false, error: "invalid json body" }, 400);
+        const p = await upsertProvider(env, body);
+        return json({
+          ok: true,
+          provider: { id: p.id, name: p.name, baseUrl: p.baseUrl, secretName: p.secretName, enabled: p.enabled },
+        });
+      }
+      if (method === "PUT" && id && !sub) {
+        const body = await readJsonBody(request);
+        if (!body) return json({ ok: false, error: "invalid json body" }, 400);
+        const p = await upsertProvider(env, { ...body, id });
+        return json({
+          ok: true,
+          provider: { id: p.id, name: p.name, baseUrl: p.baseUrl, secretName: p.secretName, enabled: p.enabled },
+        });
+      }
+      if (method === "DELETE" && id && !sub) {
+        await removeProvider(env, id);
+        return json({ ok: true, deleted: id });
+      }
+      if (method === "POST" && id && sub === "refresh") {
+        const r = await syncProvider(env, id);
+        return json({ ok: true, provider: id, added: r.added.length, removed: r.removed.length });
+      }
+    }
+
+    if (kind === "combos") {
+      if (method === "POST" && !id) {
+        const body = await readJsonBody(request);
+        if (!body) return json({ ok: false, error: "invalid json body" }, 400);
+        const c = await upsertCombo(env, body);
+        return json({ ok: true, combo: c });
+      }
+      if (method === "PUT" && id) {
+        const body = await readJsonBody(request);
+        if (!body) return json({ ok: false, error: "invalid json body" }, 400);
+        const c = await upsertCombo(env, { ...body, name: id });
+        return json({ ok: true, combo: c });
+      }
+      if (method === "DELETE" && id) {
+        await removeCombo(env, id);
+        return json({ ok: true, deleted: id });
+      }
+    }
+
+    return json({ ok: false, error: "not found" }, 404);
+  } catch (err) {
+    return err?.apiError
+      ? json({ ok: false, error: err.message }, 400)
+      : json({ ok: false, error: String(err && err.name).slice(0, 60) }, 500);
+  }
+}
+
 async function route(request, env, ctx) {
   const { pathname } = new URL(request.url);
 
@@ -526,12 +737,20 @@ async function route(request, env, ctx) {
   if (request.method === "GET" && pathname === "/v1/models") {
     const auth = routerAuth(request, env);
     if (auth) return auth;
-    return Response.json(comboModels());
+    return Response.json(await comboModels(env));
   }
 
   if (request.method === "GET" && pathname === "/admin/models") {
     if (missingSecretName(env)) return missingSecretResponse(env);
     return adminModels(request, env);
+  }
+
+  if (pathname.startsWith("/admin/api/")) {
+    if (missingSecretName(env)) return missingSecretResponse(env);
+    if (!(await adminApiAuthorized(request, env))) {
+      return json({ ok: false, error: "unauthorized" }, 401);
+    }
+    return adminApi(request, env, request.method, pathname);
   }
 
   if (request.method === "POST" && pathname === "/admin/refresh") {

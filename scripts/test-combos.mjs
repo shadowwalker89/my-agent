@@ -7,7 +7,17 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { RULES, pickModels, diversify, WEIGHTS } from "../src/combos.js";
 import { mapNvidia, mapXkiro, mapOpenRouter } from "../src/providers.js";
-import { classifyFailure } from "../src/router.js";
+import { classifyFailure, sortForStrategy } from "../src/router.js";
+import {
+  getConfig,
+  upsertProvider,
+  removeProvider,
+  upsertCombo,
+  removeCombo,
+  validateProvider,
+  validateCombo,
+  TARGET_LIMIT,
+} from "../src/config.js";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -180,6 +190,169 @@ for (const [name, rule] of Object.entries(RULES)) {
   diversityCheck(name, targets);
   asserts[name]?.(targets);
 }
+
+// ── patch 3a: config:v1 در KV، اعتبارسنجی، سقف‌ها و راز ────────────────────
+function fakeKV() {
+  const store = new Map();
+  return {
+    async get(key, type) {
+      const v = store.get(key);
+      if (v === undefined) return null;
+      return type === "json" ? JSON.parse(v) : v;
+    },
+    async put(key, value) {
+      store.set(key, String(value));
+    },
+    async list() {
+      return { keys: [...store.keys()].map((name) => ({ name })), list_complete: true };
+    },
+    store,
+  };
+}
+
+const SECRET_VALUE = "mock-secret-token-xyz"; // مقدار جعلی — هرگز در خروجی نباید بیاید
+const fakeEnv = { STATE: fakeKV(), [`${"MY_TEST_SECRET"}V`]: SECRET_VALUE };
+const SECRET_NAME = "MY_TEST_SECRETV";
+
+const seeded = await getConfig(fakeEnv);
+check(seeded.providers.length >= 3, `seed: داخلی‌ها seed نشدند (${seeded.providers.length})`);
+check(
+  ["nvidia", "openrouter", "xkiro"].every((id) => seeded.providers.some((p) => p.id === id)),
+  "seed: سه داخلی در config نیستند",
+);
+
+const throwsWithMsg = async (fn, re, label) => {
+  try {
+    await fn();
+    check(false, `${label}: خطا نباید نداشت`);
+  } catch (err) {
+    check(
+      re.test(String(err && err.message)),
+      `${label}: پیام مناسب نبود (${err && err.message})`,
+    );
+  }
+};
+
+// اعتباربجایی provider
+const goodProvider = { id: "my-gateway", baseUrl: "https://gw.example.com/v1", secretName: SECRET_NAME };
+await upsertProvider(fakeEnv, goodProvider);
+throwsWithMsg(
+  () => validateProvider(fakeEnv, { id: "bad1", baseUrl: "http://no-https.example.com", secretName: SECRET_NAME }),
+  /https/,
+  "validateProvider bad url",
+);
+throwsWithMsg(
+  () => validateProvider(fakeEnv, { id: "Bad ID!", baseUrl: "https://x.example.com", secretName: SECRET_NAME }),
+  /invalid provider id/,
+  "validateProvider bad name",
+);
+throwsWithMsg(
+  () => validateProvider(fakeEnv, { id: "ok-id", baseUrl: "https://x.example.com", secretName: "NOT_PRESENT_SECRET" }),
+  /unknown secretName/,
+  "validateProvider unknown secret",
+);
+check(
+  !/\s/.test(goodProvider.id) && /^[a-z0-9._-]{1,40}$/.test(goodProvider.id),
+  "id pattern sanity",
+);
+
+// secret هرگز در خروجی/KV نیست
+const afterUpsert = await getConfig(fakeEnv);
+const storedStr = JSON.stringify(afterUpsert);
+check(
+  storedStr.includes(SECRET_NAME) && !storedStr.includes(SECRET_VALUE),
+  "secret value leaked into config KV!",
+);
+
+// سقف‌ها: بعد از سقف، upsert خطا می‌دهد و لیست در ۲۰ می‌ماند
+let limitHit = false;
+for (let i = 0; i < 25; i++) {
+  try {
+    await upsertProvider(fakeEnv, {
+      id: `p${String(i).padStart(2, "0")}`,
+      baseUrl: "https://gw.example.com/v1",
+      secretName: SECRET_NAME,
+    });
+  } catch (err) {
+    limitHit = /max 20 providers/.test(String(err && err.message));
+    break;
+  }
+}
+check(limitHit, "سقف ۲۰ provider اعمال نشد");
+check(
+  (await getConfig(fakeEnv)).providers.length === 20,
+  `تعداد providers باید ۲۰ باشد (${(await getConfig(fakeEnv)).providers.length})`,
+);
+
+// combo: نام/strategy/سقف targets
+const comboBase = {
+  name: "mine",
+  strategy: "priority",
+  timeoutMs: 20000,
+  retries: 0,
+  targets: [
+    { provider: "my-gateway", model: "gpt-x" },
+    { provider: "nvidia", model: "z-ai/glm-5.3" },
+  ],
+};
+await upsertCombo(fakeEnv, comboBase);
+throwsWithMsg(
+  () => validateCombo(fakeEnv, { ...comboBase, strategy: "random" }, afterUpsert),
+  /strategy/,
+  "combo bad strategy",
+);
+throwsWithMsg(
+  () => validateCombo(fakeEnv, { ...comboBase, name: "BAD!" }, afterUpsert),
+  /invalid combo name/,
+  "combo bad name",
+);
+throwsWithMsg(
+  () => validateCombo(fakeEnv, { ...comboBase, targets: Array(31).fill(comboBase.targets[0]) }, afterUpsert),
+  /max 30 targets/,
+  "combo target limit",
+);
+throwsWithMsg(
+  () => validateCombo(fakeEnv, { ...comboBase, targets: [{ provider: "ghost", model: "x" }] }, afterUpsert),
+  /unknown provider/,
+  "combo unknown provider",
+);
+
+// حذف: داخلی ممنوع، دستی مجاز، combo حذف می‌شود
+throwsWithMsg(() => removeProvider(fakeEnv, "nvidia"), /builtin/, "delete builtin blocked");
+await removeProvider(fakeEnv, "my-gateway");
+await removeCombo(fakeEnv, "mine");
+
+// ── استراتژی‌های combo دستی (ترتیب هدف‌ها) ──────────────────────────────────
+const T = (p, m) => ({ provider: p, model: m });
+const order = (strategy, opts) =>
+  sortForStrategy(
+    [T("a", "m1"), T("a", "m2"), T("b", "m3"), T("c", "m4")],
+    strategy,
+    opts,
+  ).map((t) => `${t.provider}/${t.model}`);
+
+const prio = order("priority");
+check(
+  prio.join(",") === "a/m1,a/m2,b/m3,c/m4",
+  `priority ترتیب اشتباه: ${prio.join(",")}`,
+);
+const rr = order("round-robin", { rrStart: 2 });
+check(
+  rr.join(",") === "b/m3,c/m4,a/m1,a/m2",
+  `round-robin ترتیب اشتباه: ${rr.join(",")}`,
+);
+const fastestWithData = order("fastest", {
+  medians: { "a/m1": 500, "b/m3": 120, "c/m4": 900 },
+});
+check(
+  fastestWithData.join(",") === "b/m3,a/m1,c/m4,a/m2",
+  `fastest ترتیب اشتباه: ${fastestWithData.join(",")}`,
+);
+const fastestEmpty = order("fastest", {});
+check(
+  fastestEmpty.join(",") === prio.join(","),
+  `fastest بدون داده باید = priority: ${fastestEmpty.join(",")}`,
+);
 
 if (failures.length) {
   console.error("\n✖ شکست تست‌ها:");

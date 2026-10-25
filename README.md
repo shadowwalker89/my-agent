@@ -59,8 +59,11 @@ Telegram → Cloudflare Worker (src/index.js) → مدل‌روتر (nvidia/open
 
 فایل‌ها:
 
-- `src/providers.js` — تعریف providerها (baseUrl، نام راز کلید، هدرهای اضافی) و
-  `listFreeModels(env, provider)` برای کشف مدل‌های رایگان هر کدام.
+- `src/config.js` — تنظیم دستی در KV (`config:v1`): providerهای دستی و comboهای دستی
+  (seed خودکار سه داخلی در اولین خواندن)، اعتبارسنجی، سقف‌ها و CRUD.
+- `src/providers.js` — تعریف داخلی‌ها (baseUrl، نام راز کلید، هدرهای اضافی)،
+  `listProviderModels(env, ctx)` برای کشف مدل‌ها (داخلی‌ها با مپر اختصاصی،
+  بقیه با مپر عمومی سازگار با OpenAI).
 - `src/combos.js` — قانون هر combo (`chat`، `code`، `vision`، `fast`) + امتیازدهی
   (`pickModels`، `diversify`، ثابت `WEIGHTS`) و هیوریستیک‌های اندازه/نسخه/نسل قدیمی.
 - `src/catalog.js` — سینک کاتالوگ در KV و اعلان مدل‌های جدید.
@@ -96,11 +99,16 @@ Telegram → Cloudflare Worker (src/index.js) → مدل‌روتر (nvidia/open
 binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛ اگر نساخت، دستی بساز).
 کلیدها:
 
-- `catalog:nvidia` / `catalog:openrouter` / `catalog:xkiro` — لیست مدل‌ها + `updatedAt`.
+- `catalog:nvidia` / `catalog:openrouter` / `catalog:xkiro` (و `catalog:<id>` داخلی‌ها)
+  — لیست مدل‌ها + `updatedAt`.
 - `overrides:v1` — `{ pins: { combo: [...] }, bans: [...], prefer: { combo: [...] } }`.
 - `health:<provider>/<model>` — کوoldown هدف (TTL خودکار: 24h برای 404/410/400،
   10 دقیقه برای 429/5xx/timeout/empty)؛ کلید موجود = ناسالم.
 - `health:provider:<name>` — خطای 401/403 کل provider را ۱ ساعت می‌بندد.
+- `config:v1` — تنظیم دستی (patch 3ا): `{ providers, combos }`؛ نام راز ذخیره می‌شود،
+  **هرگز مقدار کلید**.
+- `rr:<combo>` — نشانگر چرخش round-robin برای combo دستی.
+- `lat:<provider>/<model>` — ۵ نمونه‌ی آخر تأخیر موفق برای استراتژی `fastest` (میانه).
 
 ### تنظیم با تلگرام (کاربرهای allowlist)
 
@@ -118,7 +126,25 @@ binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛
 - `/prefer <combo> <rx1,rx2,...>` و `/prefer <combo> reset` — جایگزینی لیست prefer آن combo.
 - `/status` — تعداد مدل کش‌شده‌ی هر provider، آخرین زمان سینک، تعداد بن/pین و
   همان شمارنده‌ی «کول‌داونِ فعلی» هر provider (منع کل provider هم جدا نمایش داده می‌شود).
+- `/combos` — لیست comboهای دستی (نام، استراتژی، تعداد هدف‌ها) + خودکارها.
 - `/start`، `/ping`، `/id` مثل قبل؛ `/id` برای همه باز است. دستور ناشناس = راهنمای کوتاه فارسی.
+
+### providerها و comboهای دستی (قدم ۳ا)
+
+علاوه بر سه داخلی (nvidia/openrouter/xkiro که خودکار seed می‌شوند)، می‌توان Provider
+سازگار با OpenAI و combo دستی تعریف کرد — همه در `config:v1` در KV:
+
+- Provider دستی: `{ id, name, baseUrl (فقط https), secretName, enabled }` —
+  `secretName` باید نام یکی از رازهای موجود wrangler باشد (فقط **موجود بودن** چک می‌شود؛
+  مقدار کلید هرگز در KV ذخیره یا برگردانده نمی‌شود). حداکثر ۲۰ provider.
+- Combo دستی: `{ name, strategy: priority|round-robin|fastest, timeoutMs, retries,
+  targets: [{ provider, model, enabled }] }` — حداکثر ۲۰ combo و ۳۰ هدف در هر combo؛
+  نام‌ها `^[a-z0-9._-]{1,40}$` و با نام comboهای خودکار (`chat`/`code`/...) یکی یعنی
+  نسخه‌ی دستی برنده است. اگر نام combo درخواستی از URL برابر یک combo دستی باشد
+  (`"model": "<نام combo دستی>"`) همان استراتژی اجرا می‌شود: `priority` = ترتیب
+  تعریف‌شده، `round-robin` = چرخش از نشانگر KV، `fastest` = مرتب بر اساس میانه‌ی
+  تأخیر موفق‌های اخیر (بدون داده = ترتیب priority). دستور `/models <combo>` و
+  `/v1/models` هر دو از comboهای دستی پشتیبانی می‌کنند.
 
 ### امتیازدهی (heuristic!)
 
@@ -166,6 +192,22 @@ binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛
   (snippet رازپاک‌شده).
 - `GET /admin/models?provider=<name>` — همان کاتالوگ زنده با فیلتر `q`/`all=1`
   (فقط `{ id }` و برای openrouter/xkiro `context_length`/`vision` در صورت وجود).
+
+### Admin JSON API (قدم ۳ا)
+
+همه‌ی مسیرهای `/admin/api/*` فقط JSON برمی‌گردانند (`{ ok, ... }` یا `{ ok:false, error }`).
+احراز هویت: هدر `X-Setup-Key: <TG_SECRET>` یا کوکی امضاشده‌ی
+`admin_session=<exp>.<hmac>` (HMAC-SHA256 از exp با `TG_SECRET`؛ مقایسه‌ی constant-time).
+مقدار کلید provider در هیچ جوابی نمی‌آید — فقط `secretName`:
+
+- `GET /admin/api/config` — کل تنظیم (providers + combos، بدون راز).
+- `POST /admin/api/providers` و `PUT/DELETE /admin/api/providers/<id>` — CRUD provider.
+- `POST /admin/api/providers/<id>/refresh` — سینک همان provider.
+- `POST /admin/api/combos` و `PUT/DELETE /admin/api/combos/<name>` — CRUD combo دستی.
+- `GET /admin/api/models?provider=<id>&q=<rx>` — جستجوی کاتالوگ با وضعیت هر مدل:
+  `ok` | `cooldown` (کلید health موجود) | `banned` (لیست بن‌ها).
+- `POST /admin/api/test` با بدنه `{ provider, model }` — همان `/test` تلگرام
+  (نتیجه‌ی کوتاه بدون راز).
 
 ### Endpoint سازگار با OpenAI
 
@@ -237,6 +279,7 @@ subrequest در حل زدن روتتر هم انجام شده (حداکثر ۲۰
 
 - [x] Telegram echo Worker با allowlist و /setup
 - [x] مدل‌روتر / combo مدل‌ها داخل Worker (قدم ۲: روتتر + endpoint سازگار با OpenAI، قدم ۲ب: کاتالوگ پویا، combo قانون‌محور، کنترل تلگرام — رتبه‌بندی کیفیت هیوریستیک است)
+- [x] قدم ۳ا: providerها و comboهای دستی در KV + admin JSON API (رازها فقط با نام)
 - [ ] GitHub Actions + OpenCode برای کارهای کدنویسی
 - [ ] صدا و عکس با Workers AI
 - [ ] بله (Bale)

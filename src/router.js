@@ -1,8 +1,15 @@
-import { PROVIDERS, redact } from "./providers.js";
+import { redact } from "./providers.js";
 import { RULES, pickModels, diversify, compilePrefer, scoreModel } from "./combos.js";
+import { getProviderCtx, getConfig } from "./config.js";
 import { loadCatalog } from "./catalog.js";
 import { getOverrides, resolvePins } from "./overrides.js";
-import { getUnhealthyProviders, isModelHealthy, markFailure } from "./health.js";
+import {
+  getUnhealthyProviders,
+  isModelHealthy,
+  markFailure,
+  recordLatency,
+  getMedianLatency,
+} from "./health.js";
 
 const DEADLINE_MS = 25000;
 const PER_TARGET_TIMEOUT_MS = 20000;
@@ -44,7 +51,36 @@ export function classifyFailure(status, bodySnippet, isTimeout) {
   };
 }
 
+// ترتیب هدف‌ها بر حسب استراتژی combo دستی (pure؛ برای تست آفلاین هم قابل استفاده)
+// - priority: ترتیب ذخیره‌شده (fallback ترتیبی)
+// - round-robin: چرخش از اندیس ذخیره‌شده‌ی KV
+// - fastest: صعودیِ میانه‌ی تأخیر؛ بدون داده → ترتیب اولویت (stable)
+export function sortForStrategy(targets, strategy, { rrStart = 0, medians = {} } = {}) {
+  const list = [...targets];
+  if (!list.length) return [];
+  if (strategy === "round-robin") {
+    const start = ((rrStart % list.length) + list.length) % list.length;
+    return list.slice(start).concat(list.slice(0, start));
+  }
+  if (strategy === "fastest") {
+    return list
+      .map((t, i) => ({ t, i, ms: medians[String(`${t.provider}/${t.model}`)] }))
+      .sort(
+        (a, b) =>
+          (a.ms ?? Infinity) - (b.ms ?? Infinity) ||
+          a.score - b.score ||
+          a.i - b.i,
+      )
+      .map((x) => x.t);
+  }
+  return list;
+}
+
 export async function getComboTargets(env, name) {
+  const cfg = env.STATE ? await getConfig(env) : { providers: [], combos: [] };
+  const manual = (cfg.combos ?? []).find((c) => c.name === name);
+  if (manual) return getManualComboTargets(env, manual, cfg);
+
   const rule = RULES[name];
   if (!rule) return { error: `unknown combo: ${name}` };
 
@@ -100,34 +136,92 @@ export async function getComboTargets(env, name) {
   };
 }
 
-function resolveDirect(nameOrProviderModel) {
+// comboهای دستی از config:v1 — استراتژی، skip سردشده‌ها، بدون diversify
+async function getManualComboTargets(env, combo, cfg) {
+  const providerMap = new Map(cfg.providers.map((p) => [p.id, p]));
+  const ov = await getOverrides(env);
+  const banSet = new Set((ov.bans ?? []).map((b) => String(b).toLowerCase()));
+  const unhealthy = await getUnhealthyProviders(env);
+
+  const candidate = [];
+  for (const t of combo.targets ?? []) {
+    if (t.enabled === false) continue;
+    const p = providerMap.get(t.provider);
+    if (!p || p.enabled === false) continue; // provider جاافتاده/خاموش — بی‌صدا رد
+    const used = `${t.provider}/${t.model}`;
+    if (banSet.has(used.toLowerCase())) continue;
+    if (unhealthy[t.provider]) continue; // منع کل provider
+    if (!(await isModelHealthy(env, used))) continue; // کول‌داون مدل
+    candidate.push({
+      provider: t.provider,
+      model: t.model,
+      score: 0,
+      ctx: { id: p.id, baseUrl: p.baseUrl, secretName: p.secretName, extraHeaders: p.extraHeaders ?? undefined },
+    });
+  }
+
+  let rrStart = 0;
+  if (combo.strategy === "round-robin" && env.STATE) {
+    const cur = Number((await env.STATE.get(`rr:${combo.name}`)) ?? 0);
+    rrStart = Number.isFinite(cur) ? cur : 0;
+    const n = candidate.length || 1;
+    await env.STATE.put(`rr:${combo.name}`, String((rrStart + 1) % n));
+  }
+
+  let medians = {};
+  if (combo.strategy === "fastest") {
+    for (const c of candidate) medians[`${c.provider}/${c.model}`] = await getMedianLatency(env, `${c.provider}/${c.model}`);
+  }
+
+  const ordered = sortForStrategy(candidate, combo.strategy, { rrStart, medians });
+  return {
+    name: combo.name,
+    manual: {
+      strategy: combo.strategy,
+      timeoutMs: combo.timeoutMs,
+      retries: combo.retries ?? 0,
+    },
+    targets: ordered.map((m) => ({
+      provider: m.provider,
+      model: m.model,
+      score: m.score,
+      pinned: false,
+      ctx: m.ctx,
+    })),
+  };
+}
+
+// direct provider/model — با همه‌ی providerهای پیکربندی‌شده کار می‌کند (داخلی + دستی)
+async function resolveDirect(nameOrProviderModel, env) {
   const s = String(nameOrProviderModel);
   const slash = s.indexOf("/");
   if (slash <= 0) return null;
   const provider = s.slice(0, slash);
   const model = s.slice(slash + 1);
-  if (!PROVIDERS[provider] || !model) return null;
-  return { provider, model };
+  if (!model || /^\s*$/s.test(model)) return null;
+  const ctx = await getProviderCtx(env, provider);
+  if (!ctx) return null;
+  return { provider, model, ctx };
 }
 
-async function tryTarget(env, providerName, model, body, timeoutMs) {
-  const provider = PROVIDERS[providerName];
-  if (!provider) return { skipReason: `unknown provider: ${providerName}` };
-  const key = env[provider.keyEnv];
-  if (!key) return { skipReason: `missing ${provider.keyEnv}` };
+// ctx = { id, baseUrl, secretName, extraHeaders } — همه‌ی providerها از config
+async function tryTarget(env, ctx, model, body, timeoutMs) {
+  if (!ctx) return { skipReason: "unknown provider" };
+  const key = env[ctx.secretName];
+  if (!key) return { skipReason: `missing ${ctx.secretName}` };
 
-  const used = `${providerName}/${model}`;
+  const used = `${ctx.id}/${model}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
   let res;
   try {
-    res = await fetch(`${provider.baseUrl}/chat/completions`, {
+    res = await fetch(`${ctx.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
       method: "POST",
       signal: controller.signal,
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${key}`,
-        ...(provider.extraHeaders ?? {}),
+        ...(ctx.extraHeaders ?? {}),
       },
       body: JSON.stringify({ ...body, model }),
     });
@@ -147,7 +241,7 @@ async function tryTarget(env, providerName, model, body, timeoutMs) {
   if (!res.ok) {
     const raw = await res.text().catch(() => "");
     return {
-      error: errorFor(used, res.status),
+      error: { target: used, reason: `http ${res.status}` },
       cause: res.status,
       status: res.status,
       raw: redact(raw, [key], 200),
@@ -164,25 +258,32 @@ export async function runCombo(
 ) {
   const wanted = String(comboNameOrProviderModel);
   let targets;
+  let manualCfg = null;
   if (RULES[wanted]) {
     const sel = await getComboTargets(env, wanted);
     if (sel.error) {
       return { ok: false, errors: [{ target: wanted, reason: truncate(sel.error) }] };
     }
     targets = sel.targets;
+    manualCfg = sel.manual ?? null;
   } else {
-    const direct = resolveDirect(wanted);
+    const direct = await resolveDirect(wanted, env);
     if (!direct) {
       return {
         ok: false,
         errors: [{ target: truncate(wanted), reason: `unknown combo or provider/model: ${truncate(wanted)}` }],
       };
     }
-    targets = [{ ...direct, score: 0, pinned: false }];
+    targets = [{ provider: direct.provider, model: direct.model, score: 0, pinned: false, ctx: direct.ctx }];
   }
 
   const started = Date.now();
   const errors = [];
+  const maxRetries = manualCfg?.retries ?? 0;
+  const perTargetTimeout = manualCfg?.timeoutMs ?? perTargetTimeoutMs;
+  const deadline = manualCfg
+    ? Math.min(55000, Math.max(deadlineMs, perTargetTimeout * (maxRetries + 2)))
+    : deadlineMs;
   // اگر کلید یک provider رد شد (401/403)، بقیه‌ی هدف‌های همان provider در این
   // فراخوانی بی‌خیال می‌شوند — فقط یک پیام «key rejected» برمی‌گردد و provider
   // یک ساعت در health منع می‌شود (markFailure خودش این را ثبت می‌کند).
@@ -191,7 +292,7 @@ export async function runCombo(
   for (const t of targets) {
     if (rejectedProviders.has(t.provider)) continue;
     const usedModel = `${t.provider}/${t.model}`;
-    const remaining = deadlineMs - (Date.now() - started);
+    const remaining = deadline - (Date.now() - started);
     if (remaining <= 0) {
       errors.push({ target: usedModel, reason: "deadline exceeded" });
       break;
@@ -202,37 +303,62 @@ export async function runCombo(
       continue;
     }
 
-    const attempt = await tryTarget(env, t.provider, t.model, body, Math.min(perTargetTimeoutMs, remaining));
-    if (attempt.skipReason) {
-      errors.push({ target: usedModel, reason: attempt.skipReason });
-    } else if (attempt.error) {
+    let ctx = t.ctx;
+    if (!ctx) ctx = await getProviderCtx(env, t.provider);
+    if (!ctx) {
+      errors.push({ target: usedModel, reason: "unknown provider" });
+      continue;
+    }
+    if (ctx.enabled === false) continue;
+
+    const t0 = Date.now();
+    // retries برای combo دستی: فقط خطاهای گذرا (timeout/429/5xx) دوباره امتحان می‌شوند
+    let attempt = null;
+    let failure = null;
+    for (let attemptNo = 0; ; attemptNo++) {
+      attempt = await tryTarget(env, ctx, t.model, body, Math.min(perTargetTimeout, remaining));
+      if (attempt.skipReason || !attempt.error) break;
       const isTimeout = attempt.cause === "timeout";
       const cls = classifyFailure(
         typeof attempt.cause === "number" ? attempt.cause : null,
         attempt.raw,
         isTimeout,
       );
+      const retryable =
+        isTimeout ||
+        (typeof attempt.cause === "number" && (attempt.cause === 429 || attempt.cause >= 500));
+      if (retryable && attemptNo < maxRetries) continue;
+      failure = { isTimeout, cls, cause: attempt.cause };
+      break;
+    }
+
+    const latencyMs = Date.now() - t0;
+
+    if (attempt.skipReason) {
+      errors.push({ target: usedModel, reason: attempt.skipReason });
+    } else if (failure) {
+      const { isTimeout, cls, cause } = failure;
       if (cls.scope === "provider") {
         rejectedProviders.add(t.provider);
         errors.push({
           target: usedModel,
-          reason: `provider ${t.provider}: key rejected (${attempt.cause})`,
+          reason: `provider ${t.provider}: key rejected (${cause})`,
         });
       } else {
         const entry = { target: usedModel };
-        if (typeof attempt.cause === "number") {
+        if (typeof cause === "number") {
           entry.reason = cls.label;
-          entry.status = attempt.cause;
+          entry.status = cause;
         } else if (isTimeout) {
           entry.reason = cls.label;
         } else {
-          entry.reason = truncate(attempt.cause);
+          entry.reason = truncate(cause);
         }
         errors.push(entry);
       }
       if (env.STATE) {
         try {
-          await markFailure(env, usedModel, cls, isTimeout ? "timeout" : truncate(attempt.cause));
+          await markFailure(env, usedModel, cls, isTimeout ? "timeout" : truncate(cause));
         } catch (err) {
           console.error("markFailure failed:", err && err.message);
         }
@@ -240,6 +366,11 @@ export async function runCombo(
     } else if (stream) {
       const res = attempt.res;
       if (res.body) {
+        try {
+          await recordLatency(env, usedModel, latencyMs);
+        } catch (err) {
+          console.error("recordLatency failed:", err && err.message);
+        }
         return {
           ok: true,
           stream: res.body,
@@ -248,7 +379,7 @@ export async function runCombo(
         };
       }
       errors.push({ target: usedModel, reason: "no stream body" });
-      await markFailure(env, usedModel, "no stream body");
+      await markFailure(env, usedModel, classifyFailure(null, "", false), "no stream body");
     } else {
       const res = attempt.res;
       let data;
@@ -256,7 +387,7 @@ export async function runCombo(
         data = await res.json();
       } catch (err) {
         errors.push({ target: usedModel, reason: truncate(`bad json: ${err && err.message}`) });
-        await markFailure(env, usedModel, "bad json response");
+        await markFailure(env, usedModel, classifyFailure(null, "", false), "bad json response");
         continue;
       }
 
@@ -267,10 +398,15 @@ export async function runCombo(
         (Array.isArray(message) && message.length === 0);
       if (empty) {
         errors.push({ target: usedModel, reason: "empty assistant message" });
-        await markFailure(env, usedModel, "empty assistant message");
+        await markFailure(env, usedModel, classifyFailure(null, "", false), "empty assistant message");
         continue;
       }
 
+      try {
+        await recordLatency(env, usedModel, latencyMs);
+      } catch (err) {
+        console.error("recordLatency failed:", err && err.message);
+      }
       return { ok: true, data, used: usedModel };
     }
   }
@@ -281,16 +417,16 @@ export async function runCombo(
 // فراخوانی مستقیم یک هدف (همان کد مسیر روتتر؛ بدون فیلتر سلامت) برای /test.
 // خروجی امن است: فقط status، تأخیر و اسنیپت رازپاک‌شده.
 export async function directCall(env, providerName, model, body, { timeoutMs = 20000 } = {}) {
-  const provider = PROVIDERS[providerName];
-  if (!provider) {
+  const ctx = await getProviderCtx(env, providerName);
+  if (!ctx) {
     return { ok: false, status: null, latencyMs: 0, snippet: `unknown provider: ${providerName}` };
   }
-  const key = env[provider.keyEnv];
+  const key = env[ctx.secretName];
   if (!key) {
-    return { ok: false, status: null, latencyMs: 0, snippet: `missing ${provider.keyEnv}` };
+    return { ok: false, status: null, latencyMs: 0, snippet: `missing ${ctx.secretName}` };
   }
   const started = Date.now();
-  const attempt = await tryTarget(env, providerName, model, body, timeoutMs);
+  const attempt = await tryTarget(env, ctx, model, body, timeoutMs);
   const latencyMs = Date.now() - started;
   if (attempt.skipReason) {
     return { ok: false, status: null, latencyMs, snippet: attempt.skipReason };

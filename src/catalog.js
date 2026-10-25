@@ -1,11 +1,15 @@
-import { listFreeModels } from "./providers.js";
+import { listProviderModels } from "./providers.js";
+import { getProviderCtx, getConfig } from "./config.js";
 import { tgBroadcast } from "./telegram.js";
 
 const NOTIFY_LIMIT = 15;
 
-export async function syncProvider(env, provider, { notify = true } = {}) {
-  const models = await listFreeModels(env, provider);
-  const key = `catalog:${provider}`;
+// catalog:<providerId> برای همه‌ی providerهای پیکربندی‌شده (داخلی + دستی)
+export async function syncProvider(env, providerId, { notify = true } = {}) {
+  const ctx = await getProviderCtx(env, providerId);
+  if (!ctx) throw new Error(`unknown provider: ${providerId}`);
+  const models = await listProviderModels(env, ctx);
+  const key = `catalog:${providerId}`;
   const prev = await env.STATE.get(key, "json");
   await env.STATE.put(key, JSON.stringify({ updatedAt: new Date().toISOString(), models }));
 
@@ -15,7 +19,7 @@ export async function syncProvider(env, provider, { notify = true } = {}) {
   const removed = (prev?.models?.map((m) => m.id) ?? []).filter((id) => !nextIds.has(id));
 
   if (notify && prev && added.length) {
-    await tgBroadcast(env, notifyText(provider, added));
+    await tgBroadcast(env, notifyText(providerId, added));
   }
   return { added, removed };
 }
@@ -26,12 +30,16 @@ function notifyText(provider, added) {
   return `🔔 مدل‌های رایگان جدید (${provider}):\n${shown.join("\n")}${more}\nبرای مرور بفرست: /models`;
 }
 
-const PROVIDER_KEYS = { nvidia: 1, openrouter: 1, xkiro: 1 };
-
 export async function loadCatalog(env) {
   if (!env.STATE) return [];
+  const cfg = await getConfig(env);
   const parts = await Promise.all(
-    Object.keys(PROVIDER_KEYS).map((p) => env.STATE.get(`catalog:${p}`, "json")),
+    cfg.providers.map(async (p) => {
+      const r = await env.STATE.get(`catalog:${p.id}`, "json");
+      return r?.models ?? [];
+    }),
   );
-  return parts.flatMap((r) => (r?.models ?? []).filter((m) => m && typeof m.id === "string"));
+  return parts
+    .flat()
+    .filter((m) => m && typeof m.id === "string");
 }
