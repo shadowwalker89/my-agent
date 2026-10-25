@@ -589,6 +589,82 @@ check(
 );
 check(!/window\.alert\s*\(/.test(html2), "alert() نباید به‌جای toast استفاده شود");
 
+// ── patch 3d: تم، ذخیره‌ی نتایج، ریسپانسیو و کارت‌های provider ──────────────
+const keys3d = [
+  "themeSystem", "themeLight", "themeDark", "themeLabel", "langBtn",
+  "onlyUntested", "clearAllResults", "clearProvResults", "clearConfirmAll",
+  "clearConfirmProv", "clearedResults", "untested", "testedAgo", "stale",
+  "nothingToTest", "noCombos", "addComboTitle", "createAndAdd", "comboNamePh",
+  "goToCombo", "summaryProvider", "stoppedEarly", "saving", "loginInvalid",
+  "showKey", "hideKey", "loggingIn", "adminKey", "loginTitle",
+];
+for (const k of keys3d) {
+  const n = occurrences(html2, k + ":");
+  check(n >= 2, `کلید i18n «${k}» باید در هر دو زبان باشد (${n})`);
+}
+check(html2.includes("admin_test_results_v1"), "کلید ذخیره‌ی نتایج تست");
+check(html2.includes("admin_models_state_v1"), "کلید ذخیره‌ی وضعیت مدل‌ها");
+check(html2.includes("admin_theme"), "کلید ذخیره‌ی تم");
+check(html2.includes("admin_provider_status_v1"), "کلید ذخیره‌ی وضعیت provider");
+check(html2.includes("RESULT_CAP = 500"), "سقف نتایج ذخیره‌شده باید ۵۰۰ باشد");
+check(
+  html2.includes("STALE_MS = 24 * 60 * 60 * 1000"),
+  "آستانه‌ی کهنه‌شدن نتایج باید ۲۴ ساعت باشد",
+);
+check(
+  html2.includes('[data-theme="dark"]') && html2.includes("color-scheme"),
+  "متغیرهای تم تیره/روشن و color-scheme باید وجود داشته باشند",
+);
+check(
+  html2.includes("prefers-color-scheme") && html2.includes("admin_theme"),
+  "تشخیص تم سیستم و ذخیره‌سازی تم باید وجود داشته باشد",
+);
+check(
+  html2.includes('data-theme-set="system"') &&
+    html2.includes('data-theme-set="light"') &&
+    html2.includes('data-theme-set="dark"'),
+  "سه دکمه‌ی تم سیستم/روشن/تیره",
+);
+check(
+  html2.includes('id="themeHeader"') && html2.includes('id="themeLogin"'),
+  "کنترل تم باید هم در هدر و هم در لاگین باشد",
+);
+check(
+  html2.includes("viewport-fit=cover"),
+  "viewport باید viewport-fit=cover داشته باشد",
+);
+check(
+  html2.includes('id="loginErr"') &&
+    html2.includes('id="eyeBtn"') &&
+    html2.includes('id="loginForm"') &&
+    html2.includes("autofocus"),
+  "فرم لاگین باید خطای درون‌خطی، نمایش کلید و autofocus داشته باشد",
+);
+check(
+  html2.includes('id="provGrid"') &&
+    html2.includes("status-area") &&
+    !html2.includes("provResult") &&
+    !html2.includes("provTbody"),
+  "هر provider باید فقط یک ناحیه‌ی وضعیت داشته باشد",
+);
+check(
+  html2.includes('id="mOnlyUntested"') &&
+    html2.includes('id="mClearProv"') &&
+    html2.includes('id="mClearAll"') &&
+    html2.includes('id="mSummary"'),
+  "کنترل‌های تست‌نشده/پاک‌سازی/خلاصه در تب مدل‌ها",
+);
+check(
+  html2.includes("max-width:700px") && html2.includes("data-label"),
+  "چیدمان موبایل و تبدیل جدول به کارت باید وجود داشته باشد",
+);
+check(
+  csp ===
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';",
+  `CSP نباید تغییر کند: ${csp}`,
+);
+check(!/\.innerHTML\s*=/.test(html2), "هیچ داده‌ای نباید با innerHTML به DOM برود");
+
 // ── پاسخ نرمالِ تست combo ({ok,status,latencyMs,text,label}) ────────────────
 const envCt = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: TG_SECRET_FAKE };
 const putProv = await workerDefault.fetch(

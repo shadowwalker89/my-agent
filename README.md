@@ -211,6 +211,7 @@ binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛
   تزریق می‌شود.
 - **زبان:** دکمه‌ی تغییر EN/FA — انگلیسی پیش‌فرض؛ فارسی با `dir="rtl"`؛ انتخاب در
   `localStorage` ذخیره می‌شود. همه‌ی متن‌ها از یک دیکشنری (`I18N.en`/`I18N.fa`) می‌آیند.
+- **ظاهر و نتایج:** تم سیستم/روشن/تیره (ذخیره در `localStorage` و اعمال پیش از رندر) و نتایج تست مدل‌ها/فیلترها/خلاصه‌ی تست‌همه در مرورگر می‌مانند؛ «پاک کردن نتایج» برای همین provider یا همه در دسترس است.
 - **امنیت:** هدرهای `Content-Security-Policy: default-src 'self'; script-src 'self'
   'unsafe-inline'; style-src 'self' 'unsafe-inline';` و `X-Frame-Options: DENY` و
   `Cache-Control: no-store` روی `/admin`؛ هیچ داده‌ی server با innerHTML تزریق
