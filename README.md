@@ -47,6 +47,11 @@ Telegram → Cloudflare Worker (src/index.js) → مدل‌روتر (nvidia/open
   هشدار مهم: هر gateway رایگان شخص ثالث فقط برای مدل‌های عمومی است — هرگز راز یا
   کد خصوصی کلاینت به آن نفرست.
 - `ROUTER_KEY` — کلید Bearer برای Endpoint سازگار با OpenAI داخل Worker.
+- `ADMIN_KEY` — کلید مجزای صفحه‌ی مدیریت (`/admin`، `/admin/api/*`، هدر `X-Setup-Key`
+  و ثبت وبهوک از `/setup`). اگر ست نشده باشد برای سازگاری همان `TG_SECRET` به‌عنوان
+  fallback استفاده می‌شود؛ کلید کوکی `admin_session` هم همین است (HMAC با `ADMIN_KEY`
+  یا fallback). `TG_SECRET` فقط مخصوص رازِ وبهوک تلگرام می‌ماند (بررسی هدر
+  `X-Telegram-Bot-Api-Secret-Token` و پارامتر `secret_token` در ثبت وبهوک).
 
 هر کدام فقط اینجاها هستند:
 
@@ -189,9 +194,9 @@ binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛
 
 - **ورود:** `GET /admin` همیشه صفحه برمی‌گرداند؛ اگر احراز نشده باشی، صفحه‌ی لاگین
   با یک فیلد کلمه‌ی عبور نمایش می‌شود. `POST /admin/login {key}` با کلید
-  `TG_SECRET` (مقایسه‌ی constant-time، خطای عمومی، هیچ‌وقت بازتاب key) کوکی
-  `admin_session` امضاشده می‌سازد (`HttpOnly; Secure; SameSite=Strict; 7 روز` —
-  همان فرمت HmAC پچ ۳ا). `POST /admin/logout` کوکی را پاک می‌کند. احراز جایگزین:
+  `ADMIN_KEY` (یا اگر ست نشده همان `TG_SECRET` — fallback؛ مقایسه‌ی constant-time،
+  خطای عمومی، هیچ‌وقت بازتاب key) کوکی `admin_session` امضاشده می‌سازد
+  (`HttpOnly; Secure; SameSite=Strict; 7 روز` — HMAC با همان کلید). `POST /admin/logout` کوکی را پاک می‌کند. احراز جایگزین:
   هدر `X-Setup-Key`.
 - **بخش‌ها:** جدول providerها (نام/baseUrl/secretName/موجود بودن راز/فعال + دکمه‌های
   افزودن/ویرایش/حذف — داخلی‌ها حذف نمی‌شوند — به‌روزرسانی کاتالوگ/تست)، پنل مدل‌ها
@@ -220,8 +225,9 @@ binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛
 ### Admin JSON API (قدم ۳ا)
 
 همه‌ی مسیرهای `/admin/api/*` فقط JSON برمی‌گردانند (`{ ok, ... }` یا `{ ok:false, error }`).
-احراز هویت: هدر `X-Setup-Key: <TG_SECRET>` یا کوکی امضاشده‌ی
-`admin_session=<exp>.<hmac>` (HMAC-SHA256 از exp با `TG_SECRET`؛ مقایسه‌ی constant-time).
+احراز هویت: هدر `X-Setup-Key: <ADMIN_KEY>` (اگر ست نشده fallback: TG_SECRET) یا
+کوکی امضاشده‌ی `admin_session=<exp>.<hmac>` (HMAC-SHA256 از exp با همان کلید؛
+مقایسه‌ی constant-time).
 مقدار کلید provider در هیچ جوابی نمی‌آید — فقط `secretName`:
 
 - `GET /admin/api/config` — کل تنظیم (providers + combos، بدون راز).

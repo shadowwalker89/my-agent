@@ -451,6 +451,110 @@ check(out.status === 200, `logout باید 200 (${out.status})`);
 const osc = out.headers.get("set-cookie") ?? "";
 check(osc.includes("Max-Age=0") && osc.includes("HttpOnly"), `کوکی logout: ${osc}`);
 
+// ── patch 3b-fix: ADMIN_KEY مجزا ────────────────────────────────────────────
+const ADMIN_KEY_FAKE = "fake-admin-key-123";
+const TG_SECRET_2 = "fake-tg-secret-456";
+const envAk = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: TG_SECRET_2, ADMIN_KEY: ADMIN_KEY_FAKE };
+
+// X-Setup-Key: فقط ADMIN_KEY قبول است، TG_SECRET رد می‌شود
+const hAK = await workerDefault.fetch(
+  new Request("https://admin.test/admin/api/config", { headers: { "X-Setup-Key": ADMIN_KEY_FAKE } }),
+  envAk,
+  ctxNull,
+);
+check(hAK.status === 200, `/api/config با ADMIN_KEY باید 200 (${hAK.status})`);
+const hTG = await workerDefault.fetch(
+  new Request("https://admin.test/admin/api/config", { headers: { "X-Setup-Key": TG_SECRET_2 } }),
+  envAk,
+  ctxNull,
+);
+check(hTG.status === 401, `TG_SECRET با ADMIN_KEY فعال باید رد شود (${hTG.status})`);
+
+// لاگین با TG_SECRET رد می‌شود؛ با ADMIN_KEY قبول
+const badTg = await workerDefault.fetch(
+  new Request("https://admin.test/admin/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key: TG_SECRET_2 }),
+  }),
+  envAk,
+  ctxNull,
+);
+check(badTg.status === 401, `لاگین TG_SECRET باید 401 باشد (${badTg.status})`);
+const goodAk = await workerDefault.fetch(
+  new Request("https://admin.test/admin/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key: ADMIN_KEY_FAKE }),
+  }),
+  envAk,
+  ctxNull,
+);
+check(goodAk.status === 200, `لاگین ADMIN_KEY باید 200 (${goodAk.status})`);
+const scAk = goodAk.headers.get("set-cookie") ?? "";
+check(scAk.includes("HttpOnly") && scAk.includes("SameSite=Strict") && scAk.includes("Secure"), `کوکی: ${scAk}`);
+const cookieAk = scAk.split(";")[0];
+const cfgAk = await workerDefault.fetch(
+  new Request("https://admin.test/admin/api/config", { headers: { cookie: cookieAk } }),
+  envAk,
+  ctxNull,
+);
+check(cfgAk.status === 200, `کوکی ADMIN_KEY باید config باز کند (${cfgAk.status})`);
+
+// کوکی با کلید دیگری امضا شده در env دیگر (ADMIN_KEY متفاوت) کار نمی‌کند (HMAC کلید=ADMIN_KEY)
+const envOther = {
+  STATE: fakeKV(),
+  TG_TOKEN: "fake-token",
+  TG_SECRET: TG_SECRET_2,
+  ADMIN_KEY: "another-admin-key-789",
+};
+const crossEnv = await workerDefault.fetch(
+  new Request("https://admin.test/admin/api/config", { headers: { cookie: cookieAk } }),
+  envOther,
+  ctxNull,
+);
+check(crossEnv.status === 401, `کوکی ADMIN_KEY دوره‌زده باید 401 (${crossEnv.status})`);
+
+// fallback: بدون ADMIN_KEY همان TG_SECRET کار می‌کند (X-Setup-Key و لاگین)
+const hFallbackHeader = await workerDefault.fetch(
+  new Request("https://admin.test/admin/api/config", { headers: { "X-Setup-Key": TG_SECRET_FAKE } }),
+  env3b,
+  ctxNull,
+);
+check(hFallbackHeader.status === 200, `fallback X-Setup-Key باید 200 (${hFallbackHeader.status})`);
+// (fallback لاگین در تست 3b بالا پوشش داده می‌شود: لاگین با TG_SECRET در env3b → 200 + کوکی)
+
+// وبهوک همچنان TG_SECRET می‌خواهد (ADMIN_KEY آن‌جا بی‌اثر است)
+const ctxStub = { waitUntil: (p) => p && typeof p.catch === "function" && p.catch(() => {}) };
+const tgOk = await workerDefault.fetch(
+  new Request("https://admin.test/telegram", {
+    method: "POST",
+    headers: { "X-Telegram-Bot-Api-Secret-Token": TG_SECRET_2 },
+    body: "{}",
+  }),
+  envAk,
+  ctxStub,
+);
+check(tgOk.status === 200, `/telegram با TG_SECRET باید 200 (${tgOk.status})`);
+const tgVoid = await workerDefault.fetch(
+  new Request("https://admin.test/telegram", {
+    method: "POST",
+    headers: { "X-Telegram-Bot-Api-Secret-Token": ADMIN_KEY_FAKE },
+    body: "{}",
+  }),
+  envAk,
+  ctxNull,
+);
+check(tgVoid.status === 401, `/telegram با ADMIN_KEY باید 401 (${tgVoid.status})`);
+
+// /setup (کلید X-Setup-Key) هم دیگر با TG_SECRET باز نمی‌شود وقتی ADMIN_KEY ست است
+const suTg = await workerDefault.fetch(
+  new Request("https://admin.test/setup", { method: "POST", headers: { "X-Setup-Key": TG_SECRET_2 } }),
+  envAk,
+  ctxNull,
+);
+check(suTg.status === 401, `/setup با TG_SECRET باید 401 (${suTg.status})`);
+
 if (failures.length) {
   console.error("\n✖ شکست تست‌ها:");
   for (const f of failures) console.error(`  - ${f}`);

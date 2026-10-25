@@ -46,6 +46,11 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
+// کلید مجزای صفحه‌ی مدیریت؛ اگر ست نشده باشد همان TG_SECRET (سازگاری با قبل)
+function adminKey(env) {
+  return env.ADMIN_KEY || env.TG_SECRET;
+}
+
 function missingSecretName(env) {
   if (!env.TG_TOKEN) return "TG_TOKEN";
   if (!env.TG_SECRET) return "TG_SECRET";
@@ -433,7 +438,7 @@ async function comboModels(env) {
 
 async function adminModels(request, env) {
   const key = request.headers.get("X-Setup-Key") ?? "";
-  if (!safeEqual(key, env.TG_SECRET)) {
+  if (!safeEqual(key, adminKey(env))) {
     return new Response("unauthorized", { status: 401 });
   }
 
@@ -480,7 +485,7 @@ async function adminModels(request, env) {
 
 async function adminRefresh(request, env) {
   const key = request.headers.get("X-Setup-Key") ?? "";
-  if (!safeEqual(key, env.TG_SECRET)) {
+  if (!safeEqual(key, adminKey(env))) {
     return new Response("unauthorized", { status: 401 });
   }
 
@@ -510,7 +515,7 @@ async function adminRefresh(request, env) {
 
 async function adminTest(request, env) {
   const key = request.headers.get("X-Setup-Key") ?? "";
-  if (!safeEqual(key, env.TG_SECRET)) {
+  if (!safeEqual(key, adminKey(env))) {
     return new Response("unauthorized", { status: 401 });
   }
   const target = new URL(request.url).searchParams.get("target") ?? "";
@@ -535,7 +540,7 @@ async function adminTest(request, env) {
 
 async function adminCatalog(request, env) {
   const key = request.headers.get("X-Setup-Key") ?? "";
-  if (!safeEqual(key, env.TG_SECRET)) {
+  if (!safeEqual(key, adminKey(env))) {
     return new Response("unauthorized", { status: 401 });
   }
   const combo = new URL(request.url).searchParams.get("combo") ?? "chat";
@@ -568,7 +573,7 @@ async function signSessionToken(env, exp) {
   const enc = new TextEncoder();
   const macKey = await crypto.subtle.importKey(
     "raw",
-    enc.encode(env.TG_SECRET),
+    enc.encode(adminKey(env)),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
@@ -580,7 +585,7 @@ async function signSessionToken(env, exp) {
 
 async function adminApiAuthorized(request, env) {
   const key = request.headers.get("X-Setup-Key") ?? "";
-  if (key && safeEqual(key, env.TG_SECRET)) return true;
+  if (key && safeEqual(key, adminKey(env))) return true;
   const cookie = request.headers.get("Cookie") ?? "";
   const m = /(?:^|;\s*)admin_session=([^;\s]+)/.exec(cookie);
   if (!m) return false;
@@ -628,7 +633,7 @@ function sessionCookie(value, maxAge) {
 async function adminLogin(request, env) {
   const body = await readJsonBody(request);
   const key = body && String(body.key ?? "");
-  if (!key || !safeEqual(key, env.TG_SECRET)) {
+  if (!key || !safeEqual(key, adminKey(env))) {
     // خطای عمومی — key بازتابانده نمی‌شود
     return json({ ok: false, error: "unauthorized" }, 401);
   }
@@ -875,7 +880,7 @@ async function route(request, env, ctx) {
     if (missingSecretName(env)) return missingSecretResponse(env);
 
     const key = request.headers.get("X-Setup-Key") ?? "";
-    if (!safeEqual(key, env.TG_SECRET)) {
+    if (!safeEqual(key, adminKey(env))) {
       return new Response("unauthorized", { status: 401 });
     }
 
