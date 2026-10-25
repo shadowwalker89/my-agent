@@ -22,6 +22,7 @@ import {
 } from "./overrides.js";
 import { tgApi, tgSend, tgBroadcast } from "./telegram.js";
 import { healthCounts } from "./health.js";
+import { ADMIN_HTML } from "./admin-page.js";
 
 const TG_ERROR_LIMIT = 120;
 
@@ -606,6 +607,50 @@ async function readJsonBody(request) {
   }
 }
 
+async function adminPage() {
+  return new Response(ADMIN_HTML, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy":
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';",
+      "x-frame-options": "DENY",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+const SESSION_COOKIE = "admin_session";
+
+function sessionCookie(value, maxAge) {
+  return `${SESSION_COOKIE}=${value}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
+}
+
+async function adminLogin(request, env) {
+  const body = await readJsonBody(request);
+  const key = body && String(body.key ?? "");
+  if (!key || !safeEqual(key, env.TG_SECRET)) {
+    // خطای عمومی — key بازتابانده نمی‌شود
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+  const exp = Date.now() + SESSION_TTL_MS;
+  const token = await signSessionToken(env, exp);
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: {
+      "content-type": "application/json",
+      "set-cookie": sessionCookie(token, Math.floor(SESSION_TTL_MS / 1000)),
+    },
+  });
+}
+
+function adminLogout() {
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: {
+      "content-type": "application/json",
+      "set-cookie": sessionCookie("", 0),
+    },
+  });
+}
+
 async function adminApiListModels(request, env) {
   const url = new URL(request.url);
   const provider = url.searchParams.get("provider") ?? "";
@@ -632,11 +677,23 @@ async function adminApiListModels(request, env) {
 
 async function adminApiTest(request, env) {
   const body = await readJsonBody(request);
-  if (!body || !body.provider || !body.model) {
-    return json({ ok: false, error: "provider and model are required" }, 400);
+  if (!body || !body.provider) {
+    return json({ ok: false, error: "provider is required" }, 400);
   }
   const ctx = await getProviderCtx(env, String(body.provider));
   if (!ctx) return json({ ok: false, error: `unknown provider: ${body.provider}` }, 400);
+  const model = body.model ? String(body.model) : "";
+  if (!model) {
+    // تست در سطح provider: یک GET /models سبک (بدون نشان دادن مقدار کلید)
+    try {
+      const list = await listProviderModels(env, ctx);
+      return json({ ok: true, provider: ctx.id, kind: "models", count: list.length });
+    } catch (err) {
+      return err?.info
+        ? json(err.info, 502)
+        : json({ ok: false, error: String(err && err.message).slice(0, 200) }, 502);
+    }
+  }
   const r = await directCall(env, String(body.provider), String(body.model), TEST_BODY, {
     timeoutMs: 20000,
   });
@@ -738,6 +795,20 @@ async function route(request, env, ctx) {
     const auth = routerAuth(request, env);
     if (auth) return auth;
     return Response.json(await comboModels(env));
+  }
+
+  if (request.method === "GET" && (pathname === "/admin" || pathname === "/admin/")) {
+    if (missingSecretName(env)) return missingSecretResponse(env);
+    return adminPage();
+  }
+
+  if (request.method === "POST" && pathname === "/admin/login") {
+    if (missingSecretName(env)) return missingSecretResponse(env);
+    return adminLogin(request, env);
+  }
+
+  if (request.method === "POST" && pathname === "/admin/logout") {
+    return adminLogout();
   }
 
   if (request.method === "GET" && pathname === "/admin/models") {

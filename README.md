@@ -182,6 +182,30 @@ binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛
 با امتیاز چاپ می‌کند و چند assert ساده (تنوع، نبود مدل embed/guard/… و حاضر بودن
 مدل‌های اصلی در code) دارد؛ شکست = exit code 1.
 
+### صفحه‌ی مدیریت (قدم ۳ب / `GET /admin`)
+
+یک صفحه‌ی HTML تک‌فایلی (بدون فریمورک و بیلد؛ CSS/JS داخل همان فایل در
+`src/admin-page.js`) که فقط با APIهای `/admin/api/*` کار می‌کند:
+
+- **ورود:** `GET /admin` همیشه صفحه برمی‌گرداند؛ اگر احراز نشده باشی، صفحه‌ی لاگین
+  با یک فیلد کلمه‌ی عبور نمایش می‌شود. `POST /admin/login {key}` با کلید
+  `TG_SECRET` (مقایسه‌ی constant-time، خطای عمومی، هیچ‌وقت بازتاب key) کوکی
+  `admin_session` امضاشده می‌سازد (`HttpOnly; Secure; SameSite=Strict; 7 روز` —
+  همان فرمت HmAC پچ ۳ا). `POST /admin/logout` کوکی را پاک می‌کند. احراز جایگزین:
+  هدر `X-Setup-Key`.
+- **بخش‌ها:** جدول providerها (نام/baseUrl/secretName/موجود بودن راز/فعال + دکمه‌های
+  افزودن/ویرایش/حذف — داخلی‌ها حذف نمی‌شوند — به‌روزرسانی کاتالوگ/تست)، پنل مدل‌ها
+  (جستجوی provider + متن، وضعیت ok|cooldown|banned، دکمه‌ی تست هر مدل) و comboهای
+  دستی (افزودن/ویرایش/حذف؛ strategy، timeoutMs، retries، هدف‌ها با دکمه‌ی بالا/پایین،
+  حداکثر ۳۰ هدف). خطاها همان متن server (`{ok:false, error}`) با textContent
+  (مقابله‌شده) نشان داده می‌شوند.
+- **زبان:** دکمه‌ی تغییر EN/FA — انگلیسی پیش‌فرض؛ فارسی با `dir="rtl"`؛ انتخاب در
+  `localStorage` ذخیره می‌شود. همه‌ی متن‌ها از یک دیکشنری (`I18N.en`/`I18N.fa`) می‌آیند.
+- **امنیت:** هدرهای `Content-Security-Policy: default-src 'self'; script-src 'self'
+  'unsafe-inline'; style-src 'self' 'unsafe-inline';` و `X-Frame-Options: DENY` و
+  `Cache-Control: no-store` روی `/admin`؛ هیچ داده‌ی server با innerHTML تزریق
+  نمی‌شود؛ مقدار کلید provider هرگز نمایش/ذخیره نمی‌شود (فقط secretName و موجود بودن).
+
 ### Endpointها برای خودم
 
 - `POST /admin/refresh?provider=<name|all>` (هدر `X-Setup-Key: <TG_SECRET>`) —

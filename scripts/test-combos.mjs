@@ -354,6 +354,103 @@ check(
   `fastest بدون داده باید = priority: ${fastestEmpty.join(",")}`,
 );
 
+// ── patch 3b: صفحه‌ی /admin (لاگین، کوکی امضاشده، هدرهای امنیتی) ────────────
+const workerDefault = (await import("../src/index.js")).default;
+const TG_SECRET_FAKE = "fake-tg-secret-for-tests";
+const env3b = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: TG_SECRET_FAKE };
+const ctxNull = {};
+
+const res0 = await workerDefault.fetch(new Request("https://admin.test/admin"), env3b, ctxNull);
+check(res0.status === 200, `GET /admin باید 200 بدهد (${res0.status})`);
+const csp = res0.headers.get("content-security-policy") ?? "";
+check(
+  csp.includes("default-src 'self'") && csp.includes("script-src 'self' 'unsafe-inline'"),
+  `CSP وجود ندارد یا ناقص: ${csp}`,
+);
+check(res0.headers.get("x-frame-options") === "DENY", "X-Frame-Options DENY");
+check(res0.headers.get("cache-control") === "no-store", "Cache-Control no-store");
+const html = await res0.text();
+check(html.includes("<!doctype html>"), "HTML دوباره نوشته نشده؟");
+check(html.includes("en: {") && html.includes("fa: {"), "هر دو بسته‌ی زبان en/fa در DOM نیست");
+check(
+  html.includes("dir=\"rtl\"") || html.includes("dir='rtl'") || html.includes("rtl"),
+  "XML dir rtl برای fa باید آماده باشد",
+);
+check(
+  !html.includes(SECRET_VALUE) && !html.includes("fake-token") && !html.includes(TG_SECRET_FAKE),
+  "راز جعلی در HTML نشت کرد!",
+);
+check(
+  !html.includes("openrouter.ai") && !html.includes("integrate.api") && !html.includes("xkiro.com"),
+  "داده‌ی کانفیگ (آدرس داخلی‌ها) نباید وابسته به HTML ثابت باشد",
+);
+
+// قبل از لاگین: /admin/api/config باید 401 بدهد
+const pre = await workerDefault.fetch(
+  new Request("https://admin.test/admin/api/config"),
+  env3b,
+  ctxNull,
+);
+check(pre.status === 401, `/config بدون احراز باید 401 بدهد (${pre.status})`);
+
+// لاگین اشتباه: 401 و کوکی نه
+const bad = await workerDefault.fetch(
+  new Request("https://admin.test/admin/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key: "wrong-key" }),
+  }),
+  env3b,
+  ctxNull,
+);
+check(bad.status === 401, `لاگین با کلید غلط باید 401 (${bad.status})`);
+check(bad.headers.get("set-cookie") === null, "کوکی با کلید غلط نباید ست شود");
+check(String(await bad.text()).includes("unauthorized"), "خطای عمومی لاگین");
+
+// لاگین درست: کوکی HttpOnly + SameSite=Strict + Secure
+const good = await workerDefault.fetch(
+  new Request("https://admin.test/admin/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key: TG_SECRET_FAKE }),
+  }),
+  env3b,
+  ctxNull,
+);
+check(good.status === 200, `لاگین درست باید 200 (${good.status})`);
+const gbody = await good.json();
+check(gbody.ok === true, "بادی لاگین ok");
+const sc = good.headers.get("set-cookie") ?? "";
+check(
+  sc.startsWith("admin_session=") && sc.includes("HttpOnly") && sc.includes("SameSite=Strict") && sc.includes("Secure"),
+  `کوکی نامناسب: ${sc}`,
+);
+const cookieVal = sc.split(";")[0];
+
+// کوکی امضاشده سبب دسترسی به /admin/api/config می‌شود
+const authed = await workerDefault.fetch(
+  new Request("https://admin.test/admin/api/config", { headers: { cookie: cookieVal } }),
+  env3b,
+  ctxNull,
+);
+check(authed.status === 200, `کوکی امضاشده کار نکرد (${authed.status})`);
+const cfgJ = await authed.json();
+check(cfgJ.ok === true && Array.isArray(cfgJ.providers), "با کوکی config ok");
+check(
+  !JSON.stringify(cfgJ).includes(TG_SECRET_FAKE),
+  "مقدار راز در جواب config نشت کرد!",
+);
+
+// logout: کوکی پاک می‌شود
+const out = await workerDefault.fetch(
+  new Request("https://admin.test/admin/logout", { method: "POST" }),
+  env3b,
+  ctxNull,
+);
+check(out.status === 200, `logout باید 200 (${out.status})`);
+const osc = out.headers.get("set-cookie") ?? "";
+check(osc.includes("Max-Age=0") && osc.includes("HttpOnly"), `کوکی logout: ${osc}`);
+
 if (failures.length) {
   console.error("\n✖ شکست تست‌ها:");
   for (const f of failures) console.error(`  - ${f}`);
