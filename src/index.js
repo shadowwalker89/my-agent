@@ -680,11 +680,78 @@ async function adminApiListModels(request, env) {
   return json({ ok: true, provider, models: out });
 }
 
+// کد استاندارد شکست برای نتیجه‌کارت صفحه‌ی admin: timeout|auth|notfound|ratelimit|server|unknown
+function failLabelCode(r) {
+  if (!r || r.ok) return null;
+  const snippet = String(r.snippet ?? "");
+  if (snippet.startsWith("timeout")) return "timeout";
+  const unwrap = /key rejected/i.test(snippet) ? "auth" : null;
+  const s = typeof r.status === "number" ? r.status : null;
+  if ((s === 401 || s === 403) || (s === null && unwrap)) return "auth";
+  if (s === 404) return "notfound";
+  if (s === 429) return "ratelimit";
+  if (s !== null && s >= 500) return "server";
+  return "unknown";
+}
+
+// تعبیر reasonهای runCombo («key rejected (401)»، «http 429»، «timeout»، ...) به همان کدها
+function comboFailLabelCode(reason) {
+  const r = String(reason ?? "");
+  if (r === "timeout" || r.startsWith("timeout")) return "timeout";
+  if (/key rejected/i.test(r)) return "auth";
+  const m = /http (\d{3})/.exec(r);
+  if (m) {
+    const s = Number(m[1]);
+    if (s === 401 || s === 403) return "auth";
+    if (s === 404) return "notfound";
+    if (s === 429) return "ratelimit";
+    if (s >= 500) return "server";
+    return "unknown";
+  }
+  return "unknown";
+}
+
 async function adminApiTest(request, env) {
   const body = await readJsonBody(request);
-  if (!body || !body.provider) {
-    return json({ ok: false, error: "provider is required" }, 400);
+  if (!body || (!body.provider && !body.combo)) {
+    return json({ ok: false, error: "provider or combo is required" }, 400);
   }
+
+  if (body.combo) {
+    // تست combo از مسیر خود روتر — یک بار اجرا
+    const name = String(body.combo);
+    const started = Date.now();
+    const res = await runCombo(env, name, TEST_BODY, { deadlineMs: 25000 });
+    const latencyMs = Date.now() - started;
+    if (res.ok) {
+      const content = res.data?.choices?.[0]?.message?.content;
+      const text =
+        typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content.map((p) => p?.text ?? "").join("")
+            : JSON.stringify(res.data ?? {});
+      return json({
+        ok: true,
+        combo: name,
+        used: res.used,
+        status: 200,
+        latencyMs,
+        text: String(text).slice(0, 200),
+        label: null,
+      });
+    }
+    const e0 = res.errors?.[0] ?? null;
+    return json({
+      ok: false,
+      combo: name,
+      status: e0?.status ?? null,
+      latencyMs,
+      text: "",
+      label: e0 ? comboFailLabelCode(e0.reason) : "unknown",
+    });
+  }
+
   const ctx = await getProviderCtx(env, String(body.provider));
   if (!ctx) return json({ ok: false, error: `unknown provider: ${body.provider}` }, 400);
   const model = body.model ? String(body.model) : "";
@@ -702,14 +769,22 @@ async function adminApiTest(request, env) {
   const r = await directCall(env, String(body.provider), String(body.model), TEST_BODY, {
     timeoutMs: 20000,
   });
-  return json({
-    ok: r.ok,
-    provider: String(body.provider),
-    model: String(body.model),
+  return json(normalizeTestResult(r, String(body.provider), String(body.model)));
+}
+
+// بدنه‌ی نهایی پاسخ تست مدل — شکل نرمال برای کارت نتیجه
+function normalizeTestResult(r, provider, model) {
+  const label = failLabelCode(r);
+  return {
+    ok: r.ok === true,
+    provider,
+    model,
     status: r.status ?? null,
-    latencyMs: r.latencyMs,
-    snippet: r.snippet,
-  });
+    latencyMs: r.latencyMs ?? null,
+    snippet: r.snippet ?? "",
+    text: r.ok ? r.snippet ?? "" : "",
+    label,
+  };
 }
 
 // بدون mutation خطرناک: خطای apiError → 400 با پیام کوتاه؛ بقیه ۵۰۰ با نام خطا

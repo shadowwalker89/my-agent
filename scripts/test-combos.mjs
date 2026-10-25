@@ -21,6 +21,10 @@ import {
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+function occurrences(hay, needle) {
+  return hay.split(needle).length - 1;
+}
+
 function loadFixture(name) {
   const p = path.join(rootDir, name);
   let buf;
@@ -554,6 +558,96 @@ const suTg = await workerDefault.fetch(
   ctxNull,
 );
 check(suTg.status === 401, `/setup با TG_SECRET باید 401 (${suTg.status})`);
+
+// ── patch 3c: UX — کانستنت‌ها، کلیدهای i18n، بدون innerHTML ─────────────────
+const html2 = await (await workerDefault.fetch(new Request("https://admin.test/admin"), env3b, ctxNull)).text();
+check(html2.includes("TEST_ALL_CONCURRENCY = 3"), "کانستنت concurrency باید ۳ باشد");
+check(html2.includes("TEST_ALL_CAP = 60"), "کانستنت cap باید ۶۰ باشد");
+check(!html2.includes("innerHTML"), "innerHTML نباید در صفحه باشد");
+const keys3c = [
+  "testAll", "stopBtn", "testing", "tooManyMsg", "showOnlyOk", "addedDone", "addToQ",
+  "newComboOpt", "newComboHint", "testCombo", "lblTimeout", "lblAuth", "lblNotFound",
+  "lblRate", "lblServer", "lblUnknown", "provHelp", "modelsHelp", "combosHelp",
+  "runDone", "failedC", "fastest", "stAll", "providers", "models", "combos",
+  "providerCol", "newCombo", "comboAdd", "nameRequired",
+];
+for (const k of keys3c) {
+  const n = occurrences(html2, k + ":");
+  check(n >= 2, `کلید i18n «${k}» باید در هر دو زبان باشد (${n})`);
+}
+// data-i18n استاتیک و دکمه‌های تب
+check(html2.includes('data-tab="provTab"'), "تب provider");
+check(html2.includes('data-tab="modelsTab"'), "تب models");
+check(html2.includes('data-tab="combosTab"'), "تب combos");
+check(html2.includes(".hidden{display:none"), "کلاس hidden باید در CSS باشد");
+check(
+  html2.includes('data-i18n="tabProviders"') &&
+    html2.includes('data-i18n="tabModels"') &&
+    html2.includes('data-i18n="tabCombos"') &&
+    html2.includes('data-i18n="logout"'),
+  "برچسب تب‌ها/خروج باید data-i18n داشته باشد",
+);
+check(!/window\.alert\s*\(/.test(html2), "alert() نباید به‌جای toast استفاده شود");
+
+// ── پاسخ نرمالِ تست combo ({ok,status,latencyMs,text,label}) ────────────────
+const envCt = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: TG_SECRET_FAKE };
+const putProv = await workerDefault.fetch(
+  new Request("https://admin.test/admin/api/providers/ctprov", {
+    method: "PUT",
+    headers: { "content-type": "application/json", "X-Setup-Key": TG_SECRET_FAKE },
+    body: JSON.stringify({ id: "ctprov", name: "ct", baseUrl: "https://127.0.0.1:9/v1", secretName: "TG_TOKEN" }),
+  }),
+  envCt,
+  ctxNull,
+);
+check(putProv.status === 200, `PUT provider ctprov (${putProv.status})`);
+const putCombo = await workerDefault.fetch(
+  new Request("https://admin.test/admin/api/combos/ct", {
+    method: "PUT",
+    headers: { "content-type": "application/json", "X-Setup-Key": TG_SECRET_FAKE },
+    body: JSON.stringify({
+      name: "ct",
+      strategy: "priority",
+      timeoutMs: 2000,
+      retries: 0,
+      targets: [{ provider: "ctprov", model: "m1" }],
+    }),
+  }),
+  envCt,
+  ctxNull,
+);
+check(putCombo.status === 200, `PUT combo ct (${putCombo.status})`);
+
+// شبکه را قطع می‌کنیم تا runCombo مسیر شکستِ «network» را برود (بدون درخواست واقعی)
+const realFetch = global.fetch;
+global.fetch = async () => {
+  throw new Error("offline-test");
+};
+let comboRes;
+try {
+  comboRes = await workerDefault.fetch(
+    new Request("https://admin.test/admin/api/test", {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Setup-Key": TG_SECRET_FAKE },
+      body: JSON.stringify({ combo: "ct" }),
+    }),
+    envCt,
+    ctxNull,
+  );
+} finally {
+  global.fetch = realFetch;
+}
+check(comboRes.status === 200, `تست combo باید 200 (${comboRes.status})`);
+const cb = await comboRes.json();
+check(
+  cb.ok === false &&
+    cb.combo === "ct" &&
+    cb.status === null &&
+    typeof cb.latencyMs === "number" &&
+    cb.text === "" &&
+    cb.label === "unknown",
+  `شکل نرمال تست combo: ${JSON.stringify(cb)}`,
+);
 
 if (failures.length) {
   console.error("\n✖ شکست تست‌ها:");

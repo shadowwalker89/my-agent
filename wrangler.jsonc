@@ -1,10 +1,25 @@
 {
-  "name": "my-agent",
-  "main": "src/index.js",
-  "compatibility_date": "2026-09-01",
-  "workers_dev": true,
-  "observability": { "enabled": true },
-  "vars": { "SHOW_MODEL": "1" },
-  "kv_namespaces": [{ "binding": "STATE" }],
-  "triggers": { "crons": ["0 */6 * * *", "10 */6 * * *", "20 */6 * * *"] }
+	"name": "my-agent",
+	"main": "src/index.js",
+	"compatibility_date": "2026-09-01",
+	"workers_dev": true,
+	"observability": {
+		"enabled": true
+	},
+	"vars": {
+		"SHOW_MODEL": "1"
+	},
+	"kv_namespaces": [
+		{
+			"binding": "STATE",
+			"id": "2183ee2f089545808c8061d52e00979d"
+		}
+	],
+	"triggers": {
+		"crons": [
+			"0 */6 * * *",
+			"10 */6 * * *",
+			"20 */6 * * *"
+		]
+	}
 }
