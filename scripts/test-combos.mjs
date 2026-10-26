@@ -18,6 +18,15 @@ import {
   validateCombo,
   TARGET_LIMIT,
 } from "../src/config.js";
+import {
+  classifyTask,
+  comboCandidates,
+  fallbackCombo,
+  selectCombo,
+  BUILTIN_COMBOS,
+  updateHasImage,
+} from "../src/task-route.js";
+import { DEFAULT_PREFS, normalizePrefs, getPrefs, setPrefs, prefsKey } from "../src/tgprefs.js";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -725,8 +734,334 @@ check(
   `شکل نرمال تست combo: ${JSON.stringify(cb)}`,
 );
 
+// ── patch 3e: xkiro 48 free models sync & combo kinds / capability tags ──────
+import { mapXkiroDetailed, listProviderModelsDetailed } from "../src/providers.js";
+import { COMBO_KINDS, capabilityTags, orderCombosForModel, autoFillTargets } from "../src/combos.js";
+
+const mockXkiroList = [];
+// پسوند :free بدون access_tier → fallback رایگان؛ tier همیشه برنده است.
+for (let i = 0; i < 20; i++) {
+  mockXkiroList.push({ id: `xkiro/model-suffix-${i}:free` });
+}
+for (let i = 0; i < 28; i++) {
+  mockXkiroList.push({ id: `xkiro/model-tier-${i}`, access_tier: "free", pricing: { input: 0, output: 0 } });
+}
+for (let i = 0; i < 5; i++) {
+  mockXkiroList.push({ id: `xkiro/paid-model-${i}`, access_tier: "paid", pricing: { input: "0.05" } });
+}
+const xkRes = mapXkiroDetailed(mockXkiroList);
+check(xkRes.models.length === 48, `xkiro باید دقیقا 48 مدل رایگان نگه دارد (${xkRes.models.length})`);
+check(xkRes.dropped.length === 5, `xkiro باید 5 مدل پولی را حذف کند (${xkRes.dropped.length})`);
+// tier paid حتی با پسوند :free و قیمت صفر باید رد شود (قاعده‌ی عمدی)
+const xkStrict = mapXkiroDetailed([{ id: "xkiro/ghost:free", access_tier: "paid", pricing: { input: 0, output: 0 } }]);
+check(xkStrict.models.length === 0 && xkStrict.dropped.length === 1, "tier paid با پسوند :free هم باید رد شود");
+
+const env3e = { STATE: fakeKV(), XKIRO_API_KEY: "fake-key" };
+const mockFetch = global.fetch;
+global.fetch = async () => new Response(JSON.stringify({ object: "list", data: mockXkiroList }), { status: 200 });
+try {
+  await upsertProvider(env3e, { id: "xkiro", baseUrl: "https://api.xkiro.com/v1", secretName: "XKIRO_API_KEY", builtin: true });
+  const sr = await listProviderModelsDetailed(env3e, { id: "xkiro", baseUrl: "https://api.xkiro.com/v1", secretName: "XKIRO_API_KEY", builtin: true });
+  check(sr.sync.fetched === 53 && sr.sync.kept === 48 && sr.sync.droppedCount === 5, `گزارش sync نامعتبر: ${JSON.stringify(sr.sync)}`);
+} finally {
+  global.fetch = mockFetch;
+}
+
+check(COMBO_KINDS.includes("code") && COMBO_KINDS.includes("vision") && COMBO_KINDS.includes("custom"), "COMBO_KINDS ناقص");
+const tags1 = capabilityTags({ id: "qwen/qwen3-vl-plus:free", capabilities: { vision: true } });
+check(tags1.includes("vision"), "تشخیص تگ vision ناموفق");
+const tags2 = capabilityTags({ id: "deepseek/deepseek-r1-distill" });
+check(tags2.includes("reasoning"), "تشخیص تگ reasoning ناموفق");
+
+const ordered = orderCombosForModel([{ name: "codeCombo", kind: "code" }, { name: "textCombo", kind: "text" }], ["coder"]);
+check(ordered[0].combo.name === "codeCombo", "مرتبسازی comboها بر اساس قابلیت coder اشتباه است");
+
+const fakeResults = {
+  "xkiro/qwen3-coder:free": { ok: true, latencyMs: 150, testedAt: Date.now() },
+  "xkiro/qwen3-vision:free": { ok: true, latencyMs: 100, testedAt: Date.now() }
+};
+const autoFilled = autoFillTargets(fakeResults, { kind: "code", limit: 5, tagsByKey: { "xkiro/qwen3-coder:free": ["coder"], "xkiro/qwen3-vision:free": ["vision"] } });
+check(autoFilled.length === 1 && autoFilled[0].model === "qwen3-coder:free", `auto-fill برای kind code باید فقط مدل coder را بردارد (${JSON.stringify(autoFilled)})`);
+
+// ── patch 3f: مسیریابی تسک تلگرام، prefs هر کاربر، 502 با available ─────────
+
+// 1) classifyTask — en/fa/خالی/مختلط/hasImage
+check(classifyTask("hello there") === "chat", "متن عادی باید chat باشد");
+check(classifyTask("") === "chat", "متن خالی باید chat باشد");
+check(classifyTask(undefined) === "chat", ".undefined باید chat باشد");
+check(classifyTask("hi, how was your day?") === "chat", "جمله‌ی عادی انگلیسی باید chat باشد");
+check(classifyTask("```js\nconst x = 1;\n```") === "code", "fence باید code باشد");
+check(classifyTask("def foo(x):\n    return x") === "code", "def باید code باشد");
+check(classifyTask("function foo() { return 1; }") === "code", "function باید code باشد");
+check(classifyTask("class Foo { }") === "code", "class باید code باشد");
+check(
+  classifyTask("TypeError: x is not a function\n    at foo (app.js:10:5)") === "code",
+  "stack trace باید code باشد",
+);
+check(
+  classifyTask("python says:\nTraceback (most recent call last):\n  File \"x.py\", line 3") === "code",
+  "python traceback باید code باشد",
+);
+check(classifyTask("look at src/index.ts") === "code", "پسوند ts باید code باشد");
+check(classifyTask("open main.go and main.py") === "code", "پسوند go/py باید code باشد");
+check(classifyTask("I have a bug in this") === "code", "bug باید code باشد");
+check(classifyTask("write a SQL query please") === "code", "sql باید code باشد");
+check(classifyTask("این کد را بررسی کن") === "code", "کد فارسی باید code باشد");
+check(classifyTask("باگ دارد این") === "code", "باگ باید code باشد");
+check(classifyTask("این خطا چیست؟") === "code", "خطا باید code باشد");
+check(classifyTask("این تابع را توضیح بده") === "code", "تابع باید code باشد");
+check(classifyTask("کدام مدل بهتر است؟") === "chat", "کدام نباید کد حساب شود");
+check(classifyTask("سلام، خوبی؟") === "chat", "جمله‌ی عادی فارسی باید chat باشد");
+check(classifyTask("hello", { hasImage: true }) === "vision", "hasImage باید vision بدهد");
+check(classifyTask("", { hasImage: true }) === "vision", "عکس بدون متن باید vision بدهد");
+check(classifyTask({ text: "hello", photo: [{ file_id: "x" }] }) === "vision", "photo در update باید vision بدهد");
+check(classifyTask({ text: "hello", document: { mime_type: "image/png" } }) === "vision", "document تصویری باید vision بدهد");
+check(classifyTask({ text: "hello", document: { mime_type: "application/pdf" } }) === "chat", "pdf باید chat بماند");
+check(updateHasImage({ photo: [{}] }) === true, "updateHasImage photo");
+check(updateHasImage({ document: { mime_type: "text/plain" } }) === false, "updateHasImage غیرتصویری");
+
+// 2) prefs — validate/defaults/cap/unknown fields + KV
+check(normalizePrefs(null).combo === null && normalizePrefs(null).auto === true && normalizePrefs(null).show === false, "پیش‌فرض prefs");
+check(normalizePrefs("x").auto === true, "بدنه‌ی غیر object باید پیش‌فرض بدهد");
+check(!("junk" in normalizePrefs({ combo: "code", auto: false, show: true, junk: "x" })), "فیلد ناشناس نادیده گرفته شود");
+const bad1 = normalizePrefs({ combo: "BAD NAME", auto: "yes", show: 1 });
+check(bad1.combo === null && bad1.auto === true && bad1.show === false, "مقادیر نامعتبر باید پیش‌فرض بمانند");
+check(normalizePrefs({ combo: "a".repeat(100) }).combo === null, "سقف طول combo باید رعایت شود");
+check(normalizePrefs({ combo: "my-co.1_x" }).combo === "my-co.1_x", "نام معتبر باید بماند");
+const persistDefaults = await getPrefs({ STATE: null }, 1);
+check(persistDefaults.combo === null && persistDefaults.auto === true && persistDefaults.show === false, "بدون KV پیش‌فرض");
+
+const kvPrefs = fakeKV();
+const envPrefs = { STATE: kvPrefs };
+const p0 = await getPrefs(envPrefs, 123);
+check(p0.combo === null && p0.auto === true && p0.show === false, "getPrefs بدون کلید = پیش‌فرض");
+const p1 = await setPrefs(envPrefs, 123, { combo: "code", auto: false });
+check(p1.combo === "code" && p1.auto === false && p1.show === false, "setPrefs");
+check(kvPrefs.store.has(prefsKey(123)), "کلید tgprefs:<userId>");
+check(JSON.stringify(kvPrefs.store.get(prefsKey(123))) !== null && !String(kvPrefs.store.get(prefsKey(123))).includes("junk"), "KV فقط فیلدهای معتبر");
+const p2 = await setPrefs(envPrefs, 123, { show: true, evil: "h" });
+check(p2.show === true && p2.combo === "code" && !("evil" in p2), "patch روی مقادیر فعلی و بدون فیلد ناشناس");
+check((await getPrefs(envPrefs, "abc")).auto === true, "userId غیر عددی باید پیش‌فرض بدهد");
+
+// 3) ترتیب انتخاب combo (auto on/off، کمبود، fallback)
+const baseP = { combo: null, auto: true, show: false };
+check(comboCandidates(baseP, "code").join(",") === "code,chat", `auto روشن: ترتیب ${comboCandidates(baseP, "code")}`);
+check(comboCandidates({ ...baseP, auto: false }, "code").join(",") === "chat", "auto خاموش چون فقط پیش‌فرض");
+check(comboCandidates({ ...baseP, combo: "mine" }, "code").join(",") === "code,mine,chat", "auto + پیش‌فرض دستی");
+check(comboCandidates({ ...baseP, combo: "mine" }, "chat").join(",") === "chat,mine", "task chat: chat اول (auto)");
+check(comboCandidates(null, undefined).join(",") === "chat", "بدون prefs/task = chat");
+check(fallbackCombo("mine", "code") === "mine", "fallback به پیش‌فرض کاربر");
+check(fallbackCombo("mine", "mine") === "chat", "fallback پیش‌فرض == انتخاب → chat");
+check(fallbackCombo("chat", "chat") === null, "fallback همان chat → هیچ");
+check(fallbackCombo(null, "chat") === null, "پیش‌فرض null == chat → هیچ");
+const selKnown = selectCombo({ combo: "mine", auto: true, show: false }, "code", {
+  isKnown: (n) => ["mine", "chat"].includes(n),
+  isUsable: () => true,
+});
+check(selKnown.combo === "mine" && selKnown.fallback === "chat", `combo گمشده → پیش‌فرض (${JSON.stringify(selKnown)})`);
+const selUnusable = selectCombo({ combo: "mine", auto: true, show: false }, "code", {
+  isKnown: () => true,
+  isUsable: (n) => n === "chat",
+});
+check(selUnusable.combo === "chat", `هدف نداشتن → chat (${JSON.stringify(selUnusable)})`);
+const selChat = selectCombo(baseP, "chat", { isKnown: (n) => BUILTIN_COMBOS.includes(n), isUsable: () => true });
+check(selChat.combo === "chat", "task chat → chat");
+check(BUILTIN_COMBOS.join(",") === "chat,code,vision,fast", "BUILTIN_COMBOS");
+
+// 4) 502 با available
+const env502 = { STATE: fakeKV(), ROUTER_KEY: "fake-router-key" };
+await upsertCombo(env502, {
+  name: "apicomb",
+  kind: "custom",
+  strategy: "priority",
+  timeoutMs: 20000,
+  retries: 0,
+  targets: [{ provider: "nvidia", model: "z-ai/glm-5.3" }],
+});
+const res502 = await workerDefault.fetch(
+  new Request("https://admin.test/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer fake-router-key" },
+    body: JSON.stringify({ model: "no-such-combo", messages: [{ role: "user", content: "hi" }] }),
+  }),
+  env502,
+  ctxNull,
+);
+check(res502.status === 502, `unknown body.model باید 502 بماند (${res502.status})`);
+const j502 = await res502.json();
+check(
+  j502.ok === false &&
+    Array.isArray(j502.available) &&
+    j502.available.includes("apicomb") &&
+    j502.available.includes("chat") &&
+    j502.available.includes("code") &&
+    j502.available.length <= 50,
+  `502 باید available معتبر بدهد (${JSON.stringify(j502.available)})`,
+);
+
+// 5) /admin/api/auto/<name> — انتخاب زنده با کاتالوگ seeder شده
+const envAuto = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: TG_SECRET_FAKE };
+await envAuto.STATE.put(
+  "catalog:nvidia",
+  JSON.stringify({ updatedAt: new Date().toISOString(), models: catalog.filter((m) => m.provider === "nvidia") }),
+);
+const rAuto404 = await workerDefault.fetch(
+  new Request("https://admin.test/admin/api/auto/ghost", { headers: { "X-Setup-Key": TG_SECRET_FAKE } }),
+  envAuto,
+  ctxNull,
+);
+check(rAuto404.status === 404, `auto ناشناس باید 404 (${rAuto404.status})`);
+const rAuto = await workerDefault.fetch(
+  new Request("https://admin.test/admin/api/auto/code", { headers: { "X-Setup-Key": TG_SECRET_FAKE } }),
+  envAuto,
+  ctxNull,
+);
+check(rAuto.status === 200, `auto code باید 200 (${rAuto.status})`);
+const jAuto = await rAuto.json();
+check(
+  jAuto.ok === true && jAuto.name === "code" && jAuto.kind === "code" && Array.isArray(jAuto.targets) &&
+    jAuto.targets.length >= 1 && jAuto.targets.length <= 8 &&
+    jAuto.targets.every((t) => t.provider && t.model && t.enabled === true),
+  `شکل auto code: ${JSON.stringify(jAuto)}`,
+);
+
+// 6) دستورهای تلگرام — /combo list/set/reject/clear، /route، /showmodel، /help
+function tgCapture() {
+  const sent = [];
+  const orig = global.fetch;
+  global.fetch = async (url, init) => {
+    const u = String(url);
+    const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+    let payload = null;
+    try {
+      payload = JSON.parse(String(init?.body ?? "{}"));
+    } catch {
+      payload = {};
+    }
+    if (m) sent.push({ method: m[1], payload });
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  return {
+    sent,
+    restore() {
+      global.fetch = orig;
+    },
+  };
+}
+
+const envTg = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret-cmd", ALLOWED_TG_IDS: "4242" };
+await upsertCombo(envTg, {
+  name: "mine",
+  kind: "custom",
+  strategy: "priority",
+  timeoutMs: 20000,
+  retries: 0,
+  targets: [{ provider: "nvidia", model: "z-ai/glm-5.3" }],
+});
+
+async function sendTg(env, rawUpdate, userId = 4242) {
+  const cap = tgCapture();
+  const pending = [];
+  try {
+    const res = await workerDefault.fetch(
+      new Request("https://admin.test/telegram", {
+        method: "POST",
+        headers: { "X-Telegram-Bot-Api-Secret-Token": env.TG_SECRET },
+        body: JSON.stringify(rawUpdate), // اگر string بود مستقیم می‌شود innerText، ولی به JSON.stringify سپرده می‌شود
+      }),
+      env,
+      { waitUntil: (p) => pending.push(p) },
+    );
+    check(res.status === 200, `/telegram باید 200 بدهد (${res.status})`);
+    await Promise.all(pending);
+  } finally {
+    cap.restore();
+  }
+  return cap.sent
+    .filter((c) => c.method === "sendMessage" && typeof c.payload.text === "string")
+    .map((c) => c.payload.text)
+    .join("\n---\n");
+}
+
+const tgUpdate = (text, userId = 4242) => ({
+  message: { text, from: { id: userId }, chat: { id: userId } },
+});
+
+const outList = await sendTg(envTg, tgUpdate("/combo"));
+check(outList.includes("mine") && outList.includes("chat") && outList.includes("code") && outList.includes("vision") && outList.includes("fast"), `/combo باید دستی + داخلی را لیست کند: ${outList.slice(0, 200)}`);
+check(outList.includes("auto") && outList.includes("combo فعلی: chat"), `/combo باید انتخاب فعلی را بگوید: ${outList.slice(0, 160)}`);
+
+await sendTg(envTg, tgUpdate("/combo mine"));
+let prefsCmd = await getPrefs(envTg, 4242);
+check(prefsCmd.combo === "mine" && prefsCmd.auto === true && prefsCmd.show === false, `پس از /combo mine: ${JSON.stringify(prefsCmd)}`);
+
+const outReject = await sendTg(envTg, tgUpdate("/combo nope"));
+check(outReject.includes("nope") && outReject.includes("mine") && outReject.includes("chat"), `/combo ناشناس باید معتبرها را لیست کند: ${outReject.slice(0, 200)}`);
+prefsCmd = await getPrefs(envTg, 4242);
+check(prefsCmd.combo === "mine", "رد شدن نباید selection را عوض کند");
+
+const outSwitch = await sendTg(envTg, tgUpdate("/combo code"));
+check(outSwitch.includes("code"), `/combo code باید تایید شود: ${outSwitch}`);
+check((await getPrefs(envTg, 4242)).combo === "code", "کامبوی داخلی هم انتخاب می‌شود");
+
+await sendTg(envTg, tgUpdate("/combo clear"));
+prefsCmd = await getPrefs(envTg, 4242);
+check(prefsCmd.combo === null, "clear باید combo=null");
+
+await sendTg(envTg, tgUpdate("/route off"));
+prefsCmd = await getPrefs(envTg, 4242);
+check(prefsCmd.auto === false && prefsCmd.combo === null, `پس از /route off: ${JSON.stringify(prefsCmd)}`);
+
+const outToggleBad = await sendTg(envTg, tgUpdate("/route maybe"));
+check(outToggleBad.includes("on|off"), "فرمت غلط toggle باید راهنما بدهد");
+check((await getPrefs(envTg, 4242)).auto === false, "فرمت غلط نباید مقدار را عوض کند");
+
+await sendTg(envTg, tgUpdate("/route on"));
+check((await getPrefs(envTg, 4242)).auto === true, "/route on");
+
+await sendTg(envTg, tgUpdate("/showmodel on"));
+prefsCmd = await getPrefs(envTg, 4242);
+check(prefsCmd.show === true, "/showmodel on");
+
+await sendTg(envTg, tgUpdate("/showmodel off"));
+check((await getPrefs(envTg, 4242)).show === false, "/showmodel off");
+
+const outHelp = await sendTg(envTg, tgUpdate("/help"));
+check(
+  outHelp.includes("/combo") && outHelp.includes("/route") && outHelp.includes("/showmodel") && outHelp.includes("/models"),
+  `/help باید دستورهای تازه را بگوید: ${outHelp.slice(0, 160)}`,
+);
+
+// کاربر غیر از allowlist پاسخی نمی‌گیرد
+const outStranger = await sendTg(envTg, tgUpdate("/combo", 9999));
+check(outStranger === "", `کاربر خارج از allowlist نباید جواب بگیرد (${outStranger.slice(0, 80)})`);
+
+// 7) پنل: کلیدهای i18n تازه (en/fa)، autoList، بدون innerHTML، هدرها بدون تغییر
+const keys3f = [
+  "autoCombos", "autoHelp", "autoBadge", "autoReadonly", "createManualCopy",
+  "copyCreated", "copyExists", "copyEmpty", "manualCombos",
+];
+for (const k of keys3f) {
+  const n = occurrences(html2, k + ":");
+  check(n >= 2, `کلید i18n «${k}» باید در هر دو زبان باشد (${n})`);
+}
+check(html2.includes('id="autoList"'), "ظرف کارت‌های auto در تب Comboها");
+check(html2.includes('data-i18n="autoCombos"') && html2.includes('data-i18n="manualCombos"'), "سرصفحه‌های auto/دستی باید data-i18n داشته باشند");
+check(html2.includes("AUTO_KINDS") && html2.includes("createManualCopy"), "منطق ساخت نسخه‌ی دستی در JS");
+check(!html2.includes("innerHTML"), "باز باید بدون innerHTML باشد");
+const adminHdr = await workerDefault.fetch(new Request("https://admin.test/admin"), env3b, ctxNull);
+check(
+  adminHdr.headers.get("content-security-policy") === csp &&
+    adminHdr.headers.get("x-frame-options") === "DENY" &&
+    adminHdr.headers.get("cache-control") === "no-store",
+  "هدرهای /admin نباید تغییر کنند",
+);
+
 if (failures.length) {
-  console.error("\n✖ شکست تست‌ها:");
+  console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
   process.exit(1);
 }

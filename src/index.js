@@ -1,4 +1,4 @@
-import { redact } from "./providers.js";
+import { redact, listProviderModels } from "./providers.js";
 import {
   getConfig,
   getProviderCtx,
@@ -7,10 +7,11 @@ import {
   upsertCombo,
   removeCombo,
 } from "./config.js";
-import { listProviderModels } from "./providers.js";
-import { RULES } from "./combos.js";
+import { RULES, capabilityTags } from "./combos.js";
 import { runCombo, getComboTargets, directCall } from "./router.js";
-import { syncProvider } from "./catalog.js";
+import { classifyTask, comboCandidates, fallbackCombo, updateHasImage } from "./task-route.js";
+import { getPrefs, setPrefs } from "./tgprefs.js";
+import { syncProvider, getSyncReport } from "./catalog.js";
 import {
   getOverrides,
   addPin,
@@ -28,6 +29,9 @@ const TG_ERROR_LIMIT = 120;
 
 const CHAT_SYSTEM_PROMPT =
   "You are a concise, helpful personal assistant. Reply in the user's language (Persian if they write Persian).";
+
+// kind هر combo داخلی برای «ساخت نسخه‌ی دستی» در پنل
+const AUTO_KINDS = { chat: "text", code: "code", vision: "vision", fast: "fast" };
 
 // هر cron به یک provider: 0 → openrouter، 10 → nvidia، 20 → xkiro
 const CRON_PROVIDER = {
@@ -96,27 +100,64 @@ function splitMessage(text) {
   return chunks;
 }
 
-async function answerChatText(env, chatId, text) {
+// combo ای «قابل استفاده» باشد یعنی شناخته (دستی یا داخلی) و حداقل یک هدف سالم داشته باشد.
+async function comboUsable(env, name) {
+  try {
+    const sel = await getComboTargets(env, name);
+    if (sel.error) return false;
+    return Array.isArray(sel.targets) && sel.targets.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function answerChatText(env, chatId, userId, text, hasImage) {
   await tgApi(env, "sendChatAction", { chat_id: chatId, action: "typing" });
 
-  const result = await runCombo(
-    env,
-    "chat",
-    {
-      messages: [
-        { role: "system", content: CHAT_SYSTEM_PROMPT },
-        { role: "user", content: text },
-      ],
-      temperature: 0.7,
-    },
-    { deadlineMs: 25000 },
-  );
+  const prefs = await getPrefs(env, userId);
+  const task = classifyTask(text, { hasImage: hasImage === true });
+  const body = {
+    messages: [
+      { role: "system", content: CHAT_SYSTEM_PROMPT },
+      { role: "user", content: text },
+    ],
+    temperature: 0.7,
+  };
+
+  const cfg = await getConfig(env);
+  const isKnown = (name) => Boolean(RULES[name]) || cfg.combos.some((c) => c.name === name);
+  const def = (prefs.combo && isKnown(prefs.combo) && prefs.combo) || "chat";
+
+  // ترتیب: [task (فقط وقتی auto روشن)]، پیش‌فرض کاربر، chat — اولین شناخته‌ی دارای هدف سالم.
+  let combo = null;
+  for (const name of comboCandidates(prefs, task)) {
+    if (!isKnown(name)) continue;
+    if (await comboUsable(env, name)) {
+      combo = name;
+      break;
+    }
+  }
+  if (!combo) combo = "chat";
+  const autoPick = prefs.auto !== false && combo === task;
+  const fallback = fallbackCombo(def, combo);
+
+  let result = await runCombo(env, combo, body, { deadlineMs: 25000 });
+  let usedCombo = combo;
+  let routed = autoPick ? "auto" : "manual";
+  if (!result.ok && fallback && fallback !== usedCombo) {
+    // جایگزینِ تنها — بدون حلقه
+    console.warn(`[tg] combo ${usedCombo} failed -> fallback ${fallback}`);
+    routed = "manual";
+    usedCombo = fallback;
+    result = await runCombo(env, fallback, body, { deadlineMs: 25000 });
+  }
 
   if (!result.ok) {
     const lines = result.errors
       .map((e) => `${e.target}: ${e.status ?? e.reason}`)
       .join("\n");
     await tgSend(env, chatId, `همه‌ی مدل‌ها شکست خوردند 🙁\n${lines}`);
+    console.log(JSON.stringify({ combo: usedCombo, used: null, routed }));
     return;
   }
 
@@ -129,18 +170,24 @@ async function answerChatText(env, chatId, text) {
         : "";
   if (!answer.trim()) {
     await tgSend(env, chatId, "پاسخ خالی بود 🙁");
+    console.log(JSON.stringify({ combo: usedCombo, used: result.used ?? null, routed }));
     return;
   }
-  if (env.SHOW_MODEL === "1") answer += `\n— ${result.used}`;
+  // show: ترجیح هر کاربر؛ SHOW_MODEL=1 همیشه override جهانی است.
+  if (prefs.show === true || env.SHOW_MODEL === "1") {
+    answer += `\n- ${usedCombo} / ${result.used}`;
+  }
+  console.log(JSON.stringify({ combo: usedCombo, used: result.used, routed }));
   for (const chunk of splitMessage(answer)) {
     await tgSend(env, chatId, chunk);
   }
 }
 
 const HELP_TEXT =
-  "دستورها: /models [combo] /combos /refresh [provider] /test <provider/model> /pin <combo> <provider/model> " +
-  "/unpin <combo> <provider/model> /ban <provider/model> /unban <provider/model> " +
-  "/prefer <combo> <rx1,rx2,...|reset> /status /ping /start — برای چت، متن ساده بفرست.";
+  "دستورها: /combo [name|clear] /route on|off /showmodel on|off /models [combo] /combos /refresh [provider] " +
+  "/test <provider/model> /pin <combo> <provider/model> /unpin <combo> <provider/model> " +
+  "/ban <provider/model> /unban <provider/model> /prefer <combo> <rx1,rx2,...|reset> " +
+  "/status /ping /start — برای چت، متن ساده بفرست.";
 
 async function providerIds(env) {
   const cfg = await getConfig(env);
@@ -257,11 +304,77 @@ async function tgTest(env, chatId, target) {
 
 const TARGET_RE = /^[^/\s]+\/\S+$/;
 
-async function tgCommand(env, chatId, text) {
+// ── تنظیم هر کاربر: combo پیش‌فرض، مسیریابی خودکار، نمایش مدل ───────────────
+
+async function tgCombo(env, chatId, args, userId) {
+  const [cfg, prefs] = await Promise.all([getConfig(env), getPrefs(env, userId)]);
+  const builtins = Object.keys(RULES);
+  if (!args.length) {
+    const manual = cfg.combos.length
+      ? cfg.combos
+          .map((c) => `• ${c.name} — ${c.kind ?? "custom"}، ${(c.targets ?? []).length} هدف`)
+          .join("\n")
+      : "• (نه داری — با پنل بساز)";
+    const auto = builtins.map((n) => `• ${n} — auto`).join("\n");
+    await tgSend(
+      env,
+      chatId,
+      `combo فعلی: ${prefs.combo ?? "chat"} | مسیریابی خودکار: ${prefs.auto ? "روشن" : "خاموش"}` +
+        `\n\ncomboهای دستی:\n${manual}\n\nخودکار:\n${auto}\n\nانتخاب: /combo <name> یا /combo clear`,
+    );
+    return;
+  }
+  const name = args[0].toLowerCase();
+  if (name === "clear") {
+    await setPrefs(env, userId, { combo: null });
+    await tgSend(env, chatId, "✅ پیش‌فرض combo پاک شد — از الان chat.");
+    return;
+  }
+  const known = Boolean(RULES[name]) || cfg.combos.some((c) => c.name === name);
+  if (!known) {
+    const valid = [...cfg.combos.map((c) => c.name), ...builtins];
+    await tgSend(env, chatId, `combo ناشناس: ${name}\ncomboهای معتبر: ${valid.join(", ")}`);
+    return;
+  }
+  await setPrefs(env, userId, { combo: name });
+  await tgSend(env, chatId, `✅ پیش‌فرض combo: ${name}`);
+}
+
+// /route on|off → auto؛ /showmodel on|off → show
+function tgToggleValue(raw) {
+  const v = String(raw ?? "").toLowerCase();
+  if (v === "on" || v === "true" || v === "1") return { on: true, off: false, ok: true };
+  if (v === "off" || v === "false" || v === "0") return { on: false, off: true, ok: true };
+  return { on: false, off: false, ok: false };
+}
+
+async function tgCommand(env, chatId, text, userId) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
   const args = parts.slice(1);
 
+  if (cmd === "/help") {
+    await tgSend(env, chatId, HELP_TEXT);
+    return;
+  }
+  if (cmd === "/combo") {
+    return tgCombo(env, chatId, args, userId);
+  }
+  if (cmd === "/route" || cmd === "/showmodel") {
+    const v = tgToggleValue(args[0]);
+    if (!v.ok) {
+      await tgSend(env, chatId, `فرمت: ${cmd} on|off`);
+      return;
+    }
+    const field = cmd === "/route" ? "auto" : "show";
+    await setPrefs(env, userId, { [field]: v.on });
+    const label =
+      cmd === "/route"
+        ? `مسیریابی خودکار: ${v.on ? "روشن" : "خاموش"}`
+        : `نمایش مدل در پاسخ: ${v.on ? "روشن" : "خاموش"}`;
+    await tgSend(env, chatId, `✅ ${label}`);
+    return;
+  }
   if (cmd === "/models") {
     return tgModels(env, chatId, args[0] ?? "chat");
   }
@@ -385,9 +498,10 @@ async function handleUpdate(env, update) {
   } else if (text === "/ping") {
     await tgSend(env, msg.chat.id, "pong");
   } else if (text.startsWith("/")) {
-    await tgCommand(env, msg.chat.id, text);
+    await tgCommand(env, msg.chat.id, text, msg.from.id);
   } else {
-    await answerChatText(env, msg.chat.id, text);
+    // عکس/فایل تصویری هنوز هندل نمی‌شود (پیام متنی فقط)؛ hasImage فقط flag تابع طبقه‌بندی است.
+    await answerChatText(env, msg.chat.id, msg.from.id, text, updateHasImage(msg));
   }
 }
 
@@ -423,13 +537,23 @@ async function chatCompletions(request, env) {
     });
   }
 
-  return Response.json({ ok: false, errors: result.errors }, { status: 502 });
+  // 502: وضعیت همان قبلی؛ لیست comboهای معتبر هم کنار خطاها (cap ۵۰).
+  return Response.json(
+    { ok: false, errors: result.errors, available: await comboNameList(env, 50) },
+    { status: 502 },
+  );
 }
 
-async function comboModels(env) {
+// لیست comboهای موجود (دستی + داخلی) — برای 502 و /v1/models؛ سقف اختیاری.
+async function comboNameList(env, cap) {
   const cfg = await getConfig(env);
   const manualNames = cfg.combos.map((c) => c.name);
   const names = [...manualNames, ...Object.keys(RULES).filter((n) => !manualNames.includes(n))];
+  return cap ? names.slice(0, cap) : names;
+}
+
+async function comboModels(env) {
+  const names = await comboNameList(env);
   return {
     object: "list",
     data: names.map((name) => ({ id: name, object: "model" })),
@@ -464,11 +588,7 @@ async function adminModels(request, env) {
   }
 
   const q = (url.searchParams.get("q") ?? "").toLowerCase();
-  const all = url.searchParams.get("all") === "1";
   let out = models;
-  if (pctx.id !== "nvidia" && pctx.builtin && !all) {
-    out = out.filter((m) => m.id.endsWith(":free"));
-  }
   if (q) out = out.filter((m) => m.id.toLowerCase().includes(q));
   out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
@@ -503,7 +623,13 @@ async function adminRefresh(request, env) {
   for (const p of list) {
     try {
       const r = await syncProvider(env, p);
-      result[p] = { added: r.added.length, removed: r.removed.length };
+      result[p] = {
+        added: r.added.length,
+        removed: r.removed.length,
+        fetched: r.sync.fetched,
+        kept: r.sync.kept,
+        dropped: r.sync.droppedCount,
+      };
     } catch (err) {
       result[p] =
         err?.info ??
@@ -675,7 +801,7 @@ async function adminApiListModels(request, env) {
     .map((m) => {
       const target = `${provider}/${m.id}`.toLowerCase();
       const status = banSet.has(target) ? "banned" : cooled.has(`health:${target}`) ? "cooldown" : "ok";
-      return { id: m.id, status };
+      return { id: m.id, status, tags: capabilityTags(m), vision: m.vision === true };
     });
   return json({ ok: true, provider, models: out });
 }
@@ -827,10 +953,40 @@ async function adminApi(request, env, method, pathname) {
         await removeProvider(env, id);
         return json({ ok: true, deleted: id });
       }
+      if (method === "GET" && id && sub === "sync-report") {
+        const pctx = await getProviderCtx(env, id);
+        if (!pctx) return json({ ok: false, error: `unknown provider: ${id}` }, 400);
+        const report = await getSyncReport(env, id);
+        if (!report) return json({ ok: false, error: "no sync report yet" }, 404);
+        return json({ ok: true, provider: id, ...report });
+      }
       if (method === "POST" && id && sub === "refresh") {
         const r = await syncProvider(env, id);
-        return json({ ok: true, provider: id, added: r.added.length, removed: r.removed.length });
+        return json({
+          ok: true,
+          provider: id,
+          added: r.added.length,
+          removed: r.removed.length,
+          fetched: r.sync.fetched,
+          kept: r.sync.kept,
+          dropped: r.sync.droppedCount,
+        });
       }
+    }
+
+    // انتخاب زنده‌ی combo خودکار (chat/code/vision/fast) — targets cap ۸ برای «ساخت نسخه‌ی دستی»
+    if (kind === "auto" && method === "GET" && id && !sub) {
+      if (!Object.prototype.hasOwnProperty.call(RULES, id)) {
+        return json({ ok: false, error: `unknown auto combo: ${id}` }, 404);
+      }
+      const sel = await getComboTargets(env, id);
+      if (sel.error) return json({ ok: false, error: sel.error }, 400);
+      return json({
+        ok: true,
+        name: id,
+        kind: AUTO_KINDS[id] ?? "custom",
+        targets: sel.targets.slice(0, 8).map((t) => ({ provider: t.provider, model: t.model, enabled: true })),
+      });
     }
 
     if (kind === "combos") {

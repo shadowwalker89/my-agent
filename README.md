@@ -79,6 +79,9 @@ Telegram → Cloudflare Worker (src/index.js) → مدل‌روتر (nvidia/open
 
 ### کاتالوگ پویا (قدم ۲ب)
 
+- Xkiro sync reporting and robust free detection via `access_tier` and pricing.
+- Multi-kind combos (`text`, `code`, `vision`, `reasoning`, `fast`, `custom`), model capability tags, and tested-OK auto-fill.
+
 لیست مدل‌های رایگان مدام عوض می‌شود؛ پس دیگر آی‌دی‌ای در `src/combos.js` نیست.
 ساختار کار:
 
@@ -133,6 +136,39 @@ binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛
   همان شمارنده‌ی «کول‌داونِ فعلی» هر provider (منع کل provider هم جدا نمایش داده می‌شود).
 - `/combos` — لیست comboهای دستی (نام، استراتژی، تعداد هدف‌ها) + خودکارها.
 - `/start`، `/ping`، `/id` مثل قبل؛ `/id` برای همه باز است. دستور ناشناس = راهنمای کوتاه فارسی.
+
+### Telegram combo routing (patch 3f)
+
+پیش‌فرض هر کاربر تلگرام از allowlist در کلید KV `tgprefs:<userId>` است:
+`{ combo: string|null, auto: boolean, show: boolean }` — پیش‌فرض: `combo=null` (یعنی `chat`)،
+`auto=روشن`، `show=خاموش`. فیلدهای ناشناس نادیده گرفته می‌شوند و اندازه سقف دارد.
+
+دستورها:
+
+- `/combo` — گزینه‌های واقعی: comboهای دستی از `config:v1` (نام، kind، تعداد هدف) +
+  داخلی‌های `chat/code/vision/fast` با برچسب «auto» + انتخاب فعلی کاربر.
+- `/combo <name>` — ست کردن combo پیش‌فرض؛ نام ناشناس رد می‌شود و فهرست معتبرها را می‌دهد.
+  `/combo clear` → برگشت به `chat`.
+- `/route on|off` — روشن/خاموش کردن مسیریابی خودکارِ تسک.
+- `/showmodel on|off` — نمایش «`- <combo> / <provider>/<model>`» در انتهای پاسخ همان کاربر؛
+  اگر `SHOW_MODEL=1` یا فایل ورکشن ست شده باشد، همیشه بر آن مقدم است (override جهانی).
+
+قانون مسیریابی خودکار: هر پیام متنی با `classifyTask` (ماژول `src/task-route.js`، تابع خالص)
+در `vision | code | chat` طبقه‌بندی می‌شود: عکس/فایل تصویری → `vision`؛ fence سه‌گانه از
+بک‌تیک، خطوط stack trace، `def`/`function`/`class` با `{` یا `:`، پسوندهای فایل مثل
+`.js` `.mjs` `.cjs` `.jsx` `.ts` `.tsx` `.py` `.go`، واژه‌هایی مثل bug/error/compile/regex/sql/function/refactor
+و معادل‌های فارسی (کد، باگ، خطا، تابع، کامپایل، ...) → `code`؛ در غیر این صورت `chat`
+(محافظه‌کارانه: هرجا شک است پاسخ `chat` است).
+
+انتخاب combo برای هر پاسخ: اولین گزینه‌ی «شناخته‌شده با حداقل یک هدف سالم» از ترتیب
+`[نتیجه‌ی classifyTask (فقط وقتی auto روشن)، combo پیش‌فرض کاربر، chat]`. اگر combo انتخاب‌شده
+در همان فراخوانی شکست بخورد، فقط یک‌بار (بدون حلقه) به پیش‌فرض کاربر و اگر همان است به `chat` برمی‌گردد
+و در لاگ Worker یادداشت می‌شود. در هر بار پاسخ فقط یک خط لاگ بدون متن پیام/راز چاپ می‌شود:
+`{combo, used, routed: auto|manual}`.
+
+توجه: هنوز پردازش عکس در بات نیست؛ `classifyTask` فقط flag اختیاری `hasImage` را می‌پذیرد
+(برای آینده). در پنل `/admin` تب Comboها هم comboهای داخلی به‌صورت کارت فقط‌خواندنی با
+نشان «auto» و دکمه‌ی «ساخت نسخه‌ی دستی» (targets از انتخاب زنده، cap ۸) نمایش داده می‌شوند.
 
 ### providerها و comboهای دستی (قدم ۳ا)
 

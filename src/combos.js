@@ -49,6 +49,113 @@ export const RULES = {
   },
 };
 
+// ── KIND و CAPABILITY ─────────────────────────────────────────────────────
+// kind فقط metadata است و در routing تأثیری ندارد؛ انتخاب/مرتب‌سازی UI و auto-fill
+// بر اساس آن انجام می‌شود. comboهای قدیمی در getConfig به custom مهاجرت می‌کنند.
+export const COMBO_KINDS = ["text", "code", "vision", "reasoning", "fast", "custom"];
+export const COMBO_TEMPLATE_KINDS = ["code", "vision", "fast", "reasoning"];
+export const CAPABILITY_TAGS = ["vision", "reasoning", "coder", "embedding", "image-gen", "fast"];
+
+const KIND_TAG = {
+  text: null,
+  code: "coder",
+  vision: "vision",
+  reasoning: "reasoning",
+  fast: "fast",
+  custom: null,
+};
+
+const TAG_PATTERNS = {
+  vision: /vision|\bvl\b|omni/i,
+  reasoning: /\br1\b|reasoning|thinking/i,
+  coder: /coder|code/i,
+  embedding: /embed/i,
+  "image-gen": /\bimage[-_]?gen|dall[-_ ]?e|flux|stable[-_ ]?diffusion|sdxl|\bimagen\b|gpt-image|midjourney/i,
+  fast: /\b(flash|mini|nano|lite|small)\b/i,
+};
+
+// تگ‌ها از id و metadata مدل استنباط می‌شوند. ترتیب خروجی ثابت است.
+export function capabilityTags(model) {
+  const id = typeof model?.id === "string" ? model.id : "";
+  const modality = typeof model?.modality === "string" ? model.modality.toLowerCase() : "";
+  const caps = model?.capabilities && typeof model.capabilities === "object" ? model.capabilities : {};
+  const tags = [];
+  for (const tag of CAPABILITY_TAGS) {
+    if (TAG_PATTERNS[tag]?.test(id)) tags.push(tag);
+  }
+  if ((modality.includes("image") && !modality.includes("chat")) || caps["image-gen"] === true) {
+    if (!tags.includes("image-gen")) tags.push("image-gen");
+  }
+  if (modality.includes("embedding") && !tags.includes("embedding")) tags.push("embedding");
+  if ((caps.vision === true || model?.vision === true) && !tags.includes("vision")) tags.push("vision");
+  if (caps.reasoning === true && !tags.includes("reasoning")) tags.push("reasoning");
+  return CAPABILITY_TAGS.filter((tag) => tags.includes(tag));
+}
+
+export function comboFit(kind, tags) {
+  const list = Array.isArray(tags) ? tags : [];
+  const need = KIND_TAG[kind] ?? null;
+  const bad = list.includes("embedding") || list.includes("image-gen");
+  if (bad) return { level: "warn", mayNotFit: true };
+  if (!need || kind === "text" || kind === "custom") return { level: "generic", mayNotFit: false };
+  if (list.includes(need)) return { level: "match", mayNotFit: false };
+  return { level: "warn", mayNotFit: true };
+}
+
+// match/generic اول (سازگار)، warn بعد؛ ترتیب اصلی حفظ می‌شود.
+export function orderCombosForModel(combos, tags) {
+  const rank = { match: 0, generic: 1, warn: 2 };
+  return (combos ?? [])
+    .map((combo, index) => ({ combo, index, fit: comboFit(combo?.kind ?? "custom", tags) }))
+    .sort((a, b) => rank[a.fit.level] - rank[b.fit.level] || a.index - b.index)
+    .map(({ combo, fit }) => ({ combo, fit }));
+}
+
+function autoFillCompatible(kind, tags) {
+  const list = Array.isArray(tags) ? tags : [];
+  if (list.includes("embedding") || list.includes("image-gen")) return false;
+  const need = KIND_TAG[kind] ?? null;
+  if (!need || kind === "custom") return true;
+  return list.includes(need);
+}
+
+const STALE_RESULT_MS = 24 * 60 * 60 * 1000;
+
+// انتخاب مدل‌های ok و تازه‌ی نتایج تست برای auto-fill؛ latency کمتر اول.
+export function autoFillTargets(
+  results,
+  { kind = "custom", limit = 8, existing = [], now = Date.now(), tagsByKey = {} } = {},
+) {
+  const n = Math.max(0, Math.min(30, Math.floor(Number(limit) || 0)));
+  if (!n) return [];
+  const seen = new Set(
+    (existing ?? []).map((t) => (typeof t === "string" ? t : `${t?.provider}/${t?.model}`)),
+  );
+  const out = [];
+  for (const [key, value] of Object.entries(results ?? {})) {
+    if (!value || value.ok !== true) continue;
+    if (typeof value.testedAt !== "number" || now - value.testedAt > STALE_RESULT_MS) continue;
+    const slash = key.indexOf("/");
+    if (slash <= 0 || slash === key.length - 1 || seen.has(key)) continue;
+    const provider = key.slice(0, slash);
+    const model = key.slice(slash + 1);
+    const tags = Array.isArray(tagsByKey[key]) ? tagsByKey[key] : capabilityTags({ id: model });
+    if (!autoFillCompatible(kind, tags)) continue;
+    out.push({
+      key,
+      provider,
+      model,
+      latencyMs: typeof value.latencyMs === "number" ? value.latencyMs : null,
+    });
+  }
+  out.sort(
+    (a, b) =>
+      (a.latencyMs ?? Number.POSITIVE_INFINITY) - (b.latencyMs ?? Number.POSITIVE_INFINITY) ||
+      a.key.localeCompare(b.key),
+  );
+  return out.slice(0, n);
+}
+
 // ── SCORING — برای تنظیم فقط این ثابت‌ها را تغییر بده ──────────────────────
 export const WEIGHTS = {
   preferBase: 20, // امتیاز اولین الگوی prefer که oid بخورد

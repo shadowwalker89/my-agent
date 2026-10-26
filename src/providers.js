@@ -82,55 +82,148 @@ function createdOf(m) {
   return typeof m?.created === "number" ? m.created : null;
 }
 
-// مپر عمومی برای providerهای دستی (سازگار با OpenAI): همه‌ی مدل‌ها، بدون فیلتر خاص
-export function mapGenericModels(list, providerId) {
-  return list.map((m) => ({
+function capabilitiesOf(m) {
+  const src = m?.capabilities;
+  if (!src || typeof src !== "object" || Array.isArray(src)) return null;
+  const out = {};
+  for (const key of ["vision", "tools", "reasoning"]) {
+    if (typeof src[key] === "boolean") out[key] = src[key];
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function modalityOf(m) {
+  return typeof m?.modality === "string" ? m.modality : null;
+}
+
+function toModel(m, providerId, vision) {
+  return {
     id: m.id,
     provider: providerId,
     context: contextOf(m),
-    vision: imageInput(m) ?? false,
+    vision,
     created: createdOf(m),
-  }));
+    capabilities: capabilitiesOf(m),
+    modality: modalityOf(m),
+  };
+}
+
+function idOf(m) {
+  return m && typeof m.id === "string" ? m.id : "";
+}
+
+function collectModels(list, decide, mapModel) {
+  const dropped = [];
+  const models = [];
+  const seen = new Set();
+  for (const m of Array.isArray(list) ? list : []) {
+    const id = idOf(m);
+    if (!id) {
+      dropped.push({ id: String(m?.id ?? "?").slice(0, 200), reason: "invalid_id" });
+      continue;
+    }
+    const reason = decide(m);
+    if (reason) {
+      dropped.push({ id: id.slice(0, 200), reason });
+      continue;
+    }
+    if (seen.has(id)) {
+      dropped.push({ id: id.slice(0, 200), reason: "duplicate" });
+      continue;
+    }
+    seen.add(id);
+    models.push(mapModel(m));
+  }
+  return { models, dropped };
+}
+
+function pricingAllZero(pricing) {
+  if (!pricing || typeof pricing !== "object") return false;
+  const values = ["input", "output", "prompt", "completion", "request"]
+    .filter((key) => pricing[key] !== undefined)
+    .map((key) => Number(pricing[key]));
+  return values.length > 0 && values.every((value) => Number.isFinite(value) && value === 0);
+}
+
+// Free بودن xkiro با access_tier تعیین می‌شود؛ پسوند :free و قیمت صفر فقط fallback
+// برای پاسخ‌های قدیمی/فیکسچرها هستند. مدل‌های paid/premium حتی با قیمت صفر رد می‌شوند.
+function isXkiroFree(m) {
+  const tier = typeof m?.access_tier === "string" ? m.access_tier.toLowerCase() : "";
+  if (tier === "free") return true;
+  if (tier === "paid" || tier === "premium") return false;
+  if (idOf(m).toLowerCase().endsWith(":free")) return true;
+  if (m?.free === true || m?.is_free === true) return true;
+  return pricingAllZero(m?.pricing);
 }
 
 // مپرهای خالص (بدون شبکه) — فایل‌های فیکسچر آفلاین هم همین را صدا می‌زنند.
+// نسخه‌ی Detailed علاوه بر مدل‌ها، فهرست حذف‌شده‌ها را برای گزارش sync برمی‌گرداند.
+export function mapGenericModelsDetailed(list, providerId) {
+  return collectModels(list, () => null, (m) => toModel(m, providerId, imageInput(m) ?? false));
+}
+
+export function mapGenericModels(list, providerId) {
+  return mapGenericModelsDetailed(list, providerId).models;
+}
+
+export function mapOpenRouterDetailed(list) {
+  return collectModels(
+    list,
+    (m) => (idOf(m).endsWith(":free") ? null : "non_free"),
+    (m) => toModel(m, "openrouter", imageInput(m) ?? false),
+  );
+}
+
 export function mapOpenRouter(list) {
-  return list
-    .filter((m) => m.id.endsWith(":free"))
-    .map((m) => ({
-      id: m.id,
-      provider: "openrouter",
-      context: contextOf(m),
-      vision: imageInput(m) ?? false,
-      created: createdOf(m),
-    }));
+  return mapOpenRouterDetailed(list).models;
+}
+
+export function mapXkiroDetailed(list) {
+  return collectModels(
+    list,
+    (m) => (isXkiroFree(m) ? null : "non_free"),
+    (m) => toModel(m, "xkiro", imageInput(m) ?? null),
+  );
 }
 
 export function mapXkiro(list) {
-  return list
-    .filter((m) => m.id.endsWith(":free"))
-    .map((m) => ({
-      id: m.id,
-      provider: "xkiro",
-      context: contextOf(m),
-      vision: imageInput(m) ?? null,
-      created: createdOf(m),
-    }));
+  return mapXkiroDetailed(list).models;
+}
+
+export function mapNvidiaDetailed(list) {
+  return collectModels(
+    list,
+    (m) => (NON_CHAT_RE.test(idOf(m)) ? "non_chat" : null),
+    (m) => toModel(m, "nvidia", NVIDIA_VISION_RE.test(idOf(m))),
+  );
 }
 
 export function mapNvidia(list) {
-  return list
-    .filter((m) => !NON_CHAT_RE.test(m.id))
-    .map((m) => ({
-      id: m.id,
-      provider: "nvidia",
-      context: contextOf(m),
-      vision: NVIDIA_VISION_RE.test(m.id),
-      created: createdOf(m),
-    }));
+  return mapNvidiaDetailed(list).models;
 }
 
-const LISTERS_IDS = { openrouter: mapOpenRouter, xkiro: mapXkiro, nvidia: mapNvidia };
+const DETAILED_LISTERS = {
+  openrouter: mapOpenRouterDetailed,
+  xkiro: mapXkiroDetailed,
+  nvidia: mapNvidiaDetailed,
+};
+
+export function mapProviderModels(providerId, list, builtin) {
+  if (builtin && DETAILED_LISTERS[providerId]) return DETAILED_LISTERS[providerId](list);
+  return mapGenericModelsDetailed(list, providerId);
+}
+
+function buildSyncReport(raw, mapped) {
+  const sample = Array.isArray(raw) ? raw.find((m) => m && typeof m === "object") : null;
+  return {
+    fetched: Array.isArray(raw) ? raw.length : 0,
+    kept: mapped.models.length,
+    droppedCount: mapped.dropped.length,
+    dropped: mapped.dropped.slice(0, 100),
+    sampleRawKeys: sample ? Object.keys(sample).slice(0, 40) : [],
+    at: new Date().toISOString(),
+  };
+}
 
 // داده‌ی seed برای config (مقادیر کلید هرگز اینجا نیستند — فقط نام راز)
 export const BUILTIN_PROVIDERS = Object.entries(PROVIDERS).map(([id, p]) => ({
@@ -188,11 +281,15 @@ export async function fetchOpenAiModels(providerId, baseUrl, key, extraHeaders) 
 
 // هر provider پیکربندی‌شده (داخلی یا دستی) — ctx از config می‌آید
 // ({ id, baseUrl, secretName, builtin, extraHeaders }); مقدار کلید فقط از env.
-export async function listProviderModels(env, ctx) {
+export async function listProviderModelsDetailed(env, ctx) {
   if (!ctx?.baseUrl || !ctx?.secretName) throw new Error(`unknown provider: ${ctx?.id ?? "?"}`);
   const key = env[ctx.secretName];
   if (!key) throw new Error(`missing ${ctx.secretName}`);
-  const list = await fetchOpenAiModels(ctx.id, ctx.baseUrl, key, ctx.extraHeaders ?? undefined);
-  if (ctx.builtin && LISTERS_IDS[ctx.id]) return LISTERS_IDS[ctx.id](list);
-  return mapGenericModels(list, ctx.id);
+  const raw = await fetchOpenAiModels(ctx.id, ctx.baseUrl, key, ctx.extraHeaders ?? undefined);
+  const mapped = mapProviderModels(ctx.id, raw, Boolean(ctx.builtin));
+  return { models: mapped.models, sync: buildSyncReport(raw, mapped) };
+}
+
+export async function listProviderModels(env, ctx) {
+  return (await listProviderModelsDetailed(env, ctx)).models;
 }

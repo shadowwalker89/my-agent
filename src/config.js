@@ -1,4 +1,5 @@
 import { BUILTIN_PROVIDERS } from "./providers.js";
+import { COMBO_KINDS } from "./combos.js";
 
 // config:v1 — پیکربندی دستی providerها (فقط سازگار با OpenAI) و comboها.
 // { providers: [{id,name,baseUrl,secretName,enabled,builtin?,extraHeaders?}],
@@ -35,6 +36,14 @@ export async function getConfig(env) {
   for (const builtin of BUILTIN_PROVIDERS) {
     if (!cfg.providers.some((p) => p.id === builtin.id)) {
       cfg.providers.push({ ...builtin });
+      changed = true;
+    }
+  }
+  // comboهای قدیمی kind ندارند → custom؛ kind نامعتبر هم به custom برمی‌گردد.
+  for (const combo of cfg.combos) {
+    if (!combo || typeof combo !== "object") continue;
+    if (!COMBO_KINDS.includes(combo.kind)) {
+      combo.kind = "custom";
       changed = true;
     }
   }
@@ -100,6 +109,10 @@ export function validateCombo(env, input, cfg) {
   if (!input || typeof input !== "object") throw apiError("body required");
   const name = String(input.name ?? "");
   if (!NAME_RE.test(name)) throw apiError("invalid combo name (a-z0-9._-, max 40)");
+  const kind = input.kind ?? "custom";
+  if (!COMBO_KINDS.includes(kind)) {
+    throw apiError(`kind must be one of: ${COMBO_KINDS.join(", ")}`);
+  }
   const strategy = input.strategy ?? "priority";
   if (!STRATEGIES.includes(strategy)) {
     throw apiError(`strategy must be one of: ${STRATEGIES.join(", ")}`);
@@ -120,7 +133,7 @@ export function validateCombo(env, input, cfg) {
     }
     return { provider: String(t.provider), model, enabled: t.enabled !== false };
   });
-  return { name, strategy, timeoutMs, retries, targets: clean };
+  return { name, kind, strategy, timeoutMs, retries, targets: clean };
 }
 
 // ── عملیات تغییر (برای admin API و تست آفلاین) ─────────────────────────────
@@ -160,6 +173,7 @@ export async function upsertCombo(env, input) {
     if (cfg.combos.length >= COMBO_LIMIT) throw apiError(`max ${COMBO_LIMIT} combos`);
     cfg.combos.push(c);
   } else {
+    if (input?.kind === undefined) c.kind = existing.kind ?? "custom";
     Object.assign(existing, c);
   }
   await setConfig(env, cfg);

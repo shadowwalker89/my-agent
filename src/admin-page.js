@@ -145,6 +145,11 @@ input::placeholder{color:var(--muted)}
 .combo-card{display:flex;flex-direction:column;gap:var(--sp-2)}
 .combo-head{display:flex;justify-content:space-between;align-items:flex-start;gap:var(--sp-2);flex-wrap:wrap}
 .combo-meta{display:flex;gap:var(--sp-2);align-items:center;flex-wrap:wrap}
+.chips{display:flex;gap:3px;flex-wrap:wrap;margin-top:3px}
+.chip{display:inline-block;padding:0 6px;border-radius:999px;background:var(--acc-soft);color:var(--acc);font-size:10px;font-weight:600;line-height:18px;white-space:nowrap}
+.sync-line{margin:2px 0}
+.fit-warn{opacity:.72}
+.may-not-fit{font-size:11px}
 .tgt-row{display:flex;gap:var(--sp-1);align-items:center;flex-wrap:wrap}
 .tgt-row input.mono{flex:1 1 160px}
 .empty{padding:var(--sp-5) var(--sp-3);text-align:center;color:var(--muted);border:1px dashed var(--line-strong);border-radius:var(--r-sm);background:var(--bg-soft)}
@@ -274,6 +279,15 @@ input::placeholder{color:var(--muted)}
             <option value="cooldown" data-i18n="stCooldown"></option>
             <option value="banned" data-i18n="stBanned"></option>
           </select>
+          <select id="mCap" data-i18n-aria="capLabel">
+            <option value="all" data-i18n="stAll"></option>
+            <option value="vision" data-i18n="tagVision"></option>
+            <option value="reasoning" data-i18n="tagReasoning"></option>
+            <option value="coder" data-i18n="tagCoder"></option>
+            <option value="embedding" data-i18n="tagEmbedding"></option>
+            <option value="image-gen" data-i18n="tagImageGen"></option>
+            <option value="fast" data-i18n="tagFast"></option>
+          </select>
           <button id="mSearch" class="primary" data-i18n="search"></button>
           <button id="mTestAll" class="primary"></button>
           <button id="mStop" class="danger hidden" data-i18n="stopBtn"></button>
@@ -307,10 +321,33 @@ input::placeholder{color:var(--muted)}
           <div><h2 data-i18n="combos"></h2><p class="help" data-i18n="combosHelp"></p></div>
           <button id="comboAdd" class="primary lg" data-i18n="comboAdd"></button>
         </div>
+        <div class="toolbar" id="comboTemplates">
+          <span class="lbl" data-i18n="templatesLabel"></span>
+          <button type="button" data-template="code" data-i18n="kindCode" data-i18n-aria="createTemplate"></button>
+          <button type="button" data-template="vision" data-i18n="kindVision" data-i18n-aria="createTemplate"></button>
+          <button type="button" data-template="fast" data-i18n="kindFast" data-i18n-aria="createTemplate"></button>
+          <button type="button" data-template="reasoning" data-i18n="kindReasoning" data-i18n-aria="createTemplate"></button>
+        </div>
+        <div class="sec-head">
+          <div><h3 data-i18n="autoCombos"></h3><p class="help" data-i18n="autoHelp"></p></div>
+        </div>
+        <div id="autoList" class="grid combo-grid"></div>
+        <div class="sec-head">
+          <div><h3 data-i18n="manualCombos"></h3></div>
+        </div>
         <div id="comboForm" class="subcard hidden">
           <h3 id="comboFormTitle"></h3>
           <div class="line">
             <span class="lbl" data-i18n="comboName"></span><input id="cName" maxlength="40" class="mono">
+            <span class="lbl" data-i18n="kindLabel"></span>
+            <select id="cKind">
+              <option value="text" data-i18n="kindText"></option>
+              <option value="code" data-i18n="kindCode"></option>
+              <option value="vision" data-i18n="kindVision"></option>
+              <option value="reasoning" data-i18n="kindReasoning"></option>
+              <option value="fast" data-i18n="kindFast"></option>
+              <option value="custom" data-i18n="kindCustom"></option>
+            </select>
             <span class="lbl" data-i18n="strategy"></span>
             <select id="cStrategy"><option>priority</option><option>round-robin</option><option>fastest</option></select>
             <span class="lbl" data-i18n="timeoutMs"></span><input id="cTimeout" type="number" min="1000" max="60000" value="20000" style="width:90px">
@@ -466,6 +503,39 @@ var I18N = {
     stoppedEarly: 'stopped early',
     refreshB: 'refresh',
     clearResults: 'Clear results',
+    kindLabel: 'Kind',
+    kindText: 'Text',
+    kindCode: 'Code',
+    kindVision: 'Vision',
+    kindReasoning: 'Reasoning',
+    kindFast: 'Fast',
+    kindCustom: 'Custom',
+    capLabel: 'Capability',
+    tagVision: 'vision',
+    tagReasoning: 'reasoning',
+    tagCoder: 'coder',
+    tagEmbedding: 'embedding',
+    tagImageGen: 'image-gen',
+    tagFast: 'fast',
+    mayNotFit: 'may not fit',
+    templatesLabel: 'Templates',
+    createTemplate: 'Create from template',
+    templateCreated: 'Template combo created',
+    fillFromTested: 'Fill from tested-OK',
+    fillCount: 'Count',
+    fillNone: 'No fresh tested-OK models match this combo kind.',
+    syncKept: 'kept',
+    syncDropped: 'dropped',
+    syncNoData: 'not synced yet',
+    autoCombos: 'Auto combos',
+    autoHelp: 'Built-in rule-based combos pick fresh models from the catalog on every run — read-only here.',
+    autoBadge: 'auto',
+    autoReadonly: 'Built-in — targets are picked automatically from the catalog.',
+    createManualCopy: 'Create manual copy',
+    copyCreated: 'Manual copy created',
+    copyExists: 'A manual combo with this name already exists.',
+    copyEmpty: 'No usable targets right now — refresh the catalog first.',
+    manualCombos: 'Manual combos',
     saving: 'Saving...'
   },
   fa: {
@@ -599,12 +669,51 @@ var I18N = {
     stoppedEarly: 'نیمه‌کاره متوقف شد',
     refreshB: 'به‌روزرسانی',
     clearResults: 'پاک کردن نتایج',
+    kindLabel: 'نوع',
+    kindText: 'متنی',
+    kindCode: 'کد',
+    kindVision: 'ویژن',
+    kindReasoning: 'استدلال',
+    kindFast: 'سریع',
+    kindCustom: 'سفارشی',
+    capLabel: 'قابلیت',
+    tagVision: 'ویژن',
+    tagReasoning: 'استدلال',
+    tagCoder: 'کد',
+    tagEmbedding: 'امبدینگ',
+    tagImageGen: 'تولید تصویر',
+    tagFast: 'سریع',
+    mayNotFit: 'ممکن است مناسب نباشد',
+    templatesLabel: 'قالب‌ها',
+    createTemplate: 'ساختن از قالب',
+    templateCreated: 'combo قالبی ساخته شد',
+    fillFromTested: 'پر کردن از تست‌شده‌های سالم',
+    fillCount: 'تعداد',
+    fillNone: 'هیچ مدل تست‌شده‌ی سالم و تازه‌ای مناسب این نوع combo نیست.',
+    syncKept: 'نگه‌داشته',
+    syncDropped: 'حذف‌شده',
+    syncNoData: 'هنوز همگام نشده',
+    autoCombos: 'comboهای خودکار',
+    autoHelp: 'comboهای داخلیِ قانون‌محور هر بار مدل‌های تازه را از کاتالوگ انتخاب می‌کنند — اینجا فقط‌خواندنی‌اند.',
+    autoBadge: 'خودکار',
+    autoReadonly: 'داخلی — هدف‌ها هر بار خودکار از کاتالوگ انتخاب می‌شوند.',
+    createManualCopy: 'ساخت نسخه‌ی دستی',
+    copyCreated: 'نسخه‌ی دستی ساخته شد',
+    copyExists: 'یک combo دستی با همین نام از قبل هست.',
+    copyEmpty: 'الان هدفِ سالمی نیست — اول کاتالوگ را به‌روزرسانی کن.',
+    manualCombos: 'comboهای دستی',
     saving: 'در حال ذخیره...'
   }
 };
 var STATUS_KEY = { ok: 'stOk', cooldown: 'stCooldown', banned: 'stBanned' };
 var STATUS_CLASS = { ok: 'b-ok', cooldown: 'b-cool', banned: 'b-ban' };
 var LABEL_KEYS = { timeout: 'lblTimeout', auth: 'lblAuth', notfound: 'lblNotFound', ratelimit: 'lblRate', server: 'lblServer', unknown: 'lblUnknown' };
+var CAP_TAGS = ['vision', 'reasoning', 'coder', 'embedding', 'image-gen', 'fast'];
+var CAP_KEY = { vision: 'tagVision', reasoning: 'tagReasoning', coder: 'tagCoder', embedding: 'tagEmbedding', 'image-gen': 'tagImageGen', fast: 'tagFast' };
+var KIND_KEYS = { text: 'kindText', code: 'kindCode', vision: 'kindVision', reasoning: 'kindReasoning', fast: 'kindFast', custom: 'kindCustom' };
+var AUTO_COMBOS = ['chat', 'code', 'vision', 'fast'];
+var AUTO_KINDS = { chat: 'text', code: 'code', vision: 'vision', fast: 'fast' };
+var KIND_TAG = { text: null, code: 'coder', vision: 'vision', reasoning: 'reasoning', fast: 'fast', custom: null };
 var TARGET_LIMIT = 30;
 var TEST_ALL_CONCURRENCY = 3;
 var TEST_ALL_CAP = 60;
@@ -645,6 +754,8 @@ var TAB_SCROLL = (function () {
   } catch (e) { return {}; }
 })();
 var searchSeq = 0;
+var SYNC_INFO = {};
+var TAGS_CACHE = {};
 
 function saveTabScroll() {
   try { sessionStorage.setItem('admin_tab_scroll_v1', JSON.stringify(TAB_SCROLL)); } catch (e) {}
@@ -678,6 +789,110 @@ function btn(text, fn, cls) {
 }
 function secs(ms) { return (ms === null || ms === undefined) ? '' : (ms / 1000).toFixed(1) + 's'; }
 function T(key) { return (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key; }
+
+var TAG_PATTERNS = {
+  vision: /vision|\bvl\b|omni/i,
+  reasoning: /\br1\b|reasoning|thinking/i,
+  coder: /coder|code/i,
+  embedding: /embed/i,
+  'image-gen': /\bimage[-_]?gen|dall[-_ ]?e|flux|stable[-_ ]?diffusion|sdxl|\bimagen\b|gpt-image|midjourney/i,
+  fast: /\b(flash|mini|nano|lite|small)\b/i
+};
+function inferTags(id) {
+  var out = [];
+  CAP_TAGS.forEach(function (tag) {
+    if (TAG_PATTERNS[tag] && TAG_PATTERNS[tag].test(String(id || ''))) out.push(tag);
+  });
+  return out;
+}
+function modelTags(m) {
+  return (m && Array.isArray(m.tags)) ? m.tags : inferTags(m && m.id);
+}
+function tagsForModel(prov, model) {
+  if (prov === CUR_PROVIDER) {
+    for (var i = 0; i < CUR_MODELS.length; i++) {
+      if (CUR_MODELS[i].id === model) return modelTags(CUR_MODELS[i]);
+    }
+  }
+  var cache = TAGS_CACHE[prov];
+  if (cache && Array.isArray(cache[prov + '/' + model])) return cache[prov + '/' + model];
+  return inferTags(model);
+}
+function tagKey(tag) { return CAP_KEY[tag] || tag; }
+function kindKey(kind) { return KIND_KEYS[kind] || KIND_KEYS.custom; }
+function suggestKind(tags) {
+  if (tags.indexOf('vision') >= 0) return 'vision';
+  if (tags.indexOf('coder') >= 0) return 'code';
+  if (tags.indexOf('reasoning') >= 0) return 'reasoning';
+  if (tags.indexOf('fast') >= 0) return 'fast';
+  return 'text';
+}
+function kindCompatible(kind, tags) {
+  if (tags.indexOf('embedding') >= 0 || tags.indexOf('image-gen') >= 0) return false;
+  var need = KIND_TAG[kind] || null;
+  if (!need || kind === 'custom') return true;
+  return tags.indexOf(need) >= 0;
+}
+function comboFit(kind, tags) {
+  var bad = tags.indexOf('embedding') >= 0 || tags.indexOf('image-gen') >= 0;
+  if (bad) return { level: 'warn', mayNotFit: true };
+  var need = KIND_TAG[kind] || null;
+  if (!need || kind === 'text' || kind === 'custom') return { level: 'generic', mayNotFit: false };
+  if (tags.indexOf(need) >= 0) return { level: 'match', mayNotFit: false };
+  return { level: 'warn', mayNotFit: true };
+}
+function orderedCombos(combos, tags) {
+  var rank = { match: 0, generic: 1, warn: 2 };
+  return (combos || []).map(function (combo, index) {
+    return { combo: combo, index: index, fit: comboFit(combo.kind || 'custom', tags) };
+  }).sort(function (a, b) {
+    return rank[a.fit.level] - rank[b.fit.level] || a.index - b.index;
+  });
+}
+function autoFillCandidates(results, kind, limit, existing, tagsByKey) {
+  var n = Math.max(0, Math.min(30, Math.floor(Number(limit) || 0)));
+  if (!n) return [];
+  var seen = {};
+  (existing || []).forEach(function (t) { seen[t.provider + '/' + t.model] = true; });
+  var out = [];
+  Object.keys(results || {}).forEach(function (key) {
+    var value = results[key];
+    if (!value || value.ok !== true) return;
+    if (typeof value.testedAt !== 'number' || Date.now() - value.testedAt > STALE_MS) return;
+    var slash = key.indexOf('/');
+    if (slash <= 0 || slash === key.length - 1 || seen[key]) return;
+    var provider = key.slice(0, slash);
+    var model = key.slice(slash + 1);
+    var tags = Array.isArray(tagsByKey[key]) ? tagsByKey[key] : inferTags(model);
+    if (!kindCompatible(kind, tags)) return;
+    out.push({
+      key: key, provider: provider, model: model,
+      latencyMs: (typeof value.latencyMs === 'number') ? value.latencyMs : null
+    });
+  });
+  out.sort(function (a, b) {
+    var al = (a.latencyMs === null) ? Infinity : a.latencyMs;
+    var bl = (b.latencyMs === null) ? Infinity : b.latencyMs;
+    return al - bl || a.key.localeCompare(b.key);
+  });
+  return out.slice(0, n);
+}
+
+async function loadTagsForProviders(providers) {
+  await Promise.all(providers.map(async function (p) {
+    if (TAGS_CACHE[p]) return;
+    var r = await api('GET', '/admin/api/models?provider=' + encodeURIComponent(p), undefined, { quiet: true });
+    if (r.data && r.data.ok) {
+      var map = {};
+      (r.data.models || []).forEach(function (m) {
+        map[p + '/' + m.id] = Array.isArray(m.tags) ? m.tags : inferTags(m.id);
+      });
+      TAGS_CACHE[p] = map;
+    } else {
+      TAGS_CACHE[p] = {};
+    }
+  }));
+}
 
 function loadResults() {
   var raw = readJson(LS_RESULTS);
@@ -727,12 +942,13 @@ function isStale(r) {
 }
 
 function loadModelState() {
-  var s = { provider: '', q: '', status: 'all', onlyOk: false, onlyUntested: false, summary: null };
+  var s = { provider: '', q: '', status: 'all', cap: 'all', onlyOk: false, onlyUntested: false, summary: null };
   var raw = readJson(LS_MODELS);
   if (raw && typeof raw === 'object') {
     if (typeof raw.provider === 'string') s.provider = raw.provider;
     if (typeof raw.q === 'string') s.q = raw.q;
     if (['all', 'ok', 'cooldown', 'banned'].indexOf(raw.status) >= 0) s.status = raw.status;
+    if (raw.cap === 'all' || CAP_TAGS.indexOf(raw.cap) >= 0) s.cap = raw.cap;
     s.onlyOk = raw.onlyOk === true;
     s.onlyUntested = raw.onlyUntested === true;
     if (raw.summary && typeof raw.summary === 'object') s.summary = raw.summary;
@@ -807,6 +1023,7 @@ function applyLang() {
   if (CFG) {
     renderProviders();
     renderCombos();
+    renderAutoCombos();
     fillProviderSelects();
     renderRows();
     renderSummary();
@@ -960,6 +1177,25 @@ $('loginForm').addEventListener('submit', async function (ev) {
   }
 });
 
+async function createTemplateCombo(kind) {
+  if (!CFG || !KIND_KEYS[kind]) return;
+  var name = kind;
+  var n = 2;
+  while ((CFG.combos || []).some(function (c) { return c.name === name; })) {
+    name = kind + '-' + n;
+    n++;
+  }
+  var r = await api('POST', '/admin/api/combos', {
+    name: name, kind: kind, strategy: 'priority', timeoutMs: 20000, retries: 0, targets: []
+  }, { quiet: true });
+  if (r.data && r.data.ok) {
+    toast('[' + name + '] ' + T('templateCreated'), 'okly');
+    await refreshCfg();
+  } else {
+    toast(r.error || T('loginFail'), 'err');
+  }
+}
+
 async function boot() {
   var r = await api('GET', '/admin/api/config', undefined, { quiet: true });
   if (r.data && r.data.ok) {
@@ -967,6 +1203,7 @@ async function boot() {
     showApp();
     renderProviders();
     renderCombos();
+    renderAutoCombos();
     fillProviderSelects();
     applyModelStateToInputs();
     renderRows();
@@ -984,6 +1221,7 @@ async function refreshCfg() {
     CFG = r.data;
     renderProviders();
     renderCombos();
+    renderAutoCombos();
     fillProviderSelects();
   }
 }
@@ -1054,6 +1292,8 @@ function renderProviders() {
     meta.appendChild(metaRow(T('secretPresent'), p.secretName ? '\u2705 ' + T('yes') : '\u274c ' + T('no')));
     meta.appendChild(metaRow(T('enabledCol'), (p.enabled === false) ? T('off') : T('on')));
     card.appendChild(meta);
+    var syncLine = el('div', 'lbl sync-line', T('syncNoData'));
+    card.appendChild(syncLine);
 
     var act = el('div', 'prov-actions');
     var bTest = btn(T('testB'), function () { testProvider(p.id); }, 'sm');
@@ -1072,10 +1312,43 @@ function renderProviders() {
 
     var status = el('div', 'status-area');
     card.appendChild(status);
-    PROV_ELS[p.id] = { test: bTest, refresh: bRefresh, edit: bEdit, del: bDel, status: status, builtin: Boolean(p.builtin) };
+    PROV_ELS[p.id] = { test: bTest, refresh: bRefresh, edit: bEdit, del: bDel, status: status, sync: syncLine, builtin: Boolean(p.builtin) };
     grid.appendChild(card);
     renderProvStatus(p.id);
+    renderSyncLine(p.id);
+    loadSyncInfo(p.id);
   });
+}
+
+async function loadSyncInfo(id, force) {
+  if (!force && Object.prototype.hasOwnProperty.call(SYNC_INFO, id)) {
+    renderSyncLine(id);
+    return;
+  }
+  var r = await api('GET', '/admin/api/providers/' + encodeURIComponent(id) + '/sync-report', undefined, { quiet: true });
+  if (r.data && r.data.ok) {
+    SYNC_INFO[id] = {
+      fetched: (typeof r.data.fetched === 'number') ? r.data.fetched : null,
+      kept: (typeof r.data.kept === 'number') ? r.data.kept : null,
+      dropped: (typeof r.data.droppedCount === 'number') ? r.data.droppedCount : null,
+      at: r.data.at || null
+    };
+  } else if (r.status !== 401) {
+    SYNC_INFO[id] = null;
+  }
+  renderSyncLine(id);
+}
+
+function renderSyncLine(id) {
+  var e = PROV_ELS[id];
+  if (!e || !e.sync) return;
+  var s = SYNC_INFO[id];
+  if (!s) { e.sync.textContent = T('syncNoData'); return; }
+  if (typeof s.fetched === 'number' && typeof s.kept === 'number') {
+    e.sync.textContent = T('syncKept') + ' ' + s.kept + '/' + s.fetched + ' · ' + T('syncDropped') + ' ' + (s.dropped || 0);
+  } else {
+    e.sync.textContent = T('syncKept') + ' ' + (s.kept === null ? '?' : s.kept);
+  }
 }
 
 function setProvButtons(id, on) {
@@ -1110,6 +1383,9 @@ function renderProvStatus(id) {
     if (r.text) c.appendChild(el('div', 'pre mono', String(r.text).slice(0, 300)));
   } else if (r.kind === 'refresh') {
     c.appendChild(el('div', 'lbl', T('modelsSynced') + ': ' + (r.count === null || r.count === undefined ? '?' : r.count)));
+    if (typeof r.fetched === 'number') {
+      c.appendChild(el('div', 'lbl', T('syncKept') + ': ' + (r.kept || 0) + '/' + r.fetched + ' · ' + T('syncDropped') + ': ' + (r.dropped || 0)));
+    }
     c.appendChild(el('div', 'lbl', T('addedLabel') + ': +' + (r.added || 0) + ' · ' + T('removedLabel') + ': -' + (r.removed || 0)));
     c.appendChild(el('div', 'lbl', T('lastSync') + ': ' + ago(r.at)));
   } else {
@@ -1166,11 +1442,20 @@ async function refreshProvider(id) {
   var r = await api('POST', '/admin/api/providers/' + encodeURIComponent(id) + '/refresh', undefined, { quiet: true });
   var out;
   if (r.data && r.data.ok) {
-    var count = null;
-    var mr = await api('GET', '/admin/api/models?provider=' + encodeURIComponent(id), undefined, { quiet: true });
-    if (mr.data && mr.data.ok) count = (mr.data.models || []).length;
+    var count = (typeof r.data.kept === 'number') ? r.data.kept : null;
+    if (count === null) {
+      var mr = await api('GET', '/admin/api/models?provider=' + encodeURIComponent(id), undefined, { quiet: true });
+      if (mr.data && mr.data.ok) count = (mr.data.models || []).length;
+    }
+    SYNC_INFO[id] = {
+      fetched: (typeof r.data.fetched === 'number') ? r.data.fetched : null,
+      kept: (typeof r.data.kept === 'number') ? r.data.kept : null,
+      dropped: (typeof r.data.dropped === 'number') ? r.data.dropped : null,
+      at: Date.now()
+    };
     out = {
       ok: true, kind: 'refresh', count: count, added: r.data.added || 0, removed: r.data.removed || 0,
+      fetched: SYNC_INFO[id].fetched, kept: SYNC_INFO[id].kept, dropped: SYNC_INFO[id].dropped,
       latencyMs: Date.now() - started, at: Date.now()
     };
   } else {
@@ -1185,6 +1470,8 @@ async function refreshProvider(id) {
   saveProvStatus();
   finishProvBusy(id, 'refresh');
   renderProvStatus(id);
+  renderSyncLine(id);
+  TAGS_CACHE[id] = {};
 }
 
 async function deleteProvider(id) {
@@ -1270,6 +1557,7 @@ function fillProviderSelects() {
 function applyModelStateToInputs() {
   $('mQ').value = MODEL_STATE.q || '';
   $('mStatus').value = MODEL_STATE.status || 'all';
+  if ($('mCap')) $('mCap').value = MODEL_STATE.cap || 'all';
   $('mOnlyOk').checked = MODEL_STATE.onlyOk === true;
   $('mOnlyUntested').checked = MODEL_STATE.onlyUntested === true;
   var sel = $('mProvider');
@@ -1314,7 +1602,16 @@ function renderRows() {
     var tr = el('tr');
     var tdModel = el('td', 'model-cell');
     tdModel.setAttribute('data-label', T('modelCol'));
-    tdModel.appendChild(el('span', 'mono', m.id));
+    var idSpan = el('span', 'mono', m.id);
+    tdModel.appendChild(idSpan);
+    var tags = modelTags(m);
+    if (tags.length) {
+      var chips = el('div', 'chips');
+      tags.forEach(function (tag) {
+        chips.appendChild(el('span', 'chip', T(tagKey(tag))));
+      });
+      tdModel.appendChild(chips);
+    }
     tr.appendChild(tdModel);
 
     var tdStatus = el('td');
@@ -1343,7 +1640,11 @@ function renderRows() {
 
 function shownModels() {
   var st = $('mStatus').value;
+  var cap = $('mCap') ? $('mCap').value : 'all';
   var out = CUR_MODELS.filter(function (m) { return st === 'all' || m.status === st; });
+  if (cap !== 'all') {
+    out = out.filter(function (m) { return modelTags(m).indexOf(cap) >= 0; });
+  }
   if ($('mOnlyOk').checked) {
     out = out.filter(function (m) {
       var r = resultFor(CUR_PROVIDER, m.id);
@@ -1376,6 +1677,7 @@ function refreshBusy() {
   $('mStop').classList.toggle('hidden', !runActive);
   $('mSearch').disabled = runActive;
   $('mStatus').disabled = runActive;
+  if ($('mCap')) $('mCap').disabled = runActive;
   $('mProvider').disabled = runActive;
   $('mQ').disabled = runActive;
   $('mOnlyOk').disabled = runActive;
@@ -1573,6 +1875,8 @@ function closeOverlay() {
 
 function openAddToCombo(prov, model) {
   if (!CFG) return;
+  var tags = tagsForModel(prov, model);
+  var suggestedKind = suggestKind(tags);
   var ov = $('ovl');
   ov.className = 'overlay';
   ov.textContent = '';
@@ -1581,11 +1885,19 @@ function openAddToCombo(prov, model) {
   card.appendChild(el('div', 'mono lbl', prov + '/' + model));
   card.appendChild(el('p', 'help', T('addToQ')));
   var list = el('div', 'stack');
-  (CFG.combos || []).forEach(function (c) {
-    var b = btn(c.name + ' (' + ((c.targets || []).length) + ')', function () {
+  var ordered = orderedCombos(CFG.combos || [], tags);
+  ordered.forEach(function (x) {
+    var c = x.combo;
+    var fit = x.fit;
+    var row = el('div', 'line');
+    var b = btn(c.name + ' · ' + T(kindKey(c.kind || 'custom')) + ' (' + ((c.targets || []).length) + ')', function () {
       addToCombo(c, prov, model, b);
-    }, 'sm');
-    list.appendChild(b);
+    }, 'sm' + (fit.mayNotFit ? ' fit-warn' : ''));
+    row.appendChild(b);
+    if (fit.mayNotFit) {
+      row.appendChild(el('span', 'lbl may-not-fit', T('mayNotFit')));
+    }
+    list.appendChild(row);
   });
   if (!CFG.combos || !CFG.combos.length) list.appendChild(el('p', 'lbl', T('newComboHint')));
   card.appendChild(list);
@@ -1595,8 +1907,8 @@ function openAddToCombo(prov, model) {
   var nameInput = el('input', 'mono grow');
   nameInput.maxLength = 40;
   nameInput.placeholder = T('comboNamePh');
-  var createBtn = btn(T('createAndAdd'), function () {
-    createComboWithTarget(nameInput.value.trim(), prov, model, createBtn);
+  var createBtn = btn(T('createAndAdd') + ' (' + T(kindKey(suggestedKind)) + ')', function () {
+    createComboWithTarget(nameInput.value.trim(), suggestedKind, prov, model, createBtn);
   }, 'primary');
   nameInput.addEventListener('keydown', function (ev) {
     if (ev.key === 'Enter') {
@@ -1630,7 +1942,7 @@ async function addToCombo(c, prov, model, btnEl) {
   if (targets.length > TARGET_LIMIT) { toast(T('maxTargetsMsg'), 'err'); return; }
   busy(btnEl, 'loading');
   var r = await api('PUT', '/admin/api/combos/' + encodeURIComponent(c.name), {
-    name: c.name, strategy: c.strategy, timeoutMs: c.timeoutMs, retries: c.retries || 0, targets: targets
+    name: c.name, kind: c.kind || 'custom', strategy: c.strategy, timeoutMs: c.timeoutMs, retries: c.retries || 0, targets: targets
   });
   idle(btnEl);
   if (r.data && r.data.ok) {
@@ -1643,11 +1955,12 @@ async function addToCombo(c, prov, model, btnEl) {
   }
 }
 
-async function createComboWithTarget(name, prov, model, btnEl) {
+async function createComboWithTarget(name, kind, prov, model, btnEl) {
   if (!name) { toast(T('nameRequired'), 'err'); return; }
   busy(btnEl, 'loading');
   var r = await api('POST', '/admin/api/combos', {
     name: name,
+    kind: kind || 'custom',
     strategy: 'priority',
     timeoutMs: 20000,
     retries: 0,
@@ -1661,6 +1974,68 @@ async function createComboWithTarget(name, prov, model, btnEl) {
       label: T('goToCombo'),
       fn: function () { showTab('combosTab'); }
     });
+  }
+}
+
+// ── comboهای خودکار داخلی — کارت فقط‌خواندنی + ساخت نسخه‌ی دستی ─────────────
+function renderAutoCombos() {
+  var list = $('autoList');
+  if (!list) return;
+  list.textContent = '';
+  if (!CFG) return;
+  AUTO_COMBOS.forEach(function (name) {
+    var manualExists = (CFG.combos || []).some(function (c) { return c.name === name; });
+    var card = el('div', 'card combo-card');
+    var head = el('div', 'combo-head');
+    var title = el('div', 'line');
+    title.appendChild(el('strong', 'mono', name));
+    title.appendChild(el('span', 'badge b-ok', T('autoBadge')));
+    title.appendChild(el('span', 'badge b-muted', T(kindKey(AUTO_KINDS[name] || 'custom'))));
+    if (manualExists) title.appendChild(el('span', 'badge b-cool', T('manualCombos')));
+    head.appendChild(title);
+    card.appendChild(head);
+    card.appendChild(el('p', 'help', T('autoReadonly')));
+    var act = el('div', 'line');
+    var b = btn(T('createManualCopy'), function () { createManualCopy(name, b); }, 'sm');
+    act.appendChild(b);
+    card.appendChild(act);
+    list.appendChild(card);
+  });
+}
+
+async function createManualCopy(name, btnEl) {
+  if (!CFG) return;
+  if ((CFG.combos || []).some(function (c) { return c.name === name; })) {
+    toast(T('copyExists'), 'err');
+    return;
+  }
+  busy(btnEl, 'loading');
+  var r = await api('GET', '/admin/api/auto/' + encodeURIComponent(name), undefined, { quiet: true });
+  if (!(r.data && r.data.ok)) {
+    idle(btnEl);
+    toast(r.error || T('copyEmpty'), 'err');
+    return;
+  }
+  var targets = (r.data.targets || []).slice(0, 8);
+  if (!targets.length) {
+    idle(btnEl);
+    toast(T('copyEmpty'), 'err');
+    return;
+  }
+  var c = await api('POST', '/admin/api/combos', {
+    name: name,
+    kind: r.data.kind || AUTO_KINDS[name] || 'custom',
+    strategy: 'priority',
+    timeoutMs: 20000,
+    retries: 0,
+    targets: targets
+  }, { quiet: true });
+  idle(btnEl);
+  if (c.data && c.data.ok) {
+    toast('[' + name + '] ' + T('copyCreated'), 'okly');
+    await refreshCfg();
+  } else {
+    toast(c.error || T('loginFail'), 'err');
   }
 }
 
@@ -1723,6 +2098,7 @@ function renderCombos() {
     var card = el('div', 'card combo-card');
     var head = el('div', 'line');
     head.appendChild(el('strong', 'mono', c.name));
+    head.appendChild(el('span', 'badge b-muted', T(kindKey(c.kind || 'custom'))));
     head.appendChild(el('span', 'lbl', c.strategy + ' · ' + c.timeoutMs + 'ms · ' + (c.retries || 0) + 'r · ' + ((c.targets || []).length) + 't'));
     card.appendChild(head);
 
@@ -1735,6 +2111,13 @@ function renderCombos() {
     card.appendChild(res);
 
     var opts = el('div', 'line');
+    var kd = el('select');
+    ['text', 'code', 'vision', 'reasoning', 'fast', 'custom'].forEach(function (k) {
+      var ok = el('option', null, T(kindKey(k)));
+      ok.value = k;
+      kd.appendChild(ok);
+    });
+    kd.value = c.kind || 'custom';
     var st = el('select');
     ['priority', 'round-robin', 'fastest'].forEach(function (s2) {
       var o2 = el('option', null, s2);
@@ -1746,6 +2129,7 @@ function renderCombos() {
     to.type = 'number'; to.min = '1000'; to.max = '60000'; to.value = c.timeoutMs;
     var re = el('input');
     re.type = 'number'; re.min = '0'; re.max = '3'; re.value = c.retries || 0;
+    opts.appendChild(el('span', 'lbl', T('kindLabel'))); opts.appendChild(kd);
     opts.appendChild(el('span', 'lbl', T('strategy'))); opts.appendChild(st);
     opts.appendChild(el('span', 'lbl', T('timeoutMs'))); opts.appendChild(to);
     opts.appendChild(el('span', 'lbl', T('retries'))); opts.appendChild(re);
@@ -1760,8 +2144,55 @@ function renderCombos() {
       if (box.children.length >= TARGET_LIMIT) { toast(T('maxLimitReached'), 'err'); return; }
       box.appendChild(tgtRow({}));
     }, 'sm'));
+    var fillInput = el('input');
+    fillInput.type = 'number'; fillInput.min = '1'; fillInput.max = '30'; fillInput.value = '8';
+    fillInput.style.width = '55px';
+    fillInput.title = T('fillCount');
+    fillInput.setAttribute('aria-label', T('fillCount'));
+    var fillBtn = btn(T('fillFromTested'), async function () {
+      var existing = gatherTargets(box);
+      var remaining = TARGET_LIMIT - existing.length;
+      if (remaining <= 0) { toast(T('maxLimitReached'), 'err'); return; }
+      var limit = Math.max(1, Math.min(30, Math.floor(Number(fillInput.value) || 8)));
+      limit = Math.min(limit, remaining);
+      var providers = [];
+      Object.keys(RESULTS).forEach(function (k) {
+        var sl = k.indexOf('/');
+        if (sl > 0) {
+          var p = k.slice(0, sl);
+          if (providers.indexOf(p) < 0) providers.push(p);
+        }
+      });
+      await loadTagsForProviders(providers);
+      var tagsByKey = {};
+      Object.keys(RESULTS).forEach(function (k) {
+        var sl = k.indexOf('/');
+        if (sl > 0) {
+          var p = k.slice(0, sl);
+          var m = k.slice(sl + 1);
+          var cache = TAGS_CACHE[p];
+          tagsByKey[k] = (cache && cache[k]) ? cache[k] : inferTags(m);
+        }
+      });
+      var picks = autoFillCandidates(RESULTS, kd.value, limit, existing, tagsByKey);
+      if (!picks.length) { toast(T('fillNone'), 'err'); return; }
+      picks.forEach(function (p) {
+        box.appendChild(tgtRow({ provider: p.provider, model: p.model, enabled: true }));
+      });
+      toast(T('addedDone') + ' ' + picks.length, 'okly');
+    }, 'sm');
+    foot.appendChild(fillInput);
+    foot.appendChild(fillBtn);
+
     var sb = btn(T('save'), async function () {
-      var body = { name: c.name, strategy: st.value, timeoutMs: Number(to.value), retries: Number(re.value), targets: gatherTargets(box) };
+      var body = {
+        name: c.name,
+        kind: kd.value,
+        strategy: st.value,
+        timeoutMs: Number(to.value),
+        retries: Number(re.value),
+        targets: gatherTargets(box)
+      };
       if (body.targets.length > TARGET_LIMIT) { toast(T('maxTargetsMsg'), 'err'); return; }
       if (body.targets.length < 1) { toast(T('needTarget'), 'err'); return; }
       busy(sb, 'saving');
@@ -1806,6 +2237,7 @@ async function deleteCombo(name) {
 function openComboFormBlank() {
   $('comboFormTitle').textContent = T('newCombo');
   $('cName').value = '';
+  if ($('cKind')) $('cKind').value = 'custom';
   $('cStrategy').value = 'priority';
   $('cTimeout').value = '20000';
   $('cRetries').value = '0';
@@ -1821,6 +2253,7 @@ async function saveComboForm() {
   var name = $('cName').value.trim();
   var body = {
     name: name,
+    kind: $('cKind') ? $('cKind').value : 'custom',
     strategy: $('cStrategy').value,
     timeoutMs: Number($('cTimeout').value),
     retries: Number($('cRetries').value),
@@ -1883,6 +2316,13 @@ $('mStatus').addEventListener('change', function () {
   saveModelState();
   renderRows();
 });
+if ($('mCap')) {
+  $('mCap').addEventListener('change', function () {
+    MODEL_STATE.cap = this.value;
+    saveModelState();
+    renderRows();
+  });
+}
 $('mOnlyOk').addEventListener('change', function () {
   MODEL_STATE.onlyOk = this.checked;
   saveModelState();
@@ -1897,6 +2337,11 @@ $('mTestAll').addEventListener('click', runTestAll);
 $('mStop').addEventListener('click', function () { runStopping = true; $('mStop').disabled = true; });
 $('mClearProv').addEventListener('click', function () { clearResults(false); });
 $('mClearAll').addEventListener('click', function () { clearResults(true); });
+
+var templateButtons = document.querySelectorAll('[data-template]');
+for (var tpi = 0; tpi < templateButtons.length; tpi++) {
+  templateButtons[tpi].addEventListener('click', function () { createTemplateCombo(this.getAttribute('data-template')); });
+}
 
 applyTheme();
 applyLang();
