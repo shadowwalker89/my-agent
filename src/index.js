@@ -24,6 +24,15 @@ import {
 import { tgApi, tgSend, tgBroadcast } from "./telegram.js";
 import { healthCounts } from "./health.js";
 import { ADMIN_HTML } from "./admin-page.js";
+import { classifyIntent, needsConfirmation } from "./intent.js";
+import {
+  dispatchDev,
+  approveDevPR,
+  rejectDevPR,
+  verifyCallbackSignature,
+  setDevActive,
+} from "./dev.js";
+import { runTask } from "./executor.js";
 
 const TG_ERROR_LIMIT = 120;
 
@@ -240,7 +249,7 @@ const HELP_TEXT =
   "دستورها: /combo [name|clear] /route on|off /showmodel on|off /models [combo] /combos /refresh [provider] " +
   "/test <provider/model> /pin <combo> <provider/model> /unpin <combo> <provider/model> " +
   "/ban <provider/model> /unban <provider/model> /prefer <combo> <rx1,rx2,...|reset> " +
-  "/status /ping /start — برای چت، متن ساده بفرست.";
+  "/intent on|off /dev <prompt> /status /ping /start — برای چت، متن ساده بفرست.";
 
 async function providerIds(env) {
   const cfg = await getConfig(env);
@@ -428,6 +437,34 @@ async function tgCommand(env, chatId, text, userId) {
     await tgSend(env, chatId, `✅ ${label}`);
     return;
   }
+  if (cmd === "/intent") {
+    const v = tgToggleValue(args[0]);
+    if (!v.ok) {
+      await tgSend(env, chatId, "فرمت: /intent on|off");
+      return;
+    }
+    await setPrefs(env, userId, { intent: v.on });
+    await tgSend(
+      env,
+      chatId,
+      `✅ مسیریابی intent: ${v.on ? "روشن" : "خاموش"}\nIntent routing: ${v.on ? "on" : "off"}`,
+    );
+    return;
+  }
+  if (cmd === "/dev") {
+    const prompt = text.slice(cmd.length).trim();
+    if (!prompt) {
+      await tgSend(
+        env,
+        chatId,
+        "فرمت: /dev <prompt>\nمثال: /dev add a /health endpoint to the worker",
+      );
+      return;
+    }
+    const r = await dispatchDev(env, prompt, chatId, userId);
+    await tgSend(env, chatId, r.text);
+    return;
+  }
   if (cmd === "/models") {
     return tgModels(env, chatId, args[0] ?? "chat");
   }
@@ -528,7 +565,152 @@ function ageString(iso) {
   return `${Math.round(mins / 1440)} روز پیش`;
 }
 
+// ── intent routing (chat | dev | task) ──────────────────────────────────────
+
+const PENDING_TTL_SEC = 600;
+
+function pendingIntentKey(userId) {
+  return `intent:pending:${String(userId ?? "")}`;
+}
+
+async function setPendingIntent(env, userId, payload) {
+  if (!env.STATE) return;
+  await env.STATE.put(pendingIntentKey(userId), JSON.stringify(payload), {
+    expirationTtl: PENDING_TTL_SEC,
+  });
+}
+
+async function takePendingIntent(env, userId) {
+  if (!env.STATE) return null;
+  const raw = await env.STATE.get(pendingIntentKey(userId), "json");
+  await env.STATE.delete(pendingIntentKey(userId));
+  return raw && typeof raw === "object" ? raw : null;
+}
+
+function callbackChatId(cb) {
+  return cb?.message?.chat?.id ?? cb?.from?.id;
+}
+
+async function runIntent(env, chatId, userId, text, intent, hasImage) {
+  if (intent.intent === "dev") {
+    const r = await dispatchDev(env, text, chatId, userId);
+    await tgSend(env, chatId, r.text);
+    return;
+  }
+  if (intent.intent === "task") {
+    const r = await runTask(env, { kind: "task", prompt: text, chatId, userId });
+    if (r.ok) {
+      if (r.text) await tgSend(env, chatId, r.text);
+      return;
+    }
+    // executor تنظیم نشده → پیام کوتاه + دکمه‌ی «فقط چت»
+    await setPendingIntent(env, userId, { prompt: text, intent: "task", hasImage: hasImage === true });
+    await tgApi(env, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "⚙️ اجراکننده‌ی task پیکربندی نشده.\n" +
+        "Task executor is not configured. Continue as chat?",
+      reply_markup: {
+        inline_keyboard: [[{ text: "💬 فقط چت / Just chat", callback_data: "intent:chat" }]],
+      },
+    });
+    return;
+  }
+  await answerChatText(env, chatId, userId, text, hasImage);
+}
+
+async function handlePlainText(env, msg, text) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const prefs = await getPrefs(env, userId);
+  if (prefs.intent === false) {
+    await answerChatText(env, chatId, userId, text, updateHasImage(msg));
+    return;
+  }
+
+  const intent = await classifyIntent(text, { env });
+  if (needsConfirmation(intent)) {
+    await setPendingIntent(env, userId, {
+      prompt: text,
+      intent: intent.intent,
+      hasImage: updateHasImage(msg) === true,
+    });
+    const pct = Math.round((Number(intent.confidence) || 0) * 100);
+    await tgApi(env, "sendMessage", {
+      chat_id: chatId,
+      text:
+        `🤔 حدس من: ${intent.intent} (اطمینان ${pct}٪)\n` +
+        `My guess: ${intent.intent} (${pct}% confidence). Proceed?`,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ بله / Yes", callback_data: "intent:yes" },
+            { text: "💬 فقط چت / Just chat", callback_data: "intent:chat" },
+          ],
+        ],
+      },
+    });
+    return;
+  }
+
+  await runIntent(env, chatId, userId, text, intent, updateHasImage(msg));
+}
+
+async function handleCallbackQuery(env, cb) {
+  const fromId = cb?.from?.id;
+  const chatId = callbackChatId(cb);
+  const data = typeof cb?.data === "string" ? cb.data : "";
+
+  try {
+    await tgApi(env, "answerCallbackQuery", { callback_query_id: cb?.id });
+  } catch {
+    // پاسخ به callback اختیاری است
+  }
+  if (!fromId || !chatId || !isAllowed(env.ALLOWED_TG_IDS, fromId)) return;
+
+  const devMatch = /^dev:(approve|reject):(\d{1,12})$/.exec(data);
+  if (devMatch) {
+    const pr = Number(devMatch[2]);
+    const result =
+      devMatch[1] === "approve" ? await approveDevPR(env, pr) : await rejectDevPR(env, pr);
+    if (result.ok) await setDevActive(env, fromId, false);
+    await tgSend(env, chatId, result.text);
+    return;
+  }
+
+  if (data === "intent:yes") {
+    const pending = await takePendingIntent(env, fromId);
+    if (!pending || typeof pending.prompt !== "string" || !pending.prompt.trim()) {
+      await tgSend(env, chatId, "درخواست منقضی شده؛ دوباره بفرست.\nThis request expired; send it again.");
+      return;
+    }
+    await runIntent(
+      env,
+      chatId,
+      fromId,
+      pending.prompt,
+      { intent: pending.intent === "task" ? "task" : "dev", confidence: 1, reason: "confirmed" },
+      pending.hasImage === true,
+    );
+    return;
+  }
+
+  if (data === "intent:chat") {
+    const pending = await takePendingIntent(env, fromId);
+    if (!pending || typeof pending.prompt !== "string" || !pending.prompt.trim()) {
+      await tgSend(env, chatId, "درخواست منقضی شده؛ دوباره بفرست.\nThis request expired; send it again.");
+      return;
+    }
+    await answerChatText(env, chatId, fromId, pending.prompt, pending.hasImage === true);
+  }
+}
+
 async function handleUpdate(env, update) {
+  if (update?.callback_query) {
+    await handleCallbackQuery(env, update.callback_query);
+    return;
+  }
+
   const msg = update.message;
   if (!msg || !msg.from || !msg.chat) return;
 
@@ -554,8 +736,61 @@ async function handleUpdate(env, update) {
     await tgCommand(env, msg.chat.id, text, msg.from.id);
   } else {
     // عکس/فایل تصویری هنوز هندل نمی‌شود (پیام متنی فقط)؛ hasImage فقط flag تابع طبقه‌بندی است.
-    await answerChatText(env, msg.chat.id, msg.from.id, text, updateHasImage(msg));
+    await handlePlainText(env, msg, text);
   }
+}
+
+// ── POST /dev/callback — امضاشده با HMAC از GitHub Actions ───────────────────
+async function devCallback(request, env) {
+  if (!env.DEV_CALLBACK_SECRET) {
+    return Response.json({ ok: false, error: "dev callback not configured" }, { status: 503 });
+  }
+  let raw;
+  try {
+    raw = await request.text();
+  } catch {
+    return Response.json({ ok: false }, { status: 400 });
+  }
+  const verified = await verifyCallbackSignature(
+    env,
+    raw,
+    request.headers.get("X-Signature") ?? "",
+  );
+  if (!verified.ok) {
+    // فقط کد خطا — هرگز بدنه یا امضا لاگ نمی‌شود.
+    console.log(JSON.stringify({ dev_callback: "rejected", code: verified.code }));
+    return Response.json({ ok: false }, { status: 401 });
+  }
+
+  const body = verified.body;
+  const pr = Number(body.pr);
+  const ok = body.ok === true && Number.isInteger(pr) && pr > 0;
+  const chatId = body.chat_id ?? body.user_id;
+  const userId = body.user_id ?? body.chat_id;
+  if (userId) await setDevActive(env, userId, false);
+
+  if (!chatId) return Response.json({ ok: true, delivered: false });
+
+  let text = ok
+    ? `🤖 اجرای dev تمام شد — PR #${pr} آماده‌ی بررسی است.\nDev run finished — PR #${pr} is ready for review.`
+    : "❌ اجرای dev بدون PR تمام شد. لاگ Actions را ببین.\nDev run finished without a PR. Check the Actions log.";
+  const url =
+    typeof body.url === "string" && /^https:\/\/github\.com\//.test(body.url) ? body.url : "";
+  if (url) text += `\n${url.slice(0, 300)}`;
+
+  const payload = { chat_id: chatId, text: text.slice(0, 4000) };
+  if (ok) {
+    payload.reply_markup = {
+      inline_keyboard: [
+        [
+          { text: "✅ Approve / تأیید", callback_data: `dev:approve:${pr}` },
+          { text: "🗑 Reject / رد", callback_data: `dev:reject:${pr}` },
+        ],
+      ],
+    };
+  }
+  await tgApi(env, "sendMessage", payload);
+  return Response.json({ ok: true, delivered: true });
 }
 
 function truncateV1(text, limit = 400) {
@@ -1137,6 +1372,10 @@ async function route(request, env, ctx) {
     return Response.json(await v1Models(env));
   }
 
+  if (request.method === "POST" && pathname === "/dev/callback") {
+    return devCallback(request, env);
+  }
+
   if (request.method === "GET" && (pathname === "/admin" || pathname === "/admin/")) {
     if (missingSecretName(env)) return missingSecretResponse(env);
     return adminPage();
@@ -1227,7 +1466,7 @@ async function route(request, env, ctx) {
         json = await tgApi(env, "setWebhook", {
           url: new URL(request.url).origin + "/telegram",
           secret_token: env.TG_SECRET,
-          allowed_updates: ["message"],
+          allowed_updates: ["message", "callback_query"],
           drop_pending_updates: true,
         });
       }
