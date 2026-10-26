@@ -1,3 +1,4 @@
+// Worker entry point — all HTTP endpoints, scheduled cron, Telegram webhook
 import { redact, listProviderModels } from "./providers.js";
 import {
   getConfig,
