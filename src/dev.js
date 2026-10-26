@@ -3,6 +3,7 @@
 //
 // Secrets used: GITHUB_DISPATCH_TOKEN (GitHub), DEV_CALLBACK_SECRET (HMAC).
 // Never log token, secret, prompt, or callback body.
+import { isProtectedPath } from "./guard.js";
 
 export const DEV_REPO_DEFAULT = "shadowwalker89/my-agent";
 export const DEV_WORKFLOW_DEFAULT = "opencode-dev.yml";
@@ -146,22 +147,10 @@ export async function dispatchDev(env, prompt, chatId, userId) {
 }
 
 // ── path guard ──────────────────────────────────────────────────────────────
-const FORBIDDEN_PATTERNS = [
-  /^\.github\//i,
-  /^opencode\.json$/i,
-  /^wrangler\.(?:jsonc|toml)$/i,
-  /(?:^|\/)\.dev\.vars(?:\..*)?$/i,
-  /(?:^|\/)\.env(?:\..*)?$/i,
-  /^package-lock\.json$/i,
-];
-
+// The single source of truth lives in ./guard.js so the workflow and Worker
+// cannot drift. `isForbiddenPath` is kept as an alias for existing callers.
 export function isForbiddenPath(path) {
-  const s = String(path ?? "")
-    .replace(/\\/g, "/")
-    .replace(/^\.\//, "")
-    .trim();
-  if (!s) return false;
-  return FORBIDDEN_PATTERNS.some((re) => re.test(s));
+  return isProtectedPath(path);
 }
 
 export function pathGuardViolations(files) {

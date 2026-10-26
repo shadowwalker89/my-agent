@@ -15,6 +15,7 @@
 | `src/task-route.js` | Pure `classifyTask`, `comboCandidates`, `selectCombo` — no side effects |
 | `src/intent.js` | `classifyIntentSync`, `classifyIntent`, `needsConfirmation` — chat/dev/task router |
 | `src/dev.js` | Dev dispatch, HMAC callback verification, PR approve/reject, path guard |
+| `src/guard.js` | Shared `isProtectedPath` used by the Worker and the opencode-dev workflow |
 | `src/executor.js` | `runTask(env, spec)` task executor interface (default: not configured) |
 | `src/admin-page.js` | Single-file admin HTML/CSS/JS (no build step) |
 | `src/telegram.js` | Telegram send helpers |
@@ -51,11 +52,11 @@ Secrets (names only): Worker needs `GITHUB_DISPATCH_TOKEN`, `DEV_CALLBACK_SECRET
 ## Mandatory rules
 
 - Run `npm run check` and `npm run test:offline` before every commit or PR. Both must pass.
-- Keep patches small and focused. One logical change per PR.
-- Never touch secrets or deploy config: do not read or edit `.dev.vars`, `.env`, `wrangler.toml`, `wrangler.jsonc`, or `opencode.json`. Never log secret values, API keys, or message contents.
+- Keep patches small and focused. PRs must stay small (max 5 files, max 300 changed lines), one purpose per PR.
+- Never log secret values, API keys, or message contents. Never read or print `.dev.vars*` / `.env*` values.
+- Agents must not edit `.github/**`, `opencode.json`, `wrangler.jsonc`, `.env*`, `.dev.vars*`. Changes to these are made by the human.
 - Never call `wrangler`, `curl`, or `rm -rf` from an agent session. Never trigger a deploy manually.
-- Never edit files under `.github/workflows/` from the automated opencode-dev agent. This is enforced by the workflow path guard and by `approveDevPR()`; developer-authored workflow changes need explicit human review.
-- For any change to runtime behaviour (routing, scoring, health, fallback, telegram commands, intent, dev pipeline), add or adjust an offline test in `scripts/test-combos.mjs` or `scripts/test-dev.mjs`.
+- For any change to runtime behaviour (routing, scoring, health, fallback, telegram commands, intent, dev pipeline, path guard), add or adjust an offline test in `scripts/test-combos.mjs` or `scripts/test-dev.mjs`.
 - Security: model mappers and router must never echo raw API keys or request headers in responses or logs. Use `redact()` from `src/providers.js` for any snippet that might contain keys.
 - Describe every change in the PR body: what changed, why, which tests cover it.
 

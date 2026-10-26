@@ -6,6 +6,10 @@ The worker endpoint is: `https://my-agent.nova-02aa82bffef8.workers.dev`
 The OpenAI-compatible API is at: `POST /v1/chat/completions` (Bearer `ROUTER_KEY`).
 Available models: `GET /v1/models` (same auth) — returns `combo/<name>` entries plus catalog models.
 
+## Expected flow
+
+`/dev` → workflow → PR → callback → Approve/Reject
+
 ## Dispatching a run
 
 **From the Actions tab:**
@@ -53,6 +57,11 @@ Repository variables needed:
 | Variable | Example | Purpose |
 |----------|---------|---------|
 | `WORKER_URL` | `https://my-agent.nova-02aa82bffef8.workers.dev` | Target for the callback POST from the deploy workflow |
+
+Deploy + callback configuration (names only):
+
+- Variable: `WORKER_URL`
+- Secrets: `DEV_CALLBACK_SECRET`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`
 
 ## Adding secrets
 

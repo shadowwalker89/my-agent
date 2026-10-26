@@ -771,9 +771,11 @@ async function devCallback(request, env) {
 
   if (!chatId) return Response.json({ ok: true, delivered: false });
 
+  const reason =
+    typeof body.reason === "string" ? body.reason.replace(/\s+/g, " ").trim().slice(0, 200) : "";
   let text = ok
     ? `🤖 اجرای dev تمام شد — PR #${pr} آماده‌ی بررسی است.\nDev run finished — PR #${pr} is ready for review.`
-    : "❌ اجرای dev بدون PR تمام شد. لاگ Actions را ببین.\nDev run finished without a PR. Check the Actions log.";
+    : `❌ اجرای dev متوقف شد — ${reason || "بدون PR"}\nDev run blocked — ${reason || "no PR"}`;
   const url =
     typeof body.url === "string" && /^https:\/\/github\.com\//.test(body.url) ? body.url : "";
   if (url) text += `\n${url.slice(0, 300)}`;
