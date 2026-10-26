@@ -1,0 +1,49 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "my-agent/combo/code",
+  "provider": {
+    "my-agent": {
+      "name": "My Agent Router",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://my-agent.nova-02aa82bffef8.workers.dev/v1",
+        "apiKey": "{env:ROUTER_KEY}"
+      },
+      "models": {
+        "combo/code": {
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
+        },
+        "combo/chat": {
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
+        }
+      }
+    }
+  },
+  "permission": {
+    "read": "allow",
+    "edit": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "bash": {
+      "npm test*": "allow",
+      "npm run check*": "allow",
+      "node scripts/*": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git add*": "allow",
+      "git commit*": "allow",
+      "*": "deny"
+    },
+    "webfetch": "deny",
+    "websearch": "deny",
+    "todowrite": "allow",
+    "question": "allow"
+  }
+}

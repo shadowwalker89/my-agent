@@ -1,0 +1,53 @@
+name: opencode-dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt for opencode to implement"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: opencode-dev
+  cancel-in-progress: false
+
+jobs:
+  opencode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run opencode
+        id: opencode
+        uses: anomalyco/opencode/github@v1.19.4
+        env:
+          ROUTER_KEY: ${{ secrets.ROUTER_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: my-agent/combo/code
+          use_github_token: true
+          prompt: ${{ inputs.prompt }}
+
+      - name: Report result
+        if: always()
+        run: |
+          if [ "${{ steps.opencode.outcome }}" = "success" ]; then
+            echo "opencode run succeeded."
+            echo "Check the Actions run for the PR URL — it is printed in the 'Run opencode' step log."
+          else
+            echo "opencode run failed or was skipped."
+            echo "Review the 'Run opencode' step log above for the error details."
+          fi
