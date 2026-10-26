@@ -21,7 +21,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  issues: write
 
 concurrency:
   group: opencode-dev
@@ -77,16 +76,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
-          bad=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json files \
-            -q '.files[].path' \
-            | grep -E '^(\.github/|opencode\.json$|wrangler\.(jsonc|toml)$|\.dev\.vars|\.env|package-lock\.json$)' || true)
-          if [ -n "$bad" ]; then
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json files \
+            -q '.files[].path' > "$RUNNER_TEMP/pr-files.txt"
+          if node scripts/guard-check.mjs "$RUNNER_TEMP/pr-files.txt"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "reason=" >> "$GITHUB_OUTPUT"
+          else
             echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "::error::PR touches protected paths and must be rejected:"
-            echo "$bad"
+            echo "reason=blocked: PR touches protected paths" >> "$GITHUB_OUTPUT"
+            echo "::error::PR touches protected paths; closing the PR and deleting the branch."
+            gh pr close "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --delete-branch \
+              --comment "Closed automatically: touches protected paths."
             exit 1
           fi
-          echo "ok=true" >> "$GITHUB_OUTPUT"
 
       - name: Notify Worker
         if: always() && inputs.chat_id != ''
@@ -98,6 +100,9 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           PR_URL: ${{ steps.pr.outputs.url }}
           PR_BRANCH: ${{ steps.pr.outputs.branch }}
+          PR_FOUND: ${{ steps.pr.outputs.found }}
+          GUARD_OK: ${{ steps.guard.outputs.ok }}
+          BLOCK_REASON: ${{ steps.guard.outputs.reason }}
           RUN_OK: ${{ steps.opencode.outcome == 'success' && steps.guard.outputs.ok == 'true' }}
         run: |
           node -e '
@@ -109,11 +114,20 @@ jobs:
             console.log("callback skipped: DEV_CALLBACK_SECRET, WORKER_URL or chat_id is missing");
             process.exit(0);
           }
+          const found = process.env.PR_FOUND === "true";
+          const guardOk = process.env.GUARD_OK === "true";
           const pr = Number(process.env.PR_NUMBER || 0);
+          const ok = process.env.RUN_OK === "true" && found && guardOk && pr > 0;
+          let reason = "";
+          if (!found) reason = "no PR found";
+          else if (!guardOk) reason = process.env.BLOCK_REASON || "blocked: guard failed";
+          else if (!ok) reason = "run failed or no PR";
+          reason = reason.replace(/\s+/g, " ").slice(0, 200);
           const body = JSON.stringify({
             timestamp: Date.now(),
             nonce: crypto.randomBytes(16).toString("hex"),
-            ok: process.env.RUN_OK === "true" && pr > 0,
+            ok,
+            reason,
             pr: pr > 0 ? pr : null,
             url: process.env.PR_URL || "",
             branch: process.env.PR_BRANCH || "",

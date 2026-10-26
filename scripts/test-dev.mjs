@@ -15,6 +15,7 @@ import {
   hmacHex,
   verifyCallbackSignature,
 } from "../src/dev.js";
+import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 
 const failures = [];
@@ -99,6 +100,14 @@ function fakeKV() {
   check(isForbiddenPath("docs/opencode-ci.md") === false, "docs مجاز");
   check(isForbiddenPath("src\\index.js") === false, "backslash نرمال شود");
   check(isForbiddenPath(".github\\workflows\\a.yml") === true, "backslash ممنوع");
+  check(isForbiddenPath("README.md") === false, "README مجاز");
+
+  // shared module used by the workflow and the Worker
+  check(isProtectedPath(".github/workflows/x.yml") === true, "guard: workflow ممنوع");
+  check(isProtectedPath("wrangler.jsonc") === true, "guard: wrangler ممنوع");
+  check(isProtectedPath("src/index.js") === false, "guard: src مجاز");
+  check(isProtectedPath("opencode.json") === true, "guard: opencode.json ممنوع");
+  check(isProtectedPath("README.md") === false, "guard: README مجاز");
 
   const v = pathGuardViolations([{ filename: "src/a.js" }, { filename: "wrangler.jsonc" }, "docs/x.md"]);
   check(v.length === 1 && v[0] === "wrangler.jsonc", `violations: ${JSON.stringify(v)}`);
@@ -160,7 +169,7 @@ function fakeKV() {
 }
 
 // ── mock world (telegram + github + unexpected) ────────────────────────────
-function mockWorld() {
+function mockWorld({ prFiles = [] } = {}) {
   const calls = { telegram: [], github: [], unexpected: 0 };
   const orig = global.fetch;
   global.fetch = async (url, init = {}) => {
@@ -182,7 +191,7 @@ function mockWorld() {
       } catch {}
       calls.github.push({ method, url: u, body });
       if (u.includes("/actions/workflows/")) return new Response(null, { status: 204 });
-      if (/\/pulls\/\d+\/files/.test(u)) return Response.json([]);
+      if (/\/pulls\/\d+\/files/.test(u)) return Response.json(prFiles);
       if (/\/pulls\/\d+\/merge$/.test(u) && method === "PUT") {
         return Response.json({ sha: "deadbeef", merged: true });
       }
@@ -320,6 +329,34 @@ function newEnv(extra = {}) {
       ctxNull,
     );
     check(noCfg.status === 503, `بدون secret باید 503 (${noCfg.status})`);
+
+    const blockedBody = {
+      timestamp: Date.now(),
+      nonce: "nonce-cb-0002",
+      ok: false,
+      reason: "blocked: PR touches protected paths",
+      pr: 8,
+      chat_id: "4242",
+      user_id: "4242",
+    };
+    const blockedRaw = JSON.stringify(blockedBody);
+    const blockedSig = await hmacHex(secret, blockedRaw);
+    const blockedRes = await workerDefault.fetch(
+      new Request("https://test.local/dev/callback", {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Signature": blockedSig },
+        body: blockedRaw,
+      }),
+      env,
+      ctxNull,
+    );
+    check(blockedRes.status === 200, `blocked callback باید 200 (${blockedRes.status})`);
+    const blockedMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(
+      String(blockedMsg?.payload?.text ?? "").includes("blocked: PR touches protected paths"),
+      `پیام blocked: ${JSON.stringify(blockedMsg?.payload)}`,
+    );
+    check(!blockedMsg?.payload?.reply_markup, "blocked callback نباید دکمه‌ی approve داشته باشد");
   } finally {
     world.restore();
   }
@@ -407,6 +444,22 @@ function newEnv(extra = {}) {
     check(String(rejectMsg?.payload?.text ?? "").includes("🗑"), `پیام reject: ${JSON.stringify(rejectMsg?.payload)}`);
 
     check(world.calls.unexpected === 0, `fetch غیرمنتظره در approve/reject: ${world.calls.unexpected}`);
+  } finally {
+    world.restore();
+  }
+}
+
+// ── 9) Approve blocked by path guard ───────────────────────────────────────
+{
+  const world = mockWorld({ prFiles: [{ filename: ".github/workflows/x.yml" }] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "approve با فایل ممنوع نباید merge بزند");
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("Blocked"), `پیام blocked approve: ${JSON.stringify(msg?.payload)}`);
+    check(world.calls.unexpected === 0, `fetch غیرمنتظره در approve ممنوع: ${world.calls.unexpected}`);
   } finally {
     world.restore();
   }
