@@ -11,7 +11,7 @@ import { RULES, capabilityTags } from "./combos.js";
 import { runCombo, getComboTargets, directCall } from "./router.js";
 import { classifyTask, comboCandidates, fallbackCombo, updateHasImage } from "./task-route.js";
 import { getPrefs, setPrefs } from "./tgprefs.js";
-import { syncProvider, getSyncReport } from "./catalog.js";
+import { syncProvider, getSyncReport, loadCatalog } from "./catalog.js";
 import {
   getOverrides,
   addPin,
@@ -77,19 +77,72 @@ function isAllowed(raw, userId) {
     .includes(String(userId));
 }
 
+// خطای سبک OpenAI برای مسیر /v1: {error:{message,type,code}}
+function openAiError(status, message, type, code) {
+  return Response.json(
+    { error: { message: String(message ?? "").slice(0, 500), type, code: code ?? null } },
+    { status },
+  );
+}
+
 function routerAuth(request, env) {
   if (!env.ROUTER_KEY) {
-    return Response.json(
-      { ok: false, error: "missing secret: ROUTER_KEY" },
-      { status: 500 },
+    // ROUTER_KEY ست نشده = /v1 خاموش (نه باز) — 503، نه باز تست
+    return openAiError(
+      503,
+      "router disabled: ROUTER_KEY secret is not set on this Worker",
+      "api_error",
+      "router_disabled",
     );
   }
   const auth = request.headers.get("Authorization") ?? "";
   const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   if (!safeEqual(bearer, env.ROUTER_KEY)) {
-    return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
+    return openAiError(401, "invalid or missing bearer token", "authentication_error", "invalid_api_key");
   }
   return null;
+}
+
+// عبور SSE: بدون بافر — هر chunk بلافاصله پاس می‌شود. اگر upstream وسط جواب مرد،
+// خطا به شکل رویداد SSE خطا فرستاده و استریم تمیز بسته می‌شود (بدون درخواست مجدد).
+const SSE_ENCODER = new TextEncoder();
+
+function wrapSseStream(upstream, used) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const done = (async () => {
+    const reader = upstream.getReader();
+    try {
+      for (;;) {
+        const { done: ended, value } = await reader.read();
+        if (ended) break;
+        await writer.write(value);
+      }
+      await writer.close();
+    } catch (err) {
+      const payload = JSON.stringify({
+        error: {
+          message: `upstream stream failed (${used})`,
+          type: "api_error",
+          code: "upstream_stream_failed",
+        },
+      });
+      try {
+        await writer.write(SSE_ENCODER.encode(`data: ${payload}\n\n`));
+        await writer.close();
+      } catch {
+        // کلاینت رفته — هیچ
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {}
+      try {
+        writer.releaseLock();
+      } catch {}
+    }
+  })();
+  return { readable, done };
 }
 
 function splitMessage(text) {
@@ -505,6 +558,11 @@ async function handleUpdate(env, update) {
   }
 }
 
+function truncateV1(text, limit = 400) {
+  const s = String(text ?? "");
+  return s.length > limit ? `${s.slice(0, limit)}…` : s;
+}
+
 async function chatCompletions(request, env) {
   const auth = routerAuth(request, env);
   if (auth) return auth;
@@ -512,34 +570,66 @@ async function chatCompletions(request, env) {
   let body;
   try {
     body = await request.json();
-  } catch (err) {
-    console.error("invalid chat body:", err && err.message);
-    return Response.json({ ok: false, error: "invalid json body" }, { status: 400 });
+  } catch {
+    return openAiError(400, "invalid JSON body", "invalid_request_error", "invalid_body");
   }
-  if (!body || typeof body.model !== "string" || !body.model) {
-    return Response.json({ ok: false, error: "body.model is required" }, { status: 400 });
+  if (!body || typeof body !== "object" || typeof body.model !== "string" || !body.model) {
+    return openAiError(400, "body.model is required", "invalid_request_error", "missing_model");
+  }
+  if (!Array.isArray(body.messages)) {
+    return openAiError(400, "body.messages must be an array", "invalid_request_error", "missing_messages");
   }
 
   const stream = body.stream === true;
+  const started = Date.now();
   const result = await runCombo(env, body.model, body, { stream });
+  const latencyMs = Date.now() - started;
+
+  // لاگ فقط metadata — هیچ محتوای پیام یا کلیدی اینجا نمی‌آید
+  console.log(
+    JSON.stringify({
+      v1: "chat",
+      model: truncateV1(body.model, 120),
+      stream,
+      ok: Boolean(result?.ok),
+      used: truncateV1(result?.used ?? null, 120),
+      latency: latencyMs,
+      targetErrors: result?.ok ? 0 : (result?.errors ?? []).length,
+    }),
+  );
 
   if (result.ok) {
     if (stream) {
-      return new Response(result.stream, {
+      const { readable } = wrapSseStream(result.stream, truncateV1(result.used ?? body.model, 120));
+      const ct = String(result.contentType ?? "");
+      return new Response(readable, {
         headers: {
-          "content-type": result.contentType ?? "text/event-stream",
-          "X-Router-Used": result.used,
+          "content-type": ct.includes("event-stream") ? ct : "text/event-stream",
+          "cache-control": "no-store",
+          "X-Router-Used": result.used ?? "",
         },
       });
     }
     return new Response(JSON.stringify(result.data), {
-      headers: { "content-type": "application/json", "X-Router-Used": result.used },
+      headers: { "content-type": "application/json", "X-Router-Used": result.used ?? "" },
     });
   }
 
-  // 502: وضعیت همان قبلی؛ لیست comboهای معتبر هم کنار خطاها (cap ۵۰).
+  // 502: OpenAI error shape + (برای دیباگ) همان errors/available قبلی — شکل قبلی حفظ می‌شود
+  const reasons = (result.errors ?? [])
+    .map((e) => `${e.target}: ${e.reason ?? e.status ?? "?"}`)
+    .join("; ");
   return Response.json(
-    { ok: false, errors: result.errors, available: await comboNameList(env, 50) },
+    {
+      error: {
+        message: truncateV1(`no target succeeded for ${JSON.stringify(body.model)} — ${reasons}`),
+        type: "api_error",
+        code: "combo_unavailable",
+      },
+      ok: false,
+      errors: result.errors ?? [],
+      available: await comboNameList(env, 50),
+    },
     { status: 502 },
   );
 }
@@ -552,12 +642,26 @@ async function comboNameList(env, cap) {
   return cap ? names.slice(0, cap) : names;
 }
 
-async function comboModels(env) {
+// GET /v1/models — comboها با آی‌دی «combo/<name>» و owned_by "router"؛
+// مدل‌های sync‌شده‌ی providerها هم اضافه می‌شوند (اختیاری — خرابی کاتالوگ بی‌اثر).
+async function v1Models(env) {
   const names = await comboNameList(env);
-  return {
-    object: "list",
-    data: names.map((name) => ({ id: name, object: "model" })),
-  };
+  const now = Math.floor(Date.now() / 1000);
+  const data = names.map((name) => ({
+    id: `combo/${name}`,
+    object: "model",
+    created: now,
+    owned_by: "router",
+  }));
+  try {
+    const catalog = await loadCatalog(env);
+    for (const m of catalog) {
+      data.push({ id: `${m.provider}/${m.id}`, object: "model", created: 0, owned_by: m.provider });
+    }
+  } catch {
+    // بدون کاتالوگ هم comboها فهرست می‌شوند
+  }
+  return { object: "list", data };
 }
 
 async function adminModels(request, env) {
@@ -1030,7 +1134,7 @@ async function route(request, env, ctx) {
   if (request.method === "GET" && pathname === "/v1/models") {
     const auth = routerAuth(request, env);
     if (auth) return auth;
-    return Response.json(await comboModels(env));
+    return Response.json(await v1Models(env));
   }
 
   if (request.method === "GET" && (pathname === "/admin" || pathname === "/admin/")) {

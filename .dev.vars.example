@@ -1,3 +1,4 @@
 TG_TOKEN=put-bot-token-here
 TG_SECRET=put-random-secret-here
 ALLOWED_TG_IDS=123456789
+ROUTER_KEY=put-router-key-here

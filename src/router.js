@@ -20,6 +20,40 @@ function truncate(text) {
   return s.length > 200 ? s.slice(0, 200) : s;
 }
 
+// نرمال‌سازی پاسخ upstream برای سازگاری با کلاینت استاندارد:
+// - usage جاافتاده → صفر (شکل object حفظ می‌شود؛ فیلد extra حذف نمی‌شود)
+// - finish_reason جاافتاده → از روی پیام استنباط می‌شود
+// - role جاافتاده → assistant
+// هیچ فیلد extra ای (مثل reasoning_content) حذف نمی‌شود.
+export function normalizeOpenAiChat(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return data;
+  if (Array.isArray(data.choices)) {
+    for (const choice of data.choices) {
+      if (!choice || typeof choice !== "object") continue;
+      if (choice.message && typeof choice.message === "object" && choice.message.role == null) {
+        choice.message.role = "assistant";
+      }
+      if (choice.finish_reason == null) {
+        const m = choice.message;
+        choice.finish_reason =
+          Array.isArray(m?.tool_calls) && m.tool_calls.length > 0 ? "tool_calls" : "stop";
+      }
+    }
+  }
+  if (data.object == null) data.object = "chat.completion";
+  if (data.created == null) data.created = Math.floor(Date.now() / 1000);
+  if (!data.usage || typeof data.usage !== "object") {
+    data.usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  } else {
+    // usage ناقص هم کامل می‌شود — فیلدهای موجود دست‌نخورده
+    const u = data.usage;
+    if (u.prompt_tokens == null) u.prompt_tokens = 0;
+    if (u.completion_tokens == null) u.completion_tokens = 0;
+    if (u.total_tokens == null) u.total_tokens = u.prompt_tokens + u.completion_tokens;
+  }
+  return data;
+}
+
 // طبقه‌بندی شکست upstream — تک‌نقطه‌ی تصمیم برای دامنه و مدت سردی:
 // scope "model" = فقط همین مدل سرد می‌شود؛ scope "provider" = کل provider.
 // برچسب فقط از status عددی ساخته می‌شود؛ هیچ‌وقت چیزی مثل "http undefined" نمی‌شود.
@@ -132,6 +166,7 @@ export async function getComboTargets(env, name) {
       model: m.id,
       score: m.score,
       pinned: Boolean(m.pinned),
+      caps: m.capabilities ?? null,
     })),
   };
 }
@@ -250,6 +285,35 @@ async function tryTarget(env, ctx, model, body, timeoutMs) {
   return { res };
 }
 
+// مدلِ درخواستی از /v1: «combo/<name>» فقط combo؛ نام ساده یا «provider/model» هم قبول است.
+// خروجی: { sel } (targets کامل) یا { direct } (فراخوانی مستقیم) یا { fail }  (خطای قطعی)
+async function resolveRouterTarget(env, wanted) {
+  const isComboRef = wanted.startsWith("combo/");
+  const name = isComboRef ? wanted.slice("combo/".length) : wanted;
+
+  if (!name) {
+    return { fail: [{ target: truncate(wanted), reason: "unknown combo: empty combo name" }] };
+  }
+  if (RULES[name]) {
+    return { name, sel: await getComboTargets(env, name) };
+  }
+  // combo دستی: هم برای نام ساده و هم بعد از پیشوند combo/
+  const cfg = env.STATE ? await getConfig(env) : { providers: [], combos: [] };
+  if ((cfg.combos ?? []).some((c) => c.name === name)) {
+    return { name, sel: await getComboTargets(env, name) };
+  }
+  const unknownErr = [{ target: truncate(name), reason: `unknown combo: ${truncate(name)}` }];
+  if (isComboRef) {
+    // داده شده combo/<x> — بازگشت مستقیم روی provider نیست؛ فقط combo
+    return { fail: unknownErr };
+  }
+  const direct = await resolveDirect(wanted, env);
+  if (direct) {
+    return { direct };
+  }
+  return { fail: [{ target: truncate(wanted), reason: `unknown combo or provider/model: ${truncate(wanted)}` }] };
+}
+
 export async function runCombo(
   env,
   comboNameOrProviderModel,
@@ -257,30 +321,30 @@ export async function runCombo(
   { deadlineMs = DEADLINE_MS, perTargetTimeoutMs = PER_TARGET_TIMEOUT_MS, stream = false } = {},
 ) {
   const wanted = String(comboNameOrProviderModel);
+  const resolved = await resolveRouterTarget(env, wanted);
   let targets;
   let manualCfg = null;
-  if (RULES[wanted]) {
-    const sel = await getComboTargets(env, wanted);
+  let comboName = null;
+  if (resolved.fail) {
+    return { ok: false, errors: resolved.fail };
+  } else if (resolved.direct) {
+    const d = resolved.direct;
+    targets = [{ provider: d.provider, model: d.model, score: 0, pinned: false, ctx: d.ctx }];
+  } else {
+    const sel = resolved.sel;
     if (sel.error) {
-      return { ok: false, errors: [{ target: wanted, reason: truncate(sel.error) }] };
+      return { ok: false, errors: [{ target: truncate(resolved.name), reason: truncate(sel.error) }] };
     }
     targets = sel.targets;
     manualCfg = sel.manual ?? null;
-  } else {
-    const direct = await resolveDirect(wanted, env);
-    if (!direct) {
-      return {
-        ok: false,
-        errors: [{ target: truncate(wanted), reason: `unknown combo or provider/model: ${truncate(wanted)}` }],
-      };
-    }
-    targets = [{ provider: direct.provider, model: direct.model, score: 0, pinned: false, ctx: direct.ctx }];
+    comboName = resolved.name;
   }
 
   const started = Date.now();
   const errors = [];
   const maxRetries = manualCfg?.retries ?? 0;
   const perTargetTimeout = manualCfg?.timeoutMs ?? perTargetTimeoutMs;
+  const needsTools = Array.isArray(body?.tools) && body.tools.length > 0;
   const deadline = manualCfg
     ? Math.min(55000, Math.max(deadlineMs, perTargetTimeout * (maxRetries + 2)))
     : deadlineMs;
@@ -300,6 +364,11 @@ export async function runCombo(
 
     if (t.model.startsWith("PLACEHOLDER")) {
       errors.push({ target: usedModel, reason: "placeholder model id" });
+      continue;
+    }
+    // هدف بدون پشتیبانی ابزار وقتی tools خواسته شده — رد (فقط اگر metadata گویا باشد)
+    if (needsTools && t.caps && t.caps.tools === false) {
+      errors.push({ target: usedModel, reason: "no tool support" });
       continue;
     }
 
@@ -376,6 +445,8 @@ export async function runCombo(
           stream: res.body,
           contentType: res.headers.get("content-type"),
           used: usedModel,
+          combo: comboName,
+          latencyMs,
         };
       }
       errors.push({ target: usedModel, reason: "no stream body" });
@@ -391,11 +462,15 @@ export async function runCombo(
         continue;
       }
 
-      const message = data?.choices?.[0]?.message?.content;
+      const { message } = data?.choices?.[0] ?? {};
+      const hasToolCalls =
+        Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
+      const content = message?.content;
       const empty =
-        !message ||
-        (typeof message === "string" && !message.trim()) ||
-        (Array.isArray(message) && message.length === 0);
+        !hasToolCalls &&
+        (!content ||
+          (typeof content === "string" && !content.trim()) ||
+          (Array.isArray(content) && content.length === 0));
       if (empty) {
         errors.push({ target: usedModel, reason: "empty assistant message" });
         await markFailure(env, usedModel, classifyFailure(null, "", false), "empty assistant message");
@@ -407,7 +482,13 @@ export async function runCombo(
       } catch (err) {
         console.error("recordLatency failed:", err && err.message);
       }
-      return { ok: true, data, used: usedModel };
+      return {
+        ok: true,
+        data: normalizeOpenAiChat(data),
+        used: usedModel,
+        combo: comboName,
+        latencyMs,
+      };
     }
   }
 

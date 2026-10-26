@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { RULES, pickModels, diversify, WEIGHTS } from "../src/combos.js";
 import { mapNvidia, mapXkiro, mapOpenRouter } from "../src/providers.js";
-import { classifyFailure, sortForStrategy } from "../src/router.js";
+import { classifyFailure, sortForStrategy, normalizeOpenAiChat, runCombo } from "../src/router.js";
 import {
   getConfig,
   upsertProvider,
@@ -1059,6 +1059,379 @@ check(
     adminHdr.headers.get("cache-control") === "no-store",
   "هدرهای /admin نباید تغییر کنند",
 );
+
+// ── patch 3g: /v1 API — auth/streایm/tool_calls/fallback/models ─────────────
+
+const ROUTER_KEY_3G = "router-key-3g";
+const bearerHeaders = (key = ROUTER_KEY_3G) => ({
+  "content-type": "application/json",
+  authorization: `Bearer ${key}`,
+});
+
+function v1Env() {
+  return {
+    STATE: fakeKV(),
+    TG_TOKEN: "fake-provider-key-1",
+    TG_SECRET: "fake-tg-secret-3g",
+    ROUTER_KEY: ROUTER_KEY_3G,
+  };
+}
+
+// combo دستی «vc» روی provider مستقل (secret هم TG_TOKEN است — جعلی)
+async function seedV1(env, targets) {
+  await upsertProvider(env, {
+    id: "gwprov",
+    name: "gwprov",
+    baseUrl: "https://gw.example.com/v1",
+    secretName: "TG_TOKEN",
+    enabled: true,
+  });
+  await upsertCombo(env, {
+    name: "vc",
+    kind: "custom",
+    strategy: "priority",
+    timeoutMs: 8000,
+    retries: 0,
+    targets,
+  });
+}
+
+const v1Target = (model) => ({ provider: "gwprov", model, enabled: true });
+
+function mockUpstreamQueue(responses) {
+  const real = global.fetch;
+  const calls = [];
+  global.fetch = async (url, init) => {
+    calls.push({ url: String(url), body: init ? String(init.body) : null });
+    const next = responses.shift();
+    if (next === undefined) throw new Error(`unexpected upstream call #${calls.length}`);
+    return typeof next === "function" ? next(calls[calls.length - 1], calls) : next;
+  };
+  return {
+    calls,
+    restore() {
+      global.fetch = real;
+    },
+  };
+}
+
+function sseResponse(lines) {
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const line of lines) controller.enqueue(enc.encode(line));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+function brokenSseResponse(lines) {
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const line of lines) controller.enqueue(enc.encode(line));
+      // error() صف‌ها را خالی می‌کند — خطا بعد از تحویل chunk اول تریگر می‌شود
+      setTimeout(() => controller.error(new Error("upstream died mid-stream")), 20);
+    },
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+const chatOk = () => ({
+  id: "cmpl-1",
+  object: "chat.completion",
+  model: "m",
+  choices: [{ index: 0, message: { role: "assistant", content: "OK!" }, finish_reason: "stop" }],
+  usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+});
+
+const v1ChatReq = (extra, key = ROUTER_KEY_3G) =>
+  new Request("https://v1.test/v1/chat/completions", {
+    method: "POST",
+    headers: bearerHeaders(key),
+    body: JSON.stringify({
+      model: "combo/vc",
+      messages: [{ role: "user", content: "say OK" }],
+      ...extra,
+    }),
+  });
+
+// 1) نرمال‌سازی پاسخ (pure)
+{
+  const n = normalizeOpenAiChat({
+    id: "x",
+    choices: [{ message: { role: "assistant", content: null, tool_calls: [{ id: "t1", type: "function" }] } }],
+    reasoning_note: "keep-me",
+  });
+  check(n.usage && n.usage.prompt_tokens === 0, "usage جاافتاده باید نرمال شود (صفر)");
+  check(n.choices[0].finish_reason === "tool_calls", "finish_reason جاافتاده برای tool_calls");
+  check(n.reasoning_note === "keep-me", "فیلد extra نباید حذف شود");
+  check(n.object === "chat.completion" && Number.isInteger(n.created), "object/created جاافتاده");
+  const n2 = normalizeOpenAiChat({
+    choices: [{ message: { content: "hi" }, reasoning_content: "step" }],
+    usage: { prompt_tokens: 5 },
+  });
+  check(n2.choices[0].finish_reason === "stop" && n2.choices[0].message.role === "assistant", "نرمال پیام ساده");
+  check(n2.choices[0].reasoning_content === "step", "reasoning_content حفظ شود");
+  check(n2.usage.completion_tokens === 0 && n2.usage.prompt_tokens === 5, "usage partial merge");
+}
+
+// 2) ROUTER_KEY ست نشده → /v1 باید 503 بدهد (بسته، نه باز)
+{
+  const env = v1Env();
+  delete env.ROUTER_KEY;
+  const r1 = await workerDefault.fetch(v1ChatReq({}), env, ctxNull);
+  check(r1.status === 503, `بدون ROUTER_KEY باید 503 (${r1.status})`);
+  const j1 = await r1.json();
+  check(j1.error && j1.error.type === "api_error", `503 باید OpenAI error بدهد (${JSON.stringify(j1)})`);
+  await seedV1(env, [v1Target("m1")]);
+  const r2 = await workerDefault.fetch(
+    new Request("https://v1.test/v1/models", { headers: bearerHeaders() }),
+    env,
+    ctxNull,
+  );
+  check(r2.status === 503, `/v1/models بدون ROUTER_KEY باید 503 (${r2.status})`);
+}
+
+// 3) کلید غلط/نبودن هدر → 401 با error.style OpenAI
+{
+  const env = v1Env();
+  const mk = (e) =>
+    workerDefault.fetch(
+      new Request("https://v1.test/v1/chat/completions", {
+        method: "POST",
+        headers: e,
+        body: JSON.stringify({ model: "combo/vc", messages: [{ role: "user", content: "x" }] }),
+      }),
+      env,
+      ctxNull,
+    );
+  const noHeader = await mk({ "content-type": "application/json" });
+  check(noHeader.status === 401, `بدون هدر باید 401 (${noHeader.status})`);
+  const wrong = await mk({ "content-type": "application/json", authorization: "Bearer wrong" });
+  const jw = await wrong.json();
+  check(wrong.status === 401 && jw.error?.type === "authentication_error", `401 OpenAI style: ${JSON.stringify(jw)}`);
+  check(!JSON.stringify(jw).includes(ROUTER_KEY_3G), "کلید درست در 401 نباید نشت کند");
+}
+
+// 4) چت non-stream — body کامل forward و پاسخ نرمال
+{
+  const env = v1Env();
+  await seedV1(env, [v1Target("m1")]);
+  const mock = mockUpstreamQueue([
+    new Response(
+      JSON.stringify({
+        id: "cmpl-2",
+        choices: [{ index: 0, message: { content: "OK!" } }],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+  ]);
+  let res;
+  try {
+    res = await workerDefault.fetch(
+      v1ChatReq({
+        temperature: 0.5,
+        max_tokens: 123,
+        tools: [{ type: "function", function: { name: "get_weather", parameters: {} } }],
+        tool_choice: "auto",
+      }),
+      env,
+      ctxNull,
+    );
+  } finally {
+    mock.restore();
+  }
+  check(res.status === 200, `non-stream باید 200 (${res.status})`);
+  const j = await res.json();
+  check(j.choices?.[0]?.message?.content === "OK!", `محتوای پاسخ: ${JSON.stringify(j).slice(0, 120)}`);
+  check(typeof j.usage === "object" && j.choices[0].finish_reason === "stop", "پاسخ نرمال usage/finish_reason");
+  check(res.headers.get("X-Router-Used") === "gwprov/m1", `X-Router-Used: ${res.headers.get("X-Router-Used")}`);
+  const sent = JSON.parse(mock.calls[0].body);
+  check(Array.isArray(sent.tools) && sent.tool_choice === "auto", "tools/tool_choice باید forward شود");
+  check(sent.temperature === 0.5 && sent.max_tokens === 123, "temperature/max_tokens باید forward شود");
+  check(Array.isArray(sent.messages) && sent.stream === undefined, "messages forward و بدون stream");
+  check(sent.model === "m1", `model upstream باید m1 باشد (${sent.model})`);
+  check(!sent.model.includes("combo/"), "پیشوند combo/ نباید به upstream برود");
+}
+
+// 5) استریم — chunks متوالی و [DONE]
+{
+  const env = v1Env();
+  await seedV1(env, [v1Target("m1")]);
+  const mock = mockUpstreamQueue([
+    sseResponse([
+      'data: {"id":"s1","choices":[{"delta":{"content":"He"}}]}\n\n',
+      'data: {"id":"s1","choices":[{"delta":{"content":"y"}}]}\n\n',
+      "data: [DONE]\n\n",
+    ]),
+  ]);
+  let res;
+  try {
+    res = await workerDefault.fetch(v1ChatReq({ stream: true }), env, ctxNull);
+  } finally {
+    mock.restore();
+  }
+  check(res.status === 200, `stream باید 200 (${res.status})`);
+  check(String(res.headers.get("content-type")).includes("event-stream"), "content-type stream");
+  const text = await res.text();
+  check(text.includes('"content":"He"') && text.includes('"content":"y"'), "هر دو chunk باید برسند");
+  check(text.trimEnd().endsWith("[DONE]"), "استریم باید با [DONE] تمام شود");
+}
+
+// 6) tool_calls non-stream — content null + tool_calls باید موفق بماند
+{
+  const env = v1Env();
+  await seedV1(env, [v1Target("m1")]);
+  const toolCalls = [
+    { id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Tehran"}' } },
+  ];
+  const mock = mockUpstreamQueue([
+    new Response(
+      JSON.stringify({
+        id: "cmpl-3",
+        choices: [
+          { index: 0, message: { role: "assistant", content: null, tool_calls: toolCalls }, finish_reason: "tool_calls" },
+        ],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+  ]);
+  let res;
+  try {
+    res = await workerDefault.fetch(
+      v1ChatReq({
+        tools: [{ type: "function", function: { name: "get_weather", parameters: { type: "object" } } }],
+      }),
+      env,
+      ctxNull,
+    );
+  } finally {
+    mock.restore();
+  }
+  check(res.status === 200, `tool-only reply نباید رد شود (${res.status})`);
+  const j = await res.json();
+  check(JSON.stringify(j.choices?.[0]?.message?.tool_calls) === JSON.stringify(toolCalls), "tool_calls باید بدون تغییر پاس شوند");
+}
+
+// 7) tool_calls در استریم — delta.tool_calls پاس می‌شود
+{
+  const env = v1Env();
+  await seedV1(env, [v1Target("m1")]);
+  const mock = mockUpstreamQueue([
+    sseResponse([
+      'data: {"id":"s2","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"Tehran\\"}"}}]}}]}\n\n',
+      'data: {"id":"s2","choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      "data: [DONE]\n\n",
+    ]),
+  ]);
+  let res;
+  try {
+    res = await workerDefault.fetch(v1ChatReq({ stream: true, tools: [{ type: "function", function: { name: "get_weather", parameters: {} } }] }), env, ctxNull);
+  } finally {
+    mock.restore();
+  }
+  const text = await res.text();
+  check(res.status === 200 && text.includes('"name":"get_weather"') && /"arguments":"\{\\"city\\"/.test(text), "delta.tool_calls پاس شد");
+  check(text.trimEnd().endsWith("[DONE]"), "استریم tool با [DONE]");
+}
+
+// 8) fallback روی 429 و 5xx — قبل از اولین بایت مجاز است
+for (const [label, status] of [["429", 429], ["5xx", 500]]) {
+  const env = v1Env();
+  await seedV1(env, [v1Target("m1"), v1Target("m2")]);
+  const mock = mockUpstreamQueue([
+    new Response(JSON.stringify({ error: { message: "slow down" } }), { status }),
+    new Response(JSON.stringify(chatOk()), { status: 200, headers: { "content-type": "application/json" } }),
+  ]);
+  let res;
+  try {
+    res = await workerDefault.fetch(v1ChatReq({}), env, ctxNull);
+  } finally {
+    mock.restore();
+  }
+  check(res.status === 200, `fallback ${label} باید 200 بدهد (${res.status})`);
+  check(mock.calls.length === 2, `fallback ${label}: دو بار فراخوانی (${mock.calls.length})`);
+  const sent2 = JSON.parse(mock.calls[1].body);
+  check(sent2.model === "m2", `هدف دوم باید m2 باشد (${sent2.model})`);
+  check(String(res.headers.get("X-Router-Used")).includes("m2"), "X-Router-Used هدف دوم");
+  const j = await res.json();
+  check(j.choices?.[0]?.message?.content === "OK!", `fallback ${label}: محتوا`);
+}
+
+// 9) خطا در میانه‌ی استریم — بدون fallback؛ رویداد SSE خطا و پایان تمیز
+{
+  const env = v1Env();
+  await seedV1(env, [v1Target("m1"), v1Target("m2")]);
+  const mock = mockUpstreamQueue([brokenSseResponse(['data: {"id":"s3","choices":[{"delta":{"content":"first"}}]}\n\n'])]);
+  let res;
+  try {
+    res = await workerDefault.fetch(v1ChatReq({ stream: true }), env, ctxNull);
+  } finally {
+    mock.restore();
+  }
+  check(res.status === 200, `استریم باید 200 شروع شود (${res.status})`);
+  const text = await res.text();
+  check(
+    mock.calls.length === 1,
+    `بعد از اولین بایت نباید fallback باشد (${mock.calls.length} فراخوانی)`,
+  );
+  check(text.includes('"content":"first"'), "chunk اول باید رسیده باشد");
+  check(text.includes('"error"') && text.includes("upstream_stream_failed"), "رویداد خطای SSE");
+}
+
+// 10) مدل ناشناس → 502 با شکل OpenAI + available
+{
+  const env = v1Env();
+  await seedV1(env, [v1Target("m1")]);
+  const res = await workerDefault.fetch(
+    new Request("https://v1.test/v1/chat/completions", {
+      method: "POST",
+      headers: bearerHeaders(),
+      body: JSON.stringify({ model: "combo/ghost", messages: [{ role: "user", content: "x" }] }),
+    }),
+    env,
+    ctxNull,
+  );
+  check(res.status === 502, `مدل ناشناس باید 502 (${res.status})`);
+  const j = await res.json();
+  check(j.error?.message && j.error?.type === "api_error" && j.error?.code === "combo_unavailable", `OpenAI error: ${JSON.stringify(j.error)}`);
+  check(Array.isArray(j.available) && j.available.includes("vc") && j.available.includes("chat"), `available: ${JSON.stringify(j.available)}`);
+}
+
+// 11) /v1/models — comboها با combo/<name> و owned_by "router"
+{
+  const env = v1Env();
+  await seedV1(env, [v1Target("m1")]);
+  const res = await workerDefault.fetch(
+    new Request("https://v1.test/v1/models", { headers: bearerHeaders() }),
+    env,
+    ctxNull,
+  );
+  check(res.status === 200, `/v1/models باید 200 (${res.status})`);
+  const j = await res.json();
+  const ids = (j.data ?? []).map((m) => m.id);
+  check(j.object === "list" && Array.isArray(j.data), "شکل list");
+  check(ids.includes("combo/vc") && ids.includes("combo/chat") && ids.includes("combo/code"), `combo/<name>: ${JSON.stringify(ids)}`);
+  const vc = j.data.find((m) => m.id === "combo/vc");
+  check(vc.owned_by === "router" && vc.object === "model", `owned_by router: ${JSON.stringify(vc)}`);
+  check(!JSON.stringify(j).includes(ROUTER_KEY_3G) && !JSON.stringify(j).includes(env.TG_TOKEN), "هیچ رازی در models نباید بیاید");
+}
+
+// 12) runCombo مستقیم با نام ساده‌ی combo دستی (رفتار سازگار تلگرام)
+{
+  const env = v1Env();
+  await seedV1(env, [v1Target("m1")]);
+  const mock = mockUpstreamQueue([new Response(JSON.stringify(chatOk()), { status: 200, headers: { "content-type": "application/json" } })]);
+  let r;
+  try {
+    r = await runCombo(env, "vc", { messages: [{ role: "user", content: "ok" }] }, {});
+  } finally {
+    mock.restore();
+  }
+  check(r.ok === true && r.used === "gwprov/m1" && r.data?.choices?.[0]?.message?.content === "OK!", `runCombo نام ساده: ${JSON.stringify(r).slice(0, 200)}`);
+}
 
 if (failures.length) {
   console.error("\nFailures found:");
