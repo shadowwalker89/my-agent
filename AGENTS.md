@@ -13,10 +13,14 @@
 | `src/health.js` | Per-target and per-provider health/cooldown in KV |
 | `src/overrides.js` | KV pin/ban/prefer tools |
 | `src/task-route.js` | Pure `classifyTask`, `comboCandidates`, `selectCombo` — no side effects |
+| `src/intent.js` | `classifyIntentSync`, `classifyIntent`, `needsConfirmation` — chat/dev/task router |
+| `src/dev.js` | Dev dispatch, HMAC callback verification, PR approve/reject, path guard |
+| `src/executor.js` | `runTask(env, spec)` task executor interface (default: not configured) |
 | `src/admin-page.js` | Single-file admin HTML/CSS/JS (no build step) |
 | `src/telegram.js` | Telegram send helpers |
 | `src/tgprefs.js` | Per-user combo preferences in KV |
-| `scripts/test-combos.mjs` | Offline test — reads fixture JSON files, asserts combo scoring |
+| `scripts/test-combos.mjs` | Offline test — combo scoring, config, Telegram commands |
+| `scripts/test-dev.mjs` | Offline test — intent, executor, dispatch, HMAC, path guard, approve/reject |
 | `wrangler.jsonc` | Cloudflare Worker config — do not edit |
 
 ## How to verify your changes
@@ -25,21 +29,33 @@ Run both commands before finishing:
 
 ```
 npm run check
-node scripts/test-combos.mjs
+npm run test:offline
 ```
 
 `npm run check` is a syntax check (`node --check`) on every `.js` and `.mjs` file under `src/` and `scripts/`. It exits 1 on any syntax error.
 
-`node scripts/test-combos.mjs` is an offline test that validates combo scoring logic without network, KV, or secrets. It reads fixture files `xk-models.json`, `nv-models.json`, `or-models.json` from the repo root if present (gitignored; skip gracefully if absent), then runs assertions on `classifyTask`, combo selection, and config helpers. Exit code 1 means a regression.
+`npm run test:offline` runs `scripts/test-combos.mjs` then `scripts/test-dev.mjs`. Both are offline (no network, KV, or secrets). `test-combos.mjs` reads fixture files `xk-models.json`, `nv-models.json`, `or-models.json` from the repo root when present (gitignored); when absent it warns and skips catalog-dependent assertions instead of failing. Exit code 1 means a regression.
+
+## Dev pipeline (Telegram → GitHub Actions → PR → Telegram)
+
+1. Telegram text is classified by `src/intent.js` as `chat`, `dev`, or `task`.
+2. Low-confidence `dev`/`task` asks for confirmation with inline buttons (`intent:yes` / `intent:chat`), pending 10 minutes in KV.
+3. `dev` calls `dispatchDev()` → GitHub `workflow_dispatch` of `.github/workflows/opencode-dev.yml` with `prompt`, `chat_id`, `user_id`.
+4. The workflow runs opencode, runs a path guard, then POSTs a signed body to `/dev/callback`.
+5. The Worker verifies HMAC + timestamp + nonce, clears the active run, and sends PR approve/reject buttons.
+6. Approve squash-merges only `opencode/dispatch-*` or `dispatch/*` branches whose files pass the path guard; reject closes the PR and deletes the branch.
+7. `task` calls `runTask()` in `src/executor.js`; with no `EXECUTOR` backend it offers "Just chat" instead of failing.
+
+Secrets (names only): Worker needs `GITHUB_DISPATCH_TOKEN`, `DEV_CALLBACK_SECRET`; GitHub Actions needs `ROUTER_KEY`, `DEV_CALLBACK_SECRET`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, plus the `WORKER_URL` variable. `.github/workflows/deploy.yml` deploys using the committed `wrangler.jsonc`; it skips with a warning when the Cloudflare secrets are absent.
 
 ## Mandatory rules
 
-- Run `npm run check` and `node scripts/test-combos.mjs` before every commit or PR. Both must pass.
+- Run `npm run check` and `npm run test:offline` before every commit or PR. Both must pass.
 - Keep patches small and focused. One logical change per PR.
 - Never touch secrets or deploy config: do not read or edit `.dev.vars`, `.env`, `wrangler.toml`, `wrangler.jsonc`, or `opencode.json`. Never log secret values, API keys, or message contents.
-- Never call `wrangler`, `curl`, or `rm -rf`. Never trigger a deploy.
-- Never edit files under `.github/workflows/`.
-- For any change to runtime behaviour (routing, scoring, health, fallback, telegram commands), add or adjust an offline test in `scripts/test-combos.mjs`.
+- Never call `wrangler`, `curl`, or `rm -rf` from an agent session. Never trigger a deploy manually.
+- Never edit files under `.github/workflows/` from the automated opencode-dev agent. This is enforced by the workflow path guard and by `approveDevPR()`; developer-authored workflow changes need explicit human review.
+- For any change to runtime behaviour (routing, scoring, health, fallback, telegram commands, intent, dev pipeline), add or adjust an offline test in `scripts/test-combos.mjs` or `scripts/test-dev.mjs`.
 - Security: model mappers and router must never echo raw API keys or request headers in responses or logs. Use `redact()` from `src/providers.js` for any snippet that might contain keys.
 - Describe every change in the PR body: what changed, why, which tests cover it.
 

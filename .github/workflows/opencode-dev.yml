@@ -7,6 +7,16 @@ on:
         description: "Prompt for opencode to implement"
         required: true
         type: string
+      chat_id:
+        description: "Telegram chat ID for the result callback (optional)"
+        required: false
+        type: string
+        default: ""
+      user_id:
+        description: "Telegram user ID for the result callback (optional)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -41,13 +51,87 @@ jobs:
           use_github_token: true
           prompt: ${{ inputs.prompt }}
 
-      - name: Report result
-        if: always()
+      - name: Find dispatch PR
+        id: pr
+        if: steps.opencode.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ steps.opencode.outcome }}" = "success" ]; then
-            echo "opencode run succeeded."
-            echo "Check the Actions run for the PR URL — it is printed in the 'Run opencode' step log."
+          pr_json=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 30 \
+            --json number,url,headRefName,createdAt \
+            -q '[.[] | select(.headRefName | startswith("opencode/dispatch-"))] | sort_by(.createdAt) | last')
+          if [ -z "$pr_json" ] || [ "$pr_json" = "null" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No open opencode/dispatch-* PR was found."
           else
-            echo "opencode run failed or was skipped."
-            echo "Review the 'Run opencode' step log above for the error details."
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "number=$(echo "$pr_json" | jq -r .number)" >> "$GITHUB_OUTPUT"
+            echo "url=$(echo "$pr_json" | jq -r .url)" >> "$GITHUB_OUTPUT"
+            echo "branch=$(echo "$pr_json" | jq -r .headRefName)" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Path guard
+        id: guard
+        if: steps.pr.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          bad=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json files \
+            -q '.files[].path' \
+            | grep -E '^(\.github/|opencode\.json$|wrangler\.(jsonc|toml)$|\.dev\.vars|\.env|package-lock\.json$)' || true)
+          if [ -n "$bad" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::error::PR touches protected paths and must be rejected:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Worker
+        if: always() && inputs.chat_id != ''
+        env:
+          DEV_CALLBACK_SECRET: ${{ secrets.DEV_CALLBACK_SECRET }}
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          USER_ID: ${{ inputs.user_id }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          PR_BRANCH: ${{ steps.pr.outputs.branch }}
+          RUN_OK: ${{ steps.opencode.outcome == 'success' && steps.guard.outputs.ok == 'true' }}
+        run: |
+          node -e '
+          const crypto = require("crypto");
+          const secret = process.env.DEV_CALLBACK_SECRET || "";
+          const base = (process.env.WORKER_URL || "").replace(/\/+$/, "");
+          const chatId = process.env.CHAT_ID || "";
+          if (!secret || !base || !chatId) {
+            console.log("callback skipped: DEV_CALLBACK_SECRET, WORKER_URL or chat_id is missing");
+            process.exit(0);
+          }
+          const pr = Number(process.env.PR_NUMBER || 0);
+          const body = JSON.stringify({
+            timestamp: Date.now(),
+            nonce: crypto.randomBytes(16).toString("hex"),
+            ok: process.env.RUN_OK === "true" && pr > 0,
+            pr: pr > 0 ? pr : null,
+            url: process.env.PR_URL || "",
+            branch: process.env.PR_BRANCH || "",
+            chat_id: chatId,
+            user_id: process.env.USER_ID || chatId,
+          });
+          const signature = crypto.createHmac("sha256", secret).update(body).digest("hex");
+          fetch(base + "/dev/callback", {
+            method: "POST",
+            headers: { "content-type": "application/json", "X-Signature": signature },
+            body,
+          })
+            .then((res) => {
+              console.log("callback status:", res.status);
+              if (!res.ok) process.exitCode = 1;
+            })
+            .catch((err) => {
+              console.error("callback failed:", err && err.message);
+              process.exitCode = 1;
+            });
+          '
