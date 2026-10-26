@@ -284,14 +284,17 @@ binding `STATE` بدون id (wrangler موقع deploy خودش می‌سازد؛
 ### Endpoint سازگار با OpenAI
 
 - `POST /v1/chat/completions` با هدر `Authorization: Bearer <ROUTER_KEY>`
-  (مقایسه‌ی constant-time؛ بدون کلید ۴۰۱، اگر `ROUTER_KEY` ست نشده ۵۰۰ با نام راز جاافتاده).
-  `body.model` یا نام combo است (مثلاً `"chat"`) یا `provider/model` مستقیم (مثلاً `"nvidia/<id>"`).
-  `stream: true` = پاس‌اس‌اس‌ئی مستقیم از provider؛ `stream: false` = JSON کامل.
-  هدر پاسخ `X-Router-Used` می‌گوید کدام هدف جواب داده (قید فووتر پیام تلگرام با
-  `SHOW_MODEL=1` هم همین کار را می‌کند).
-- `GET /v1/models` با همان احراز هویت؛ آی‌دی‌ها همان نام comboها هستند.
-- در شکست کامل: ۵۰۲ با لیست `{ target, status|reason }` — هرگز کلید یا بدنه‌ای که ممکن است
-  راز برگرداند، متن‌ها تا ۲۰۰ حرف بریده می‌شوند.
+  (مقایسه‌ی constant-time؛ بدون کلید ۴۰۱، اگر `ROUTER_KEY` ست نشده ۵۰۳ با پیام واضح).
+  `body.model` یا `combo/<name>` است (مثلاً `"combo/chat"`) یا نام combo دستی (`"chat"`)
+  یا `provider/model` مستقیم (مثلاً `"nvidia/<id>"`).
+  `stream: true` = پاس‌اس‌اس‌ئی مستقیم از provider؛ `stream: false` = JSON کامل
+  (شکل OpenAI نرمال: `object`, `created`, `usage`, `finish_reason` همیشه پر می‌شوند).
+  هدر پاسخ `X-Router-Used` می‌گوید کدام هدف جواب داد.
+- `GET /v1/models` با همان احراز هویت؛ comboها با آی‌دی `combo/<name>` و `owned_by: "router"` +
+  مدل‌های sync‌شده‌ی providerها.
+- در شکست کامل: ۵۰۲ با شکل خطای OpenAI + `available` (فهرست comboهای معتبر) —
+  هرگز کلید یا بدنه‌ای که ممکن است راز برگرداند.
+- کلاینت مرجع: `scripts/smoke-v1.mjs` (بدون نیاز به وابستگی).
 
 ### رفتار fallback و سلامت
 

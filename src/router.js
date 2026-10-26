@@ -294,12 +294,9 @@ async function resolveRouterTarget(env, wanted) {
   if (!name) {
     return { fail: [{ target: truncate(wanted), reason: "unknown combo: empty combo name" }] };
   }
-  if (RULES[name]) {
-    return { name, sel: await getComboTargets(env, name) };
-  }
   // combo دستی: هم برای نام ساده و هم بعد از پیشوند combo/
   const cfg = env.STATE ? await getConfig(env) : { providers: [], combos: [] };
-  if ((cfg.combos ?? []).some((c) => c.name === name)) {
+  if (RULES[name] || (cfg.combos ?? []).some((c) => c.name === name)) {
     return { name, sel: await getComboTargets(env, name) };
   }
   const unknownErr = [{ target: truncate(name), reason: `unknown combo: ${truncate(name)}` }];

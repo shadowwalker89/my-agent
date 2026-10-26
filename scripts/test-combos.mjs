@@ -76,11 +76,15 @@ if (nv) catalog.push(...mapNvidia(nv));
 const xk = loadFixture("xk-models.json");
 if (xk) catalog.push(...mapXkiro(xk));
 
-if (!catalog.length) {
-  console.error("هیچ فیکسچری در دسترس نبود؛ تست آفلاین قابل اجرا نیست.");
-  process.exit(1);
+// فیکسچرها gitignored هستند؛ نبودشان فقط بخش‌های وابسته به کاتالوگ را رد می‌کند.
+const hasCatalog = catalog.length > 0;
+if (!hasCatalog) {
+  console.warn(
+    "⚠ هیچ فیکسچری در دسترس نبود — assertهای وابسته به کاتالوگ رد می‌شوند؛ بقیه اجرا می‌شوند.",
+  );
+} else {
+  console.log(`کاتالوگ آزمایشی: ${catalog.length} مدل [${[...new Set(catalog.map((m) => m.provider))].join(", ")}]`);
 }
-console.log(`کاتالوگ آزمایشی: ${catalog.length} مدل [${[...new Set(catalog.map((m) => m.provider))].join(", ")}]`);
 
 const failures = [];
 
@@ -192,16 +196,20 @@ function diversityCheck(name, targets) {
 }
 
 const topTargets = {};
-for (const [name, rule] of Object.entries(RULES)) {
-  const scored = plainScored(rule);
-  const targets = diversify([], scored, rule.maxTargets).map((m) => ({
-    ...m,
-    pinned: false,
-  }));
-  topTargets[name] = targets;
-  show(`combo «${name}» — ${Math.min(8, targets.length)} هدف از ${targets.length}`, targets.slice(0, 8));
-  diversityCheck(name, targets);
-  asserts[name]?.(targets);
+if (hasCatalog) {
+  for (const [name, rule] of Object.entries(RULES)) {
+    const scored = plainScored(rule);
+    const targets = diversify([], scored, rule.maxTargets).map((m) => ({
+      ...m,
+      pinned: false,
+    }));
+    topTargets[name] = targets;
+    show(`combo «${name}» — ${Math.min(8, targets.length)} هدف از ${targets.length}`, targets.slice(0, 8));
+    diversityCheck(name, targets);
+    asserts[name]?.(targets);
+  }
+} else {
+  console.log("\n== combo scoring ==\n  (بدون فیکسچر رد شد)");
 }
 
 // ── patch 3a: config:v1 در KV، اعتبارسنجی، سقف‌ها و راز ────────────────────
@@ -916,14 +924,18 @@ const rAuto = await workerDefault.fetch(
   envAuto,
   ctxNull,
 );
-check(rAuto.status === 200, `auto code باید 200 (${rAuto.status})`);
-const jAuto = await rAuto.json();
-check(
-  jAuto.ok === true && jAuto.name === "code" && jAuto.kind === "code" && Array.isArray(jAuto.targets) &&
-    jAuto.targets.length >= 1 && jAuto.targets.length <= 8 &&
-    jAuto.targets.every((t) => t.provider && t.model && t.enabled === true),
-  `شکل auto code: ${JSON.stringify(jAuto)}`,
-);
+if (hasCatalog) {
+  check(rAuto.status === 200, `auto code باید 200 (${rAuto.status})`);
+  const jAuto = await rAuto.json();
+  check(
+    jAuto.ok === true && jAuto.name === "code" && jAuto.kind === "code" && Array.isArray(jAuto.targets) &&
+      jAuto.targets.length >= 1 && jAuto.targets.length <= 8 &&
+      jAuto.targets.every((t) => t.provider && t.model && t.enabled === true),
+    `شکل auto code: ${JSON.stringify(jAuto)}`,
+  );
+} else {
+  check(rAuto.status === 400, `auto بدون کاتالوگ باید 400 (${rAuto.status})`);
+}
 
 // 6) دستورهای تلگرام — /combo list/set/reject/clear، /route، /showmodel، /help
 function tgCapture() {
