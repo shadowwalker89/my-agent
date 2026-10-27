@@ -197,6 +197,10 @@ function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://c
         body = init.body ? JSON.parse(String(init.body)) : null;
       } catch {}
       calls.github.push({ method, url: u, body });
+      if (u.includes("/actions/workflows/ci.yml/runs") && method === "GET") {
+        if (runsForbidden) return new Response("", { status: 403 });
+        return Response.json({ workflow_runs: ciRuns });
+      }
       if (u.includes("/actions/workflows/")) return new Response(null, { status: 204 });
       if (/\/pulls\/\d+\/files/.test(u)) return Response.json(prFiles);
       if (/\/pulls\/\d+\/merge$/.test(u) && method === "PUT") {
@@ -209,10 +213,6 @@ function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://c
           state: ciState === "missing" ? "pending" : ciState,
           statuses: ciState === "missing" ? [] : [{ context: "ci/offline-checks", state: ciState, target_url: ciTargetUrl }],
         });
-      }
-      if (u.includes("/actions/workflows/ci.yml/runs") && method === "GET") {
-        if (runsForbidden) return new Response("", { status: 403 });
-        return Response.json({ workflow_runs: ciRuns });
       }
       if (prMissing) {
         // handled below by status check
@@ -491,8 +491,9 @@ function newEnv(extra = {}) {
 }
 
 // ── 10) Approve blocked by CI state ─────────────────────────────────────────
+const CI_TARGET_URL = "https://github.com/o/r/actions/runs/1";
 for (const st of ["failure", "pending", "missing", "error"]) {
-  const world = mockWorld({ ciState: st });
+  const world = mockWorld({ ciState: st, ciTargetUrl: CI_TARGET_URL });
   try {
     const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
     await sendTg(env, cbUpdate("dev:approve:7"));
@@ -500,8 +501,10 @@ for (const st of ["failure", "pending", "missing", "error"]) {
     check(!merge, `approve با CI=${st} نباید merge بزند`);
     const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
     check(Boolean(msg), `پیام برای CI=${st}`);
-    if (st === "failure" || st === "error") {
-      check(String(msg?.payload?.text ?? "").includes("http"), `پیام CI failure باید URL داشته باشد: ${JSON.stringify(msg?.payload)}`);
+    if (st === "failure") {
+      check(String(msg?.payload?.text ?? "").includes(CI_TARGET_URL), `پیام CI failure باید URL داشته باشد: ${JSON.stringify(msg?.payload)}`);
+    } else if (st === "error") {
+      check(String(msg?.payload?.text ?? "").includes("500"), `پیام CI error باید کد HTTP داشته باشد: ${JSON.stringify(msg?.payload)}`);
     } else {
       check(String(msg?.payload?.text ?? "").includes("CI"), `پیام CI pending: ${JSON.stringify(msg?.payload)}`);
     }
@@ -688,6 +691,7 @@ for (const [st, expected] of [["success", "success"], ["failure", "failure"], ["
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
+  process.exitCode = 1;
   process.exit(1);
 }
 console.log("\n✓ assertهای pipeline 3i برقرار شد.");

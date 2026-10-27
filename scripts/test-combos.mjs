@@ -1448,6 +1448,7 @@ for (const [label, status] of [["429", 429], ["5xx", 500]]) {
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
+  process.exitCode = 1;
   process.exit(1);
 }
 console.log("\n✓ همه‌ی assertهای آفلاین برقرار شد.");
