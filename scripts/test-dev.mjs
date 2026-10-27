@@ -538,6 +538,8 @@ for (const st of ["failure", "pending", "missing", "error"]) {
   check(safeGithubUrl(null) === "", "null rejected");
 }
 
+check(1 === 2, "intentional failure: 1 !== 2");
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
