@@ -44,8 +44,14 @@ On smoke failure, `npx wrangler rollback --message "smoke test failed" --yes` ru
 - Otherwise: Telegram "🚨 rollback هم ناموفق بود، دستی بررسی کن".
 The job ends failed in both cases.
 
+## Endpoints
+
+- `/health` — returns `{ok: true}` when the Worker is running and healthy; used by deploy smoke tests and rollback verification.
+
 ## Known limits
 
 - Rollback reverts Worker code only, not KV/D1 data.
 - CI dispatch from opencode-dev uses GITHUB_TOKEN; a dispatch failure is logged as a warning and does not fail the job.
 - `simulate_failure` triggers a real rollback to the previous version.
+
+</ARG>
