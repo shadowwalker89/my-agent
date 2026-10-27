@@ -91,7 +91,7 @@ jobs:
           fi
 
       - name: Notify Worker
-        if: always() && inputs.chat_id != ''
+        if: always()
         env:
           DEV_CALLBACK_SECRET: ${{ secrets.DEV_CALLBACK_SECRET }}
           WORKER_URL: ${{ vars.WORKER_URL }}
@@ -103,6 +103,7 @@ jobs:
           PR_FOUND: ${{ steps.pr.outputs.found }}
           GUARD_OK: ${{ steps.guard.outputs.ok }}
           BLOCK_REASON: ${{ steps.guard.outputs.reason }}
+          OPENCODE_OUTCOME: ${{ steps.opencode.outcome }}
           RUN_OK: ${{ steps.opencode.outcome == 'success' && steps.guard.outputs.ok == 'true' }}
         run: |
           node -e '
@@ -116,10 +117,12 @@ jobs:
           }
           const found = process.env.PR_FOUND === "true";
           const guardOk = process.env.GUARD_OK === "true";
+          const opencodeOk = process.env.OPENCODE_OUTCOME === "success";
           const pr = Number(process.env.PR_NUMBER || 0);
           const ok = process.env.RUN_OK === "true" && found && guardOk && pr > 0;
           let reason = "";
-          if (!found) reason = "no PR found";
+          if (!opencodeOk) reason = "opencode failed";
+          else if (!found) reason = "no changes were made";
           else if (!guardOk) reason = process.env.BLOCK_REASON || "blocked: guard failed";
           else if (!ok) reason = "run failed or no PR";
           reason = reason.replace(/\s+/g, " ").slice(0, 200);

@@ -465,6 +465,66 @@ function newEnv(extra = {}) {
   }
 }
 
+// ── 10) callback with ok=false clears lock and replies ─────────────────────
+{
+  const world = mockWorld();
+  try {
+    const secret = "test-callback-secret-nopr";
+    const env = newEnv({ DEV_CALLBACK_SECRET: secret });
+    await env.STATE.put("dev:active:4242", "1");
+    const body = {
+      timestamp: Date.now(),
+      nonce: "nonce-cb-nopr-1",
+      ok: false,
+      reason: "no changes were made",
+      pr: null,
+      chat_id: "4242",
+      user_id: "4242",
+    };
+    const raw = JSON.stringify(body);
+    const sig = await hmacHex(secret, raw);
+    const res = await workerDefault.fetch(
+      new Request("https://test.local/dev/callback", {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Signature": sig },
+        body: raw,
+      }),
+      env,
+      ctxNull,
+    );
+    check(res.status === 200, `ok=false callback باید 200 (${res.status})`);
+    check((await env.STATE.get("dev:active:4242")) === null, "ok=false باید lock را پاک کند");
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(Boolean(msg), "ok=false باید پیام بفرستد");
+    check(
+      String(msg?.payload?.text ?? "").includes("No changes were made"),
+      `پیام ok=false: ${JSON.stringify(msg?.payload)}`,
+    );
+    check(!msg?.payload?.reply_markup, "ok=false نباید دکمه‌ی approve داشته باشد");
+  } finally {
+    world.restore();
+  }
+}
+
+// ── 11) approve/reject errors are answered ─────────────────────────────────
+{
+  const world = mockWorld();
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    env.STATE.delete = async () => {
+      throw new Error("kv down");
+    };
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(
+      String(msg?.payload?.text ?? "").includes("approve failed"),
+      `پیام خطای approve: ${JSON.stringify(msg?.payload)}`,
+    );
+  } finally {
+    world.restore();
+  }
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);

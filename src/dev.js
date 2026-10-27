@@ -60,6 +60,11 @@ export async function setDevActive(env, userId, active) {
   }
 }
 
+export async function releaseDevActive(env, userId) {
+  if (!userId) return;
+  await setDevActive(env, userId, false);
+}
+
 // ── dispatch ────────────────────────────────────────────────────────────────
 export async function dispatchDev(env, prompt, chatId, userId) {
   const text = String(prompt ?? "").trim();

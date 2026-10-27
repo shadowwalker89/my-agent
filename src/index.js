@@ -30,7 +30,7 @@ import {
   approveDevPR,
   rejectDevPR,
   verifyCallbackSignature,
-  setDevActive,
+  releaseDevActive,
 } from "./dev.js";
 import { runTask } from "./executor.js";
 
@@ -670,11 +670,20 @@ async function handleCallbackQuery(env, cb) {
 
   const devMatch = /^dev:(approve|reject):(\d{1,12})$/.exec(data);
   if (devMatch) {
+    const action = devMatch[1];
     const pr = Number(devMatch[2]);
-    const result =
-      devMatch[1] === "approve" ? await approveDevPR(env, pr) : await rejectDevPR(env, pr);
-    if (result.ok) await setDevActive(env, fromId, false);
-    await tgSend(env, chatId, result.text);
+    let result;
+    try {
+      result = action === "approve" ? await approveDevPR(env, pr) : await rejectDevPR(env, pr);
+      if (result.ok) await releaseDevActive(env, fromId);
+    } catch (err) {
+      console.error(JSON.stringify({ dev_action: action, code: err?.code || "error" }));
+      result = {
+        ok: false,
+        text: `❌ خطا در ${action} برای PR #${pr}.\n${action} failed for PR #${pr}.`,
+      };
+    }
+    await tgSend(env, chatId, result.text || `❌ ${action} returned no result for PR #${pr}.`);
     return;
   }
 
@@ -767,32 +776,55 @@ async function devCallback(request, env) {
   const ok = body.ok === true && Number.isInteger(pr) && pr > 0;
   const chatId = body.chat_id ?? body.user_id;
   const userId = body.user_id ?? body.chat_id;
-  if (userId) await setDevActive(env, userId, false);
 
-  if (!chatId) return Response.json({ ok: true, delivered: false });
+  try {
+    if (!chatId) return Response.json({ ok: true, delivered: false });
 
-  const reason =
-    typeof body.reason === "string" ? body.reason.replace(/\s+/g, " ").trim().slice(0, 200) : "";
-  let text = ok
-    ? `🤖 اجرای dev تمام شد — PR #${pr} آماده‌ی بررسی است.\nDev run finished — PR #${pr} is ready for review.`
-    : `❌ اجرای dev متوقف شد — ${reason || "بدون PR"}\nDev run blocked — ${reason || "no PR"}`;
-  const url =
-    typeof body.url === "string" && /^https:\/\/github\.com\//.test(body.url) ? body.url : "";
-  if (url) text += `\n${url.slice(0, 300)}`;
+    const reason = cleanDevReason(body.reason);
+    let text = ok
+      ? `🤖 اجرای dev تمام شد — PR #${pr} آماده‌ی بررسی است.\nDev run finished — PR #${pr} is ready for review.`
+      : devFailureText(reason);
+    const url =
+      typeof body.url === "string" && /^https:\/\/github\.com\//.test(body.url) ? body.url : "";
+    if (url) text += `\n${url.slice(0, 300)}`;
 
-  const payload = { chat_id: chatId, text: text.slice(0, 4000) };
-  if (ok) {
-    payload.reply_markup = {
-      inline_keyboard: [
-        [
-          { text: "✅ Approve / تأیید", callback_data: `dev:approve:${pr}` },
-          { text: "🗑 Reject / رد", callback_data: `dev:reject:${pr}` },
+    const payload = { chat_id: chatId, text: text.slice(0, 4000) };
+    if (ok) {
+      payload.reply_markup = {
+        inline_keyboard: [
+          [
+            { text: "✅ Approve / تأیید", callback_data: `dev:approve:${pr}` },
+            { text: "🗑 Reject / رد", callback_data: `dev:reject:${pr}` },
+          ],
         ],
-      ],
-    };
+      };
+    }
+    await tgApi(env, "sendMessage", payload);
+    return Response.json({ ok: true, delivered: true });
+  } finally {
+    try {
+      await releaseDevActive(env, userId);
+    } catch (err) {
+      console.error(JSON.stringify({ dev_callback: "release_failed", code: err?.code || "error" }));
+    }
   }
-  await tgApi(env, "sendMessage", payload);
-  return Response.json({ ok: true, delivered: true });
+}
+
+function cleanDevReason(raw) {
+  return typeof raw === "string" ? raw.replace(/\s+/g, " ").trim().slice(0, 200) : "";
+}
+
+function devFailureText(reason) {
+  if (reason === "no changes were made") {
+    return "ℹ️ تغییری ایجاد نشد؛ PR جدیدی ساخته نشد.\nNo changes were made — no new PR was created.";
+  }
+  if (reason === "opencode failed") {
+    return "❌ اجرای opencode شکست خورد؛ نتیجه‌ای برای بررسی نیست.\nopencode failed — there is no result to review.";
+  }
+  if (reason.startsWith("blocked:")) {
+    return `⛔ ${reason}\nBlocked — the PR was not approved.`;
+  }
+  return `❌ اجرای dev متوقف شد — ${reason || "بدون PR"}\nDev run blocked — ${reason || "no PR"}`;
 }
 
 function truncateV1(text, limit = 400) {
