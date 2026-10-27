@@ -31,6 +31,9 @@ import {
   rejectDevPR,
   verifyCallbackSignature,
   setDevActive,
+  getPRCiStatus,
+  ciStateEmoji,
+  safeGithubUrl,
 } from "./dev.js";
 import { runTask } from "./executor.js";
 
@@ -678,6 +681,44 @@ async function handleCallbackQuery(env, cb) {
     return;
   }
 
+  const ciMatch = /^dev:ci:(\d{1,12})$/.exec(data);
+  if (ciMatch) {
+    const pr = Number(ciMatch[1]);
+    let ciEmoji = "⏳";
+    let ciState = "pending";
+    let targetUrl = "";
+    try {
+      const ci = await getPRCiStatus(env, pr);
+      ciState = ci.state;
+      ciEmoji = ciStateEmoji(ci.state);
+      targetUrl = ci.target_url ? String(ci.target_url) : "";
+    } catch {
+      ciEmoji = "⏳";
+    }
+    const text =
+      `PR #${pr} — CI: ${ciEmoji} (${ciState})` +
+      (targetUrl ? `\\n${targetUrl}` : "");
+    try {
+      await tgApi(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: cb?.message?.message_id,
+        text: text.slice(0, 4000),
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "✅ Approve / تأیید", callback_data: `dev:approve:${pr}` },
+              { text: "🗑 Reject / رد", callback_data: `dev:reject:${pr}` },
+            ],
+            [{ text: "🔄 بررسی CI", callback_data: `dev:ci:${pr}` }],
+          ],
+        },
+      });
+    } catch {
+      await tgSend(env, chatId, text);
+    }
+    return;
+  }
+
   if (data === "intent:yes") {
     const pending = await takePendingIntent(env, fromId);
     if (!pending || typeof pending.prompt !== "string" || !pending.prompt.trim()) {
@@ -774,11 +815,22 @@ async function devCallback(request, env) {
   const reason =
     typeof body.reason === "string" ? body.reason.replace(/\s+/g, " ").trim().slice(0, 200) : "";
   let text = ok
-    ? `🤖 اجرای dev تمام شد — PR #${pr} آماده‌ی بررسی است.\nDev run finished — PR #${pr} is ready for review.`
-    : `❌ اجرای dev متوقف شد — ${reason || "بدون PR"}\nDev run blocked — ${reason || "no PR"}`;
-  const url =
-    typeof body.url === "string" && /^https:\/\/github\.com\//.test(body.url) ? body.url : "";
-  if (url) text += `\n${url.slice(0, 300)}`;
+    ? `🤖 اجرای dev تمام شد — PR #${pr} آماده‌ی بررسی است.\\nDev run finished — PR #${pr} is ready for review.`
+    : `❌ اجرای dev متوقف شد — ${reason || "بدون PR"}\\nDev run blocked — ${reason || "no PR"}`;
+  const url = safeGithubUrl(body.url);
+  if (url) text += `\\n${url.slice(0, 300)}`;
+
+  if (ok) {
+    // CI state line (usually still pending at first send).
+    let ciEmoji = "⏳";
+    try {
+      const ci = await getPRCiStatus(env, pr);
+      ciEmoji = ciStateEmoji(ci.state);
+    } catch {
+      ciEmoji = "⏳";
+    }
+    text += `\\nCI: ${ciEmoji}`;
+  }
 
   const payload = { chat_id: chatId, text: text.slice(0, 4000) };
   if (ok) {
@@ -788,11 +840,13 @@ async function devCallback(request, env) {
           { text: "✅ Approve / تأیید", callback_data: `dev:approve:${pr}` },
           { text: "🗑 Reject / رد", callback_data: `dev:reject:${pr}` },
         ],
+        [{ text: "🔄 بررسی CI", callback_data: `dev:ci:${pr}` }],
       ],
     };
   }
   await tgApi(env, "sendMessage", payload);
   return Response.json({ ok: true, delivered: true });
+
 }
 
 function truncateV1(text, limit = 400) {
@@ -1362,6 +1416,10 @@ async function route(request, env, ctx) {
 
   if (request.method === "GET" && pathname === "/") {
     return new Response("ok");
+  }
+
+  if (request.method === "GET" && pathname === "/health") {
+    return Response.json({ ok: true });
   }
 
   if (request.method === "POST" && pathname === "/v1/chat/completions") {

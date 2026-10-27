@@ -11,6 +11,11 @@ export const DEV_RATE_LIMIT = 5;
 export const DEV_ACTIVE_TTL_SEC = 30 * 60;
 export const DEV_CALLBACK_WINDOW_MS = 5 * 60 * 1000;
 
+export function safeGithubUrl(url) {
+  if (typeof url !== "string" || !url) return "";
+  return /^https:\/\/github\.com\//.test(url) ? url : "";
+}
+
 export function devRepo(env) {
   const v = typeof env?.GH_REPO === "string" ? env.GH_REPO.trim() : "";
   return v || DEV_REPO_DEFAULT;
@@ -257,6 +262,58 @@ async function fetchOpenPR(env, prNumber) {
   return { ok: true, pr };
 }
 
+export const CI_STATUS_CONTEXT = "ci/offline-checks";
+
+// Fetch the combined commit status for a PR's head SHA and extract the
+// ci/offline-checks entry. Returns { state, target_url, sha, ok, code? }.
+// state is one of: success | failure | error | pending | missing
+export async function getPRCiStatus(env, prNumber) {
+  const found = await fetchOpenPR(env, prNumber);
+  if (!found.ok) {
+    return { ok: false, code: found.code, state: "missing", target_url: null, sha: null };
+  }
+  const sha = found.pr?.head?.sha ? String(found.pr.head.sha) : "";
+  if (!sha) {
+    return { ok: false, code: "no_sha", state: "missing", target_url: null, sha: null };
+  }
+  const repo = devRepo(env);
+  let res;
+  try {
+    res = await githubFetch(env, `/repos/${repo}/commits/${encodeURIComponent(sha)}/status`);
+  } catch (err) {
+    return { ok: false, code: err?.code || "network", state: "missing", target_url: null, sha };
+  }
+  if (!res.ok) {
+    return { ok: false, code: "status_failed", status: res.status, state: "missing", target_url: null, sha };
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    return { ok: false, code: "bad_json", state: "missing", target_url: null, sha };
+  }
+  const statuses = Array.isArray(data?.statuses) ? data.statuses : [];
+  const ci = statuses.find((s) => s && s.context === CI_STATUS_CONTEXT);
+  if (!ci) {
+    return { ok: true, code: "ci_missing", state: "missing", target_url: data?.target_url ?? null, sha };
+  }
+  const state = String(ci.state ?? "pending").toLowerCase();
+  return {
+    ok: true,
+    code: "ci_" + state,
+    state: ["success", "failure", "error", "pending"].includes(state) ? state : "pending",
+    target_url: ci.target_url ?? data?.target_url ?? null,
+    sha,
+  };
+}
+
+export function ciStateEmoji(state) {
+  const s = String(state ?? "").toLowerCase();
+  if (s === "success") return "✅";
+  if (s === "failure" || s === "error") return "❌";
+  return "⏳";
+}
+
 export async function approveDevPR(env, prNumber) {
   if (!env?.GITHUB_DISPATCH_TOKEN) {
     return { ok: false, code: "missing_token", text: "GITHUB_DISPATCH_TOKEN is missing on the Worker." };
@@ -303,6 +360,29 @@ export async function approveDevPR(env, prNumber) {
         text:
           `⛔ فایل ممنوع در PR: ${violations.slice(0, 8).join(", ")}\n` +
           `Blocked: PR touches protected paths.`,
+      };
+    }
+
+    const ci = await getPRCiStatus(env, prNumber);
+    if (ci.state !== "success") {
+      if (ci.state === "failure" || ci.state === "error") {
+        const url = ci.target_url ? `\\n${ci.target_url}` : "";
+        return {
+          ok: false,
+          code: "ci_failed",
+          ci,
+          text:
+            `❌ CI ناموفق بود. merge انجام نشد.\\n` +
+            `CI failed; merge was not performed.${url}`,
+        };
+      }
+      return {
+        ok: false,
+        code: "ci_pending",
+        ci,
+        text:
+          "⏳ CI هنوز در حال اجراست (یا وضعیت آن موجود نیست). کمی بعد دوباره تلاش کن.\\n" +
+          "CI is still running (or status not available yet). Try again shortly.",
       };
     }
 

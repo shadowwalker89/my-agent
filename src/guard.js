@@ -7,7 +7,7 @@
 export const PROTECTED_PATTERNS = Object.freeze([
   /^\.github\//i,
   /^opencode\.json$/i,
-  /^wrangler\.(?:jsonc|toml)$/i,
+  /^wrangler\.(?:json|jsonc|toml)$/i,
   /^\.dev\.vars/i,
   /^\.env/i,
   /^package-lock\.json$/i,

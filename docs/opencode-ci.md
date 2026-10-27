@@ -37,7 +37,8 @@ The workflow accepts optional `chat_id` / `user_id` inputs. When they are presen
 - Plain text is classified by `src/intent.js` (`chat` / `dev` / `task`). Low-confidence dev/task requests ask for confirmation with inline buttons; the pending request lives 10 minutes in KV.
 - `/intent on|off` toggles intent routing per user; when off, every text goes straight to chat.
 - The Worker rate-limits dev dispatch to 5 per user per hour and allows one active run per user (30 minutes).
-- Approve squash-merges only `opencode/dispatch-*` or `dispatch/*` branches after a second path-guard check. Reject closes the PR and deletes the branch.
+- Approve squash-merges only `opencode/dispatch-*` or `dispatch/*` branches after a second path-guard check and a green `ci/offline-checks` status. Reject closes the PR and deletes the branch.
+- PRs created by the workflow dispatch `ci.yml` on the PR head branch (PRs opened with GITHUB_TOKEN do not trigger pull_request workflows). Approve is blocked while CI is pending or failing.
 - `task` uses `runTask()` in `src/executor.js`. No `EXECUTOR` backend is configured today, so the bot offers "Just chat" instead of failing.
 
 Callback security: the workflow signs the JSON body with HMAC-SHA256 (`DEV_CALLBACK_SECRET`) and sends it in `X-Signature`; the Worker also enforces a 5-minute timestamp window and a one-time nonce stored in KV. Callback failures are logged by code only — never the body or signature.
