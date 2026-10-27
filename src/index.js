@@ -33,6 +33,7 @@ import {
   setDevActive,
   getPRCiStatus,
   ciStateEmoji,
+  safeGithubUrl,
 } from "./dev.js";
 import { runTask } from "./executor.js";
 
@@ -670,7 +671,7 @@ async function handleCallbackQuery(env, cb) {
   }
   if (!fromId || !chatId || !isAllowed(env.ALLOWED_TG_IDS, fromId)) return;
 
-  const devMatch = /^dev:(approve|reject):(\\d{1,12})$/.exec(data);
+  const devMatch = /^dev:(approve|reject):(\d{1,12})$/.exec(data);
   if (devMatch) {
     const pr = Number(devMatch[2]);
     const result =
@@ -680,7 +681,7 @@ async function handleCallbackQuery(env, cb) {
     return;
   }
 
-  const ciMatch = /^dev:ci:(\\d{1,12})$/.exec(data);
+  const ciMatch = /^dev:ci:(\d{1,12})$/.exec(data);
   if (ciMatch) {
     const pr = Number(ciMatch[1]);
     let ciEmoji = "⏳";
@@ -816,8 +817,7 @@ async function devCallback(request, env) {
   let text = ok
     ? `🤖 اجرای dev تمام شد — PR #${pr} آماده‌ی بررسی است.\\nDev run finished — PR #${pr} is ready for review.`
     : `❌ اجرای dev متوقف شد — ${reason || "بدون PR"}\\nDev run blocked — ${reason || "no PR"}`;
-  const url =
-    typeof body.url === "string" && /^https:\\/\\/github\\.com\\//.test(body.url) ? body.url : "";
+  const url = safeGithubUrl(body.url);
   if (url) text += `\\n${url.slice(0, 300)}`;
 
   if (ok) {

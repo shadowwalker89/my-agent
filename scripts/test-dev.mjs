@@ -14,6 +14,7 @@ import {
   safeEqualStr,
   hmacHex,
   verifyCallbackSignature,
+  safeGithubUrl,
 } from "../src/dev.js";
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
@@ -179,7 +180,7 @@ function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://c
   global.fetch = async (url, init = {}) => {
     const u = String(url);
     if (u.startsWith("https://api.telegram.org/")) {
-      const m = /\\/bot[^/]+\\/(\\w+)$/.exec(u);
+      const m = /\/bot[^/]+\/(\w+)$/.exec(u);
       let payload = {};
       try {
         payload = JSON.parse(String(init.body ?? "{}"));
@@ -195,17 +196,17 @@ function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://c
       } catch {}
       calls.github.push({ method, url: u, body });
       if (u.includes("/actions/workflows/")) return new Response(null, { status: 204 });
-      if (/\\/pulls\\/\\d+\\/files/.test(u)) return Response.json(prFiles);
-      if (/\\/pulls\\/\\d+\\/merge$/.test(u) && method === "PUT") {
+      if (/\/pulls\/\d+\/files/.test(u)) return Response.json(prFiles);
+      if (/\/pulls\/\d+\/merge$/.test(u) && method === "PUT") {
         return Response.json({ sha: "deadbeef", merged: true });
       }
-      if (/\\/commits\\/[^/]+\\/status$/.test(u) && method === "GET") {
+      if (/\/commits\/[^/]+\/status$/.test(u) && method === "GET") {
         return Response.json({
           state: ciState,
           statuses: ciState === "missing" ? [] : [{ context: "ci/offline-checks", state: ciState, target_url: ciTargetUrl }],
         });
       }
-      if (/\\/pulls\\/\\d+$/.test(u) && method === "GET") {
+      if (/\/pulls\/\d+$/.test(u) && method === "GET") {
         return Response.json({
           state: "open",
           number: 7,
@@ -213,7 +214,7 @@ function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://c
           html_url: "https://github.com/shadowwalker89/my-agent/pull/7",
         });
       }
-      if (/\\/pulls\\/\\d+$/.test(u) && method === "PATCH") return Response.json({ state: "closed" });
+      if (/\/pulls\/\d+$/.test(u) && method === "PATCH") return Response.json({ state: "closed" });
       if (u.includes("/git/refs/heads/") && method === "DELETE") return new Response(null, { status: 204 });
       return new Response("", { status: 200 });
     }
@@ -524,6 +525,17 @@ for (const st of ["failure", "pending", "missing", "error"]) {
   } finally {
     world.restore();
   }
+}
+
+// ── safeGithubUrl ───────────────────────────────────────────────────────────
+{
+  check(safeGithubUrl("https://github.com/shadowwalker89/my-agent/pull/7") === "https://github.com/shadowwalker89/my-agent/pull/7", "valid github url passes");
+  check(safeGithubUrl("http://github.com/x") === "", "http rejected");
+  check(safeGithubUrl("https://evil.com/https://github.com/x") === "", "other host rejected");
+  check(safeGithubUrl("https://github.com.evil.com/x") === "", "lookalike rejected");
+  check(safeGithubUrl("") === "", "empty rejected");
+  check(safeGithubUrl(42) === "", "non-string rejected");
+  check(safeGithubUrl(null) === "", "null rejected");
 }
 
 if (failures.length) {

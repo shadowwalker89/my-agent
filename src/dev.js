@@ -11,6 +11,11 @@ export const DEV_RATE_LIMIT = 5;
 export const DEV_ACTIVE_TTL_SEC = 30 * 60;
 export const DEV_CALLBACK_WINDOW_MS = 5 * 60 * 1000;
 
+export function safeGithubUrl(url) {
+  if (typeof url !== "string" || !url) return "";
+  return /^https:\/\/github\.com\//.test(url) ? url : "";
+}
+
 export function devRepo(env) {
   const v = typeof env?.GH_REPO === "string" ? env.GH_REPO.trim() : "";
   return v || DEV_REPO_DEFAULT;
