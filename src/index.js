@@ -32,8 +32,10 @@ import {
   verifyCallbackSignature,
   setDevActive,
   getPRCiStatus,
+  getCiRuns,
   ciStateEmoji,
   safeGithubUrl,
+  devRepo,
 } from "./dev.js";
 import { runTask } from "./executor.js";
 
@@ -676,7 +678,19 @@ async function handleCallbackQuery(env, cb) {
     const pr = Number(devMatch[2]);
     const result =
       devMatch[1] === "approve" ? await approveDevPR(env, pr) : await rejectDevPR(env, pr);
-    if (result.ok) await setDevActive(env, fromId, false);
+    if (result.ok) {
+      await setDevActive(env, fromId, false);
+      // Remove stale inline buttons from the original PR message (ignore errors).
+      try {
+        await tgApi(env, "editMessageReplyMarkup", {
+          chat_id: chatId,
+          message_id: cb?.message?.message_id,
+          reply_markup: { inline_keyboard: [] },
+        });
+      } catch {
+        // ignore
+      }
+    }
     await tgSend(env, chatId, result.text);
     return;
   }
@@ -686,18 +700,35 @@ async function handleCallbackQuery(env, cb) {
     const pr = Number(ciMatch[1]);
     let ciEmoji = "⏳";
     let ciState = "pending";
+    let ciReason = "pending";
     let targetUrl = "";
+    let extra = "";
     try {
       const ci = await getPRCiStatus(env, pr);
       ciState = ci.state;
+      ciReason = ci.reason;
       ciEmoji = ciStateEmoji(ci.state);
       targetUrl = ci.target_url ? String(ci.target_url) : "";
+      if (ci.reason === "no_status") {
+        const runs = await getCiRuns(env, ci.branch);
+        if (runs && runs.ok && runs.found && runs.run) {
+          extra = `\nCI run: ${runs.run.status ?? "?"}/${runs.run.conclusion ?? "?"} ${runs.run.html_url ?? ""}`.trim();
+        } else if (runs && runs.ok && !runs.found) {
+          extra = "\nno ci.yml run found for this branch";
+        }
+        extra += `\nhttps://github.com/${devRepo(env)}/pull/${pr}/checks`;
+      } else if (ci.reason === "forbidden") {
+        extra = "\nToken lacks 'Commit statuses: Read' permission.";
+      } else if (ci.reason === "error") {
+        extra += ci.status ? `\nHTTP ${ci.status}` : "";
+      }
     } catch {
       ciEmoji = "⏳";
     }
     const text =
-      `PR #${pr} — CI: ${ciEmoji} (${ciState})` +
-      (targetUrl ? `\\n${targetUrl}` : "");
+      `PR #${pr} — CI: ${ciEmoji} (${ciReason})` +
+      (targetUrl ? `\n${targetUrl}` : "") +
+      (extra ? `\n${extra}` : "");
     try {
       await tgApi(env, "editMessageText", {
         chat_id: chatId,
@@ -815,10 +846,10 @@ async function devCallback(request, env) {
   const reason =
     typeof body.reason === "string" ? body.reason.replace(/\s+/g, " ").trim().slice(0, 200) : "";
   let text = ok
-    ? `🤖 اجرای dev تمام شد — PR #${pr} آماده‌ی بررسی است.\\nDev run finished — PR #${pr} is ready for review.`
-    : `❌ اجرای dev متوقف شد — ${reason || "بدون PR"}\\nDev run blocked — ${reason || "no PR"}`;
+    ? `🤖 اجرای dev تمام شد — PR #${pr} آماده‌ی بررسی است.\nDev run finished — PR #${pr} is ready for review.`
+    : `❌ اجرای dev متوقف شد — ${reason || "بدون PR"}\nDev run blocked — ${reason || "no PR"}`;
   const url = safeGithubUrl(body.url);
-  if (url) text += `\\n${url.slice(0, 300)}`;
+  if (url) text += `\n${url.slice(0, 300)}`;
 
   if (ok) {
     // CI state line (usually still pending at first send).
@@ -829,7 +860,7 @@ async function devCallback(request, env) {
     } catch {
       ciEmoji = "⏳";
     }
-    text += `\\nCI: ${ciEmoji}`;
+    text += `\nCI: ${ciEmoji}`;
   }
 
   const payload = { chat_id: chatId, text: text.slice(0, 4000) };

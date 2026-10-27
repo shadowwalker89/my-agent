@@ -15,6 +15,8 @@ import {
   hmacHex,
   verifyCallbackSignature,
   safeGithubUrl,
+  getCiRuns,
+  getPRCiStatus,
 } from "../src/dev.js";
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
@@ -174,7 +176,7 @@ function fakeKV() {
 }
 
 // ── mock world (telegram + github + unexpected) ────────────────────────────
-function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://ci.example/run/1" } = {}) {
+function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://ci.example/run/1", ciRuns = [{ status: "in_progress", conclusion: null, html_url: "https://runs.example/1" }], runsForbidden = false, prState = "open", prMerged = false, prMissing = false } = {}) {
   const calls = { telegram: [], github: [], unexpected: 0 };
   const orig = global.fetch;
   global.fetch = async (url, init = {}) => {
@@ -195,20 +197,32 @@ function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://c
         body = init.body ? JSON.parse(String(init.body)) : null;
       } catch {}
       calls.github.push({ method, url: u, body });
+      if (u.includes("/actions/workflows/ci.yml/runs") && method === "GET") {
+        if (runsForbidden) return new Response("", { status: 403 });
+        return Response.json({ workflow_runs: ciRuns });
+      }
       if (u.includes("/actions/workflows/")) return new Response(null, { status: 204 });
       if (/\/pulls\/\d+\/files/.test(u)) return Response.json(prFiles);
       if (/\/pulls\/\d+\/merge$/.test(u) && method === "PUT") {
         return Response.json({ sha: "deadbeef", merged: true });
       }
       if (/\/commits\/[^/]+\/status$/.test(u) && method === "GET") {
+        if (ciState === "forbidden") return new Response("", { status: 403 });
+        if (ciState === "error") return new Response("", { status: 500 });
         return Response.json({
-          state: ciState,
+          state: ciState === "missing" ? "pending" : ciState,
           statuses: ciState === "missing" ? [] : [{ context: "ci/offline-checks", state: ciState, target_url: ciTargetUrl }],
         });
       }
+      if (prMissing) {
+        // handled below by status check
+      }
       if (/\/pulls\/\d+$/.test(u) && method === "GET") {
+        if (prMissing) return new Response("", { status: 404 });
         return Response.json({
-          state: "open",
+          state: prState,
+          merged: prMerged,
+          merged_at: prMerged ? "2026-01-01T00:00:00Z" : null,
           number: 7,
           head: { ref: "opencode/dispatch-abc-123", sha: "headsha123" },
           html_url: "https://github.com/shadowwalker89/my-agent/pull/7",
@@ -477,8 +491,9 @@ function newEnv(extra = {}) {
 }
 
 // ── 10) Approve blocked by CI state ─────────────────────────────────────────
+const CI_TARGET_URL = "https://github.com/o/r/actions/runs/1";
 for (const st of ["failure", "pending", "missing", "error"]) {
-  const world = mockWorld({ ciState: st });
+  const world = mockWorld({ ciState: st, ciTargetUrl: CI_TARGET_URL });
   try {
     const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
     await sendTg(env, cbUpdate("dev:approve:7"));
@@ -486,8 +501,10 @@ for (const st of ["failure", "pending", "missing", "error"]) {
     check(!merge, `approve با CI=${st} نباید merge بزند`);
     const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
     check(Boolean(msg), `پیام برای CI=${st}`);
-    if (st === "failure" || st === "error") {
-      check(String(msg?.payload?.text ?? "").includes("http"), `پیام CI failure باید URL داشته باشد: ${JSON.stringify(msg?.payload)}`);
+    if (st === "failure") {
+      check(String(msg?.payload?.text ?? "").includes(CI_TARGET_URL), `پیام CI failure باید URL داشته باشد: ${JSON.stringify(msg?.payload)}`);
+    } else if (st === "error") {
+      check(String(msg?.payload?.text ?? "").includes("500"), `پیام CI error باید کد HTTP داشته باشد: ${JSON.stringify(msg?.payload)}`);
     } else {
       check(String(msg?.payload?.text ?? "").includes("CI"), `پیام CI pending: ${JSON.stringify(msg?.payload)}`);
     }
@@ -538,9 +555,143 @@ for (const st of ["failure", "pending", "missing", "error"]) {
   check(safeGithubUrl(null) === "", "null rejected");
 }
 
+// ── no literal backslash-n in outgoing messages ─────────────────────────────
+{
+  const world = mockWorld({ ciState: "pending" });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake", DEV_CALLBACK_SECRET: "test-callback-secret" });
+    await sendTg(env, msgUpdate("add a /health endpoint to the worker"));
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const world2 = mockWorld({ ciState: "failure" });
+    try {
+      const env2 = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+      await sendTg(env2, cbUpdate("dev:approve:7"));
+    } finally {
+      world2.restore();
+    }
+    await sendTg(env, cbUpdate("dev:reject:7"));
+    await sendTg(env, cbUpdate("dev:ci:7"));
+    for (const c of world.calls.telegram) {
+      const t = c.payload?.text;
+      if (typeof t === "string") {
+        check(!/\\n/.test(t), `literal backslash-n in message: ${JSON.stringify(t)}`);
+      }
+    }
+  } finally {
+    world.restore();
+  }
+}
+
+// ── dev callback message has no literal backslash-n ─────────────────────────
+{
+  const world = mockWorld();
+  try {
+    const secret = "test-callback-secret";
+    const env = newEnv({ DEV_CALLBACK_SECRET: secret });
+    const body = { timestamp: Date.now(), nonce: "nonce-msg-0001", ok: true, pr: 7, url: "https://github.com/shadowwalker89/my-agent/pull/7", chat_id: "4242", user_id: "4242" };
+    const raw = JSON.stringify(body);
+    const sig = await hmacHex(secret, raw);
+    await workerDefault.fetch(new Request("https://test.local/dev/callback", { method: "POST", headers: { "content-type": "application/json", "X-Signature": sig }, body: raw }), env, ctxNull);
+    const sent = world.calls.telegram.find((c) => c.method === "sendMessage");
+    check(!/\\n/.test(String(sent?.payload?.text ?? "")), `callback message literal backslash-n: ${JSON.stringify(sent?.payload?.text)}`);
+  } finally {
+    world.restore();
+  }
+}
+
+// ── getPRCiStatus reasons ───────────────────────────────────────────────────
+for (const [st, expected] of [["success", "success"], ["failure", "failure"], ["pending", "pending"], ["missing", "no_status"], ["forbidden", "forbidden"], ["error", "error"]]) {
+  const world = mockWorld({ ciState: st });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    const ci = await getPRCiStatus(env, 7);
+    check(ci.reason === expected, `getPRCiStatus(${st}) reason=${ci.reason} (expected ${expected})`);
+    if (st === "forbidden") check(ci.status === 403, `forbidden status ${ci.status}`);
+    if (st === "error") check(ci.status === 500, `error status ${ci.status}`);
+  } finally {
+    world.restore();
+  }
+}
+
+// ── getCiRuns optional lookup ───────────────────────────────────────────────
+{
+  const world = mockWorld({ ciState: "missing", ciRuns: [{ status: "completed", conclusion: "success", html_url: "https://runs.example/2" }] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    const runs = await getCiRuns(env, "opencode/dispatch-abc-123");
+    check(runs.ok === true && runs.found === true && runs.run?.conclusion === "success", `getCiRuns found: ${JSON.stringify(runs)}`);
+  } finally {
+    world.restore();
+  }
+}
+{
+  const world = mockWorld({ ciState: "missing", ciRuns: [] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    const runs = await getCiRuns(env, "opencode/dispatch-abc-123");
+    check(runs.ok === true && runs.found === false, `getCiRuns empty: ${JSON.stringify(runs)}`);
+  } finally {
+    world.restore();
+  }
+}
+{
+  const world = mockWorld({ ciState: "missing", runsForbidden: true });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    const runs = await getCiRuns(env, "opencode/dispatch-abc-123");
+    check(runs.ok === false, `getCiRuns forbidden skipped: ${JSON.stringify(runs)}`);
+  } finally {
+    world.restore();
+  }
+}
+
+// ── approve deletes head branch ──────────────────────────────────────────────
+{
+  const world = mockWorld({ ciState: "success" });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const del = world.calls.github.find((c) => c.method === "DELETE" && c.url.includes("/git/refs/heads/"));
+    check(Boolean(del), "approve باید شاخه‌ی head را حذف کند");
+    check(String(del?.url ?? "").includes("opencode%2Fdispatch-abc-123") || String(del?.url ?? "").includes("opencode/dispatch-abc-123"), `delete url: ${JSON.stringify(del)}`);
+  } finally {
+    world.restore();
+  }
+}
+
+// ── closed/merged/not-found PR handling ──────────────────────────────────────
+{
+  const world = mockWorld({ prMissing: true });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("was not found"), `not found approve: ${JSON.stringify(msg?.payload)}`);
+  } finally { world.restore(); }
+}
+{
+  const world = mockWorld({ prState: "closed", prMerged: true });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("already merged"), `merged approve: ${JSON.stringify(msg?.payload)}`);
+  } finally { world.restore(); }
+}
+{
+  const world = mockWorld({ prState: "closed", prMerged: false });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:reject:7"));
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("already closed"), `closed reject: ${JSON.stringify(msg?.payload)}`);
+  } finally { world.restore(); }
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
+  process.exitCode = 1;
   process.exit(1);
 }
 console.log("\n✓ assertهای pipeline 3i برقرار شد.");

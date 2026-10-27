@@ -253,57 +253,108 @@ async function githubFetch(env, path, init = {}) {
   });
 }
 
-async function fetchOpenPR(env, prNumber) {
+async function fetchPR(env, prNumber) {
   const repo = devRepo(env);
   const res = await githubFetch(env, `/repos/${repo}/pulls/${Number(prNumber)}`);
-  if (!res.ok) return { ok: false, code: "pr_not_found", status: res.status };
+  if (!res.ok) {
+    return { ok: false, code: res.status === 404 ? "pr_not_found" : "pr_fetch_failed", status: res.status, pr: null };
+  }
   const pr = await res.json();
-  if (pr?.state !== "open") return { ok: false, code: "pr_not_open", status: 200 };
-  return { ok: true, pr };
+  return { ok: true, code: "ok", status: res.status, pr };
+}
+
+async function fetchOpenPR(env, prNumber) {
+  const found = await fetchPR(env, prNumber);
+  if (!found.ok) return found;
+  if (found.pr?.state !== "open") {
+    return { ok: false, code: "pr_not_open", status: found.status, pr: found.pr };
+  }
+  return { ok: true, status: found.status, pr: found.pr };
 }
 
 export const CI_STATUS_CONTEXT = "ci/offline-checks";
 
 // Fetch the combined commit status for a PR's head SHA and extract the
-// ci/offline-checks entry. Returns { state, target_url, sha, ok, code? }.
-// state is one of: success | failure | error | pending | missing
+// ci/offline-checks entry. Returns a structured result:
+//   reason: "success" | "failure" | "pending" | "no_status" | "forbidden" | "error"
 export async function getPRCiStatus(env, prNumber) {
   const found = await fetchOpenPR(env, prNumber);
   if (!found.ok) {
-    return { ok: false, code: found.code, state: "missing", target_url: null, sha: null };
+    return { ok: false, code: found.code, reason: "error", state: "missing", target_url: null, sha: null, status: found.status ?? null };
   }
   const sha = found.pr?.head?.sha ? String(found.pr.head.sha) : "";
+  const branch = found.pr?.head?.ref ? String(found.pr.head.ref) : "";
   if (!sha) {
-    return { ok: false, code: "no_sha", state: "missing", target_url: null, sha: null };
+    return { ok: false, code: "no_sha", reason: "error", state: "missing", target_url: null, sha: null, branch, status: null };
   }
   const repo = devRepo(env);
   let res;
   try {
     res = await githubFetch(env, `/repos/${repo}/commits/${encodeURIComponent(sha)}/status`);
   } catch (err) {
-    return { ok: false, code: err?.code || "network", state: "missing", target_url: null, sha };
+    return { ok: false, code: err?.code || "network", reason: "error", state: "missing", target_url: null, sha, branch, status: null };
+  }
+  if (res.status === 401 || res.status === 403) {
+    return { ok: false, code: "forbidden", reason: "forbidden", state: "missing", target_url: null, sha, branch, status: res.status };
   }
   if (!res.ok) {
-    return { ok: false, code: "status_failed", status: res.status, state: "missing", target_url: null, sha };
+    return { ok: false, code: "status_failed", reason: "error", state: "missing", target_url: null, sha, branch, status: res.status };
   }
   let data;
   try {
     data = await res.json();
   } catch {
-    return { ok: false, code: "bad_json", state: "missing", target_url: null, sha };
+    return { ok: false, code: "bad_json", reason: "error", state: "missing", target_url: null, sha, branch, status: res.status };
   }
   const statuses = Array.isArray(data?.statuses) ? data.statuses : [];
   const ci = statuses.find((s) => s && s.context === CI_STATUS_CONTEXT);
   if (!ci) {
-    return { ok: true, code: "ci_missing", state: "missing", target_url: data?.target_url ?? null, sha };
+    return { ok: true, code: "ci_missing", reason: "no_status", state: "missing", target_url: data?.target_url ?? null, sha, branch, status: res.status };
   }
   const state = String(ci.state ?? "pending").toLowerCase();
+  const normalized = ["success", "failure", "error", "pending"].includes(state) ? state : "pending";
+  const reason =
+    normalized === "success" ? "success" : normalized === "failure" || normalized === "error" ? "failure" : "pending";
   return {
     ok: true,
-    code: "ci_" + state,
-    state: ["success", "failure", "error", "pending"].includes(state) ? state : "pending",
+    code: "ci_" + normalized,
+    reason,
+    state: normalized,
     target_url: ci.target_url ?? data?.target_url ?? null,
     sha,
+    branch,
+    status: res.status,
+  };
+}
+
+// Display-only helper for no_status: look up recent ci.yml runs for a branch.
+export async function getCiRuns(env, branch) {
+  if (!branch) return { ok: false, found: false, run: null };
+  const repo = devRepo(env);
+  let res;
+  try {
+    res = await githubFetch(env, `/repos/${repo}/actions/workflows/ci.yml/runs?branch=${encodeURIComponent(branch)}&per_page=3`);
+  } catch {
+    return { ok: false, found: false, run: null };
+  }
+  if (!res.ok) return { ok: false, found: false, run: null };
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    return { ok: false, found: false, run: null };
+  }
+  const runs = Array.isArray(data?.workflow_runs) ? data.workflow_runs : [];
+  if (!runs.length) return { ok: true, found: false, run: null };
+  const r = runs[0];
+  return {
+    ok: true,
+    found: true,
+    run: {
+      status: r?.status ?? null,
+      conclusion: r?.conclusion ?? null,
+      html_url: r?.html_url ?? null,
+    },
   };
 }
 
@@ -322,13 +373,32 @@ export async function approveDevPR(env, prNumber) {
   try {
     const found = await fetchOpenPR(env, prNumber);
     if (!found.ok) {
+      const pr = found.pr;
+      if (found.code === "pr_not_found" || found.status === 404) {
+        return {
+          ok: false,
+          code: "pr_not_found",
+          text: `❌ PR #${prNumber} پیدا نشد.\nPR #${prNumber} was not found.`,
+        };
+      }
+      if (pr && pr.merged === true) {
+        return {
+          ok: false,
+          code: "pr_merged",
+          text: `✅ این PR قبلاً merge شده است.\nThis PR is already merged.`,
+        };
+      }
+      if (pr && pr.state === "closed") {
+        return {
+          ok: false,
+          code: "pr_closed",
+          text: `🗑 این PR قبلاً بسته/رد شده است.\nThis PR is already closed.`,
+        };
+      }
       return {
         ok: false,
         code: found.code,
-        text:
-          found.code === "pr_not_open"
-            ? `❌ PR #${prNumber} باز نیست.\nPR #${prNumber} is not open.`
-            : `❌ PR #${prNumber} پیدا نشد.\nPR #${prNumber} was not found.`,
+        text: `❌ PR #${prNumber} باز نیست.\nPR #${prNumber} is not open.`,
       };
     }
     const pr = found.pr;
@@ -364,16 +434,56 @@ export async function approveDevPR(env, prNumber) {
     }
 
     const ci = await getPRCiStatus(env, prNumber);
-    if (ci.state !== "success") {
-      if (ci.state === "failure" || ci.state === "error") {
-        const url = ci.target_url ? `\\n${ci.target_url}` : "";
+    if (ci.reason !== "success") {
+      if (ci.reason === "failure") {
+        const url = ci.target_url ? `\n${ci.target_url}` : "";
         return {
           ok: false,
           code: "ci_failed",
           ci,
           text:
-            `❌ CI ناموفق بود. merge انجام نشد.\\n` +
+            `❌ CI ناموفق بود. merge انجام نشد.\n` +
             `CI failed; merge was not performed.${url}`,
+        };
+      }
+      if (ci.reason === "forbidden") {
+        return {
+          ok: false,
+          code: "ci_forbidden",
+          ci,
+          text:
+            "⛔ توکن GitHub اجازه‌ی خواندن وضعیت CI را ندارد (Commit statuses: Read).\n" +
+            "The GitHub token lacks the 'Commit statuses: Read' permission.",
+        };
+      }
+      if (ci.reason === "no_status") {
+        const repo = devRepo(env);
+        const link = `https://github.com/${repo}/pull/${prNumber}/checks`;
+        let runsText = "";
+        const runs = await getCiRuns(env, ci.branch);
+        if (runs && runs.ok && runs.found && runs.run) {
+          runsText = `\nCI run: ${runs.run.status ?? "?"}/${runs.run.conclusion ?? "?"} ${runs.run.html_url ?? ""}`.trim();
+        } else if (runs && runs.ok && !runs.found) {
+          runsText = "\nno ci.yml run found for this branch";
+        }
+        return {
+          ok: false,
+          code: "ci_no_status",
+          ci,
+          text:
+            `⏳ CI هنوز گزارشی نداده است.\n` +
+            `CI has not reported yet.\n${link}${runsText}`,
+        };
+      }
+      if (ci.reason === "error") {
+        const code = ci.status ? ` (HTTP ${ci.status})` : "";
+        return {
+          ok: false,
+          code: "ci_error",
+          ci,
+          text:
+            `❌ خواندن وضعیت CI شکست خورد${code}.\n` +
+            `Reading CI status failed${code}.`,
         };
       }
       return {
@@ -381,8 +491,8 @@ export async function approveDevPR(env, prNumber) {
         code: "ci_pending",
         ci,
         text:
-          "⏳ CI هنوز در حال اجراست (یا وضعیت آن موجود نیست). کمی بعد دوباره تلاش کن.\\n" +
-          "CI is still running (or status not available yet). Try again shortly.",
+          "⏳ CI هنوز در حال اجراست. کمی بعد دوباره تلاش کن.\n" +
+          "CI is still running. Try again shortly.",
       };
     }
 
@@ -400,6 +510,15 @@ export async function approveDevPR(env, prNumber) {
       };
     }
     const merged = await mergeRes.json().catch(() => ({}));
+    const branch = String(pr?.head?.ref ?? "");
+    if (branch && isDispatchBranch(branch)) {
+      const refPath = branch.split("/").map((p) => encodeURIComponent(p)).join("/");
+      try {
+        await githubFetch(env, `/repos/${repo}/git/refs/heads/${refPath}`, { method: "DELETE" });
+      } catch {
+        // ignore: branch deletion must not fail the approve flow
+      }
+    }
     return {
       ok: true,
       sha: merged?.sha ?? null,
@@ -427,13 +546,32 @@ export async function rejectDevPR(env, prNumber) {
   try {
     const found = await fetchOpenPR(env, prNumber);
     if (!found.ok) {
+      const pr = found.pr;
+      if (found.code === "pr_not_found" || found.status === 404) {
+        return {
+          ok: false,
+          code: "pr_not_found",
+          text: `PR #${prNumber} پیدا نشد.\nPR #${prNumber} was not found.`,
+        };
+      }
+      if (pr && pr.merged === true) {
+        return {
+          ok: false,
+          code: "pr_merged",
+          text: `این PR قبلاً merge شده است.\nThis PR is already merged.`,
+        };
+      }
+      if (pr && pr.state === "closed") {
+        return {
+          ok: false,
+          code: "pr_closed",
+          text: `این PR قبلاً بسته/رد شده است.\nThis PR is already closed.`,
+        };
+      }
       return {
         ok: false,
         code: found.code,
-        text:
-          found.code === "pr_not_open"
-            ? `PR #${prNumber} باز نیست — چیزی برای reject نیست.\nPR #${prNumber} is not open.`
-            : `PR #${prNumber} پیدا نشد.\nPR #${prNumber} was not found.`,
+        text: `PR #${prNumber} باز نیست — چیزی برای reject نیست.\nPR #${prNumber} is not open.`,
       };
     }
     const pr = found.pr;
