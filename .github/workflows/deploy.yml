@@ -2,6 +2,12 @@ name: deploy
 
 on:
   workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: "Force smoke test to fail after deploy (tests rollback)"
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -13,14 +19,33 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-main
+  group: deploy
   cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      WORKER_URL: https://my-agent.nova-02aa82bffef8.workers.dev
     steps:
+      - name: Preflight secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ROUTER_KEY: ${{ secrets.ROUTER_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          missing=""
+          for v in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID ROUTER_KEY TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID; do
+            if [ -z "${!v}" ]; then missing="$missing $v"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required secrets:$missing"
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -28,9 +53,11 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
 
       - name: Verify (syntax + offline tests)
         run: |
+          npm ci
           npm run check
           npm run test:offline
 
@@ -55,3 +82,90 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: "4"
           command: deploy
+
+      - name: Smoke test
+        id: smoke
+        if: steps.guard.outputs.ok == 'true'
+        env:
+          ROUTER_KEY: ${{ secrets.ROUTER_KEY }}
+          SIMULATE_FAILURE: ${{ inputs.simulate_failure }}
+        run: |
+          if [ "${SIMULATE_FAILURE}" = "true" ]; then
+            echo "simulate_failure=true: forcing smoke failure after successful deploy"
+            exit 1
+          fi
+          health_ok=0
+          for i in $(seq 1 12); do
+            if curl -fsS "${WORKER_URL}/health" | grep -q '"ok":true'; then
+              health_ok=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$health_ok" != "1" ]; then
+            echo "smoke: /health did not return ok:true"
+            exit 1
+          fi
+          models_ok=0
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /tmp/models.json -w "%{http_code}" \
+              -H "Authorization: Bearer ${ROUTER_KEY}" "${WORKER_URL}/v1/models")
+            if [ "$code" = "200" ]; then
+              if node -e "const d=require('fs').readFileSync('/tmp/models.json','utf8');const j=JSON.parse(d);process.exit(Array.isArray(j.data)&&j.data.length>0?0:1)"; then
+                models_ok=1
+                break
+              fi
+            fi
+            sleep 5
+          done
+          if [ "$models_ok" != "1" ]; then
+            echo "smoke: /v1/models did not return 200 with at least one model"
+            cat /tmp/models.json 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Rollback and notify on smoke failure
+        if: failure() && steps.smoke.outcome == 'failure'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          rollback_ok=0
+          if npx wrangler rollback --message "smoke test failed" --yes; then
+            rollback_ok=1
+          fi
+          health_ok=0
+          for i in $(seq 1 12); do
+            if curl -fsS "${WORKER_URL}/health" | grep -q '"ok":true'; then
+              health_ok=1
+              break
+            fi
+            sleep 5
+          done
+          short_sha="${GITHUB_SHA::7}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [ "$rollback_ok" = "1" ] && [ "$health_ok" = "1" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=⚠️ دیپلوی ناموفق بود و rollback انجام شد (${short_sha}) ${run_url}" >/dev/null
+          else
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=🚨 rollback هم ناموفق بود، دستی بررسی کن ${run_url}" >/dev/null
+          fi
+          exit 1
+
+      - name: Notify success
+        if: success()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          commit_msg="$(git log -1 --pretty=%s | head -n 1)"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=✅ دیپلوی موفق (${short_sha}) ${commit_msg}" >/dev/null

@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check": "node -e \"const fs=require('fs'),p=require('path'),cp=require('child_process');const walk=d=>fs.readdirSync(d,{withFileTypes:true}).flatMap(e=>e.isDirectory()?walk(p.join(d,e.name)):(/\\.(js|mjs)$/.test(e.name)?[p.join(d,e.name)]:[]));const files=[...walk('src'),...walk('scripts')];let ok=true;for(const f of files){const r=cp.spawnSync(process.execPath,['--check',f],{stdio:'inherit'});if(r.status!==0)ok=false}if(!ok)process.exit(1)\"",
+    "check": "node -e \"const fs=require('fs'),p=require('path'),cp=require('child_process');const walk=d=>fs.readdirSync(d,{withFileTypes:true}).flatMap(e=>e.isDirectory()?walk(p.join(d,e.name)):(/\\\\.(js|mjs)$/.test(e.name)?[p.join(d,e.name)]:[]));const files=[...walk('src'),...walk('scripts')];let ok=true;for(const f of files){const r=cp.spawnSync(process.execPath,['--check',f],{stdio:'inherit'});if(r.status!==0)ok=false}if(!ok)process.exit(1)\" && node scripts/check-opencode-config.mjs",
     "test:offline": "node scripts/test-combos.mjs && node scripts/test-dev.mjs"
   },
   "devDependencies": {

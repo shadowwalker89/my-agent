@@ -67,4 +67,5 @@ Secrets (names only): Worker needs `GITHUB_DISPATCH_TOKEN`, `DEV_CALLBACK_SECRET
 - KV binding is `STATE`. Never use `env.STATE` outside of `src/` files — scripts are Node.js and mock KV.
 - Scoring constants live entirely in `WEIGHTS` at the top of `src/combos.js`. Tune there only.
 - Admin page is one self-contained file (`src/admin-page.js`). No external CDN dependencies.
+- Protected paths for the agent (deny in opencode.json): `.github/**`, `opencode.json`, `wrangler.toml`, `wrangler.jsonc`, `wrangler.json`, `.dev.vars*`, `.env*` (except `*.env.example` / `.dev.vars.example`), `package-lock.json`. Humans change these manually.
 - Log format for each routed request: one line, no message text, no keys: `{combo, used, routed: "auto"|"manual"}`.

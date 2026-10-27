@@ -93,6 +93,9 @@ function fakeKV() {
   check(isForbiddenPath("src/index.js") === false, "src مجاز");
   check(isForbiddenPath("wrangler.jsonc") === true, "wrangler ممنوع");
   check(isForbiddenPath("wrangler.toml") === true, "wrangler.toml ممنوع");
+  check(isForbiddenPath("wrangler.json") === true, "wrangler.json ممنوع");
+  check(isForbiddenPath(".github/workflows/ci.yml") === true, "ci.yml ممنوع");
+  check(isForbiddenPath(".github/workflows/deploy.yml") === true, "deploy.yml ممنوع");
   check(isForbiddenPath(".dev.vars") === true, ".dev.vars ممنوع");
   check(isForbiddenPath(".env.local") === true, ".env.local ممنوع");
   check(isForbiddenPath("package-lock.json") === true, "package-lock ممنوع");
@@ -105,6 +108,7 @@ function fakeKV() {
   // shared module used by the workflow and the Worker
   check(isProtectedPath(".github/workflows/x.yml") === true, "guard: workflow ممنوع");
   check(isProtectedPath("wrangler.jsonc") === true, "guard: wrangler ممنوع");
+  check(isProtectedPath("wrangler.json") === true, "guard: wrangler.json ممنوع");
   check(isProtectedPath("src/index.js") === false, "guard: src مجاز");
   check(isProtectedPath("opencode.json") === true, "guard: opencode.json ممنوع");
   check(isProtectedPath("README.md") === false, "guard: README مجاز");
@@ -169,13 +173,13 @@ function fakeKV() {
 }
 
 // ── mock world (telegram + github + unexpected) ────────────────────────────
-function mockWorld({ prFiles = [] } = {}) {
+function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://ci.example/run/1" } = {}) {
   const calls = { telegram: [], github: [], unexpected: 0 };
   const orig = global.fetch;
   global.fetch = async (url, init = {}) => {
     const u = String(url);
     if (u.startsWith("https://api.telegram.org/")) {
-      const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+      const m = /\\/bot[^/]+\\/(\\w+)$/.exec(u);
       let payload = {};
       try {
         payload = JSON.parse(String(init.body ?? "{}"));
@@ -191,19 +195,25 @@ function mockWorld({ prFiles = [] } = {}) {
       } catch {}
       calls.github.push({ method, url: u, body });
       if (u.includes("/actions/workflows/")) return new Response(null, { status: 204 });
-      if (/\/pulls\/\d+\/files/.test(u)) return Response.json(prFiles);
-      if (/\/pulls\/\d+\/merge$/.test(u) && method === "PUT") {
+      if (/\\/pulls\\/\\d+\\/files/.test(u)) return Response.json(prFiles);
+      if (/\\/pulls\\/\\d+\\/merge$/.test(u) && method === "PUT") {
         return Response.json({ sha: "deadbeef", merged: true });
       }
-      if (/\/pulls\/\d+$/.test(u) && method === "GET") {
+      if (/\\/commits\\/[^/]+\\/status$/.test(u) && method === "GET") {
+        return Response.json({
+          state: ciState,
+          statuses: ciState === "missing" ? [] : [{ context: "ci/offline-checks", state: ciState, target_url: ciTargetUrl }],
+        });
+      }
+      if (/\\/pulls\\/\\d+$/.test(u) && method === "GET") {
         return Response.json({
           state: "open",
           number: 7,
-          head: { ref: "opencode/dispatch-abc-123" },
+          head: { ref: "opencode/dispatch-abc-123", sha: "headsha123" },
           html_url: "https://github.com/shadowwalker89/my-agent/pull/7",
         });
       }
-      if (/\/pulls\/\d+$/.test(u) && method === "PATCH") return Response.json({ state: "closed" });
+      if (/\\/pulls\\/\\d+$/.test(u) && method === "PATCH") return Response.json({ state: "closed" });
       if (u.includes("/git/refs/heads/") && method === "DELETE") return new Response(null, { status: 204 });
       return new Response("", { status: 200 });
     }
@@ -460,6 +470,57 @@ function newEnv(extra = {}) {
     const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
     check(String(msg?.payload?.text ?? "").includes("Blocked"), `پیام blocked approve: ${JSON.stringify(msg?.payload)}`);
     check(world.calls.unexpected === 0, `fetch غیرمنتظره در approve ممنوع: ${world.calls.unexpected}`);
+  } finally {
+    world.restore();
+  }
+}
+
+// ── 10) Approve blocked by CI state ─────────────────────────────────────────
+for (const st of ["failure", "pending", "missing", "error"]) {
+  const world = mockWorld({ ciState: st });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, `approve با CI=${st} نباید merge بزند`);
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(Boolean(msg), `پیام برای CI=${st}`);
+    if (st === "failure" || st === "error") {
+      check(String(msg?.payload?.text ?? "").includes("http"), `پیام CI failure باید URL داشته باشد: ${JSON.stringify(msg?.payload)}`);
+    } else {
+      check(String(msg?.payload?.text ?? "").includes("CI"), `پیام CI pending: ${JSON.stringify(msg?.payload)}`);
+    }
+    check(world.calls.unexpected === 0, `fetch غیرمنتظره در CI=${st}: ${world.calls.unexpected}`);
+  } finally {
+    world.restore();
+  }
+}
+
+// ── 11) CI refresh button re-renders message ────────────────────────────────
+{
+  const world = mockWorld({ ciState: "success" });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:ci:7"));
+    const edit = world.calls.telegram.find((c) => c.method === "editMessageText");
+    check(Boolean(edit), "dev:ci باید editMessageText بزند");
+    check(String(edit?.payload?.text ?? "").includes("✅"), `refresh text: ${JSON.stringify(edit?.payload)}`);
+    check(world.calls.unexpected === 0, `fetch غیرمنتظره در refresh: ${world.calls.unexpected}`);
+  } finally {
+    world.restore();
+  }
+}
+
+// ── 12) /health route ───────────────────────────────────────────────────────
+{
+  const world = mockWorld();
+  try {
+    const env = newEnv();
+    const res = await workerDefault.fetch(new Request("https://test.local/health"), env, ctxNull);
+    check(res.status === 200, `/health باید 200 (${res.status})`);
+    const json = await res.json();
+    check(json?.ok === true, `/health باید {ok:true}: ${JSON.stringify(json)}`);
+    check(world.calls.unexpected === 0 && world.calls.github.length === 0, "health نباید fetch/outbound داشته باشد");
   } finally {
     world.restore();
   }

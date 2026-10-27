@@ -26,8 +26,40 @@
     }
   },
   "permission": {
-    "read": "allow",
-    "edit": "allow",
+    "read": {
+      "*": "allow",
+      ".dev.vars": "deny",
+      "**/.dev.vars": "deny",
+      ".env": "deny",
+      "**/.env": "deny",
+      ".env.*": "deny",
+      "**/.env.*": "deny",
+      "*.env.example": "allow",
+      "**/*.env.example": "allow",
+      ".dev.vars.example": "allow",
+      "**/.dev.vars.example": "allow"
+    },
+    "edit": {
+      "*": "allow",
+      ".github/**": "deny",
+      "**/.github/**": "deny",
+      "opencode.json": "deny",
+      "**/opencode.json": "deny",
+      "wrangler.toml": "deny",
+      "**/wrangler.toml": "deny",
+      "wrangler.jsonc": "deny",
+      "**/wrangler.jsonc": "deny",
+      "wrangler.json": "deny",
+      "**/wrangler.json": "deny",
+      ".dev.vars": "deny",
+      "**/.dev.vars": "deny",
+      ".env": "deny",
+      "**/.env": "deny",
+      ".env.*": "deny",
+      "**/.env.*": "deny",
+      "package-lock.json": "deny",
+      "**/package-lock.json": "deny"
+    },
     "glob": "allow",
     "grep": "allow",
     "bash": {
