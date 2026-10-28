@@ -462,14 +462,21 @@ export async function getPRCiState(env, prNumber) {
   // failure for this SHA, even if a later workflow_dispatch run succeeded.
   // workflow_dispatch runs before the Trigger CI fix checked out main, so
   // they must not mask a pull_request failure. A pull_request run that is
-  // still action_required is reported as pending, not as success.
+  // still action_required blocks only while no successful test of this SHA
+  // exists: bot-authored PRs' pull_request runs need manual approval and
+  // never run on their own, while Trigger CI (workflow_dispatch, since 3m
+  // checking out the PR head SHA) already tested this SHA and posted the
+  // commit status. A pull_request run that is actually queued/in_progress
+  // still blocks, because it may yet fail.
   const prRuns = runs.filter((r) => String(r?.event ?? "") === "pull_request");
   const prFailed = prRuns.some((r) => String(r?.status ?? "").toLowerCase() === "completed" && ["failure", "cancelled", "timed_out", "startup_failure"].includes(String(r?.conclusion ?? "").toLowerCase()));
   const prActionRequired = prRuns.some((r) => String(r?.conclusion ?? "").toLowerCase() === "action_required");
   const prPending = prRuns.some((r) => ["queued", "in_progress", "waiting", "requested", "pending"].includes(String(r?.status ?? "").toLowerCase()));
+  const wdSuccess = runs.some((r) => String(r?.event ?? "") === "workflow_dispatch" && String(r?.status ?? "").toLowerCase() === "completed" && String(r?.conclusion ?? "").toLowerCase() === "success");
+  const prActionRequiredBlocked = prActionRequired && !(wdSuccess && statusState === "success");
   let state;
   if (prFailed) state = "failure";
-  else if (prActionRequired || prPending) state = "pending";
+  else if (prPending || prActionRequiredBlocked) state = "pending";
   else if (forbidden || runsForbidden) state = "forbidden";
   else if (statusState === "failure" || statusState === "error") state = "failure";
   else if (statusError) state = "error";
