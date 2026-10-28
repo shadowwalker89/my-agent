@@ -8,7 +8,7 @@ Telegram /dev
   -> PR (opencode/dispatch-*)
   -> path guard + dispatch ci.yml on PR head
   -> Telegram callback with Approve / Reject / 🔄 CI buttons
-  -> Approve checks ci/offline-checks status:
+  -> Approve checks the ci.yml run on the exact PR head SHA (fail closed):
        success  -> squash merge -> push to main -> deploy.yml
        failure  -> blocked, shows CI run URL
        pending  -> blocked, retry shortly

@@ -17,6 +17,7 @@ import {
   safeGithubUrl,
   getCiRuns,
   getPRCiStatus,
+  getPRCiState,
 } from "../src/dev.js";
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
@@ -176,7 +177,7 @@ function fakeKV() {
 }
 
 // ── mock world (telegram + github + unexpected) ────────────────────────────
-function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://ci.example/run/1", ciRuns = [{ status: "in_progress", conclusion: null, html_url: "https://runs.example/1" }], runsForbidden = false, prState = "open", prMerged = false, prMissing = false } = {}) {
+function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://ci.example/run/1", ciRuns = [{ status: "completed", conclusion: "success", html_url: "https://runs.example/1", head_sha: "headsha123", run_number: 12, event: "push", created_at: "2026-01-01T00:00:00Z" }], runsForbidden = false, ciRunsStatus = 200, prState = "open", prMerged = false, prMissing = false } = {}) {
   const calls = { telegram: [], github: [], unexpected: 0 };
   const orig = global.fetch;
   global.fetch = async (url, init = {}) => {
@@ -197,10 +198,11 @@ function mockWorld({ prFiles = [], ciState = "success", ciTargetUrl = "https://c
         body = init.body ? JSON.parse(String(init.body)) : null;
       } catch {}
       calls.github.push({ method, url: u, body });
-      if (u.includes("/actions/workflows/ci.yml/runs") && method === "GET") {
-        if (runsForbidden) return new Response("", { status: 403 });
-        return Response.json({ workflow_runs: ciRuns });
-      }
+       if (u.includes("/actions/workflows/ci.yml/runs") && method === "GET") {
+         if (runsForbidden) return new Response("", { status: 403 });
+         if (ciRunsStatus && ciRunsStatus !== 200) return new Response("", { status: ciRunsStatus });
+         return Response.json({ workflow_runs: ciRuns });
+       }
       if (u.includes("/actions/workflows/")) return new Response(null, { status: 204 });
       if (/\/pulls\/\d+\/files/.test(u)) return Response.json(prFiles);
       if (/\/pulls\/\d+\/merge$/.test(u) && method === "PUT") {
@@ -490,28 +492,146 @@ function newEnv(extra = {}) {
   }
 }
 
-// ── 10) Approve blocked by CI state ─────────────────────────────────────────
+// ── 10) Approve blocked/allowed by CI state (new gate) ──────────────────────
 const CI_TARGET_URL = "https://github.com/o/r/actions/runs/1";
+const RUN_SUCCESS = { status: "completed", conclusion: "success", html_url: "https://runs.example/success", head_sha: "headsha123", run_number: 12, event: "push", created_at: "2026-01-01T00:00:00Z" };
+const RUN_FAILURE = { status: "completed", conclusion: "failure", html_url: "https://runs.example/fail", head_sha: "headsha123", run_number: 13, event: "push", created_at: "2026-01-01T00:00:00Z" };
+const RUN_CANCELLED = { status: "completed", conclusion: "cancelled", html_url: "https://runs.example/cancelled", head_sha: "headsha123", run_number: 14, event: "push", created_at: "2026-01-01T00:00:00Z" };
+const RUN_IN_PROGRESS = { status: "in_progress", conclusion: null, html_url: "https://runs.example/ip", head_sha: "headsha123", run_number: 15, event: "push", created_at: "2026-01-01T00:00:00Z" };
+const RUN_QUEUED = { status: "queued", conclusion: null, html_url: "https://runs.example/q", head_sha: "headsha123", run_number: 16, event: "push", created_at: "2026-01-01T00:00:00Z" };
+const RUN_OTHER_SHA = { status: "completed", conclusion: "success", html_url: "https://runs.example/other", head_sha: "other123456", run_number: 17, event: "push", created_at: "2026-01-01T00:00:00Z" };
+
+// status failure overrides a successful run
+{
+  const world = mockWorld({ ciState: "failure", ciTargetUrl: CI_TARGET_URL, ciRuns: [RUN_SUCCESS] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "status failure باید merge را بلاک کند");
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(Boolean(msg), "پیام برای status failure");
+    check(world.calls.unexpected === 0, `fetch غیرمنتظره status failure: ${world.calls.unexpected}`);
+  } finally { world.restore(); }
+}
+// status missing but run success -> allowed
+{
+  const world = mockWorld({ ciState: "missing", ciRuns: [RUN_SUCCESS] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await env.STATE.put("dev:active:4242", "1");
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(Boolean(merge), "status missing + run success باید merge بزند");
+    check((await env.STATE.get("dev:active:4242")) === null, "active بعد از approve پاک شود");
+    const del = world.calls.github.find((c) => c.method === "DELETE" && c.url.includes("/git/refs/heads/"));
+    check(Boolean(del), "approve باید شاخه‌ی head را حذف کند");
+  } finally { world.restore(); }
+}
+// run with different head_sha -> no_ci
+{
+  const world = mockWorld({ ciState: "success", ciRuns: [RUN_OTHER_SHA] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "sha متفاوت نباید merge بزند");
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("/pull/7/checks"), `no_ci باید checks link داشته باشد: ${JSON.stringify(msg?.payload)}`);
+  } finally { world.restore(); }
+}
+// failure run -> blocked with run URL
+{
+  const world = mockWorld({ ciState: "success", ciRuns: [RUN_FAILURE] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "run failure نباید merge بزند");
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("https://runs.example/fail"), `پیام باید run URL داشته باشد: ${JSON.stringify(msg?.payload)}`);
+  } finally { world.restore(); }
+}
+// cancelled run -> blocked with run URL
+{
+  const world = mockWorld({ ciState: "success", ciRuns: [RUN_CANCELLED] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "run cancelled نباید merge بزند");
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("https://runs.example/cancelled"), `پیام باید run URL داشته باشد: ${JSON.stringify(msg?.payload)}`);
+  } finally { world.restore(); }
+}
+// in_progress -> pending
+{
+  const world = mockWorld({ ciState: "success", ciRuns: [RUN_IN_PROGRESS] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "run in_progress نباید merge بزند");
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("CI"), `پیام pending: ${JSON.stringify(msg?.payload)}`);
+  } finally { world.restore(); }
+}
+// queued -> pending
+{
+  const world = mockWorld({ ciState: "success", ciRuns: [RUN_QUEUED] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "run queued نباید merge بزند");
+  } finally { world.restore(); }
+}
+// no run -> no_ci
+{
+  const world = mockWorld({ ciState: "success", ciRuns: [] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "بدون run نباید merge بزند");
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("/pull/7/checks"), `no_ci باید checks link داشته باشد: ${JSON.stringify(msg?.payload)}`);
+  } finally { world.restore(); }
+}
+// HTTP 403 on runs call -> forbidden
+{
+  const world = mockWorld({ ciState: "success", runsForbidden: true });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "runs 403 نباید merge بزند");
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("Commit statuses"), `forbidden پیام: ${JSON.stringify(msg?.payload)}`);
+  } finally { world.restore(); }
+}
+// HTTP 500 on runs call -> HTTP 500
+{
+  const world = mockWorld({ ciState: "success", ciRunsStatus: 500 });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "runs 500 نباید merge بزند");
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("500"), `پیام CI error باید کد HTTP داشته باشد: ${JSON.stringify(msg?.payload)}`);
+  } finally { world.restore(); }
+}
+// original ciState loop (commit status only) kept for getPRCiStatus parity
 for (const st of ["failure", "pending", "missing", "error"]) {
-  const world = mockWorld({ ciState: st, ciTargetUrl: CI_TARGET_URL });
+  const world = mockWorld({ ciState: st, ciRuns: [] });
   try {
     const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
     await sendTg(env, cbUpdate("dev:approve:7"));
     const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
     check(!merge, `approve با CI=${st} نباید merge بزند`);
-    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
-    check(Boolean(msg), `پیام برای CI=${st}`);
-    if (st === "failure") {
-      check(String(msg?.payload?.text ?? "").includes(CI_TARGET_URL), `پیام CI failure باید URL داشته باشد: ${JSON.stringify(msg?.payload)}`);
-    } else if (st === "error") {
-      check(String(msg?.payload?.text ?? "").includes("500"), `پیام CI error باید کد HTTP داشته باشد: ${JSON.stringify(msg?.payload)}`);
-    } else {
-      check(String(msg?.payload?.text ?? "").includes("CI"), `پیام CI pending: ${JSON.stringify(msg?.payload)}`);
-    }
     check(world.calls.unexpected === 0, `fetch غیرمنتظره در CI=${st}: ${world.calls.unexpected}`);
-  } finally {
-    world.restore();
-  }
+  } finally { world.restore(); }
 }
 
 // ── 11) CI refresh button re-renders message ────────────────────────────────
@@ -557,12 +677,12 @@ for (const st of ["failure", "pending", "missing", "error"]) {
 
 // ── no literal backslash-n in outgoing messages ─────────────────────────────
 {
-  const world = mockWorld({ ciState: "pending" });
+  const world = mockWorld({ ciState: "success", ciRuns: [{ status: "in_progress", conclusion: null, html_url: "https://runs.example/ip", head_sha: "headsha123", run_number: 15, event: "push", created_at: "2026-01-01T00:00:00Z" }] });
   try {
     const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake", DEV_CALLBACK_SECRET: "test-callback-secret" });
     await sendTg(env, msgUpdate("add a /health endpoint to the worker"));
     await sendTg(env, cbUpdate("dev:approve:7"));
-    const world2 = mockWorld({ ciState: "failure" });
+    const world2 = mockWorld({ ciState: "success", ciRuns: [{ status: "completed", conclusion: "failure", html_url: "https://runs.example/fail", head_sha: "headsha123", run_number: 13, event: "push", created_at: "2026-01-01T00:00:00Z" }] });
     try {
       const env2 = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
       await sendTg(env2, cbUpdate("dev:approve:7"));
@@ -615,10 +735,10 @@ for (const [st, expected] of [["success", "success"], ["failure", "failure"], ["
 
 // ── getCiRuns optional lookup ───────────────────────────────────────────────
 {
-  const world = mockWorld({ ciState: "missing", ciRuns: [{ status: "completed", conclusion: "success", html_url: "https://runs.example/2" }] });
+  const world = mockWorld({ ciState: "missing", ciRuns: [{ status: "completed", conclusion: "success", html_url: "https://runs.example/2", head_sha: "headsha123", run_number: 12, created_at: "2026-01-01T00:00:00Z" }] });
   try {
     const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
-    const runs = await getCiRuns(env, "opencode/dispatch-abc-123");
+    const runs = await getCiRuns(env, "headsha123");
     check(runs.ok === true && runs.found === true && runs.run?.conclusion === "success", `getCiRuns found: ${JSON.stringify(runs)}`);
   } finally {
     world.restore();
@@ -628,7 +748,7 @@ for (const [st, expected] of [["success", "success"], ["failure", "failure"], ["
   const world = mockWorld({ ciState: "missing", ciRuns: [] });
   try {
     const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
-    const runs = await getCiRuns(env, "opencode/dispatch-abc-123");
+    const runs = await getCiRuns(env, "headsha123");
     check(runs.ok === true && runs.found === false, `getCiRuns empty: ${JSON.stringify(runs)}`);
   } finally {
     world.restore();
@@ -638,7 +758,7 @@ for (const [st, expected] of [["success", "success"], ["failure", "failure"], ["
   const world = mockWorld({ ciState: "missing", runsForbidden: true });
   try {
     const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
-    const runs = await getCiRuns(env, "opencode/dispatch-abc-123");
+    const runs = await getCiRuns(env, "headsha123");
     check(runs.ok === false, `getCiRuns forbidden skipped: ${JSON.stringify(runs)}`);
   } finally {
     world.restore();
