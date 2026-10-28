@@ -823,6 +823,8 @@ for (const [st, expected] of [["success", "success"], ["failure", "failure"], ["
   } finally { world.restore(); }
 }
 
+check(1 === 2, "assert.equal(1, 2)");
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
@@ -830,3 +832,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log("\n✓ assertهای pipeline 3i برقرار شد.");
+
+</ARG>
