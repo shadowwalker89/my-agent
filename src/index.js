@@ -32,10 +32,13 @@ import {
   verifyCallbackSignature,
   setDevActive,
   getPRCiStatus,
+  getPRCiState,
   getCiRuns,
   ciStateEmoji,
   safeGithubUrl,
   devRepo,
+  findLatestDispatchPR,
+  getDiag,
 } from "./dev.js";
 import { runTask } from "./executor.js";
 
@@ -470,6 +473,19 @@ async function tgCommand(env, chatId, text, userId) {
     await tgSend(env, chatId, r.text);
     return;
   }
+  if (cmd === "/diag") {
+    const prArg = (args[0] ?? "").trim();
+    let prNumber = null;
+    if (/^\d{1,12}$/.test(prArg)) prNumber = Number(prArg);
+    else prNumber = await findLatestDispatchPR(env);
+    if (!prNumber) {
+      await tgSend(env, chatId, "PR dispatch پیدا نشد.\nNo dispatch PR found.");
+      return;
+    }
+    const diagText = await getDiag(env, prNumber);
+    await tgSend(env, chatId, diagText.slice(0, 4000));
+    return;
+  }
   if (cmd === "/models") {
     return tgModels(env, chatId, args[0] ?? "chat");
   }
@@ -704,31 +720,32 @@ async function handleCallbackQuery(env, cb) {
     let targetUrl = "";
     let extra = "";
     try {
-      const ci = await getPRCiStatus(env, pr);
+      const ci = await getPRCiState(env, pr);
       ciState = ci.state;
       ciReason = ci.reason;
-      ciEmoji = ciStateEmoji(ci.state);
-      targetUrl = ci.target_url ? String(ci.target_url) : "";
-      if (ci.reason === "no_status") {
-        const runs = await getCiRuns(env, ci.branch);
-        if (runs && runs.ok && runs.found && runs.run) {
-          extra = `\nCI run: ${runs.run.status ?? "?"}/${runs.run.conclusion ?? "?"} ${runs.run.html_url ?? ""}`.trim();
-        } else if (runs && runs.ok && !runs.found) {
-          extra = "\nno ci.yml run found for this branch";
-        }
+      ciEmoji = ciStateEmoji(ci.state === "success" ? "success" : ci.state === "failure" ? "failure" : "pending");
+      const shaShort = ci.short_sha || String(ci.sha ?? "").slice(0, 7);
+      const run = ci.run;
+      targetUrl = run?.html_url ? String(run.html_url) : (ci.target_url ? String(ci.target_url) : "");
+       if (run) {
+          extra = `\nrun #${run.run_number ?? "?"} on ${shaShort}`;
+          if (targetUrl) extra += `\n${targetUrl}`;
+       } else {
+         extra = "";
+       }
+      if (ci.state === "forbidden") {
+        extra += "\nToken lacks 'Commit statuses: Read' permission.";
+      } else if (ci.state === "error") {
+        extra += ci.http_status ? `\nHTTP ${ci.http_status}` : "";
+      } else if (ci.state === "no_ci") {
         extra += `\nhttps://github.com/${devRepo(env)}/pull/${pr}/checks`;
-      } else if (ci.reason === "forbidden") {
-        extra = "\nToken lacks 'Commit statuses: Read' permission.";
-      } else if (ci.reason === "error") {
-        extra += ci.status ? `\nHTTP ${ci.status}` : "";
       }
     } catch {
       ciEmoji = "⏳";
     }
-    const text =
-      `PR #${pr} — CI: ${ciEmoji} (${ciReason})` +
-      (targetUrl ? `\n${targetUrl}` : "") +
-      (extra ? `\n${extra}` : "");
+     const text =
+       `PR #${pr} — CI: ${ciEmoji} (${ciReason})` +
+       (extra ? `${extra}` : "");
     try {
       await tgApi(env, "editMessageText", {
         chat_id: chatId,
@@ -854,13 +871,20 @@ async function devCallback(request, env) {
   if (ok) {
     // CI state line (usually still pending at first send).
     let ciEmoji = "⏳";
+    let ciLine = "CI: ⏳";
     try {
-      const ci = await getPRCiStatus(env, pr);
-      ciEmoji = ciStateEmoji(ci.state);
+      const ci = await getPRCiState(env, pr);
+      ciEmoji = ciStateEmoji(ci.state === "success" ? "success" : ci.state === "failure" ? "failure" : "pending");
+      const shaShort = ci.short_sha || String(ci.sha ?? "").slice(0, 7);
+      if (ci.run) {
+        ciLine = `CI: ${ciEmoji} run #${ci.run.run_number ?? "?"} on ${shaShort}`;
+      } else {
+        ciLine = `CI: ${ciEmoji} (${ci.state})`;
+      }
     } catch {
       ciEmoji = "⏳";
     }
-    text += `\nCI: ${ciEmoji}`;
+    text += `\n${ciLine}`;
   }
 
   const payload = { chat_id: chatId, text: text.slice(0, 4000) };

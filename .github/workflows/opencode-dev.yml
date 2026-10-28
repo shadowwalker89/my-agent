@@ -40,6 +40,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Mark run start
+        id: start
+        run: echo "ts=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+
       - name: Run opencode
         id: opencode
         uses: anomalyco/opencode/github@148842ef7cb1bc34192b3fff57d0f9721ab9c801 # v1.19.4
@@ -56,6 +60,7 @@ jobs:
         if: steps.opencode.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          START_TS: ${{ steps.start.outputs.ts }}
         run: |
           pr_json=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 30 \
             --json number,url,headRefName,createdAt \
@@ -63,12 +68,19 @@ jobs:
           if [ -z "$pr_json" ] || [ "$pr_json" = "null" ]; then
             echo "found=false" >> "$GITHUB_OUTPUT"
             echo "No open opencode/dispatch-* PR was found."
-          else
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "number=$(echo "$pr_json" | jq -r .number)" >> "$GITHUB_OUTPUT"
-            echo "url=$(echo "$pr_json" | jq -r .url)" >> "$GITHUB_OUTPUT"
-            echo "branch=$(echo "$pr_json" | jq -r .headRefName)" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          created=$(echo "$pr_json" | jq -r '.createdAt // empty')
+          created_ts=$(date -d "$created" +%s 2>/dev/null || echo 0)
+          if [ "$created_ts" -lt "$START_TS" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "Latest dispatch PR was created before this run started; treating as no new PR."
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "number=$(echo "$pr_json" | jq -r .number)" >> "$GITHUB_OUTPUT"
+          echo "url=$(echo "$pr_json" | jq -r .url)" >> "$GITHUB_OUTPUT"
+          echo "branch=$(echo "$pr_json" | jq -r .headRefName)" >> "$GITHUB_OUTPUT"
 
       - name: Path guard
         id: guard

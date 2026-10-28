@@ -327,42 +327,250 @@ export async function getPRCiStatus(env, prNumber) {
   };
 }
 
-// Display-only helper for no_status: look up recent ci.yml runs for a branch.
-export async function getCiRuns(env, branch) {
-  if (!branch) return { ok: false, found: false, run: null };
+// Display-only helper: look up recent ci.yml runs for a head SHA.
+export async function getCiRuns(env, headShaOrBranch, maybeHeadSha, maybeLimit) {
+  let sha = headShaOrBranch;
+  let limit = 10;
+  if (typeof maybeHeadSha === "number") {
+    limit = maybeHeadSha;
+  } else if (typeof maybeHeadSha === "string" && maybeHeadSha) {
+    sha = maybeHeadSha;
+    if (typeof maybeLimit === "number") limit = maybeLimit;
+  }
+  if (!sha) return { ok: false, found: false, run: null, runs: [] };
   const repo = devRepo(env);
   let res;
   try {
-    res = await githubFetch(env, `/repos/${repo}/actions/workflows/ci.yml/runs?branch=${encodeURIComponent(branch)}&per_page=3`);
+    res = await githubFetch(env, `/repos/${repo}/actions/workflows/ci.yml/runs?head_sha=${encodeURIComponent(sha)}&per_page=${Number(limit) || 10}`);
   } catch {
-    return { ok: false, found: false, run: null };
+    return { ok: false, found: false, run: null, runs: [] };
   }
-  if (!res.ok) return { ok: false, found: false, run: null };
+  if (!res.ok) return { ok: false, found: false, run: null, runs: [], status: res.status };
   let data;
   try {
     data = await res.json();
   } catch {
-    return { ok: false, found: false, run: null };
+    return { ok: false, found: false, run: null, runs: [], status: res.status };
   }
-  const runs = Array.isArray(data?.workflow_runs) ? data.workflow_runs : [];
-  if (!runs.length) return { ok: true, found: false, run: null };
-  const r = runs[0];
-  return {
-    ok: true,
-    found: true,
-    run: {
-      status: r?.status ?? null,
-      conclusion: r?.conclusion ?? null,
-      html_url: r?.html_url ?? null,
-    },
+  const all = Array.isArray(data?.workflow_runs) ? data.workflow_runs : [];
+  const matching = all.filter((r) => r && String(r.head_sha ?? "") === String(sha));
+  if (!matching.length) return { ok: true, found: false, run: null, runs: [] };
+  matching.sort((a, b) => {
+    const an = Number(a?.run_number ?? 0);
+    const bn = Number(b?.run_number ?? 0);
+    if (bn !== an) return bn - an;
+    return String(b?.created_at ?? "").localeCompare(String(a?.created_at ?? ""));
+  });
+  const r = matching[0];
+  const run = {
+    id: r?.id ?? null,
+    run_number: r?.run_number ?? null,
+    event: r?.event ?? null,
+    status: r?.status ?? null,
+    conclusion: r?.conclusion ?? null,
+    html_url: r?.html_url ?? null,
+    head_sha: r?.head_sha ?? null,
+    created_at: r?.created_at ?? null,
   };
+  return { ok: true, found: true, run, runs: matching.map((x) => ({
+    id: x?.id ?? null,
+    run_number: x?.run_number ?? null,
+    event: x?.event ?? null,
+    status: x?.status ?? null,
+    conclusion: x?.conclusion ?? null,
+    html_url: x?.html_url ?? null,
+    head_sha: x?.head_sha ?? null,
+    created_at: x?.created_at ?? null,
+  })) };
 }
 
+export function shortSha(sha) {
+  return String(sha ?? "").slice(0, 7);
+}
+
+export async function getPRCiState(env, prNumber) {
+  const found = await fetchOpenPR(env, prNumber);
+  if (!found.ok) {
+    return {
+      ok: false,
+      code: found.code,
+      state: "error",
+      reason: "error",
+      sha: null,
+      branch: null,
+      short_sha: null,
+      run: null,
+      runs: [],
+      status: found.status ?? null,
+      target_url: null,
+      http_status: found.status ?? null,
+    };
+  }
+  const sha = found.pr?.head?.sha ? String(found.pr.head.sha) : "";
+  const branch = found.pr?.head?.ref ? String(found.pr.head.ref) : "";
+  if (!sha) {
+    return { ok: false, code: "no_sha", state: "error", reason: "error", sha: null, branch, short_sha: null, run: null, runs: [], status: null, target_url: null, http_status: null };
+  }
+
+  const repo = devRepo(env);
+  let statusRes = null;
+  let statusData = null;
+  let statusHttp = null;
+  let forbidden = false;
+  let statusError = false;
+  try {
+    statusRes = await githubFetch(env, `/repos/${repo}/commits/${encodeURIComponent(sha)}/status`);
+    statusHttp = statusRes.status;
+    if (statusRes.status === 401 || statusRes.status === 403) forbidden = true;
+    else if (statusRes.ok) statusData = await statusRes.json();
+    else statusError = true;
+  } catch {
+    statusError = true;
+  }
+
+  const statuses = Array.isArray(statusData?.statuses) ? statusData.statuses : [];
+  const ci = statuses.find((s) => s && s.context === CI_STATUS_CONTEXT) || null;
+  const statusState = ci
+    ? (["success", "failure", "error", "pending"].includes(String(ci.state ?? "").toLowerCase())
+        ? String(ci.state).toLowerCase()
+        : "pending")
+    : (statusData ? "missing" : null);
+  const targetUrl = ci?.target_url ?? statusData?.target_url ?? null;
+
+  const runsResult = await getCiRuns(env, sha, 10);
+  const runs = runsResult.ok ? runsResult.runs : [];
+  const run = runsResult.ok && runsResult.found ? runsResult.run : null;
+  const runsForbidden = !runsResult.ok && (runsResult.status === 401 || runsResult.status === 403);
+  const runsError = !runsResult.ok && !runsForbidden;
+
+  let runState = "no_ci";
+  if (run) {
+    const st = String(run.status ?? "").toLowerCase();
+    const concl = String(run.conclusion ?? "").toLowerCase();
+    if (st === "completed") {
+      if (concl === "success") runState = "success";
+      else if (["failure", "cancelled", "timed_out", "startup_failure", "action_required"].includes(concl)) runState = "failure";
+      else runState = "failure";
+    } else if (["queued", "in_progress", "waiting", "requested", "pending"].includes(st)) {
+      runState = "pending";
+    } else {
+      runState = "pending";
+    }
+  }
+
+  let state;
+  if (forbidden || runsForbidden) state = "forbidden";
+  else if (statusState === "failure" || statusState === "error") state = "failure";
+  else if (statusError) state = "error";
+  else if (runsError) state = "error";
+  else if (runState === "success") state = "success";
+  else if (runState === "failure") state = "failure";
+  else if (runState === "pending") state = "pending";
+  else state = "no_ci";
+
+  const httpStatus = (runsForbidden || runsError)
+    ? (runsResult.status ?? statusHttp)
+    : statusHttp;
+  return {
+    ok: true,
+    code: state,
+    state,
+    reason: state,
+    sha,
+    branch,
+    short_sha: shortSha(sha),
+    run,
+    runs,
+    status: httpStatus,
+    target_url: targetUrl,
+    http_status: httpStatus,
+    status_state: statusState,
+    run_state: runState,
+  };
+}
 export function ciStateEmoji(state) {
   const s = String(state ?? "").toLowerCase();
   if (s === "success") return "✅";
   if (s === "failure" || s === "error") return "❌";
   return "⏳";
+}
+export async function findLatestDispatchPR(env) {
+  const repo = devRepo(env);
+  let res;
+  try {
+    res = await githubFetch(env, `/repos/${repo}/pulls?state=open&per_page=100`);
+  } catch {
+    return null;
+  }
+  if (!res.ok) return null;
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    return null;
+  }
+  const list = Array.isArray(data) ? data : [];
+  const dispatch = list
+    .filter((p) => isDispatchBranch(p?.head?.ref))
+    .sort((a, b) => new Date(b?.created_at ?? 0).getTime() - new Date(a?.created_at ?? 0).getTime());
+  return dispatch.length ? (dispatch[0]?.number ?? null) : null;
+}
+
+export async function getDiag(env, prNumber) {
+  const found = await fetchOpenPR(env, prNumber);
+  if (!found.ok) {
+    return `PR #${prNumber}: ${found.code ?? "error"} (HTTP ${found.status ?? "?"})`;
+  }
+  const pr = found.pr;
+  const sha = pr?.head?.sha ? String(pr.head.sha) : "";
+  const branch = pr?.head?.ref ? String(pr.head.ref) : "";
+  const state = pr?.state ?? "?";
+  const merged = pr?.merged === true;
+  const repo = devRepo(env);
+
+  let statusLines = "";
+  let statusHttp = null;
+  try {
+    const res = await githubFetch(env, `/repos/${repo}/commits/${encodeURIComponent(sha)}/status`);
+    statusHttp = res.status;
+    if (res.ok) {
+      const data = await res.json();
+      const statuses = Array.isArray(data?.statuses) ? data.statuses : [];
+      statusLines = statuses.length
+        ? statuses.map((s) => `  - ${s.context}: ${s.state}`).join("\n")
+        : "  (none)";
+    } else if (res.status === 401 || res.status === 403) {
+      statusLines = `  (forbidden, HTTP ${res.status})`;
+    } else {
+      statusLines = `  (HTTP ${res.status})`;
+    }
+  } catch {
+    statusLines = "  (error)";
+  }
+
+  const runsResult = await getCiRuns(env, sha, 5);
+  let runLines = "";
+  if (runsResult.ok) {
+    if (runsResult.runs && runsResult.runs.length) {
+      runLines = runsResult.runs
+        .map((r) => `  - #${r.run_number ?? "?"} ${r.event ?? "?"} ${r.status ?? "?"}/${r.conclusion ?? "?"} sha=${shortSha(r.head_sha)} ${r.html_url ?? ""}`)
+        .join("\n");
+    } else {
+      runLines = "  (none)";
+    }
+  } else {
+    runLines = `  (HTTP ${runsResult.status ?? "?"})`;
+  }
+
+  const ci = await getPRCiState(env, prNumber);
+  return (
+    `PR #${prNumber}: state=${state}${merged ? " (merged)" : ""}\n` +
+    `branch: ${branch}\n` +
+    `head sha: ${shortSha(sha)}\n` +
+    `commit statuses on ${shortSha(sha)}:\n${statusLines}\n` +
+    `last ci.yml runs:\n${runLines}\n` +
+    `verdict: ${ci.state}`
+  );
 }
 
 export async function approveDevPR(env, prNumber) {
@@ -433,20 +641,25 @@ export async function approveDevPR(env, prNumber) {
       };
     }
 
-    const ci = await getPRCiStatus(env, prNumber);
-    if (ci.reason !== "success") {
-      if (ci.reason === "failure") {
-        const url = ci.target_url ? `\n${ci.target_url}` : "";
+    const ci = await getPRCiState(env, prNumber);
+    const shaShort = ci.short_sha || shortSha(ci.sha);
+    const run = ci.run;
+    const runLine = run
+      ? `CI: ${ciStateEmoji(ci.state === "success" ? "success" : ci.state === "failure" ? "failure" : "pending")} run #${run.run_number ?? "?"} on ${shaShort}`
+      : `CI: ${ciStateEmoji(ci.state === "success" ? "success" : ci.state === "failure" ? "failure" : "pending")} ${ci.state}`;
+    const runUrl = run?.html_url ? `\n${run.html_url}` : (ci.target_url ? `\n${ci.target_url}` : "");
+    if (ci.state !== "success") {
+      if (ci.state === "failure") {
         return {
           ok: false,
           code: "ci_failed",
           ci,
           text:
             `❌ CI ناموفق بود. merge انجام نشد.\n` +
-            `CI failed; merge was not performed.${url}`,
+            `CI failed; merge was not performed.\n${runLine}${runUrl}`,
         };
       }
-      if (ci.reason === "forbidden") {
+      if (ci.state === "forbidden") {
         return {
           ok: false,
           code: "ci_forbidden",
@@ -456,27 +669,20 @@ export async function approveDevPR(env, prNumber) {
             "The GitHub token lacks the 'Commit statuses: Read' permission.",
         };
       }
-      if (ci.reason === "no_status") {
+      if (ci.state === "no_ci") {
         const repo = devRepo(env);
         const link = `https://github.com/${repo}/pull/${prNumber}/checks`;
-        let runsText = "";
-        const runs = await getCiRuns(env, ci.branch);
-        if (runs && runs.ok && runs.found && runs.run) {
-          runsText = `\nCI run: ${runs.run.status ?? "?"}/${runs.run.conclusion ?? "?"} ${runs.run.html_url ?? ""}`.trim();
-        } else if (runs && runs.ok && !runs.found) {
-          runsText = "\nno ci.yml run found for this branch";
-        }
         return {
           ok: false,
           code: "ci_no_status",
           ci,
           text:
             `⏳ CI هنوز گزارشی نداده است.\n` +
-            `CI has not reported yet.\n${link}${runsText}`,
+            `CI has not reported yet.\n${link}`,
         };
       }
-      if (ci.reason === "error") {
-        const code = ci.status ? ` (HTTP ${ci.status})` : "";
+      if (ci.state === "error") {
+        const code = ci.http_status ? ` (HTTP ${ci.http_status})` : "";
         return {
           ok: false,
           code: "ci_error",
@@ -491,8 +697,8 @@ export async function approveDevPR(env, prNumber) {
         code: "ci_pending",
         ci,
         text:
-          "⏳ CI هنوز در حال اجراست. کمی بعد دوباره تلاش کن.\n" +
-          "CI is still running. Try again shortly.",
+          `⏳ CI هنوز در حال اجراست. کمی بعد دوباره تلاش کن.\n` +
+          `CI is still running. Try again shortly.\n${runLine}${runUrl}`,
       };
     }
 
