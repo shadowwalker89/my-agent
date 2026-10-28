@@ -21,7 +21,6 @@ import {
 } from "../src/dev.js";
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
-import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import { saveMessage, getLatestFileMessage } from "../src/db.js";
 import {
@@ -882,72 +881,74 @@ for (const [st, expected] of [["success", "success"], ["failure", "failure"], ["
 // .run/.all/.first); the adapter translates that to SQLite. This tests the
 // real SQL (kind filter, LIMIT, ON CONFLICT) — the only simulation is the
 // adapter itself, not the queries. Live D1 verification is still a 1b job.
-{
-  const sqlite = new DatabaseSync(":memory:");
-  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
-  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
-  const db = {
-    prepare(sql) {
-      const stmt = sqlite.prepare(sql);
-      return {
-        bind(...params) {
-          return {
-            run: async () => {
-              stmt.run(...params);
-              return { success: true };
-            },
-            all: async () => ({ results: stmt.all(...params) }),
-            first: async () => stmt.get(...params) ?? null,
-          };
-        },
-      };
-    },
-  };
-  const failingDb = { prepare() { throw new Error("boom"); } };
+let DatabaseSync = null;
+try { DatabaseSync = (await import("node:sqlite")).DatabaseSync; } catch { console.warn("\u26a0 node:sqlite در دسترس نیست \u2014 تست‌های ۱الف رد شد."); }
+if (DatabaseSync) {
+    const sqlite = new DatabaseSync(":memory:");
+    sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    const db = {
+      prepare(sql) {
+        const stmt = sqlite.prepare(sql);
+        return {
+          bind(...params) {
+            return {
+              run: async () => {
+                stmt.run(...params);
+                return { success: true };
+              },
+              all: async () => ({ results: stmt.all(...params) }),
+              first: async () => stmt.get(...params) ?? null,
+            };
+          },
+        };
+      },
+    };
+    const failingDb = { prepare() { throw new Error("boom"); } };
 
-  // kind defaults to chat; daily rows are excluded from chat context.
-  await saveMessage(db, { userId: 1, role: "user", content: "hello" });
-  await saveMessage(db, { userId: 1, role: "assistant", content: "hi back" });
-  await saveMessage(db, { userId: 1, role: "user", content: "spent 1000", kind: "daily" });
-  await saveMessage(db, { userId: 1, role: "user", content: "bogus-kind", kind: "bogus" });
-  const ctx = await getChatContext(db, 1);
-  check(ctx.length === 3, `chat-only context: ${JSON.stringify(ctx.map((m) => m.content))}`);
-  check(!ctx.some((m) => m.content === "spent 1000"), "daily message must not be in chat context");
-  check(ctx[0].content === "hello" && ctx[1].role === "assistant", "context is oldest-first, roles kept");
+    // kind defaults to chat; daily rows are excluded from chat context.
+    await saveMessage(db, { userId: 1, role: "user", content: "hello" });
+    await saveMessage(db, { userId: 1, role: "assistant", content: "hi back" });
+    await saveMessage(db, { userId: 1, role: "user", content: "spent 1000", kind: "daily" });
+    await saveMessage(db, { userId: 1, role: "user", content: "bogus-kind", kind: "bogus" });
+    const ctx = await getChatContext(db, 1);
+    check(ctx.length === 3, `chat-only context: ${JSON.stringify(ctx.map((m) => m.content))}`);
+    check(!ctx.some((m) => m.content === "spent 1000"), "daily message must not be in chat context");
+    check(ctx[0].content === "hello" && ctx[1].role === "assistant", "context is oldest-first, roles kept");
 
-  // Fixed date: a supplied ISO created_at is stored verbatim.
-  await saveMessage(db, { userId: 2, role: "user", content: "dated", createdAt: "2026-10-28T00:00:00.000Z" });
-  const dated = sqlite.prepare("SELECT created_at FROM messages WHERE user_id = 2").get();
-  check(dated?.created_at === "2026-10-28T00:00:00.000Z", `fixed created_at: ${dated?.created_at}`);
+    // Fixed date: a supplied ISO created_at is stored verbatim.
+    await saveMessage(db, { userId: 2, role: "user", content: "dated", createdAt: "2026-10-28T00:00:00.000Z" });
+    const dated = sqlite.prepare("SELECT created_at FROM messages WHERE user_id = 2").get();
+    check(dated?.created_at === "2026-10-28T00:00:00.000Z", `fixed created_at: ${dated?.created_at}`);
 
-  // Latest Telegram file reference (messages only; files table untouched).
-  await saveMessage(db, { userId: 3, role: "user", content: "file", tgFileId: "AgACabc", fileName: "a.pdf", fileMime: "application/pdf" });
-  const latest = await getLatestFileMessage(db, 3);
-  check(latest?.tg_file_id === "AgACabc" && latest?.file_name === "a.pdf", `latest file: ${JSON.stringify(latest)}`);
-  check((await getLatestFileMessage(db, 99)) === null, "no file for unknown user -> null");
+    // Latest Telegram file reference (messages only; files table untouched).
+    await saveMessage(db, { userId: 3, role: "user", content: "file", tgFileId: "AgACabc", fileName: "a.pdf", fileMime: "application/pdf" });
+    const latest = await getLatestFileMessage(db, 3);
+    check(latest?.tg_file_id === "AgACabc" && latest?.file_name === "a.pdf", `latest file: ${JSON.stringify(latest)}`);
+    check((await getLatestFileMessage(db, 99)) === null, "no file for unknown user -> null");
 
-  // Limit: 60 chat rows -> exactly the last 50, in order.
-  for (let i = 1; i <= 60; i++) await saveMessage(db, { userId: 4, role: "user", content: `m${i}` });
-  const ctx60 = await getChatContext(db, 4);
-  check(ctx60.length === CHAT_CONTEXT_LIMIT, `limit 50: got ${ctx60.length}`);
-  check(ctx60[0].content === "m11" && ctx60[49].content === "m60", "limit keeps newest 50 in order");
+    // Limit: 60 chat rows -> exactly the last 50, in order.
+    for (let i = 1; i <= 60; i++) await saveMessage(db, { userId: 4, role: "user", content: `m${i}` });
+    const ctx60 = await getChatContext(db, 4);
+    check(ctx60.length === CHAT_CONTEXT_LIMIT, `limit 50: got ${ctx60.length}`);
+    check(ctx60[0].content === "m11" && ctx60[49].content === "m60", "limit keeps newest 50 in order");
 
-  // DB unavailable or failing: no throw, empty/false results, chat continues.
-  check(JSON.stringify(await getChatContext(null, 1)) === "[]", "null DB -> empty context");
-  check(JSON.stringify(await getChatContext({}, 1)) === "[]", "no-DB env -> empty context");
-  check(JSON.stringify(await getChatContext(failingDb, 1)) === "[]", "failing DB -> empty context");
-  check((await saveMessage(failingDb, { userId: 1, content: "x" })).ok === false, "failing DB save -> ok:false");
-  check((await getSetting(null, 1, "currency")) === null, "null DB setting -> null");
-  check((await getDefaultCurrency(null, 1)) === DEFAULT_CURRENCY, "null DB currency -> TOMAN");
+    // DB unavailable or failing: no throw, empty/false results, chat continues.
+    check(JSON.stringify(await getChatContext(null, 1)) === "[]", "null DB -> empty context");
+    check(JSON.stringify(await getChatContext({}, 1)) === "[]", "no-DB env -> empty context");
+    check(JSON.stringify(await getChatContext(failingDb, 1)) === "[]", "failing DB -> empty context");
+    check((await saveMessage(failingDb, { userId: 1, content: "x" })).ok === false, "failing DB save -> ok:false");
+    check((await getSetting(null, 1, "currency")) === null, "null DB setting -> null");
+    check((await getDefaultCurrency(null, 1)) === DEFAULT_CURRENCY, "null DB currency -> TOMAN");
 
-  // Explicit settings only: unknown key refused, value upserts, no auto writer.
-  check((await setSetting(db, 5, "mood", "happy")).ok === false, "unknown setting key refused");
-  check((await setSetting(db, 5, "currency", "")).ok === false, "empty setting refused");
-  await setSetting(db, 5, "currency", "USD");
-  check((await getDefaultCurrency(db, 5)) === "USD", "explicit currency remembered");
-  await setSetting(db, 5, "currency", "EUR");
-  check((await getDefaultCurrency(db, 5)) === "EUR", "setting upserts to new value");
-  check((await getDefaultCurrency(db, 6)) === "TOMAN", "fresh user -> fixed TOMAN, never inferred");
+    // Explicit settings only: unknown key refused, value upserts, no auto writer.
+    check((await setSetting(db, 5, "mood", "happy")).ok === false, "unknown setting key refused");
+    check((await setSetting(db, 5, "currency", "")).ok === false, "empty setting refused");
+    await setSetting(db, 5, "currency", "USD");
+    check((await getDefaultCurrency(db, 5)) === "USD", "explicit currency remembered");
+    await setSetting(db, 5, "currency", "EUR");
+    check((await getDefaultCurrency(db, 5)) === "EUR", "setting upserts to new value");
+    check((await getDefaultCurrency(db, 6)) === "TOMAN", "fresh user -> fixed TOMAN, never inferred");
 }
 
 if (failures.length) {
