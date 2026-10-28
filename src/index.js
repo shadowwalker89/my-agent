@@ -862,9 +862,12 @@ async function devCallback(request, env) {
 
   const reason =
     typeof body.reason === "string" ? body.reason.replace(/\s+/g, " ").trim().slice(0, 200) : "";
+  const noPr = !ok && reason === "no PR found";
   let text = ok
     ? `🤖 اجرای dev تمام شد — PR #${pr} آماده‌ی بررسی است.\nDev run finished — PR #${pr} is ready for review.`
-    : `❌ اجرای dev متوقف شد — ${reason || "بدون PR"}\nDev run blocked — ${reason || "no PR"}`;
+    : noPr
+      ? `ℹ️ تغییری ایجاد نشد — PR جدیدی ساخته نشد.\nNo change was created — no new PR.`
+      : `❌ اجرای dev متوقف شد — ${reason || "بدون PR"}\nDev run blocked — ${reason || "no PR"}`;
   const url = safeGithubUrl(body.url);
   if (url) text += `\n${url.slice(0, 300)}`;
 

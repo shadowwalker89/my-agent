@@ -765,6 +765,21 @@ for (const [st, expected] of [["success", "success"], ["failure", "failure"], ["
   }
 }
 
+// ── getPRCiState: pull_request failure is not masked by workflow_dispatch success ─
+{
+  const world = mockWorld({ ciState: "missing", ciRuns: [
+    { status: "completed", conclusion: "failure", html_url: "https://runs.example/pr", head_sha: "headsha123", run_number: 16, event: "pull_request", created_at: "2026-01-01T00:00:00Z" },
+    { status: "completed", conclusion: "success", html_url: "https://runs.example/wd", head_sha: "headsha123", run_number: 17, event: "workflow_dispatch", created_at: "2026-01-01T00:01:00Z" },
+  ] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "x" });
+    const ci = await getPRCiState(env, 7);
+    check(ci.state === "failure", `getPRCiState pull_request failure masked: ${ci.state}`);
+  } finally {
+    world.restore();
+  }
+}
+
 // ── approve deletes head branch ──────────────────────────────────────────────
 {
   const world = mockWorld({ ciState: "success" });
