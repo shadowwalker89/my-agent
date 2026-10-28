@@ -780,6 +780,49 @@ for (const [st, expected] of [["success", "success"], ["failure", "failure"], ["
   }
 }
 
+// ── getPRCiState: pull_request action_required does not block when Trigger CI tested this SHA ─
+{
+  const world = mockWorld({ ciState: "success", ciRuns: [
+    { status: "completed", conclusion: "action_required", html_url: "https://runs.example/pr", head_sha: "headsha123", run_number: 23, event: "pull_request", created_at: "2026-01-01T00:00:00Z" },
+    { status: "completed", conclusion: "success", html_url: "https://runs.example/wd", head_sha: "headsha123", run_number: 24, event: "workflow_dispatch", created_at: "2026-01-01T00:01:00Z" },
+  ] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "x" });
+    const ci = await getPRCiState(env, 7);
+    check(ci.state === "success", `getPRCiState action_required with wd success should be success: ${ci.state}`);
+  } finally {
+    world.restore();
+  }
+}
+{
+  // Same runs, but no successful commit status: action_required still blocks.
+  const world = mockWorld({ ciState: "missing", ciRuns: [
+    { status: "completed", conclusion: "action_required", html_url: "https://runs.example/pr", head_sha: "headsha123", run_number: 23, event: "pull_request", created_at: "2026-01-01T00:00:00Z" },
+    { status: "completed", conclusion: "success", html_url: "https://runs.example/wd", head_sha: "headsha123", run_number: 24, event: "workflow_dispatch", created_at: "2026-01-01T00:01:00Z" },
+  ] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "x" });
+    const ci = await getPRCiState(env, 7);
+    check(ci.state === "pending", `getPRCiState action_required without status success should be pending: ${ci.state}`);
+  } finally {
+    world.restore();
+  }
+}
+{
+  // Narrow scope: a pull_request run actually in progress still blocks, even with wd success.
+  const world = mockWorld({ ciState: "success", ciRuns: [
+    { status: "in_progress", conclusion: null, html_url: "https://runs.example/pr", head_sha: "headsha123", run_number: 23, event: "pull_request", created_at: "2026-01-01T00:00:00Z" },
+    { status: "completed", conclusion: "success", html_url: "https://runs.example/wd", head_sha: "headsha123", run_number: 24, event: "workflow_dispatch", created_at: "2026-01-01T00:01:00Z" },
+  ] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "x" });
+    const ci = await getPRCiState(env, 7);
+    check(ci.state === "pending", `getPRCiState pull_request in_progress should be pending: ${ci.state}`);
+  } finally {
+    world.restore();
+  }
+}
+
 // ── approve deletes head branch ──────────────────────────────────────────────
 {
   const world = mockWorld({ ciState: "success" });
