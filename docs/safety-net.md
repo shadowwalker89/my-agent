@@ -47,6 +47,7 @@ The job ends failed in both cases.
 ## Endpoints
 
 - `/health` — وضعیت سلامت Worker را برمی‌گرداند (`ok: true/false`) و برای smoke test بعد از deploy و rollback استفاده می‌شود.
+- `/v1/models` — کatalog مدل‌های فعال را برمی‌گرداند (KV cache یا fallback به combos.js) و برای smoke test بعد از deploy استفاده می‌شود.
 
 ## Known limits
 
