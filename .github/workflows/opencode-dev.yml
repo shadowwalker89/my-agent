@@ -114,11 +114,16 @@ jobs:
             echo "::warning::failed to read PR head branch for CI dispatch"
             exit 0
           }
+          head_sha=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid 2>/dev/null) || head_sha=""
           if [ -z "$branch" ] || [ "$branch" = "null" ]; then
             echo "::warning::PR head branch is empty; skipping CI dispatch"
             exit 0
           fi
-          if ! gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"; then
+          if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
+            echo "::warning::PR head SHA is empty; skipping CI dispatch"
+            exit 0
+          fi
+          if ! gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" -f ref="$head_sha"; then
             echo "::warning::failed to dispatch ci.yml for branch $branch"
           fi
 
