@@ -39,6 +39,17 @@ export async function ensureUserRow(env, userId) { const id = Number(userId); if
 // Keys carry only the short id; owner is checked after load (forbidden = silent, not expired).
 function draftKey(id) { return `daily:draft:${id}`; }
 function askKey(id) { return `daily:ask:${id}`; }
+// Pending-ask slot (Part 3): ONE slot per user, 600s TTL like money drafts.
+// {question, askId?}: question is always the bot's own ask text; askId points at the existing daily:ask record.
+function pendingKey(id) { return `daily:pending-ask:${id}`; }
+async function setPendingAsk(env, userId, question, askId) { await putKv(env, pendingKey(userId), askId ? { question, askId } : { question }); }
+async function getPendingAsk(env, userId) { return getKv(env, pendingKey(userId)); }
+async function clearPendingAsk(env, userId) { await delKv(env, pendingKey(userId)); }
+function askKeyboard(question, id) {
+  return question === "expense-or-chat"
+    ? [[{ text: "💰 خرج", callback_data: `daily:ask:${id}:expense` }, { text: "💬 چت", callback_data: `daily:ask:${id}:chat` }]]
+    : [[{ text: "💰 خرج", callback_data: `daily:ask:${id}:expense` }, { text: "📥 درآمد", callback_data: `daily:ask:${id}:income` }]];
+}
 function newId() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
 async function putKv(env, key, value) { if (!env.STATE) return; try { await env.STATE.put(key, JSON.stringify(value), { expirationTtl: DRAFT_TTL_SEC }); } catch {} }
 async function getKv(env, key) { if (!env.STATE) return null; try { const raw = await env.STATE.get(key, "json"); return raw && typeof raw === "object" ? raw : null; } catch { return null; } }
@@ -82,17 +93,16 @@ async function runDailyBranch(env, o, c, ctx) {
     if (question === "expense-or-chat" || question === "expense-or-income") {
       const id = newId();
       await putKv(env, askKey(id), { owner: userId, text, question });
-      const buttons = question === "expense-or-chat"
-        ? [[{ text: "💰 خرج", callback_data: `daily:ask:${id}:expense` }, { text: "💬 چت", callback_data: `daily:ask:${id}:chat` }]]
-        : [[{ text: "💰 خرج", callback_data: `daily:ask:${id}:expense` }, { text: "📥 درآمد", callback_data: `daily:ask:${id}:income` }]];
-      await o.send(askText(question), { replyMarkup: { inline_keyboard: buttons } });
+      await setPendingAsk(env, userId, askText(question), id);
+      await o.send(askText(question), { replyMarkup: { inline_keyboard: askKeyboard(question, id) } });
       return "handled";
     }
+    await setPendingAsk(env, userId, askText(question));
     await o.send(askText(question));
     return "handled";
   }
   if (c.intent === "translate") {
-    if (c.ask) { await o.send(askText(c.ask)); return "handled"; }
+    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask)); await o.send(askText(c.ask)); return "handled"; }
     const targetName = c.target === "en" ? "English" : c.target === "fa" ? "Persian" : c.target;
     await o.chat(c.text, { systemPrompt: `Translate the following text${targetName ? ` to ${targetName}` : ""}. Reply with only the translation.`, saveText: text, noHistory: true });
     return "handled";
@@ -110,14 +120,14 @@ async function runDailyBranch(env, o, c, ctx) {
     return "handled";
   }
   if (c.intent === "reminder") {
-    if (c.ask) { await o.send(askText(c.ask)); return "handled"; }
+    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask)); await o.send(askText(c.ask)); return "handled"; }
     const r = await runDb(env, "INSERT INTO reminders (user_id, text, due_at, status, created_at) VALUES (?, ?, ?, ?, ?)", [userId, c.text, c.due, "pending", new Date().toISOString()]);
     await o.send(r.ok ? `⏰ یادآوری فقط ذخیره شد (ارسال سر وقت هنوز فعال نیست): ${c.text} — ${c.due}` : NOT_SAVED_TEXT);
     if (r.ok) await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
     return "handled";
   }
   if (c.intent === "expense-query") {
-    if (c.ask) { await o.send(askText(c.ask)); return "handled"; }
+    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask)); await o.send(askText(c.ask)); return "handled"; }
     const sums = await queryExpenseSums(env, userId, c.range);
     const keys = Object.keys(sums);
     await o.send(keys.length ? keys.map((k) => `${k}: ${sums[k]}`).join("\n") : "در این بازه خرجی ثبت نشده است.");
@@ -136,7 +146,7 @@ async function runDailyBranch(env, o, c, ctx) {
     return "handled";
   }
   if (c.intent === "note-query") {
-    if (c.ask) { await o.send(askText(c.ask)); return "handled"; }
+    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask)); await o.send(askText(c.ask)); return "handled"; }
     const rows = await allDb(env, "SELECT text FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 5", [userId]);
     await o.send(rows.length ? rows.map((r) => `• ${r.text}`).join("\n") : "یادداشتی پیدا نشد.");
     await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
@@ -159,22 +169,78 @@ async function runDailyBranch(env, o, c, ctx) {
   return "chat";
 }
 
-// Model step (Part 2 wiring): the model only picks the branch. Every
-// branch below re-validates the ORIGINAL full text with the rule code,
-// so model output fields (amount/date/currency/confidence) are never
-// read — parseModelIntent already drops them. followup is Part 3 and is
-// ignored here. Returns { ret, outcome, ms }: ret is "handled" | "chat"
-// | "chat-direct", outcome is the timing-log outcome.
-async function runModelBranch(env, o, rule, ctx) {
+// Re-ask the pending question after a model failure (Part 3); button asks reuse the SAME ask id.
+async function reaskPending(env, o, slot) {
+  if (slot.askId) {
+    const ask = await getKv(env, askKey(slot.askId));
+    if (!ask || Number(ask.owner) !== Number(o.userId) || (ask.question !== "expense-or-chat" && ask.question !== "expense-or-income")) { await o.send(EXPIRED_TEXT); return; }
+    await o.send(askText(ask.question), { replyMarkup: { inline_keyboard: askKeyboard(ask.question, slot.askId) } });
+    await setPendingAsk(env, o.userId, askText(ask.question), slot.askId);
+    return;
+  }
+  await o.send(slot.question);
+  await setPendingAsk(env, o.userId, slot.question);
+}
+
+// Follow-up resolution (Part 3): only with a slot AND a model followup.
+// Returns {ret, outcome}, or null to fall through to the normal switch.
+// Money safety is unchanged: rule extraction + confirm flow, no record without Confirm.
+async function resolveFollowup(env, o, slot, m, ctx) {
+  const { text } = o;
+  if (slot.askId) {
+    const ask = await getKv(env, askKey(slot.askId));
+    if (!ask) { await o.send(EXPIRED_TEXT); return { ret: "handled", outcome: "routed" }; }
+    if (Number(ask.owner) !== Number(o.userId)) return { ret: "handled", outcome: "routed" };
+    if (ask.question !== "expense-or-chat" && ask.question !== "expense-or-income") return null;
+    const choice = m.followup === "yes" ? "expense" : ask.question === "expense-or-chat" ? "chat" : "income";
+    if (choice === "chat") { await o.chat(ask.text, {}); return { ret: "handled", outcome: "chat" }; }
+    const ex = parseExpense(ask.text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, ask.text);
+    if (ex?.error) { const q = askText(mapQuestion(ex.error)); await o.send(q); await setPendingAsk(env, o.userId, q); return { ret: "handled", outcome: "asked" }; }
+    await startConfirm(env, o, choice, ex);
+    return { ret: "handled", outcome: "routed" };
+  }
+  // Plain-text ask slot.
+  if (m.followup === "no") { await o.send("باشه، ثبت نشد."); return { ret: "handled", outcome: "routed" }; }
+  if (slot.question === askText("amount") && (m.intent === "expense" || m.intent === "income")) {
+    const ex = parseExpense(text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, text);
+    if (ex?.error) { await o.send(askText("amount")); await setPendingAsk(env, o.userId, askText("amount")); return { ret: "handled", outcome: "asked" }; }
+    return { ret: await runDailyBranch(env, o, { intent: m.intent, extraction: ex }, ctx), outcome: "routed" };
+  }
+  if (slot.question === askText("amount")) {
+    // Bare "yes" (or a non-money verdict): "yes" alone answers no amount.
+    await o.send(askText("amount")); await setPendingAsk(env, o.userId, askText("amount")); return { ret: "handled", outcome: "asked" };
+  }
+  // Non-amount plain ask + "yes": a fresh everyday intent runs fresh (the
+  // user answered with a full message); a bare "yes" answers nothing, so
+  // the same question is re-asked instead of dumping "yes" into chat.
+  if (m.intent !== "chat") return null;
+  await o.send(slot.question); await setPendingAsk(env, o.userId, slot.question); return { ret: "handled", outcome: "asked" };
+}
+
+// Model step (Part 3): the model only picks the branch; every branch below
+// re-validates the ORIGINAL text with rule code, so model output fields are
+// never read (parseModelIntent drops them). followup is consumed ONLY with a
+// pending-ask slot; without one it is ignored, as in Part 2. Exported for tests (branch-level).
+export async function runModelBranch(env, o, rule, ctx) {
   const t0 = Date.now();
-  const m = await classifyDailyWithModel(env, o.text);
+  const slot = await getPendingAsk(env, o.userId);
+  // A skipped call (missing key) is NOT a failure: Part 2 behaviour remains, stale slot just consumed.
+  const keyMissing = !env || !env.ROUTER_KEY;
+  const m = keyMissing ? null : await classifyDailyWithModel(env, o.text, slot?.question ?? null);
   const ms = () => Date.now() - t0;
+  // Old slot consumed now: later paths resolve (stays cleared) or send a new ask (fresh slot).
+  await clearPendingAsk(env, o.userId);
   // A validated translate intent with one bad field: ask the language,
   // on either tier — a targeted ask, not a generic failure.
-  if (m && m.invalid === "target") { await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+  if (m && m.invalid === "target") { await setPendingAsk(env, o.userId, askText("language")); await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() }; }
   if (!m) {
+    if (slot && !keyMissing) { await reaskPending(env, o, slot); return { ret: "handled", outcome: "asked", ms: ms() }; }
     if (rule.intent === "ask") { const ret = await runDailyBranch(env, o, rule, ctx); return { ret, outcome: "asked", ms: ms() }; }
     return { ret: "chat", outcome: "chat", ms: ms() };
+  }
+  if (slot && m.followup) {
+    const f = await resolveFollowup(env, o, slot, m, ctx);
+    if (f) return { ret: f.ret, outcome: f.outcome, ms: ms() };
   }
   const { text } = o;
   const reclassify = () => classifyDaily(text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered });
@@ -192,7 +258,7 @@ async function runModelBranch(env, o, rule, ctx) {
     case "note": {
       const c2 = reclassify();
       if (c2.intent === "note") return { ret: await runDailyBranch(env, o, c2, ctx), outcome: "routed", ms: ms() };
-      await o.send(askText("note-text")); return { ret: "handled", outcome: "asked", ms: ms() };
+      await setPendingAsk(env, o.userId, askText("note-text")); await o.send(askText("note-text")); return { ret: "handled", outcome: "asked", ms: ms() };
     }
     case "reminder": {
       const r = parseReminder(normalizeText(text), ctx.now, text);
@@ -204,9 +270,9 @@ async function runModelBranch(env, o, rule, ctx) {
       const c2 = reclassify();
       let body = c2.intent === "translate" ? c2.text : null;
       if (!body) { const colon = /[:：]\s*([\s\S]+)/.exec(text); body = colon ? colon[1].trim() : null; }
-      if (!body) { await o.send(askText("text")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+      if (!body) { await setPendingAsk(env, o.userId, askText("text")); await o.send(askText("text")); return { ret: "handled", outcome: "asked", ms: ms() }; }
       const target = m.target || (c2.intent === "translate" && ["en", "fa", "ar"].includes(c2.target) ? c2.target : null);
-      if (!target) { await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+      if (!target) { await setPendingAsk(env, o.userId, askText("language")); await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() }; }
       return { ret: await runDailyBranch(env, o, { intent: "translate", text: body, target }, ctx), outcome: "routed", ms: ms() };
     }
     case "remember": {
@@ -239,12 +305,12 @@ async function runModelBranch(env, o, rule, ctx) {
 export async function handleDailyText(env, o) {
   const { userId, text } = o;
   const now = o.nowMs ?? Date.now();
-  if (!dbOf(env)) return "chat"; // D1 unavailable: everyday off, chat keeps working
+  if (!dbOf(env)) { await clearPendingAsk(env, userId); return "chat"; } // D1 unavailable: everyday off, chat keeps working
   const remembered = await getDefaultCurrency(env, userId);
   const c = classifyDaily(text, { nowMs: now, rememberedCurrency: remembered });
-  if (c.intent === "command") return "chat";
+  if (c.intent === "command") { await clearPendingAsk(env, userId); return "chat"; }
   const ctx = { now, remembered };
-  if (c.intent !== "chat" && c.intent !== "ask") return runDailyBranch(env, o, c, ctx);
+  if (c.intent !== "chat" && c.intent !== "ask") { await clearPendingAsk(env, userId); return runDailyBranch(env, o, c, ctx); }
   // Ask/chat tier: exactly one model call. Timing log: combo, tier,
   // duration, outcome — never message text or keys.
   const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx);
@@ -258,6 +324,7 @@ export async function resolveDailyCallback(env, o) {
   const m = /^daily:(confirm|cancel|ask):([^:]+)(?::(chat|expense|income))?$/.exec(o.data);
   if (!m) return false;
   const [, action, id, choice] = m;
+  await clearPendingAsk(env, o.fromId);
   if (action === "confirm" || action === "cancel") {
     let r;
     if (action === "confirm") r = await confirmExpenseDraft(env, o.fromId, id);
@@ -276,7 +343,7 @@ export async function resolveDailyCallback(env, o) {
   await o.editMarkup();
   if (choice === "chat") { await o.chat(ask.text, {}); return true; }
   const ex = parseExpense(ask.text, { nowMs: o.nowMs ?? Date.now() }, ask.text);
-  if (ex?.error) { await o.send(askText(mapQuestion(ex.error))); return true; }
+  if (ex?.error) { const q = askText(mapQuestion(ex.error)); await setPendingAsk(env, o.fromId, q); await o.send(q); return true; }
   await startConfirm(env, o, choice, ex);
   return true;
 }
