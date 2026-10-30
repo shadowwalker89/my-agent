@@ -1074,11 +1074,21 @@ if (DatabaseSync) {
   // Day-after-tomorrow through the classifier, ZWNJ-safe.
   check(ex("خرج کردم پس‌فردا ۵۰۰ تومان نان").date === "2026-10-30", "day-after-tomorrow via classifier, ZWNJ form");
   check(ex("خرج کردم پس فردا ۵۰۰ تومان نان").date === "2026-10-30", "day-after-tomorrow via classifier, space form");
-  check(cl("۱,۵ میلیون تومان").intent === "ask" && cl("خرج کردم ۱٫۵ میلیون تومان نان").intent === "ask" && cl("۱.۵ میلیون تومان").intent === "ask" && cl("خرج کردم دو سه هزار تومان نان").intent === "ask" && cl("۲،۳ تومان").intent === "ask" && ex("خرج کردم 1,000 تومان نان").amount === 1000, "fourth round: decimals, separators, no-و numbers");
-  check(cl("نمره‌ی ۲۰ گرفتم").intent === "chat" && cl("یادت باشد ارز پیش‌فرضم تومان است").setting?.value === "TOMAN" && cl("۵۰۰۰ تومان نگرفتم").intent === "chat" && cl("نخریدم").intent === "chat", "fourth round: grade chat, default currency, negated verbs");
+  check(cl("۱,۵ میلیون تومان").intent === "ask", "fourth round: comma decimal asks");
+  check(cl("خرج کردم ۱٫۵ میلیون تومان نان").intent === "ask", "fourth round: decimal with million asks");
+  check(cl("۱.۵ میلیون تومان").intent === "ask", "fourth round: dot decimal asks");
+  check(cl("خرج کردم دو سه هزار تومان نان").intent === "ask", "fourth round: two numbers without و ask");
+  check(cl("۲،۳ تومان").intent === "ask", "fourth round: Arabic comma is not a separator");
+  check(ex("خرج کردم 1,000 تومان نان").amount === 1000, "fourth round: comma thousands separator still works");
+  check(cl("نمره‌ی ۲۰ گرفتم").intent === "chat", "fourth round: grade is chat");
+  check(cl("یادت باشد ارز پیش‌فرضم تومان است").setting?.value === "TOMAN", "fourth round: default currency setting");
+  check(cl("۵۰۰۰ تومان نگرفتم").intent === "chat", "fourth round: negated got is chat");
+  check(cl("نخریدم").intent === "chat", "fourth round: negated buy is chat");
   for (const q of ["هفته‌ی گذشته چقدر خرج کردم؟", "ماه گذشته چقدر خرج کردم؟", "پریروز چقدر خرج کردم؟", "امسال چقدر خرج کردم؟", "سه روز پیش چقدر خرج کردم؟", "آبان چقدر خرج کردم؟"]) check(cl(q).intent === "expense-query" && cl(q).ask === "period", `unknown period asks: ${q}`);
-  check(cl("۵۰۰ تومان خرج کردم، دیگه چقدر مونده؟").intent === "expense" && cl("امروز چقدر خرج کردم؟").intent === "expense-query", "fourth round: amount plus past verb beats query");
-  check(ex("خرج کردم پس‌فردا ۵۰۰ تومان نان").item === "نان" && ex("خرج کردم ۵۰۰ تومان کرایه‌ی تاکسی").item === "کرایه‌ی تاکسی", "fourth round: item text");
+  check(cl("۵۰۰ تومان خرج کردم، دیگه چقدر مونده؟").intent === "expense", "fourth round: amount plus past verb is an expense");
+  check(cl("امروز چقدر خرج کردم؟").intent === "expense-query", "fourth round: amount-less question stays a query");
+  check(ex("خرج کردم پس‌فردا ۵۰۰ تومان نان").item === "نان", "fourth round: day-after-tomorrow is not part of the item");
+  check(ex("خرج کردم ۵۰۰ تومان کرایه‌ی تاکسی").item === "کرایه‌ی تاکسی", "fourth round: item keeps its ZWNJ");
   check(ex("خرج کردم ۵۰۰ هزار تومن نان").amount === 500000 && ex("خرج کردم ۵۰۰ هزار تومن نان").currency === "TOMAN", "fifth: تومن is a currency, 500 thousand تومن is 500000");
   check(cl("خرج کردم ۵۰۰ هزار نان").intent === "ask" && cl("خرج کردم ۵۰۰ هزار نان").question === "amount", "fifth: multiplier without currency asks, never bare 500");
   check(cl("خرج کردم ۲ میلیارد تومان خانه").intent === "ask" && cl("خرج کردم ۲ میلیارد تومان خانه").question === "amount", "fifth: میلیارد is not a parsed multiplier, asks");
@@ -1094,3 +1104,41 @@ if (failures.length) {
   process.exit(1);
 }
 console.log("\n✓ assertهای pipeline 3i برقرار شد.");
+
+// ── Step 1b-1c: note/translate/remember branches, on top of 1b-1b ──
+{
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+  const cl = (s) => classifyDaily(s, { nowMs: NOW });
+  // Note is anchored again (it stores without confirmation) or after a short prefix.
+  check(cl("لطفا یادداشت کن خرید نان").intent === "note" && cl("لطفا یادداشت کن خرید نان").text === "خرید نان", "note after short prefix");
+  check(cl("ببین یادداشت کن تماس با علی").intent === "note", "note after look prefix");
+  check(cl("یادداشت کن خط اول\nمی‌شود خط دوم").text === "خط اول\nمی‌شود خط دوم", "multiline note body is exact, newline and ZWNJ preserved");
+  // Translate body is sliced from the original text; destination passes through.
+  check(cl("ترجمه کن خط اول\nخط دوم").text === "خط اول\nخط دوم", "multiline translate body is exact");
+  const ar = cl("ترجمه کن به عربی: سلام"); check(ar.intent === "translate" && ar.target === "عربی" && ar.text === "سلام", `arabic destination passes through: ${JSON.stringify(ar)}`);
+  check(cl("ترجمه کن به انگلیسی: سلام").target === "en", "known destination still maps to a code");
+  // Colloquial remember with a time is a reminder, not a refused setting.
+  const late = cl("فردا ساعت ۹ یادت باشه جلسه دارم"); check(late.intent === "reminder" && late.due === "2026-10-29T09:00:00+03:30", `colloquial remember with time is a reminder: ${JSON.stringify(late)}`);
+  check(cl("یادت باشد ارز پیش‌فرضم دلار است").intent === "remember" && cl("یادت باشد ارز پیش‌فرضم دلار است").setting?.value === "USD", "default-currency setting, ZWNJ form");
+  check(cl("یادت باشد ارزم constructor").refused === true, "genuine invalid setting still refused");
+  check(cl("۵۰۰۰ تومان بستنی گرفتم").intent === "ask" && cl("۵۰۰۰ تومان بستنی گرفتم").question === "expense-or-income", "got with a product asks expense-or-income (moved from B)");
+  // Reminder body is sliced from the original text, ZWNJ preserved.
+  const rb = cl("یادم بینداز فردا ساعت ۹ زنگ بزن به می‌شود"); check(rb.intent === "reminder" && rb.text === "زنگ بزن به می‌شود", `reminder body preserves ZWNJ: ${JSON.stringify(rb)}`);
+}
+
+if (failures.length) {
+  console.error("\nFailures found:");
+  for (const f of failures) console.error(`  - ${f}`);
+  process.exitCode = 1;
+  process.exit(1);
+}
+console.log("\n✓ assertهای pipeline 3i برقرار شد.");
+
+// ── Step 1b-1c additions moved from B: negation gate, verb-gated two amounts ──
+{
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+  const cl = (s) => classifyDaily(s, { nowMs: NOW });
+  check(cl("امروز ۵۰۰ تومان خرج نکردم").intent === "chat", "negation gate: خرج نکردم is chat, not an expense");
+  check(cl("دلار ۶۰۰۰۰ تومان و یورو ۷۰۰۰۰ تومان شده").intent === "chat", "price list without a verb reaches chat");
+  check(cl("خرج کردم ۵۰۰ تومان نان و ۲۰۰ تومان آب").intent === "ask" && cl("خرج کردم ۵۰۰ تومان نان و ۲۰۰ تومان آب").question === "amount", "two amounts with a verb ask");
+}
