@@ -1036,6 +1036,13 @@ if (DatabaseSync) {
   check(normalizeText("يادداشت كتاب") === "یادداشت کتاب", "arabic letters normalised");
   check(cl("يادداشت کن فردا با علی تماس بگیرم").intent === "note", "arabic-letter note works");
   check(cl("یادداشت های امروز").intent === "note-query", "space variant note query");
+  // Joined colloquial spellings (from speech transcription) reach
+  // note-query; note creation and the bare-note ask are not stolen.
+  check(cl("یادداشتهامو نشون بده").intent === "note-query", "joined note query: یادداشتهامو");
+  check(cl("یادداشتهایم را نشان بده").intent === "note-query", "joined note query: یادداشتهایم");
+  check(cl("یادداشتهام را نشان بده").intent === "note-query", "joined note query: یادداشتهام");
+  check(cl("یادداشت کن فردا به علی زنگ بزنم").intent === "note", "joined query fix does not steal note creation");
+  check(cl("یادداشت").intent === "ask" && cl("یادداشت").question === "note-text", "joined query fix does not steal bare note ask");
   check(cl("خلاصه اش کن").intent === "file-reference", "space variant file reference");
   // Colloquial forms and unanchored reminder.
   check(cl("یادت باشه ارزم تومانه").intent === "remember" && cl("یادت باشه ارزم تومانه").setting?.value === "TOMAN", "colloquial remember + currency with trailing ه");
