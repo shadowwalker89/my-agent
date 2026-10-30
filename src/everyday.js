@@ -1,7 +1,8 @@
 // Step 1b-2: everyday wiring (money, notes, reminders, translate,
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
-import { classifyDaily, parseExpense, formatJalali, sumByCurrency } from "./daily.js";
+import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency } from "./daily.js";
+import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
 import { saveMessage } from "./db.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
@@ -13,7 +14,7 @@ const NOT_SAVED_TEXT = "ذخیره نشد، دوباره تلاش کن";
 
 export function mapQuestion(q) { return q === "ambiguous" ? "amount" : q; } // TODO from 1b-1, resolved here
 export function askText(q) {
-  return { amount: "مبلغ چقدر بود؟", decimal: "مبلغ اعشاری در این قدم پذیرفته نیست؛ مبلغ را به عدد صحیح بگو.", period: "برای کدام دوره؟ امروز، دیروز، این هفته یا این ماه؟", date: "تاریخ را درست بگو؛ آن تاریخ معتبر نیست.", "hour-ambiguous": "ساعت را با صبح یا عصر مشخص کن.", "no-time": "ساعت یادآوری را بگو.", past: "آن زمان گذشته است؛ زمان آینده را بگو.", empty: "یادآوری برای چه کاری؟", text: "چه متنی را ترجمه کنم؟", "expense-or-chat": "این خرج است یا چت؟", "expense-or-income": "این خرج است یا درآمد؟" }[q] ?? "دوباره بگو؟";
+  return { amount: "مبلغ چقدر بود؟", decimal: "مبلغ اعشاری در این قدم پذیرفته نیست؛ مبلغ را به عدد صحیح بگو.", period: "برای کدام دوره؟ امروز، دیروز، این هفته یا این ماه؟", date: "تاریخ را درست بگو؛ آن تاریخ معتبر نیست.", "hour-ambiguous": "ساعت را با صبح یا عصر مشخص کن.", "no-time": "ساعت یادآوری را بگو.", past: "آن زمان گذشته است؛ زمان آینده را بگو.", empty: "یادآوری برای چه کاری؟", text: "چه متنی را ترجمه کنم؟", "expense-or-chat": "این خرج است یا چت؟", "expense-or-income": "این خرج است یا درآمد؟", "note-text": "چه چیزی را یادداشت کنم؟", language: "به چه زبانی؟" }[q] ?? "دوباره بگو؟";
 }
 
 // Chat context: last 50 rows plus the 8,000-char cap, oldest dropped first.
@@ -63,17 +64,14 @@ export async function confirmExpenseDraft(env, userId, id) {
   return { status: "ok", draft };
 }
 
-// Everyday text, Part 1 scope: expense/income/ask only. Returns "handled"
-// or "chat" (fall through to the normal chat/task/dev path). Confident
+// Branch dispatch for a rule-classified intent. Returns "handled" or
+// "chat" (fall through to the normal chat/task/dev path). Confident
 // money messages are saved as kind daily; ask messages are not saved yet
 // (choice asks live in KV until chosen, other asks await a corrected resend).
-export async function handleDailyText(env, o) {
+// Used by both the rule path and the model path: the model only picks the
+// branch, and every branch below validates the ORIGINAL text again.
+async function runDailyBranch(env, o, c, ctx) {
   const { userId, text } = o;
-  const now = o.nowMs ?? Date.now();
-  if (!dbOf(env)) return "chat"; // D1 unavailable: everyday off, chat keeps working
-  const remembered = await getDefaultCurrency(env, userId);
-  const c = classifyDaily(text, { nowMs: now, rememberedCurrency: remembered });
-  if (c.intent === "chat" || c.intent === "command") return "chat";
   if (c.intent === "expense" || c.intent === "income") {
     await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
     await startConfirm(env, o, c.intent, c.extraction);
@@ -159,6 +157,99 @@ export async function handleDailyText(env, o) {
     return "handled";
   }
   return "chat";
+}
+
+// Model step (Part 2 wiring): the model only picks the branch. Every
+// branch below re-validates the ORIGINAL full text with the rule code,
+// so model output fields (amount/date/currency/confidence) are never
+// read — parseModelIntent already drops them. followup is Part 3 and is
+// ignored here. Returns { ret, outcome, ms }: ret is "handled" | "chat"
+// | "chat-direct", outcome is the timing-log outcome.
+async function runModelBranch(env, o, rule, ctx) {
+  const t0 = Date.now();
+  const m = await classifyDailyWithModel(env, o.text);
+  const ms = () => Date.now() - t0;
+  // A validated translate intent with one bad field: ask the language,
+  // on either tier — a targeted ask, not a generic failure.
+  if (m && m.invalid === "target") { await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+  if (!m) {
+    if (rule.intent === "ask") { const ret = await runDailyBranch(env, o, rule, ctx); return { ret, outcome: "asked", ms: ms() }; }
+    return { ret: "chat", outcome: "chat", ms: ms() };
+  }
+  const { text } = o;
+  const reclassify = () => classifyDaily(text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered });
+  switch (m.intent) {
+    case "chat":
+      if (rule.intent === "ask") { const ret = await runDailyBranch(env, o, { intent: "ask", question: "expense-or-chat" }, ctx); return { ret, outcome: "asked", ms: ms() }; }
+      if (o.hasImage) return { ret: "chat", outcome: "chat", ms: ms() };
+      return { ret: "chat-direct", outcome: "chat", ms: ms() };
+    case "dev": await o.send(freeTextDevSuggestion()); return { ret: "handled", outcome: "routed", ms: ms() };
+    case "expense": case "income": {
+      const ex = parseExpense(text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, text);
+      if (ex?.error) { const ret = await runDailyBranch(env, o, { intent: "ask", question: ex.error }, ctx); return { ret, outcome: "asked", ms: ms() }; }
+      return { ret: await runDailyBranch(env, o, { intent: m.intent, extraction: ex }, ctx), outcome: "routed", ms: ms() };
+    }
+    case "note": {
+      const c2 = reclassify();
+      if (c2.intent === "note") return { ret: await runDailyBranch(env, o, c2, ctx), outcome: "routed", ms: ms() };
+      await o.send(askText("note-text")); return { ret: "handled", outcome: "asked", ms: ms() };
+    }
+    case "reminder": {
+      const r = parseReminder(normalizeText(text), ctx.now, text);
+      const c2 = r.ask ? { intent: "reminder", ask: r.ask } : { intent: "reminder", text: r.text, due: r.due };
+      const ret = await runDailyBranch(env, o, c2, ctx);
+      return { ret, outcome: r.ask ? "asked" : "routed", ms: ms() };
+    }
+    case "translate": {
+      const c2 = reclassify();
+      let body = c2.intent === "translate" ? c2.text : null;
+      if (!body) { const colon = /[:：]\s*([\s\S]+)/.exec(text); body = colon ? colon[1].trim() : null; }
+      if (!body) { await o.send(askText("text")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+      const target = m.target || (c2.intent === "translate" && ["en", "fa", "ar"].includes(c2.target) ? c2.target : null);
+      if (!target) { await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+      return { ret: await runDailyBranch(env, o, { intent: "translate", text: body, target }, ctx), outcome: "routed", ms: ms() };
+    }
+    case "remember": {
+      const c2 = reclassify();
+      if (c2.intent === "remember") return { ret: await runDailyBranch(env, o, c2, ctx), outcome: "routed", ms: ms() };
+      await o.send("در این قدم فقط تنظیم‌ها نگه داشته می‌شوند؛ خاطره‌های آزاد در قدم حافظه می‌آیند");
+      return { ret: "handled", outcome: "routed", ms: ms() };
+    }
+    case "expense-query": {
+      const c2 = reclassify();
+      if (c2.intent === "expense-query") { const ret = await runDailyBranch(env, o, c2, ctx); return { ret, outcome: c2.ask ? "asked" : "routed", ms: ms() }; }
+      const ret = await runDailyBranch(env, o, { intent: "expense-query", ask: "period" }, ctx);
+      return { ret, outcome: "asked", ms: ms() };
+    }
+    case "note-query": return { ret: await runDailyBranch(env, o, { intent: "note-query" }, ctx), outcome: "routed", ms: ms() };
+    case "last-expense": return { ret: await runDailyBranch(env, o, { intent: "last-expense" }, ctx), outcome: "routed", ms: ms() };
+    case "file-reference": {
+      const ret = await runDailyBranch(env, o, { intent: "file-reference" }, ctx);
+      return { ret, outcome: ret === "chat" ? "chat" : "routed", ms: ms() };
+    }
+    default: return { ret: "chat", outcome: "chat", ms: ms() };
+  }
+}
+
+// Everyday text, Part 2: rule first, model only when the rule is
+// uncertain (ask) or finds no everyday branch (chat). Confident rule
+// results never reach a model. Returns "handled", "chat" (normal
+// chat/task/dev path), or "chat-direct" (model already said chat for a
+// text message, so the caller answers directly and skips classifyIntent).
+export async function handleDailyText(env, o) {
+  const { userId, text } = o;
+  const now = o.nowMs ?? Date.now();
+  if (!dbOf(env)) return "chat"; // D1 unavailable: everyday off, chat keeps working
+  const remembered = await getDefaultCurrency(env, userId);
+  const c = classifyDaily(text, { nowMs: now, rememberedCurrency: remembered });
+  if (c.intent === "command") return "chat";
+  const ctx = { now, remembered };
+  if (c.intent !== "chat" && c.intent !== "ask") return runDailyBranch(env, o, c, ctx);
+  // Ask/chat tier: exactly one model call. Timing log: combo, tier,
+  // duration, outcome — never message text or keys.
+  const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx);
+  console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome }));
+  return ret;
 }
 
 // daily: callbacks. Returns true when the data was a daily: callback.
