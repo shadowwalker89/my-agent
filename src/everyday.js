@@ -52,6 +52,16 @@ async function setPendingAsk(env, userId, question, askId, kind, pendingBody) {
   if (pendingBody) value.pendingBody = pendingBody;
   await putKv(env, pendingKey(userId), value);
 }
+// Language-name mapper for deterministic language-slot answers (en/fa/ar
+// only, the pre-existing everyday target restriction — "German" re-asks).
+function parseLanguageAnswer(text) {
+  const t = String(text ?? "").trim().toLowerCase().replace(/^به\s+/u, "").replace(/[؟?!.،,:：\s]+$/u, "");
+  if (["en", "english", "انگلیسی", "انگليسي"].includes(t)) return "en";
+  if (["fa", "persian", "farsi", "فارسی", "فارسي"].includes(t)) return "fa";
+  if (["ar", "arabic", "عربی", "عربي"].includes(t)) return "ar";
+  return null;
+}
+
 // Slot kind, with a defensive fallback for slots built without one (Part 3
 // slots): button slots by askId, otherwise reverse the ask text to its key.
 function slotKind(slot) {
@@ -270,6 +280,27 @@ export async function runModelBranch(env, o, rule, ctx) {
   if (m && m.invalid === "target") {
     const keep = slot && slotKind(slot) === "language" ? slot.pendingBody : slot && slotKind(slot) === "translate-text" ? o.text : deriveTranslateBody(o.text, ctx);
     await setPendingAsk(env, o.userId, askText("language"), undefined, "language", keep || undefined); await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() };
+  }
+  if (!m && rule.intent === "chat" && slot) {
+    // Fallback body-slot handling: ONLY when the model gave nothing
+    // (failure, timeout, unparseable output, or missing key). Model
+    // successes keep the old 3b behaviour; the slot kind decides only
+    // as a fallback, so a live model that never returns JSON cannot
+    // loop on re-ask. Chat tier only: rule "ask" keeps the model path.
+    const fallbackKind = slotKind(slot);
+    if (fallbackKind === "note-text" || fallbackKind === "translate-text" || (fallbackKind === "language" && slot.pendingBody)) {
+      if (fallbackKind === "note-text") {
+        if (!o.text.trim()) { await setPendingAsk(env, o.userId, askText("note-text"), undefined, "note-text"); await o.send(askText("note-text")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+        return { ret: await runDailyBranch(env, o, { intent: "note", text: o.text }, ctx), outcome: "routed", ms: ms() };
+      }
+      if (fallbackKind === "translate-text") {
+        if (!o.text.trim()) { await setPendingAsk(env, o.userId, askText("text"), undefined, "translate-text"); await o.send(askText("text")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+        await setPendingAsk(env, o.userId, askText("language"), undefined, "language", o.text); await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() };
+      }
+      const target = parseLanguageAnswer(o.text);
+      if (!target) { await setPendingAsk(env, o.userId, askText("language"), undefined, "language", slot.pendingBody); await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+      return { ret: await runDailyBranch(env, o, { intent: "translate", text: slot.pendingBody, target }, ctx), outcome: "routed", ms: ms() };
+    }
   }
   if (!m) {
     // Part 3b deviation: for body slots (note-text/translate-text/language)
