@@ -371,6 +371,10 @@ export async function handleDailyText(env, o) {
   const c = classifyDaily(text, { nowMs: now, rememberedCurrency: remembered });
   if (c.intent === "command") { await clearPendingAsk(env, userId); return "chat"; }
   const ctx = { now, remembered };
+  // Bare-note ask bypasses the model step: the model is exactly what
+  // failed live for bare notes (chat verdict -> hallucinated storage).
+  // runDailyBranch asks for the text and sets the note-text slot itself.
+  if (c.intent === "ask" && c.question === "note-text") { await clearPendingAsk(env, userId); return runDailyBranch(env, o, c, ctx); }
   if (c.intent !== "chat" && c.intent !== "ask") { await clearPendingAsk(env, userId); return runDailyBranch(env, o, c, ctx); }
   // Ask/chat tier: exactly one model call. Timing log: combo, tier,
   // duration, outcome — never message text or keys.
