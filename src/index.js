@@ -26,7 +26,7 @@ import { healthCounts } from "./health.js";
 import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation, freeTextDevSuggestion } from "./intent.js";
 import { getChatContext } from "./memory.js";
-import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders } from "./everyday.js";
+import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile } from "./everyday.js";
 import { saveMessage } from "./db.js";
 import {
   dispatchDev,
@@ -840,6 +840,16 @@ async function handleUpdate(env, update) {
   if (!isAllowed(env.ALLOWED_TG_IDS, msg.from.id)) return;
 
   if (!text) {
+    // Non-text file: photo (largest size) or document. Saved as kind
+    // daily, no R2 in Step 1; summarising comes with the file step.
+    const photo = Array.isArray(msg.photo) && msg.photo.length ? msg.photo[msg.photo.length - 1] : null;
+    const doc = msg.document && typeof msg.document === "object" ? msg.document : null;
+    const fileId = photo?.file_id ?? doc?.file_id;
+    if (fileId) {
+      await ensureUserRow(env, msg.from.id);
+      const handled = await handleDailyFile(env, { userId: msg.from.id, chatId: msg.chat.id, tgFileId: fileId, fileName: doc?.file_name ?? null, fileMime: doc?.mime_type ?? (photo ? "image/jpeg" : null), caption: typeof msg.caption === "string" ? msg.caption : null, send: (msgText) => tgSend(env, msg.chat.id, msgText) });
+      if (handled) return;
+    }
     await tgSend(env, msg.chat.id, "فعلاً فقط پیام متنی پشتیبانی می‌شود 🙏");
     return;
   }
