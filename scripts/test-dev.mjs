@@ -1766,6 +1766,154 @@ if (DatabaseSync) {
 }
 
 
+
+// ── Model router Part 3b: slot-aware body consumption (stacks on Part 3) ──
+// Fixes the Part 3 loop: a model note/translate verdict re-gated on rule
+// reclassification could never store/translate a follow-up body. Slot kind
+// (never a Persian-text comparison) decides the slot cases below.
+if (DatabaseSync) {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  const d1 = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
+  const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4501,4502,4503,4504,4505,4506,4507,4508,4509,4510", DB: d1, ROUTER_KEY: "k-test", ...extra });
+  const fakeSend = () => { const sent = []; return { sent, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, api: async () => ({ ok: true }) }; };
+  const o = (env, userId, text, extra = {}) => ({ chatId: userId, userId, text, send: extra.send, chat: extra.chat ?? (async () => {}), nowMs: extra.nowMs, hasImage: extra.hasImage });
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+  const origFetch = global.fetch;
+  let fetchCalls = 0;
+  const mockModel = (content) => { fetchCalls = 0; global.fetch = async () => { fetchCalls++; return Response.json({ choices: [{ message: { content } }] }); }; };
+  const mockModelFail = () => { fetchCalls = 0; global.fetch = async () => { fetchCalls++; throw new Error("boom"); }; };
+  const modelJson = (intent, extra = {}) => JSON.stringify({ intent, followup: null, target: null, ...extra });
+  const lastText = (s) => String(s.sent.at(-1)?.text ?? "");
+  const slotOf = async (env, uid) => env.STATE.get(`daily:pending-ask:${uid}`, "json");
+  const noteAsk = async (env, s, uid) => { mockModel(modelJson("note")); await handleDailyText(env, o(env, uid, "یادداشت", { ...s, nowMs: NOW })); };
+  // (a) Bare note, end to end: bare note -> note-text ask -> body -> note stored, slot cleared.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await noteAsk(env, s, 4501);
+    check(lastText(s).includes("چه چیزی را یادداشت کنم؟") && (await slotOf(env, 4501))?.kind === "note-text", "3b: bare note sets note-text slot with kind");
+    mockModel(modelJson("note"));
+    const r = await handleDailyText(env, o(env, 4501, "فردا به علی زنگ بزنم", { ...s, nowMs: NOW }));
+    check(r === "handled" && lastText(s).includes("یادداشت ذخیره شد") && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4501")[0].n === 1 && rows("SELECT text FROM notes WHERE user_id = 4501")[0].text === "فردا به علی زنگ بزنم" && (await slotOf(env, 4501)) === null, "3b: note body follow-up stored end to end, slot cleared");
+  }
+  // (b) Translate, end to end: translate with no body -> text ask -> body + target -> translated.
+  {
+    const env = mkEnv(), s = fakeSend(); let chats = [];
+    mockModel(modelJson("translate", { target: "en" }));
+    await handleDailyText(env, o(env, 4502, "ترجمه کن", { ...s, nowMs: NOW }));
+    check(lastText(s).includes("چه متنی را ترجمه کنم؟") && (await slotOf(env, 4502))?.kind === "translate-text", "3b: translate with no body sets translate-text slot with kind");
+    mockModel(modelJson("translate", { target: "en" }));
+    const r = await handleDailyText(env, o(env, 4502, "سلام دنیا", { ...s, nowMs: NOW, chat: async (text, copts) => { chats.push({ text, copts }); } }));
+    check(r === "handled" && chats[0]?.text === "سلام دنیا" && String(chats[0]?.copts?.systemPrompt ?? "").includes("English") && chats[0]?.copts?.noHistory === true && (await slotOf(env, 4502)) === null, "3b: translate body follow-up executed end to end with target");
+  }
+  // (c) Translate + language, end to end: body without target -> language ask (body kept) -> language answer -> original body translated.
+  {
+    const env = mkEnv(), s = fakeSend(); let chats = [];
+    mockModel(modelJson("translate", { target: "en" }));
+    await handleDailyText(env, o(env, 4503, "ترجمه کن", { ...s, nowMs: NOW }));
+    mockModel(modelJson("translate"));
+    await handleDailyText(env, o(env, 4503, "سلام دنیا", { ...s, nowMs: NOW }));
+    const slot = await slotOf(env, 4503);
+    check(lastText(s).includes("به چه زبانی؟") && slot?.kind === "language" && slot?.pendingBody === "سلام دنیا", "3b: body without target -> language ask keeps body in slot");
+    mockModel(modelJson("translate", { target: "en" }));
+    const r = await handleDailyText(env, o(env, 4503, "انگلیسی", { ...s, nowMs: NOW, chat: async (text, copts) => { chats.push({ text, copts }); } }));
+    check(r === "handled" && chats[0]?.text === "سلام دنیا" && String(chats[0]?.copts?.systemPrompt ?? "").includes("English") && (await slotOf(env, 4503)) === null, "3b: language answer translates the ORIGINAL body end to end");
+  }
+  // (c2) Invalid model target with a translate-text slot -> language ask keeps the body.
+  {
+    const env = mkEnv(), s = fakeSend();
+    mockModel(modelJson("translate", { target: "en" }));
+    await handleDailyText(env, o(env, 4504, "ترجمه کن", { ...s, nowMs: NOW }));
+    mockModel(modelJson("translate", { target: "de" }));
+    await handleDailyText(env, o(env, 4504, "سلام دنیا", { ...s, nowMs: NOW }));
+    const slot = await slotOf(env, 4504);
+    check(lastText(s).includes("به چه زبانی؟") && slot?.kind === "language" && slot?.pendingBody === "سلام دنیا", "3b: invalid target with translate-text slot -> language ask keeps body");
+  }
+  // (d1) Model failure with a note-text slot -> same question, nothing stored, slot (kind) preserved.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await noteAsk(env, s, 4505);
+    mockModelFail();
+    const r = await handleDailyText(env, o(env, 4505, "فردا به علی زنگ بزنم", { ...s, nowMs: NOW }));
+    const slot = await slotOf(env, 4505);
+    check(r === "handled" && lastText(s).includes("چه چیزی را یادداشت کنم؟") && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4505")[0].n === 0 && slot?.kind === "note-text", "3b: failure with note-text slot -> same ask, nothing stored, kind preserved");
+  }
+  // (d2) Missing key with a note-text slot -> same question re-asked (NOT chat, NOT dropped), nothing stored.
+  {
+    const env = mkEnv(), s = fakeSend(); let chats = [];
+    await noteAsk(env, s, 4506);
+    const env2 = { ...env, ROUTER_KEY: undefined };
+    mockModel(modelJson("note"));
+    const r = await handleDailyText(env2, o(env2, 4506, "فردا به علی زنگ بزنم", { ...s, nowMs: NOW, chat: async (t) => { chats.push(t); } }));
+    const slot = await slotOf(env, 4506);
+    check(r === "handled" && fetchCalls === 0 && lastText(s).includes("چه چیزی را یادداشت کنم؟") && chats.length === 0 && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4506")[0].n === 0 && slot?.kind === "note-text", "3b: missing key with note-text slot -> same ask, not chat, not dropped");
+  }
+  // (d3) Model failure with a language slot -> same language ask, body kept.
+  {
+    const env = mkEnv(), s = fakeSend();
+    mockModel(modelJson("translate", { target: "en" }));
+    await handleDailyText(env, o(env, 4507, "ترجمه کن", { ...s, nowMs: NOW }));
+    mockModel(modelJson("translate"));
+    await handleDailyText(env, o(env, 4507, "سلام دنیا", { ...s, nowMs: NOW }));
+    mockModelFail();
+    await handleDailyText(env, o(env, 4507, "انگلیسی", { ...s, nowMs: NOW }));
+    const slot = await slotOf(env, 4507);
+    check(lastText(s).includes("به چه زبانی؟") && slot?.kind === "language" && slot?.pendingBody === "سلام دنیا", "3b: failure with language slot -> same ask, body kept");
+  }
+  // (e) >300-char note body is stored in full; the classification payload stays capped.
+  {
+    const env = mkEnv(), s = fakeSend(); let payload = null;
+    await noteAsk(env, s, 4508);
+    const body = "فردا به علی زنگ بزنم. ".repeat(20);
+    check(body.length > 300, "3b fixture: body is over 300 chars");
+    global.fetch = async (url, init) => { payload = JSON.parse(init.body); return Response.json({ choices: [{ message: { content: modelJson("note") } }] }); };
+    await handleDailyText(env, o(env, 4508, body, { ...s, nowMs: NOW }));
+    const stored = rows("SELECT text FROM notes WHERE user_id = 4508")[0]?.text;
+    const sentMsg = payload?.messages?.[1]?.content ?? "";
+    const sentUserText = sentMsg.includes("پیام کاربر: ") ? sentMsg.split("پیام کاربر: ")[1] : sentMsg;
+    check(stored === body && sentUserText.length <= 300, "3b: >300-char body stored in full, classification user text capped at 300");
+  }
+  // (f) Empty note body -> re-ask, nothing stored.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await noteAsk(env, s, 4509);
+    mockModel(modelJson("note"));
+    await handleDailyText(env, o(env, 4509, "   ", { ...s, nowMs: NOW }));
+    check(lastText(s).includes("چه چیزی را یادداشت کنم؟") && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4509")[0].n === 0, "3b: empty note body -> re-ask, nothing stored");
+  }
+  // (g) Kind fallback: a slot built without kind still resolves by its ask text.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await env.STATE.put("daily:pending-ask:4510", JSON.stringify({ question: "چه چیزی را یادداشت کنم؟" }));
+    mockModel(modelJson("note"));
+    await handleDailyText(env, o(env, 4510, "فردا به علی زنگ بزنم", { ...s, nowMs: NOW }));
+    check(rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4510")[0].n === 1 && rows("SELECT text FROM notes WHERE user_id = 4510")[0].text === "فردا به علی زنگ بزنم", "3b: kind-less slot falls back to ask-text kind, body stored");
+  }
+  // (h) Abandonment with a note-text slot: model chat -> chat-direct, slot cleared, no expense-or-chat ask.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await noteAsk(env, s, 4511);
+    const before = await slotOf(env, 4511);
+    mockModel(modelJson("chat"));
+    const r = await handleDailyText(env, o(env, 4511, "فردا به علی زنگ بزنم", { ...s, nowMs: NOW }));
+    check(before?.kind === "note-text" && r === "chat-direct" && (await slotOf(env, 4511)) === null && !s.sent.some((m) => String(m.text ?? "").includes("این خرج است یا چت؟")) && fetchCalls === 1, "3b: note-text slot + model chat -> chat-direct, slot cleared, no expense-or-chat ask");
+  }
+  // (i) Abandonment with a translate-text slot: model chat -> chat-direct, slot cleared, no expense-or-chat ask.
+  {
+    const env = mkEnv(), s = fakeSend();
+    mockModel(modelJson("translate", { target: "en" }));
+    await handleDailyText(env, o(env, 4512, "ترجمه کن", { ...s, nowMs: NOW }));
+    const before = await slotOf(env, 4512);
+    mockModel(modelJson("chat"));
+    const r = await handleDailyText(env, o(env, 4512, "سلام دنیا", { ...s, nowMs: NOW }));
+    check(before?.kind === "translate-text" && r === "chat-direct" && (await slotOf(env, 4512)) === null && !s.sent.some((m) => String(m.text ?? "").includes("این خرج است یا چت؟")) && fetchCalls === 1, "3b: translate-text slot + model chat -> chat-direct, slot cleared, no expense-or-chat ask");
+  }
+  global.fetch = origFetch;
+}
+
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
