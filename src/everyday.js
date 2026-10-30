@@ -40,9 +40,34 @@ export async function ensureUserRow(env, userId) { const id = Number(userId); if
 function draftKey(id) { return `daily:draft:${id}`; }
 function askKey(id) { return `daily:ask:${id}`; }
 // Pending-ask slot (Part 3): ONE slot per user, 600s TTL like money drafts.
-// {question, askId?}: question is always the bot's own ask text; askId points at the existing daily:ask record.
+// {question, askId?, kind?, pendingBody?}: question is always the bot's own
+// ask text; askId points at the existing daily:ask record. Part 3b adds kind
+// (a stable identifier like "note-text", never a Persian-text comparison) and
+// pendingBody (a body already known while a language ask is pending).
 function pendingKey(id) { return `daily:pending-ask:${id}`; }
-async function setPendingAsk(env, userId, question, askId) { await putKv(env, pendingKey(userId), askId ? { question, askId } : { question }); }
+async function setPendingAsk(env, userId, question, askId, kind, pendingBody) {
+  const value = { question };
+  if (askId) value.askId = askId;
+  if (kind) value.kind = kind;
+  if (pendingBody) value.pendingBody = pendingBody;
+  await putKv(env, pendingKey(userId), value);
+}
+// Slot kind, with a defensive fallback for slots built without one (Part 3
+// slots): button slots by askId, otherwise reverse the ask text to its key.
+function slotKind(slot) {
+  if (!slot || typeof slot !== "object") return "other";
+  if (slot.kind) return slot.kind;
+  if (slot.askId) return "button";
+  for (const key of ["amount", "decimal", "period", "date", "hour-ambiguous", "no-time", "past", "empty", "text", "expense-or-chat", "expense-or-income", "note-text", "language"]) {
+    if (slot.question === askText(key)) return key === "text" ? "translate-text" : key;
+  }
+  return "other";
+}
+// Slots whose question must survive a skipped/failed model call: dropping
+// them would lose the question (Part 3b deviation from the generic skip rule).
+function isBodySlot(slot) { return ["note-text", "translate-text", "language"].includes(slotKind(slot)); }
+// Rule ask key -> slot kind ("text" is the translate-body ask).
+function kindForAskKey(key) { return key === "text" ? "translate-text" : key; }
 async function getPendingAsk(env, userId) { return getKv(env, pendingKey(userId)); }
 async function clearPendingAsk(env, userId) { await delKv(env, pendingKey(userId)); }
 function askKeyboard(question, id) {
@@ -93,16 +118,16 @@ async function runDailyBranch(env, o, c, ctx) {
     if (question === "expense-or-chat" || question === "expense-or-income") {
       const id = newId();
       await putKv(env, askKey(id), { owner: userId, text, question });
-      await setPendingAsk(env, userId, askText(question), id);
+      await setPendingAsk(env, userId, askText(question), id, "button");
       await o.send(askText(question), { replyMarkup: { inline_keyboard: askKeyboard(question, id) } });
       return "handled";
     }
-    await setPendingAsk(env, userId, askText(question));
+    await setPendingAsk(env, userId, askText(question), undefined, kindForAskKey(question));
     await o.send(askText(question));
     return "handled";
   }
   if (c.intent === "translate") {
-    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask)); await o.send(askText(c.ask)); return "handled"; }
+    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask === "language" ? "language" : kindForAskKey(c.ask), c.ask === "language" ? c.text : undefined); await o.send(askText(c.ask)); return "handled"; }
     const targetName = c.target === "en" ? "English" : c.target === "fa" ? "Persian" : c.target;
     await o.chat(c.text, { systemPrompt: `Translate the following text${targetName ? ` to ${targetName}` : ""}. Reply with only the translation.`, saveText: text, noHistory: true });
     return "handled";
@@ -120,14 +145,14 @@ async function runDailyBranch(env, o, c, ctx) {
     return "handled";
   }
   if (c.intent === "reminder") {
-    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask)); await o.send(askText(c.ask)); return "handled"; }
+    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask); await o.send(askText(c.ask)); return "handled"; }
     const r = await runDb(env, "INSERT INTO reminders (user_id, text, due_at, status, created_at) VALUES (?, ?, ?, ?, ?)", [userId, c.text, c.due, "pending", new Date().toISOString()]);
     await o.send(r.ok ? `⏰ یادآوری فقط ذخیره شد (ارسال سر وقت هنوز فعال نیست): ${c.text} — ${c.due}` : NOT_SAVED_TEXT);
     if (r.ok) await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
     return "handled";
   }
   if (c.intent === "expense-query") {
-    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask)); await o.send(askText(c.ask)); return "handled"; }
+    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask); await o.send(askText(c.ask)); return "handled"; }
     const sums = await queryExpenseSums(env, userId, c.range);
     const keys = Object.keys(sums);
     await o.send(keys.length ? keys.map((k) => `${k}: ${sums[k]}`).join("\n") : "در این بازه خرجی ثبت نشده است.");
@@ -146,7 +171,7 @@ async function runDailyBranch(env, o, c, ctx) {
     return "handled";
   }
   if (c.intent === "note-query") {
-    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask)); await o.send(askText(c.ask)); return "handled"; }
+    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask); await o.send(askText(c.ask)); return "handled"; }
     const rows = await allDb(env, "SELECT text FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 5", [userId]);
     await o.send(rows.length ? rows.map((r) => `• ${r.text}`).join("\n") : "یادداشتی پیدا نشد.");
     await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
@@ -175,11 +200,11 @@ async function reaskPending(env, o, slot) {
     const ask = await getKv(env, askKey(slot.askId));
     if (!ask || Number(ask.owner) !== Number(o.userId) || (ask.question !== "expense-or-chat" && ask.question !== "expense-or-income")) { await o.send(EXPIRED_TEXT); return; }
     await o.send(askText(ask.question), { replyMarkup: { inline_keyboard: askKeyboard(ask.question, slot.askId) } });
-    await setPendingAsk(env, o.userId, askText(ask.question), slot.askId);
+    await setPendingAsk(env, o.userId, askText(ask.question), slot.askId, "button", slot.pendingBody);
     return;
   }
   await o.send(slot.question);
-  await setPendingAsk(env, o.userId, slot.question);
+  await setPendingAsk(env, o.userId, slot.question, undefined, slotKind(slot), slot.pendingBody);
 }
 
 // Follow-up resolution (Part 3): only with a slot AND a model followup.
@@ -195,7 +220,7 @@ async function resolveFollowup(env, o, slot, m, ctx) {
     const choice = m.followup === "yes" ? "expense" : ask.question === "expense-or-chat" ? "chat" : "income";
     if (choice === "chat") { await o.chat(ask.text, {}); return { ret: "handled", outcome: "chat" }; }
     const ex = parseExpense(ask.text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, ask.text);
-    if (ex?.error) { const q = askText(mapQuestion(ex.error)); await o.send(q); await setPendingAsk(env, o.userId, q); return { ret: "handled", outcome: "asked" }; }
+    if (ex?.error) { const q = askText(mapQuestion(ex.error)); await o.send(q); await setPendingAsk(env, o.userId, q, undefined, mapQuestion(ex.error)); return { ret: "handled", outcome: "asked" }; }
     await startConfirm(env, o, choice, ex);
     return { ret: "handled", outcome: "routed" };
   }
@@ -203,18 +228,27 @@ async function resolveFollowup(env, o, slot, m, ctx) {
   if (m.followup === "no") { await o.send("باشه، ثبت نشد."); return { ret: "handled", outcome: "routed" }; }
   if (slot.question === askText("amount") && (m.intent === "expense" || m.intent === "income")) {
     const ex = parseExpense(text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, text);
-    if (ex?.error) { await o.send(askText("amount")); await setPendingAsk(env, o.userId, askText("amount")); return { ret: "handled", outcome: "asked" }; }
+    if (ex?.error) { await o.send(askText("amount")); await setPendingAsk(env, o.userId, askText("amount"), undefined, "amount"); return { ret: "handled", outcome: "asked" }; }
     return { ret: await runDailyBranch(env, o, { intent: m.intent, extraction: ex }, ctx), outcome: "routed" };
   }
   if (slot.question === askText("amount")) {
     // Bare "yes" (or a non-money verdict): "yes" alone answers no amount.
-    await o.send(askText("amount")); await setPendingAsk(env, o.userId, askText("amount")); return { ret: "handled", outcome: "asked" };
+    await o.send(askText("amount")); await setPendingAsk(env, o.userId, askText("amount"), undefined, "amount"); return { ret: "handled", outcome: "asked" };
   }
   // Non-amount plain ask + "yes": a fresh everyday intent runs fresh (the
   // user answered with a full message); a bare "yes" answers nothing, so
   // the same question is re-asked instead of dumping "yes" into chat.
   if (m.intent !== "chat") return null;
-  await o.send(slot.question); await setPendingAsk(env, o.userId, slot.question); return { ret: "handled", outcome: "asked" };
+  await o.send(slot.question); await setPendingAsk(env, o.userId, slot.question, undefined, slotKind(slot), slot.pendingBody); return { ret: "handled", outcome: "asked" };
+}
+
+// Translate body derivation, shared by the translate case and the
+// invalid-target ask: rule body first, then a "text: body" colon fallback.
+function deriveTranslateBody(text, ctx) {
+  const c2 = classifyDaily(text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered });
+  let body = c2.intent === "translate" ? c2.text : null;
+  if (!body) { const colon = /[:：]\s*([\s\S]+)/.exec(text); body = colon ? colon[1].trim() : null; }
+  return body || null;
 }
 
 // Model step (Part 3): the model only picks the branch; every branch below
@@ -231,10 +265,18 @@ export async function runModelBranch(env, o, rule, ctx) {
   // Old slot consumed now: later paths resolve (stays cleared) or send a new ask (fresh slot).
   await clearPendingAsk(env, o.userId);
   // A validated translate intent with one bad field: ask the language,
-  // on either tier — a targeted ask, not a generic failure.
-  if (m && m.invalid === "target") { await setPendingAsk(env, o.userId, askText("language")); await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+  // on either tier — a targeted ask, not a generic failure. A body known
+  // here (follow-up body, kept body, or derived body) rides in the slot.
+  if (m && m.invalid === "target") {
+    const keep = slot && slotKind(slot) === "language" ? slot.pendingBody : slot && slotKind(slot) === "translate-text" ? o.text : deriveTranslateBody(o.text, ctx);
+    await setPendingAsk(env, o.userId, askText("language"), undefined, "language", keep || undefined); await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() };
+  }
   if (!m) {
-    if (slot && !keyMissing) { await reaskPending(env, o, slot); return { ret: "handled", outcome: "asked", ms: ms() }; }
+    // Part 3b deviation: for body slots (note-text/translate-text/language)
+    // a SKIPPED call (missing key) re-asks like a failure — the generic
+    // skip-to-chat would silently drop the question. Other slots keep
+    // Part 3 behaviour (skip -> rule ask / chat, slot consumed).
+    if (slot && (!keyMissing || isBodySlot(slot))) { await reaskPending(env, o, slot); return { ret: "handled", outcome: "asked", ms: ms() }; }
     if (rule.intent === "ask") { const ret = await runDailyBranch(env, o, rule, ctx); return { ret, outcome: "asked", ms: ms() }; }
     return { ret: "chat", outcome: "chat", ms: ms() };
   }
@@ -244,6 +286,26 @@ export async function runModelBranch(env, o, rule, ctx) {
   }
   const { text } = o;
   const reclassify = () => classifyDaily(text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered });
+  // Part 3b: slot-aware body consumption. When the pending slot asked for a
+  // body and the model verdict matches it, the follow-up's FULL text IS the
+  // body — the reclassification gate below must not loop on it. This bypass
+  // applies ONLY to these slot cases; all non-slot verdicts keep Part 2/3
+  // behaviour. Bodies always come from o.text (full), never the 300-char
+  // classification payload (that cap lives only inside classifyDailyWithModel).
+  const kind = slot ? slotKind(slot) : "other";
+  if (slot && kind === "note-text" && m.intent === "note") {
+    if (!text.trim()) { await setPendingAsk(env, o.userId, askText("note-text"), undefined, "note-text"); await o.send(askText("note-text")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+    return { ret: await runDailyBranch(env, o, { intent: "note", text }, ctx), outcome: "routed", ms: ms() };
+  }
+  if (slot && kind === "translate-text" && m.intent === "translate") {
+    if (!text.trim()) { await setPendingAsk(env, o.userId, askText("text"), undefined, "translate-text"); await o.send(askText("text")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+    if (m.target) return { ret: await runDailyBranch(env, o, { intent: "translate", text, target: m.target }, ctx), outcome: "routed", ms: ms() };
+    await setPendingAsk(env, o.userId, askText("language"), undefined, "language", text); await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() };
+  }
+  if (slot && kind === "language" && m.intent === "translate" && slot.pendingBody) {
+    if (m.target) return { ret: await runDailyBranch(env, o, { intent: "translate", text: slot.pendingBody, target: m.target }, ctx), outcome: "routed", ms: ms() };
+    await setPendingAsk(env, o.userId, askText("language"), undefined, "language", slot.pendingBody); await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() };
+  }
   switch (m.intent) {
     case "chat":
       if (rule.intent === "ask") { const ret = await runDailyBranch(env, o, { intent: "ask", question: "expense-or-chat" }, ctx); return { ret, outcome: "asked", ms: ms() }; }
@@ -258,7 +320,7 @@ export async function runModelBranch(env, o, rule, ctx) {
     case "note": {
       const c2 = reclassify();
       if (c2.intent === "note") return { ret: await runDailyBranch(env, o, c2, ctx), outcome: "routed", ms: ms() };
-      await setPendingAsk(env, o.userId, askText("note-text")); await o.send(askText("note-text")); return { ret: "handled", outcome: "asked", ms: ms() };
+      await setPendingAsk(env, o.userId, askText("note-text"), undefined, "note-text"); await o.send(askText("note-text")); return { ret: "handled", outcome: "asked", ms: ms() };
     }
     case "reminder": {
       const r = parseReminder(normalizeText(text), ctx.now, text);
@@ -268,11 +330,10 @@ export async function runModelBranch(env, o, rule, ctx) {
     }
     case "translate": {
       const c2 = reclassify();
-      let body = c2.intent === "translate" ? c2.text : null;
-      if (!body) { const colon = /[:：]\s*([\s\S]+)/.exec(text); body = colon ? colon[1].trim() : null; }
-      if (!body) { await setPendingAsk(env, o.userId, askText("text")); await o.send(askText("text")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+      const body = deriveTranslateBody(text, ctx);
+      if (!body) { await setPendingAsk(env, o.userId, askText("text"), undefined, "translate-text"); await o.send(askText("text")); return { ret: "handled", outcome: "asked", ms: ms() }; }
       const target = m.target || (c2.intent === "translate" && ["en", "fa", "ar"].includes(c2.target) ? c2.target : null);
-      if (!target) { await setPendingAsk(env, o.userId, askText("language")); await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() }; }
+      if (!target) { await setPendingAsk(env, o.userId, askText("language"), undefined, "language", body); await o.send(askText("language")); return { ret: "handled", outcome: "asked", ms: ms() }; }
       return { ret: await runDailyBranch(env, o, { intent: "translate", text: body, target }, ctx), outcome: "routed", ms: ms() };
     }
     case "remember": {
@@ -343,7 +404,7 @@ export async function resolveDailyCallback(env, o) {
   await o.editMarkup();
   if (choice === "chat") { await o.chat(ask.text, {}); return true; }
   const ex = parseExpense(ask.text, { nowMs: o.nowMs ?? Date.now() }, ask.text);
-  if (ex?.error) { const q = askText(mapQuestion(ex.error)); await setPendingAsk(env, o.fromId, q); await o.send(q); return true; }
+  if (ex?.error) { const q = askText(mapQuestion(ex.error)); await setPendingAsk(env, o.fromId, q, undefined, mapQuestion(ex.error)); await o.send(q); return true; }
   await startConfirm(env, o, choice, ex);
   return true;
 }
