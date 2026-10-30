@@ -149,7 +149,7 @@ async function runDailyBranch(env, o, c, ctx) {
     return "handled";
   }
   if (c.intent === "note") {
-    const r = await runDb(env, "INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)", [userId, c.text, "text", new Date().toISOString()]);
+    const r = await runDb(env, "INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)", [userId, c.text, o.source === "voice" ? "voice" : "text", new Date().toISOString()]);
     await o.send(r.ok ? "✅ یادداشت ذخیره شد." : NOT_SAVED_TEXT);
     if (r.ok) await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
     return "handled";
