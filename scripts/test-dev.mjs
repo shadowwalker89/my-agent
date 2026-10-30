@@ -1019,6 +1019,18 @@ if (DatabaseSync) {
   check(cl("خرج آخر چی بود؟").intent === "last-expense", "last-expense: kharj akhar");
   check(cl("آخرین خرج چقدر بود؟").intent === "last-expense", "last-expense beats period ask");
   check(cl("خرج کردم ۵۰۰ تومان نان").intent === "expense", "last-expense does not steal a real expense");
+  // Declaration expense (live voice failure 2026-10-30): a "new expense"
+  // declaration with خرید but no past-tense verb must reach expense,
+  // never chat conf 1. Category is never invented.
+  { const d = cl("یک هزینه جدید خرید نون 1500 تومن"); check(d.intent === "expense" && d.confidence === 1 && d.extraction?.amount === 1500 && d.extraction?.currency === "TOMAN" && d.extraction?.item === "نون" && d.extraction?.category === null, `declaration expense: exact voice wording: ${JSON.stringify(d)}`); }
+  { const d = cl("خرج جدید خرید شیر 2000 تومان"); check(d.intent === "expense" && d.extraction?.amount === 2000 && d.extraction?.item === "شیر", `declaration expense: kharj variant: ${JSON.stringify(d)}`); }
+  { const d = cl("هزینه‌ی جدید خرید نون ۱۵۰۰ تومان"); check(d.intent === "expense" && d.extraction?.amount === 1500 && d.extraction?.item === "نون", `declaration expense: ZWNJ + Persian digits: ${JSON.stringify(d)}`); }
+  check(cl("هزینه جدید خرید 1500 تومن").intent === "ask" && cl("هزینه جدید خرید 1500 تومن").question === "expense-or-chat", "declaration without an item asks, never stores");
+  check(cl("هزینه جدید خرید نون 1500 تومن و شیر 2000 تومان").intent === "ask" && cl("هزینه جدید خرید نون 1500 تومن و شیر 2000 تومان").question === "amount", "declaration with two amounts asks");
+  check(cl("هزینه جدید چیست؟").intent !== "expense", "declaration question is not an expense");
+  check(cl("امروز چقدر خرج کردم؟").intent === "expense-query", "declaration fix does not steal the today query");
+  check(cl("خرج قبلی چی بود؟").intent === "last-expense", "declaration fix does not steal last-expense");
+  check(cl("هزینه جدید خرید نون 1500 تومن نکردم").intent !== "expense", "negated declaration is not an expense");
   check(cl("۳۲ آبان چقدر خرج کردم؟").intent === "expense-query" && cl("۳۲ آبان چقدر خرج کردم؟").ask === "date", "invalid jalali in query asks, never weekRange(null)");
   // Normalisation first: Arabic letters, space/ZWNJ variants.
   check(normalizeText("يادداشت كتاب") === "یادداشت کتاب", "arabic letters normalised");
