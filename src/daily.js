@@ -354,6 +354,36 @@ export function classifyDaily(text, opts = {}) {
     else range = { start: date, end: date };
     return { intent: "expense-query", confidence: 1, period, range };
   }
+  // Declaration expense: a spoken-style "new expense" declaration with
+  // خرید but no past-tense verb ("یک هزینه جدید خرید نون 1500 تومن")
+  // previously fell to chat conf 1 via the token-count fallback below,
+  // so a live voice expense was answered by chat and never stored.
+  // Placed before the verb branch so the خرج variant gets the same
+  // cleaned item (the verb branch's خرج+anchored path kept "جدید" in
+  // the item); verb-only messages cannot fire it (they lack جدید+خرید).
+  // Fires only for an explicit declaration + خرید + anchored amount +
+  // a remaining item noun, with no query wording and no negation.
+  // Normalisation already turns ZWNJ into a space, so "هزینه‌ی جدید"
+  // arrives as the tokens هزینه / ی / جدید.
+  if (amount?.anchored && !NEGATED_RE.test(raw) && !/چقدر|چقد|چند|چیست/.test(raw) && !/[؟?]\s*$/.test(raw)) {
+    const toks = raw.replace(/[؟?!.،,]/g, " ").split(/\s+/).filter(Boolean);
+    let decl = -1;
+    for (let i = 0; i < toks.length; i++) {
+      if ((toks[i] === "هزینه" || toks[i] === "خرج") && (toks[i + 1] === "جدید" || (toks[i + 1] === "ی" && toks[i + 2] === "جدید"))) { decl = i; break; }
+    }
+    if (decl >= 0 && toks.includes("خرید")) {
+      if (countAnchoredAmounts(raw) >= 2) return { intent: "ask", confidence: 0.5, question: "amount" };
+      const ex = parseExpense(raw, opts, text);
+      if (ex?.error === "date") return { intent: "ask", confidence: 0.5, question: "date" };
+      if (ex?.error) return { intent: "ask", confidence: 0.5, question: "expense-or-chat" };
+      // Strip the declaration words from the item (parseExpense keeps
+      // them, since only verbs are in its STOP set); a ZWNJ-spelled
+      // trigger splits into two normalised parts, so filter per part.
+      const item = String(ex.item ?? "").split(/\s+/).flatMap((t) => normalizeText(t).split(/\s+/)).filter((t) => !["یک", "هزینه", "خرج", "جدید", "ی"].includes(t)).join(" ").trim();
+      if (!item) return { intent: "ask", confidence: 0.5, question: "expense-or-chat" };
+      return { intent: "expense", confidence: 1, extraction: { ...ex, item } };
+    }
+  }
   const hasE = !NEGATED_RE.test(raw) && (EXPENSE_VERBS.test(raw) || (/(?<!\p{L})خرج(?!\p{L})/u.test(raw) && amount?.anchored));
   const hasI = !NEGATED_RE.test(raw) && (INCOME_VERBS.test(raw) || (/(?<!\p{L})درآمد(?!\p{L})/u.test(raw) && amount?.anchored) || (/(?<!\p{L})گرفتم(?![\p{L}])/u.test(raw) && amount?.anchored));
   if (hasE || hasI) {
