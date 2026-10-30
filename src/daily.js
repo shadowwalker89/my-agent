@@ -145,3 +145,199 @@ export function parseReminder(text, nowMs) {
   return { due: `${date}T${pad(hour.hour)}:${pad(hour.minute)}:00+03:30`, text: body };
 }
 export { REMINDER_TRIGGERS };
+// ── Step 1b-1b: amount and classifier (on top of 1b-1a) ─────────────────
+// Normalisation runs FIRST, before every pattern in this section.
+// Object-key safety: every map lookup below uses Object.hasOwn, never
+// bare indexing, so a user word like "constructor" cannot return a
+// function from Object.prototype.
+export const DEFAULT_CURRENCY = "TOMAN";
+const CUR = { "تومان": "TOMAN", "تومنی": "TOMAN", "تومن": "TOMAN", "ریال": "IRR", "دلار": "USD", "یورو": "EUR", "€": "EUR", "$": "USD" };
+const ONES = { "یک": 1, "دو": 2, "سه": 3, "چهار": 4, "پنج": 5, "شش": 6, "هفت": 7, "هشت": 8, "ده": 10, "یازده": 11, "دوازده": 12, "سیزده": 13, "چهارده": 14, "پانزده": 15, "شانزده": 16, "هفده": 17, "هجده": 18, "نوزده": 19 };
+const TENS = { "بیست": 20, "سی": 30, "چهل": 40, "پنجاه": 50, "شصت": 60, "هفتاد": 70, "هشتاد": 80, "نود": 90 };
+const HUNDREDS = { "صد": 100, "دویست": 200, "سیصد": 300, "چهارصد": 400, "پانصد": 500, "ششصد": 600, "هفتصد": 700, "هشتصد": 800, "نهصد": 900 };
+const COUNTING = new Set(["تا", "عدد", "کیلو", "گرم", "لیتر", "متر", "نفر", "دانه", "مرتبه", "دفعه", "بار", "جلد", "بسته", "ساعت"]); const MULTS = new Set(["هزار", "میلیون", "میلیارد"]);
+export function normalizeText(t) {
+  return String(t ?? "").replace(/ي/g, "ی").replace(/ك/g, "ک").replace(/‌/g, " "); // one-to-one only: no collapse, no trim, so indices match the original text
+}
+function stripThousands(t) { return String(t).replace(/(\d)[,٬](?=\d{3}(?!\d))/g, "$1"); }
+function has(map, key) { return Object.hasOwn(map, key); }
+// Parse a number phrase: a run of number tokens (digits or words)
+// joined by "و", composed into segments, each optionally multiplied
+// by thousand/million, and summed. A bare multiplier alone is its own
+// value (هزار = 1000). A bare segment after a million segment, without
+// thousand, is ambiguous (2,000,500 vs colloquial 2.5 million) and
+// returns an error instead of either value.
+export function parseNumberPhrase(toks, start = 0) {
+  const segments = []; let i = start, cur = 0, seen = false, lastNumber = false;
+  while (i < toks.length) {
+    const tok = toks[i];
+    if (tok === "و") { if (!seen && segments.length === 0) break; lastNumber = false; i++; continue; }
+    if (tok === "هزار" || tok === "میلیون") { segments.push({ value: seen ? cur : 1, mult: tok }); cur = 0; seen = false; lastNumber = false; i++; continue; }
+    let v = null;
+    if (/^\d+$/.test(tok)) v = Number(tok); else if (has(ONES, tok)) v = ONES[tok]; else if (has(TENS, tok)) v = TENS[tok]; else if (has(HUNDREDS, tok)) v = HUNDREDS[tok];
+    if (v === null) break;
+    if (lastNumber) return { error: "ambiguous", consumed: i - start }; // "دو سه" without "و" never sums
+    cur += v; seen = true; lastNumber = true; i++;
+  }
+  if (seen) segments.push({ value: cur, mult: null });
+  if (segments.length === 0) return null;
+  for (let j = 0; j < segments.length - 1; j++) if (segments[j].mult === "میلیون" && segments[j + 1].mult === null) return { error: "ambiguous", consumed: i - start };
+  const value = segments.reduce((a, sg) => a + sg.value * (sg.mult === "هزار" ? 1000 : sg.mult === "میلیون" ? 1000000 : 1), 0);
+  return { value, consumed: i - start, bareMultiplier: segments.length === 1 && segments[0].mult !== null && segments[0].value === 1 };
+}
+export function resolveDefaultCurrency(remembered) {
+  if (typeof remembered === "string") {
+    if (has(CUR, remembered)) return CUR[remembered];
+    if (remembered.endsWith("ه") && has(CUR, remembered.slice(0, -1))) return CUR[remembered.slice(0, -1)];
+    if (["TOMAN", "IRR", "USD", "EUR"].includes(remembered)) return remembered;
+  }
+  return DEFAULT_CURRENCY;
+}
+export function sumByCurrency(rows) { const out = {}; for (const r of rows || []) { if (!r || !Number.isInteger(r.amount)) continue; const c = r.currency_code || DEFAULT_CURRENCY; out[c] = (out[c] || 0) + r.amount; } return out; }
+const CUR_WORDS = ["تومان", "تومنی", "تومن", "ریال", "دلار", "یورو", "€", "$"];
+// Amount, anchored to the currency word when present. Number words count
+// ONLY when followed by a currency word. A bare digit amount is returned
+// with anchored:false and is only used by the classifier when a verb is
+// present and the digit is not next to a month name or counting word.
+export function parseAmount(text, rememberedCurrency) {
+  const t = stripThousands(normalizeDigits(normalizeText(text)));
+  if (/(\d+)\s*[.٫,]\s*(\d+)\s*(?:هزار|میلیون)?\s*(?:تومان|تومنی|تومن|ریال|دلار|یورو|€|\$)/.test(t)) return { error: "decimal" };
+  const toks = t.replace(/[؟?!.،,]/g, " ").split(/\s+/).filter(Boolean);
+  const ci = toks.findIndex((x) => CUR_WORDS.includes(x));
+  if (ci >= 0) {
+    // Unknown token directly before a multiplier asks, never silently 1000.
+    // Known non-number tokens (verbs, dates, prepositions) do not count:
+    // "خرج کردم هزار تومان" is still 1000, but "نه/فلان هزار" asks.
+    if (ci > 1 && (toks[ci - 1] === "هزار" || toks[ci - 1] === "میلیون")) {
+      const prev = toks[ci - 2];
+      const knownNonNumber = new Set(["خرج", "کردم", "پرداخت", "خریدم", "خرید", "گرفتم", "دریافت", "امروز", "دیروز", "فردا", "را", "برای", "از", "به", "در", "با", "است", "هست", ...JMONTHS]);
+      if (prev !== "و" && !/^\d+$/.test(prev) && !has(ONES, prev) && !has(TENS, prev) && !has(HUNDREDS, prev) && !knownNonNumber.has(prev)) return { error: "unknown-number" };
+    }
+    // Find a number phrase ending exactly at the currency token.
+    for (let s = Math.max(0, ci - 7); s < ci; s++) {
+      const ph = parseNumberPhrase(toks.slice(s, ci), 0);
+      if (ph?.error === "ambiguous") return { error: "amount" };
+      if (ph && ph.consumed === ci - s) {
+        if (ph.value <= 0 || ph.value > Number.MAX_SAFE_INTEGER) return { error: "amount" };
+        return { amount: ph.value, currency: CUR[toks[ci]], matched: toks.slice(s, ci + 1).join(" "), anchored: true, bareMultiplier: ph.bareMultiplier };
+      }
+    }
+    return null;
+  }
+  return null;
+}
+// Bare digits usable as an amount: digits NOT adjacent to a month name
+// or a counting word (so "۷ آبان" and "۳ تا" are never money).
+// Returns { digits: [...] } with the surviving digit values in order.
+export function bareDigits(text) {
+  const toks = stripThousands(normalizeDigits(normalizeText(text))).replace(/[؟?!.،,]/g, " ").split(/\s+/).filter(Boolean);
+  const out = [];
+  for (let i = 0; i < toks.length; i++) {
+    if (!/^\d+$/.test(toks[i])) continue;
+    const prev = toks[i - 1], next = toks[i + 1];
+    if (JMONTHS.includes(prev) || JMONTHS.includes(next) || COUNTING.has(prev) || COUNTING.has(next) || MULTS.has(prev) || MULTS.has(next)) continue;
+    out.push(Number(toks[i]));
+  }
+  return out;
+}
+const STOP = new Set(["تومان", "ریال", "دلار", "یورو", "€", "$", "امروز", "دیروز", "فردا", "خرج", "کردم", "پرداخت", "خریدم", "خرید", "گرفتم", "دریافت", "را", "برای", "از", "به", "در", "با", "و", "است", "هست", "هزار", "میلیون", ...JMONTHS]);
+function stripItem(text, amount, origText) {
+  // Item from the ORIGINAL text; normalisation is for matching only.
+  const amtToks = amount?.matched ? amount.matched.split(/\s+/) : [];
+  return String(origText ?? text).replace(/پس[\s‌]فردا/g, " ").replace(/[؟?!.،,]/g, " ").split(/\s+/).filter(Boolean).filter((tok) => !normalizeDigits(normalizeText(tok)).split(/\s+/).filter(Boolean).every((pt) => STOP.has(pt) || /^\d+$/.test(pt) || amtToks.includes(pt))).join(" ").trim();
+}
+export function parseExpense(text, opts = {}, origText) {
+  const a = parseAmount(text, opts.rememberedCurrency);
+  if (a?.error) return a;
+  // Currency/multiplier with no parsable amount asks, never a bare fallback (500 هزار -> 500).
+  if (!a && /(?<!\p{L})(تومان|تومنی|تومن|ریال|دلار|یورو|هزار|میلیون|میلیارد|€|\$)(?!\p{L})/u.test(normalizeText(text))) return { error: "amount" };
+  let amount = a;
+  if (!a) {
+    // Bare digits only: exactly one surviving digit becomes the amount.
+    const digits = bareDigits(text);
+    if (digits.length !== 1) return { error: "ambiguous" };
+    amount = { amount: digits[0], currency: resolveDefaultCurrency(opts.rememberedCurrency), matched: String(digits[0]), anchored: false };
+  }
+  if (amount.amount <= 0 || amount.amount > Number.MAX_SAFE_INTEGER) return { error: "amount" };
+  const date = parseRelativeDate(text, opts.nowMs ?? Date.now()); if (date === null) return { error: "date" };
+  return { ...amount, date, item: stripItem(text, amount, origText), category: null };
+}
+const EXPENSE_VERBS = /(?<!\p{L})(خرج کردم|پرداخت کردم|خریدم|خرید کردم)(?![\p{L}])/u, INCOME_VERBS = /(?<!\p{L})(دریافت کردم|واریز شد|حقوق گرفتم|پول گرفتم)(?![\p{L}])/u;
+const WEAK_BUY = /(?<!\p{L})(خریدم|خرید کردم)(?![\p{L}])/u;
+const NOTE_RE = /(?:یادداشت\s+کن(?![\p{L}])|یادداشت\s*[:：])\s*([\s\S]+)/u, REMINDER_RE = /(?<!\p{L})(?:یادم بینداز|یادآوری کن|یادم بنداز|یادت باشه)(?![\p{L}])/u; // NOTE: یادت باشه here is dead code until 1b-1c: the remember branch above runs first
+const NOTE_QUERY_RE = /(یادداشت\s+های|یادداشت\s+هام|یادداشت\s+های امروز)/;
+const FILE_RE = /(?<!\p{L})(خلاصه\s+اش\s+کن(?![\p{L}])|خلاصه\s+کن(?![\p{L}])|خلاصه\s+اش|این فایل را خلاصه\s+کن(?![\p{L}]))/u;
+const TRANSLATE_VERB = /(?<!\p{L})(?:ترجمه\s+(?:کن|کنید|بکن))(?![\p{L}])/u;
+// Rule-only classifier. Confident = 1; ambiguous = { intent: "ask" }.
+// Never a guess, never a model call. Strict translate is checked FIRST:
+// a bare word "translate" anywhere is not a translate, only the verb is.
+export function classifyDaily(text, opts = {}) {
+  const now = opts.nowMs ?? Date.now(), raw = normalizeText(text);
+  if (!raw.trim()) return { intent: "chat", confidence: 1 };
+  if (raw.trimStart().startsWith("/")) return { intent: "command", confidence: 1 };
+  const trVerb = TRANSLATE_VERB.exec(raw);
+  if (trVerb) {
+    const after = raw.slice(trVerb.index + trVerb[0].length).trim().replace(/^[:：]\s*/, "");
+    const targetMatch = /به\s+(انگلیسی|فارسی)/.exec(raw);
+    const target = targetMatch ? (targetMatch[1] === "انگلیسی" ? "en" : "fa") : null;
+    const body = after.replace(/^به\s+(انگلیسی|فارسی)\s*[:：]?\s*/, "").trim();
+    if (!body) return { intent: "translate", confidence: 0.5, ask: "text" };
+    return { intent: "translate", confidence: 1, target, text: body };
+  }
+  // Remember/note/reminder are UNANCHORED now that strict translate runs
+  // first, so a reminder at the end of a message is still caught.
+  const rem = /(?<!\p{L})(?:یادت باشد|یادت باشه|به خاطر بسپار)(?![\p{L}])\s+([\s\S]+)/u.exec(raw);
+  if (rem) {
+    const rest = rem[1].trim();
+    const cur = /^(?:ارز[\s\u200c]+پیش[\s\u200c]*فرضم|ارزم)\s+(\S+)/.exec(rest);
+    if (cur) { const tok = cur[1].replace(/[؟?!.،,]+$/, ""); const code = has(CUR, tok) ? CUR[tok] : (tok.endsWith("ه") && has(CUR, tok.slice(0, -1)) ? CUR[tok.slice(0, -1)] : (["TOMAN", "IRR", "USD", "EUR"].includes(tok) ? tok : null)); return code ? { intent: "remember", confidence: 1, setting: { key: "currency", value: code } } : { intent: "remember", confidence: 1, refused: true }; }
+    const lang = /^(?:زبانم|زبان)\s+(\S+)/.exec(rest);
+    if (lang) { const v = lang[1] === "انگلیسی" ? "en" : lang[1] === "فارسی" ? "fa" : (lang[1] === "en" || lang[1] === "fa" ? lang[1] : null); return v ? { intent: "remember", confidence: 1, setting: { key: "language", value: v } } : { intent: "remember", confidence: 1, refused: true }; }
+    const name = /^(?:نامم|اسمم)\s+([\s\S]+)/.exec(rest);
+    if (name) { let v = name[1].trim().replace(/\s+(است|هست)$/, "").trim(); return v && v.length <= 50 ? { intent: "remember", confidence: 1, setting: { key: "name", value: v } } : { intent: "remember", confidence: 1, refused: true }; }
+    return { intent: "remember", confidence: 1, refused: true };
+  }
+  const note = NOTE_RE.exec(raw); if (note && note[1].trim()) return { intent: "note", confidence: 1, text: note[1].trim() };
+  if (REMINDER_RE.test(raw)) { const r = parseReminder(raw, now); return r.ask ? { intent: "reminder", confidence: 0.5, ask: r.ask } : { intent: "reminder", confidence: 1, due: r.due, text: r.text }; }
+  // Expense query: needs "how much/total" or a period word with a question
+  // mark. An unknown period (e.g. last week) asks, never returns today.
+  // An invalid date asks, never calls weekRange(null).
+  const amount = parseAmount(raw, opts.rememberedCurrency);
+  const hasHowMuch = /چقدر|مجموع/.test(raw), hasQuestion = /[؟?]\s*$/.test(raw);
+  const periodWord = /این هفته/.test(raw) ? "week" : /این ماه/.test(raw) ? "month" : /دیروز/.test(raw) ? "yesterday" : /امروز/.test(raw) ? "today" : null;
+  const unknownPeriod = /(گذشته|قبل|اخیر|پریروز|سال)/.test(raw) || /(?<!\p{L})پیش(?!\p{L})/u.test(raw) || (findMonth(raw) && !new RegExp(`[0-9۰-۹٠-٩]+\\s*${findMonth(raw)[0]}|${findMonth(raw)[0]}\\s*[0-9۰-۹٠-٩]+`).test(raw));
+  const hasExpenseWord = /(?<!\p{L})(خرج|هزینه)(?!\p{L})/u.test(raw);
+  if (hasExpenseWord && (hasHowMuch || (periodWord && hasQuestion)) && !(amount?.anchored && EXPENSE_VERBS.test(raw))) {
+    if (unknownPeriod || (!periodWord && !findMonth(raw) && !/(?:\d{4}-\d{2}-\d{2}|\d{1,4}\/\d{1,2}\/\d{1,2})/.test(normalizeDigits(raw)))) return { intent: "expense-query", confidence: 0.5, ask: "period" };
+    const date = parseRelativeDate(raw, now); if (date === null) return { intent: "expense-query", confidence: 0.5, ask: "date" };
+    const period = periodWord || "today";
+    let range;
+    if (period === "week") { range = weekRange(date); if (!range) return { intent: "expense-query", confidence: 0.5, ask: "date" }; }
+    else if (period === "month") { range = monthRange(date); if (!range) return { intent: "expense-query", confidence: 0.5, ask: "date" }; }
+    else range = { start: date, end: date };
+    return { intent: "expense-query", confidence: 1, period, range };
+  }
+  const hasE = EXPENSE_VERBS.test(raw) || (/(?<!\p{L})خرج(?!\p{L})/u.test(raw) && amount?.anchored);
+  const hasI = INCOME_VERBS.test(raw) || (/(?<!\p{L})درآمد(?!\p{L})/u.test(raw) && amount?.anchored) || (/(?<!\p{L})گرفتم(?![\p{L}])/u.test(raw) && amount?.anchored);
+  if (hasE || hasI) {
+    if (amount?.error === "decimal") return { intent: "ask", confidence: 0.5, question: "decimal" };
+    if (amount?.error === "amount" || amount?.error === "unknown-number") return { intent: "ask", confidence: 0.5, question: "amount" };
+    const digits = amount?.anchored ? [] : bareDigits(raw); if (amount?.anchored || digits.length === 1) { const ex = parseExpense(raw, opts, text); if (ex?.error === "date") return { intent: "ask", confidence: 0.5, question: "date" }; if (ex?.error) return { intent: "ask", confidence: 0.5, question: ex.error }; // TODO 1b-2: map question "ambiguous" to "amount" before it reaches Telegram
+    return { intent: hasI && !hasE ? "income" : "expense", confidence: 1, extraction: ex }; }
+  return { intent: "ask", confidence: 0.5, question: WEAK_BUY.test(raw) ? "expense-or-chat" : "amount" };
+  }
+  if (amount?.error === "decimal") return { intent: "ask", confidence: 0.5, question: "decimal" };
+  if (amount?.error === "amount") return { intent: "ask", confidence: 0.5, question: "amount" };
+  if (amount?.error === "unknown-number") return { intent: "chat", confidence: 1 }; // no verb: a bare-thousand statement is chat, not an amount question
+  if (NOTE_QUERY_RE.test(raw)) { const date = parseRelativeDate(raw, now); if (date === null) return { intent: "note-query", confidence: 0.5, ask: "date" }; return { intent: "note-query", confidence: 1, date }; }
+  if (FILE_RE.test(raw)) {
+    // File reference only for a short message with no accompanying text:
+    // a colon followed by text means the user is asking about that text.
+    const hasColonText = /[:：]\s*\S/.test(raw), tokens = raw.split(/\s+/).filter(Boolean).length;
+    if (!hasColonText && tokens <= 6) return { intent: "file-reference", confidence: 1 };
+    return { intent: "chat", confidence: 1 };
+  }
+  // No verb: ask only for a short message that carries a currency word.
+  if (amount?.anchored) { if (amount.bareMultiplier) return { intent: "chat", confidence: 1 }; if (raw.split(/\s+/).some((tok) => /^ن(خریدم|خرید|گرفتم|پرداختم|دریافت|کردم)/u.test(tok))) return { intent: "chat", confidence: 1 }; const tokens = raw.split(/\s+/).filter(Boolean).length; if (tokens <= 4) return { intent: "ask", confidence: 0.5, question: "expense-or-chat" }; return { intent: "chat", confidence: 1 }; }
+  return { intent: "chat", confidence: 1 };
+}
