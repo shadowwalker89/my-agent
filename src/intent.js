@@ -179,13 +179,18 @@ export function parseModelIntent(raw) {
 // Missing ROUTER_KEY -> skipped (null). Any error, non-OK status, or
 // unparseable/invalid output -> null (or the {invalid: "target"} sentinel
 // from parseModelIntent). No message text or key is ever logged here.
-export async function classifyDailyWithModel(env, text) {
+// classifyDailyWithModel: (env, text, pendingQuestion?) -> result | null.
+// pendingQuestion (Part 3) is the bot's OWN previous ask text, sent as one labelled line — never user data, history, or D1 records.
+export async function classifyDailyWithModel(env, text, pendingQuestion = null) {
   if (!env || !env.ROUTER_KEY) return null;
+  const userContent = pendingQuestion
+    ? `پرسش قبلی بات: ${pendingQuestion}\nپیام کاربر: ${String(text).slice(0, 300)}`
+    : String(text).slice(0, 300);
   const body = {
     model: `combo/${MODEL_INTENT_COMBO}`,
     messages: [
       { role: "system", content: MODEL_INTENT_SYSTEM },
-      { role: "user", content: String(text).slice(0, 300) },
+      { role: "user", content: userContent },
     ],
     max_tokens: MODEL_INTENT_MAX_TOKENS,
     temperature: 0,
