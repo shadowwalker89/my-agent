@@ -657,8 +657,12 @@ async function handlePlainText(env, msg, text) {
   // Allow-list already checked in handleUpdate; only then create the row.
   await ensureUserRow(env, userId);
   // Order: explicit /dev (tgCommand) -> everyday -> chat/task/dev.
-  const daily = await handleDailyText(env, { chatId, userId, text, ...dailySenders(env, chatId),
+  const daily = await handleDailyText(env, { chatId, userId, text, hasImage: updateHasImage(msg), ...dailySenders(env, chatId),
     chat: (modelText, copts) => answerChatText(env, chatId, userId, modelText, updateHasImage(msg), copts) });
+  // Model already said chat for a text message: answer directly, skip
+  // classifyIntent (dev was in the model allow-list and was rejected).
+  // Image messages keep today's path (they return "chat", not "chat-direct").
+  if (daily === "chat-direct") { await answerChatText(env, chatId, userId, text, updateHasImage(msg)); return; }
   if (daily !== "chat") return;
 
   const prefs = await getPrefs(env, userId);

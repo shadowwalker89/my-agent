@@ -1447,6 +1447,164 @@ console.log("\n✓ assertهای pipeline 3i برقرار شد.");
   global.fetch = origFetch;
 }
 
+// ── Model router Part 2: core wiring, no pending-ask ───────────────────────
+// The model picks the branch; rule code re-validates the original text.
+// fetch is mocked per case and restored at the end of the block.
+{
+  check(askText("note-text") === "چه چیزی را یادداشت کنم؟" && askText("language") === "به چه زبانی؟", "new ask keys: note-text, language");
+}
+if (DatabaseSync) {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  const d1 = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
+  const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4301,4302,4303,4304,4305,4306,4307,4308,4309,4310,4311,4312,4313,4314", DB: d1, ROUTER_KEY: "k-test", ...extra });
+  const fakeSend = () => { const sent = []; return { sent, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, api: async () => ({ ok: true }) }; };
+  const o = (env, userId, text, extra = {}) => ({ chatId: userId, userId, text, send: extra.send, chat: extra.chat ?? (async () => {}), nowMs: extra.nowMs, hasImage: extra.hasImage });
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+  const origFetch = global.fetch;
+  let fetchCalls = 0;
+  const mockModel = (content) => { fetchCalls = 0; global.fetch = async () => { fetchCalls++; return Response.json({ choices: [{ message: { content } }] }); }; };
+  const mockModelFail = () => { fetchCalls = 0; global.fetch = async () => { fetchCalls++; throw new Error("boom"); }; };
+  const modelJson = (intent, extra = {}) => JSON.stringify({ intent, followup: null, target: null, ...extra });
+  const lastText = (s) => String(s.sent.at(-1)?.text ?? "");
+  const hasConfirm = (s) => (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).some((d) => d.startsWith("daily:confirm:"));
+  const hasAskBtn = (s) => (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).some((d) => d.startsWith("daily:ask:"));
+  // Rule-confident messages never call the model.
+  {
+    const env = mkEnv(), s = fakeSend(); let chats = [];
+    mockModel(modelJson("chat"));
+    check((await handleDailyText(env, o(env, 4301, "امروز چقد خرج کردم؟", { ...s, nowMs: NOW }))) === "handled" && fetchCalls === 0, "confident query: no model call");
+    check((await handleDailyText(env, o(env, 4301, "خرج قبلی چی بود؟", { ...s, nowMs: NOW }))) === "handled" && fetchCalls === 0, "confident last-expense: no model call");
+    const r = await handleDailyText(env, o(env, 4301, "ترجمه کن به انگلیسی: سلام دنیا", { ...s, nowMs: NOW, chat: async (text, copts) => { chats.push({ text, copts }); } }));
+    check(r === "handled" && fetchCalls === 0 && chats[0]?.copts?.noHistory === true, "confident translate: no model call, history-free");
+  }
+  // Ask tier + model expense -> confirm, no row before confirm.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("expense"));
+    const r = await handleDailyText(env, o(env, 4302, "۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    check(r === "handled" && fetchCalls === 1 && hasConfirm(s) && lastText(s).includes("500") && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0, "ask-tier model expense -> confirm, no row yet");
+  }
+  // Ask tier + model chat -> expense-or-chat buttons, not silent chat.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("chat"));
+    const r = await handleDailyText(env, o(env, 4303, "۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    check(r === "handled" && fetchCalls === 1 && hasAskBtn(s) && lastText(s).includes("این خرج است یا چت؟"), "ask-tier model chat -> buttons, not silent chat");
+  }
+  // Ask tier + model failure -> the SAME ask again, no record.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModelFail();
+    const r = await handleDailyText(env, o(env, 4304, "۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    check(r === "handled" && fetchCalls === 1 && lastText(s).includes("این خرج است یا چت؟") && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0, "ask-tier failure -> same ask, no record");
+  }
+  // Model amount/date fields are ignored: the confirm shows the rule amount.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("expense", { amount: 999, currency: "USD", date: "2026-01-01" }));
+    await handleDailyText(env, o(env, 4305, "۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    check(lastText(s).includes("500") && !lastText(s).includes("999"), "model amount field ignored, rule amount used");
+  }
+  // Chat tier + model expense without an amount -> amount ask, no record.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("expense"));
+    const r = await handleDailyText(env, o(env, 4306, "خرج", { ...s, nowMs: NOW }));
+    check(r === "handled" && fetchCalls === 1 && lastText(s).includes("مبلغ چقدر بود؟") && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0, "chat-tier model expense, no amount -> amount ask");
+  }
+  // Chat tier + model note (bare) -> note-text ask, nothing stored.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("note"));
+    const r = await handleDailyText(env, o(env, 4307, "یادداشت", { ...s, nowMs: NOW }));
+    check(r === "handled" && fetchCalls === 1 && lastText(s).includes("چه چیزی را یادداشت کنم؟") && rows("SELECT COUNT(*) AS n FROM notes")[0].n === 0, "chat-tier model note, no body -> note-text ask");
+  }
+  // Chat tier + model chat: text -> chat-direct, image -> today's chat path.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("chat"));
+    check((await handleDailyText(env, o(env, 4308, "سلام، چطوری؟", { ...s, nowMs: NOW }))) === "chat-direct" && fetchCalls === 1, "chat-tier model chat, text -> chat-direct");
+    check((await handleDailyText(env, o(env, 4308, "سلام، چطوری؟", { ...s, nowMs: NOW, hasImage: true }))) === "chat" && fetchCalls === 2, "chat-tier model chat, image -> chat (classifyIntent still runs)");
+  }
+  // Chat tier + model failure -> chat path, no ask spam.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModelFail();
+    check((await handleDailyText(env, o(env, 4309, "سلام، چطوری؟", { ...s, nowMs: NOW }))) === "chat" && fetchCalls === 1, "chat-tier failure -> chat path");
+  }
+  // Chat tier + model dev -> suggestion only, never a dispatch (no github fetch).
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("dev"));
+    const r = await handleDailyText(env, o(env, 4310, "پروژه", { ...s, nowMs: NOW }));
+    check(r === "handled" && lastText(s).includes("/dev") && fetchCalls === 1, "model dev -> suggestion only");
+  }
+  // Chat tier + model translate: history-free, colon body, model target wins.
+  {
+    const env = mkEnv(), s = fakeSend(); let chats = [];
+    mockModel(modelJson("translate", { target: "en" }));
+    const r = await handleDailyText(env, o(env, 4311, "اینو انگلیسیش کن: سلام دنیا", { ...s, nowMs: NOW, chat: async (text, copts) => { chats.push({ text, copts }); } }));
+    check(r === "handled" && chats[0]?.text === "سلام دنیا" && chats[0]?.copts?.noHistory === true && String(chats[0]?.copts?.systemPrompt ?? "").includes("English"), "model translate: history-free, colon body, en target");
+  }
+  // Model translate with an invalid target -> language ask, never a guess.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("translate", { target: "de" }));
+    await handleDailyText(env, o(env, 4312, "اینو انگلیسیش کن: سلام دنیا", { ...s, nowMs: NOW }));
+    check(lastText(s).includes("به چه زبانی؟"), "invalid model target -> language ask");
+  }
+  // Chat tier + model reminder without a trigger verb -> stored from the rule parse.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("reminder"));
+    const r = await handleDailyText(env, o(env, 4313, "فردا جلسه دارم ساعت ۹", { ...s, nowMs: NOW }));
+    check(r === "handled" && lastText(s).includes("2026-10-29T09:00:00+03:30") && rows("SELECT COUNT(*) AS n FROM reminders WHERE user_id = 4313")[0].n === 1, "model reminder stored with rule-parsed due");
+  }
+  // Chat tier + model expense-query without a period -> period ask.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("expense-query"));
+    await handleDailyText(env, o(env, 4314, "خرج‌ها رو بگو", { ...s, nowMs: NOW }));
+    check(lastText(s).includes("برای کدام دوره؟"), "model expense-query, no period -> period ask");
+  }
+  // Model file-reference: in-window finds the file, out-of-window asks.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await handleDailyFile(env, { userId: 4315, tgFileId: "file-1", fileName: "doc.pdf", fileMime: "application/pdf", send: s.send });
+    mockModel(modelJson("file-reference"));
+    await handleDailyText(env, o(env, 4315, "اون فایل رو خلاصه کن", { ...s, nowMs: NOW }));
+    check(lastText(s).includes("doc.pdf"), "model file-reference in window finds the file");
+    const env2 = mkEnv(), s2 = fakeSend(); mockModel(modelJson("file-reference"));
+    await handleDailyText(env2, o(env2, 4316, "اون فایل رو خلاصه کن", { ...s2, nowMs: NOW }));
+    check(lastText(s2).includes("کدام فایل؟"), "model file-reference out of window asks");
+  }
+  // D1 unavailable: model step off, no fetch, chat keeps working.
+  {
+    const env = mkEnv({ DB: null }), s = fakeSend(); mockModel(modelJson("expense"));
+    check((await handleDailyText(env, o(env, 4317, "۵۰۰ تومان نان", { ...s, nowMs: NOW }))) === "chat" && fetchCalls === 0, "D1 unavailable: no model call, chat path");
+  }
+  // Missing ROUTER_KEY: model step skipped, today's behaviour remains.
+  {
+    const env = mkEnv({ ROUTER_KEY: undefined }), s = fakeSend(); mockModel(modelJson("expense"));
+    check((await handleDailyText(env, o(env, 4318, "۵۰۰ تومان نان", { ...s, nowMs: NOW }))) === "handled" && fetchCalls === 0 && lastText(s).includes("این خرج است یا چت؟"), "missing key, ask tier -> same ask, no fetch");
+    check((await handleDailyText(env, o(env, 4318, "سلام، چطوری؟", { ...s, nowMs: NOW }))) === "chat" && fetchCalls === 0, "missing key, chat tier -> chat, no fetch");
+  }
+  // Timing log: combo, tier, ms, outcome — never the message text.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("chat"));
+    const origLog = console.log; const lines = []; console.log = (...a) => { lines.push(a.join(" ")); };
+    await handleDailyText(env, o(env, 4319, "سلام، چطوری؟", { ...s, nowMs: NOW }));
+    console.log = origLog;
+    const entry = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((j) => j && j.modelIntent);
+    check(Boolean(entry) && entry.modelIntent === "chat" && entry.tier === "chat" && typeof entry.ms === "number" && entry.outcome === "chat" && !lines.some((l) => l.includes("سلام، چطوری؟")), "timing log: combo/tier/ms/outcome, no message text");
+  }
+  // Full flow: model chat verdict skips classifyIntent (a dev-looking
+  // message must NOT get the /dev suggestion; the chat answer is attempted).
+  {
+    const world = mockWorld();
+    const prevFetch = global.fetch;
+    global.fetch = async (url, init) => String(url).startsWith(workerBaseUrl()) ? Response.json({ choices: [{ message: { content: modelJson("chat") } }] }) : prevFetch(url, init);
+    try {
+      const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", DB: d1, ROUTER_KEY: "k-test", GITHUB_DISPATCH_TOKEN: "gh-fake" };
+      await sendTg(env, msgUpdate("پروژه"));
+      const texts = world.calls.telegram.filter((c) => c.method === "sendMessage").map((c) => String(c.payload?.text ?? ""));
+      check(texts.some((x) => x.includes("همه‌ی مدل‌ها شکست خوردند")) && !texts.some((x) => x.includes("با /dev بفرست")), "full flow: model chat skips classifyIntent, no dev suggestion");
+    } finally { global.fetch = prevFetch; world.restore(); }
+  }
+  global.fetch = origFetch;
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
