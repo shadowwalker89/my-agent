@@ -32,6 +32,7 @@ import {
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
 import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder } from "../src/daily.js";
+import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
 
 const failures = [];
 function check(cond, msg) {
@@ -983,6 +984,109 @@ if (DatabaseSync) {
   check(parseReminder("یادم بینداز ۳۲ آبان ساعت ۹ جلسه", NOW).ask === "date", "invalid jalali day asks, never null date");
 }
 
+// ── Step 1b-1b: amount and classifier, on top of 1b-1a (still no wiring) ──
+{
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+  const cl = (s) => classifyDaily(s, { nowMs: NOW });
+  const ex = (s) => cl(s).extraction;
+  // Word-number parser: 13-19, hundreds, "and" joins, multipliers.
+  check(ex("خرج کردم بیست و پنج هزار تومان نان").amount === 25000, "twenty-five thousand");
+  check(ex("خرج کردم دویست هزار تومان نان").amount === 200000, "two hundred thousand");
+  check(ex("خرج کردم پانزده هزار تومان نان").amount === 15000, "fifteen thousand");
+  check(ex("خرج کردم دو میلیون و پانصد هزار تومان نان").amount === 2500000, "two million and five hundred thousand");
+  check(ex("خرج کردم بیست هزار تومان").amount === 20000 && ex("خرج کردم سی هزار تومان").amount === 30000 && ex("خرج کردم پنجاه هزار تومان").amount === 50000 && ex("خرج کردم صد هزار تومان").amount === 100000, "tens/hundred thousands");
+  check(cl("خرج کردم فلان هزار تومان نان").intent === "ask", "unknown word before thousand asks, never 1000");
+  check(parseNumberPhrase(["دو", "میلیون", "و", "پانصد", "هزار"]).value === 2500000, "phrase parser");
+  // Bare digits with a verb: month/counting neighbours are not money.
+  check(cl("خرج کردم ۷ آبان نان").intent === "ask", "digit next to a month is not an amount");
+  check(cl("۳ تا کتاب خریدم").intent === "ask" && cl("۳ تا کتاب خریدم").question === "expense-or-chat", "counting word digit is not an amount");
+  check(cl("خرج کردم ۵۰۰ و ۳۰۰ نان").intent === "ask", "several bare numbers ask");
+  check(cl("خرج کردم ۵۰۰ نان").intent === "expense" && ex("خرج کردم ۵۰۰ نان").amount === 500, "single bare digit with verb is an amount");
+  check(cl("گوشی خریدم، نظرت چیه؟").intent === "ask" && cl("گوشی خریدم، نظرت چیه؟").question === "expense-or-chat", "weak buy without amount asks expense-or-chat");
+  // Strict translate: verb required, checked first, empty text asks.
+  check(cl("خرج کردم ۵۰۰ تومان برای ترجمه کتاب").intent === "expense", "bare word translate does not steal an expense");
+  check(cl("این ترجمه خوب نیست").intent === "chat", "bare word translate is chat");
+  check(cl("ترجمه کن: سلام").intent === "translate", "translate verb works");
+  check(cl("لطفا این را ترجمه کن به انگلیسی: سلام").intent === "translate" && cl("لطفا این را ترجمه کن به انگلیسی: سلام").target === "en", "translate with target");
+  check(cl("ترجمه کن:").intent === "translate" && cl("ترجمه کن:").ask === "text", "empty translate asks");
+  // Expense query: whole month, unknown period asks, strict pattern.
+  const mq = cl("خرج این ماه چقدر شد؟"); check(mq.intent === "expense-query" && mq.range.start === "2026-10-01" && mq.range.end === "2026-10-31", `month range is whole month: ${JSON.stringify(mq.range)}`);
+  check(cl("هفته‌ی پیش چقدر خرج کردم؟").intent === "expense-query" && cl("هفته‌ی پیش چقدر خرج کردم؟").ask === "period", "last week asks, never today");
+  check(cl("چرا اینقدر خرج می‌کنم؟").intent === "chat", "bare question about spending is chat");
+  check(cl("امروز چقدر خرج کردم؟").intent === "expense-query", "today query still works");
+  check(cl("۳۲ آبان چقدر خرج کردم؟").intent === "expense-query" && cl("۳۲ آبان چقدر خرج کردم؟").ask === "date", "invalid jalali in query asks, never weekRange(null)");
+  // Normalisation first: Arabic letters, space/ZWNJ variants.
+  check(normalizeText("يادداشت كتاب") === "یادداشت کتاب", "arabic letters normalised");
+  check(cl("يادداشت کن فردا با علی تماس بگیرم").intent === "note", "arabic-letter note works");
+  check(cl("یادداشت های امروز").intent === "note-query", "space variant note query");
+  check(cl("خلاصه اش کن").intent === "file-reference", "space variant file reference");
+  // Colloquial forms and unanchored reminder.
+  check(cl("یادت باشه ارزم تومانه").intent === "remember" && cl("یادت باشه ارزم تومانه").setting?.value === "TOMAN", "colloquial remember + currency with trailing ه");
+  check(cl("یادت باشد اسمم سمیه").setting?.value === "سمیه" && cl("یادت باشد اسمم مرضیه").setting?.value === "مرضیه" && cl("یادت باشد اسمم آسیه").setting?.value === "آسیه", "names ending in یه are stored as written");
+  check(cl("یادت باشد اسمم فاطمه").setting?.value === "فاطمه", "legitimate final ه is kept");
+  const late = cl("فردا ساعت ۹ یادم بینداز جلسه دارم"); check(late.intent === "reminder" && late.due === "2026-10-29T09:00:00+03:30", `reminder at end of message: ${JSON.stringify(late)}`);
+  // Object-key safety: constructor must not return a function.
+  check(cl("یادت باشد ارزم constructor").refused === true, "constructor is not a currency");
+  check(cl("خرج کردم constructor هزار تومان نان").intent === "ask", "constructor before thousand asks");
+  // First-round non-regressions (spot checks).
+  check(cl("یک سوال دارم").intent === "chat" && cl("هزار و یک شب").intent === "chat" && cl("۲+۲ چند می‌شود؟").intent === "chat", "normal chat stays chat");
+  check(cl("نه هزار تومان خرج کردم").intent === "ask", "nine is not a number in amounts");
+  check(cl("خرج کردم ۱۰٫۵ تومان نان").question === "decimal", "decimal question is decimal");
+  check(ex("خرج کردم 1,000 تومان نان").amount === 1000, "comma thousands separator");
+  check(ex("خرج کردم ۵۰ € نان").currency === "EUR", "euro symbol is EUR");
+  const jex = ex("خرج کردم ۷ آبان ۱۰۰۰ تومان نان"); check(jex.amount === 1000 && jex.date === "2026-10-29", "jalali amount + date");
+  check(cl("یادداشت کن خط اول\nخط دوم").text.includes("خط دوم"), "multiline note");
+  check(cl("این متن را خلاصه کن: سلام دنیا").intent === "chat", "text summary request is chat");
+  check(resolveDefaultCurrency(null) === "TOMAN" && resolveDefaultCurrency("USD") === "USD", "default currency from setting only");
+  check(sumByCurrency([{ amount: 1000, currency_code: "TOMAN" }, { amount: 5, currency_code: "USD" }]).TOMAN === 1000, "sums by currency");
+  check(!fs.readFileSync(new URL("../src/daily.js", import.meta.url), "utf8").includes("users.currency"), "1b currency path never reads the users currency column");
+}
+// ── Step 1b-1b, third-round fixes (amount/query/parser, in the 1b-1b diff) ──
+{
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+  const cl = (s) => classifyDaily(s, { nowMs: NOW });
+  const ex = (s) => cl(s).extraction;
+  // Query requires the expense/cost word.
+  check(cl("فاصله‌ی تهران تا شیراز چقدر است؟").intent === "chat", "distance question is chat, not an expense query");
+  check(cl("این کتاب چقدر است؟").intent === "chat", "price question is chat");
+  check(cl("امروز هوا چطور است؟").intent === "chat", "weather question is chat");
+  check(cl("هزینه‌ی این ماه چقدر شد؟").intent === "expense-query", "cost word also opens a query");
+  // Verb word boundaries: first-person verb forms do not match.
+  check(cl("نمی‌توانم ترجمه کنم").intent === "chat", "first-person translate form is chat");
+  check(cl("ترجمه کنی این متن را").intent !== "translate", "second-person translate form is not translate");
+  check(cl("می‌خواهم یادداشت کنم که فردا جلسه دارم").intent === "chat", "first-person note form is not a note");
+  check(cl("یادآوری کنی جلسه را").intent !== "reminder", "first-person reminder form is not a reminder");
+  // One amount parser for digits and words.
+  check(ex("خرج کردم هزار و پانصد تومان نان").amount === 1500, "thousand and five hundred is 1500, not 500");
+  check(ex("خرج کردم ۲ میلیون و ۵۰۰ هزار تومان نان").amount === 2500000, "digit million plus digit thousand");
+  check(cl("خرج کردم دو میلیون و پانصد تومان نان").intent === "ask" && cl("خرج کردم دو میلیون و پانصد تومان نان").question === "amount", "million plus bare number asks, never 2000500 or 2500000");
+  check(parseNumberPhrase(["2", "میلیون", "و", "500", "هزار"]).value === 2500000, "digit tokens in the phrase parser");
+  // Bare "got" alone is not income when a product remains.
+  check(cl("۵۰۰۰ تومان گرفتم").intent === "income", "got with no product stays income");
+  check(cl("حقوق گرفتم ۵۰۰۰ تومان").intent === "income", "salary verb stays income");
+  // Bare thousand without a verb is chat; with a verb it is intentionally 1000.
+  check(cl("این کتاب هزار تومان است").intent === "chat", "bare thousand without a verb is chat");
+  check(cl("برای نان هزار تومان").intent === "chat", "bare thousand phrase without a verb is chat");
+  check(cl("خرج کردم هزار تومان نان").intent === "expense" && ex("خرج کردم هزار تومان نان").amount === 1000, "bare thousand with a verb is intentionally 1000");
+  // Normalisation is one-to-one: newlines survive, ZWNJ becomes a space only in the normalised form.
+  check(normalizeText("خط اول\nخط دوم") === "خط اول\nخط دوم", "normalisation does not flatten newlines");
+  check(normalizeText("می‌شود") === "می شود", "ZWNJ becomes a space in the normalised form only");
+  // Day-after-tomorrow through the classifier, ZWNJ-safe.
+  check(ex("خرج کردم پس‌فردا ۵۰۰ تومان نان").date === "2026-10-30", "day-after-tomorrow via classifier, ZWNJ form");
+  check(ex("خرج کردم پس فردا ۵۰۰ تومان نان").date === "2026-10-30", "day-after-tomorrow via classifier, space form");
+  check(cl("۱,۵ میلیون تومان").intent === "ask" && cl("خرج کردم ۱٫۵ میلیون تومان نان").intent === "ask" && cl("۱.۵ میلیون تومان").intent === "ask" && cl("خرج کردم دو سه هزار تومان نان").intent === "ask" && cl("۲،۳ تومان").intent === "ask" && ex("خرج کردم 1,000 تومان نان").amount === 1000, "fourth round: decimals, separators, no-و numbers");
+  check(cl("نمره‌ی ۲۰ گرفتم").intent === "chat" && cl("یادت باشد ارز پیش‌فرضم تومان است").setting?.value === "TOMAN" && cl("۵۰۰۰ تومان نگرفتم").intent === "chat" && cl("نخریدم").intent === "chat", "fourth round: grade chat, default currency, negated verbs");
+  for (const q of ["هفته‌ی گذشته چقدر خرج کردم؟", "ماه گذشته چقدر خرج کردم؟", "پریروز چقدر خرج کردم؟", "امسال چقدر خرج کردم؟", "سه روز پیش چقدر خرج کردم؟", "آبان چقدر خرج کردم؟"]) check(cl(q).intent === "expense-query" && cl(q).ask === "period", `unknown period asks: ${q}`);
+  check(cl("۵۰۰ تومان خرج کردم، دیگه چقدر مونده؟").intent === "expense" && cl("امروز چقدر خرج کردم؟").intent === "expense-query", "fourth round: amount plus past verb beats query");
+  check(ex("خرج کردم پس‌فردا ۵۰۰ تومان نان").item === "نان" && ex("خرج کردم ۵۰۰ تومان کرایه‌ی تاکسی").item === "کرایه‌ی تاکسی", "fourth round: item text");
+  check(ex("خرج کردم ۵۰۰ هزار تومن نان").amount === 500000 && ex("خرج کردم ۵۰۰ هزار تومن نان").currency === "TOMAN", "fifth: تومن is a currency, 500 thousand تومن is 500000");
+  check(cl("خرج کردم ۵۰۰ هزار نان").intent === "ask" && cl("خرج کردم ۵۰۰ هزار نان").question === "amount", "fifth: multiplier without currency asks, never bare 500");
+  check(cl("خرج کردم ۲ میلیارد تومان خانه").intent === "ask" && cl("خرج کردم ۲ میلیارد تومان خانه").question === "amount", "fifth: میلیارد is not a parsed multiplier, asks");
+  const lq = cl("7 آبان چقدر خرج کردم؟"); check(lq.intent === "expense-query" && !lq.ask && lq.range.start === "2026-10-29", "fifth: Latin-digit date takes the date path, not period");
+  check(cl("تا حالا چقدر خرج کردم؟").intent === "expense-query" && cl("تا حالا چقدر خرج کردم؟").ask === "period", "fifth: query without period asks period");
+  check(cl("مجموع خرج‌هایم چقدر است؟").intent === "expense-query" && cl("مجموع خرج‌هایم چقدر است؟").ask === "period", "fifth: total without period asks period");
+  check(ex("خرج کردم ۵۰۰ تومان پس انداز").item === "پس انداز", "fifth: پس انداز survives intact");
+}
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
