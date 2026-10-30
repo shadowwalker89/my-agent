@@ -327,10 +327,14 @@ export function classifyDaily(text, opts = {}) {
   // mark. An unknown period (e.g. last week) asks, never returns today.
   // An invalid date asks, never calls weekRange(null).
   const amount = parseAmount(raw, opts.rememberedCurrency);
-  const hasHowMuch = /چقدر|مجموع/.test(raw), hasQuestion = /[؟?]\s*$/.test(raw);
+  const hasHowMuch = /چقدر|چقد|مجموع/.test(raw), hasQuestion = /[؟?]\s*$/.test(raw);
   const periodWord = /این هفته/.test(raw) ? "week" : /این ماه/.test(raw) ? "month" : /دیروز/.test(raw) ? "yesterday" : /امروز/.test(raw) ? "today" : null;
   const unknownPeriod = /(گذشته|قبل|اخیر|پریروز|سال)/.test(raw) || /(?<!\p{L})پیش(?!\p{L})/u.test(raw) || (findMonth(raw) && !new RegExp(`[0-9۰-۹٠-٩]+\\s*${findMonth(raw)[0]}|${findMonth(raw)[0]}\\s*[0-9۰-۹٠-٩]+`).test(raw));
   const hasExpenseWord = /(?<!\p{L})(خرج|هزینه)(?!\p{L})/u.test(raw);
+  // Last-expense question: answered from D1, never from the chat model.
+  // Placed before the period query (so "آخرین خرج چقدر بود؟" is not a
+  // period ask) but never steals a recordable expense (amount + verb).
+  if (/(?<!\p{L})(خرج\s+قبلی|آخرین\s+خرج|خرج\s+آخر)(?!\p{L})/u.test(raw) && !(amount?.anchored && EXPENSE_VERBS.test(raw))) return { intent: "last-expense", confidence: 1 };
   if (hasExpenseWord && (hasHowMuch || (periodWord && hasQuestion)) && !(amount?.anchored && EXPENSE_VERBS.test(raw))) {
     if (unknownPeriod || (!periodWord && !findMonth(raw) && !/(?:\d{4}-\d{2}-\d{2}|\d{1,4}\/\d{1,2}\/\d{1,2})/.test(normalizeDigits(raw)))) return { intent: "expense-query", confidence: 0.5, ask: "period" };
     const date = parseRelativeDate(raw, now); if (date === null) return { intent: "expense-query", confidence: 0.5, ask: "date" };
