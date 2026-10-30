@@ -31,6 +31,7 @@ import {
   CHAT_CONTEXT_LIMIT,
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
+import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder } from "../src/daily.js";
 
 const failures = [];
 function check(cond, msg) {
@@ -949,6 +950,37 @@ if (DatabaseSync) {
     await setSetting(db, 5, "currency", "EUR");
     check((await getDefaultCurrency(db, 5)) === "EUR", "setting upserts to new value");
     check((await getDefaultCurrency(db, 6)) === "TOMAN", "fresh user -> fixed TOMAN, never inferred");
+}
+
+
+// ── Step 1b-1a: pure date/time functions (no Telegram, no D1, no model) ──
+{
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0); // Wed 2026-10-28, 15:30 Iran time
+  check(iranDate(Date.UTC(2026, 9, 28, 22, 0, 0)) === "2026-10-29", "iran midnight boundary");
+  const wk = weekRange("2026-10-28"); check(wk.start === "2026-10-24" && wk.end === "2026-10-30", `week saturday: ${JSON.stringify(wk)}`);
+  check(weekRange(null) === null && weekRange("2026-02-30") === null, "weekRange never crashes on invalid date");
+  const mo = monthRange("2026-10-28"); check(mo.start === "2026-10-01" && mo.end === "2026-10-31", "month range is the whole month");
+  check(jalaliToGregorian(1405, 8, 7) === "2026-10-29", "jalali to gregorian");
+  const gj = gregorianToJalali("2026-10-29"); check(gj.jy === 1405 && gj.jm === 8 && gj.jd === 7, `gregorian to jalali: ${JSON.stringify(gj)}`);
+  check(formatJalali("2026-10-29").includes("آبان"), "jalali display");
+  check(parseRelativeDate("1405/8/7", NOW) === "2026-10-29", "jalali slash date");
+  check(parseRelativeDate("2026-10-29", NOW) === "2026-10-29" && parseRelativeDate("2026-02-30", NOW) === null, "iso date validated");
+  check(parseRelativeDate("۷ آبان، ۵۰۰ تومان نان", NOW) === "2026-10-29", "month found despite ، after it");
+  check(parseRelativeDate("۷ آبان ۱۴۵۰۰۰ تومان", NOW) === "2026-10-29", "year not taken from 145000");
+  check(parseRelativeDate("پس فردا", NOW) === "2026-10-30" && parseRelativeDate("پس‌فردا", NOW) === "2026-10-30", "day after tomorrow, with and without space");
+  check(parseHour("ساعت ۳ بعد از ظهر").hour === 15, "afternoon checked before noon");
+  check(parseHour("ساعت ۲ ظهر").hour === 14 && parseHour("ساعت ۱۲ ظهر").hour === 12 && parseHour("ساعت ۸ ظهر").ask === "hour-ambiguous", "noon rules: 12 stays, 1-4 +12, rest asks");
+  check(parseHour("ساعت دوازده").hour === 12, "hour twelve, not two");
+  check(parseHour("ساعت ۸ جلسه شبکه").hour === 8 && parseHour("ساعت ۸ صبحانه").hour === 8, "qualifiers inside other words do not count");
+  check(parseHour("ساعت نه").hour === 9 && parseHour("ساعت پنج").ask === "hour-ambiguous", "hour nine morning, hour five asks");
+  check(parseHour("ساعت دوازده شب").ask === "hour-ambiguous" && parseHour("ساعت یک شب").ask === "hour-ambiguous" && parseHour("ساعت ۸ شب").hour === 20, "night rules");
+  check(parseHour("ساعت نه و ربع").hour === 9 && parseHour("ساعت نه و ربع").minute === 15, "quarter hour");
+  check(parseReminder("یادم بینداز فردا ساعت نه جلسه دارم", NOW).due === "2026-10-29T09:00:00+03:30", "tomorrow 09:00 reminder");
+  const rb = parseReminder("یادم بینداز فردا ساعت ۹ صبح جلسه دارم", NOW); check(rb.text === "جلسه دارم" && !rb.text.includes("صبح"), `reminder body drops qualifier: ${JSON.stringify(rb)}`);
+  check(parseReminder("یادم بینداز فردا ساعت ۹", NOW).ask === "empty", "empty reminder asks for what");
+  check(parseReminder("یادم بینداز فردا جلسه دارم", NOW).ask === "no-time", "reminder without time asks");
+  check(parseReminder("یادم بینداز امروز ساعت نه جلسه دارم", NOW).ask === "past", "past reminder asks");
+  check(parseReminder("یادم بینداز ۳۲ آبان ساعت ۹ جلسه", NOW).ask === "date", "invalid jalali day asks, never null date");
 }
 
 if (failures.length) {
