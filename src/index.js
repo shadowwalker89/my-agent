@@ -190,7 +190,9 @@ async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
   const prefs = await getPrefs(env, userId);
   const task = classifyTask(text, { hasImage: hasImage === true });
   // Chat context: last 50 chat-kind rows, capped at 8,000 characters.
-  const history = buildChatContext(await getChatContext(env, userId));
+  // Translate skips history entirely: a weak model let note-themed history
+  // override the translate system prompt (observed in Telegram tests).
+  const history = opts.noHistory ? [] : buildChatContext(await getChatContext(env, userId));
   const body = {
     messages: [
       { role: "system", content: opts.systemPrompt || CHAT_SYSTEM_PROMPT },
