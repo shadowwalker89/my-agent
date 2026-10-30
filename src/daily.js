@@ -321,7 +321,16 @@ export function classifyDaily(text, opts = {}) {
       return { intent: "remember", confidence: 1, refused: true };
     }
   }
-  const note = NOTE_RE.exec(raw); if (note && note[1].trim()) return { intent: "note", confidence: 1, text: text.slice(note.index + note[0].length - note[1].length).trim() };
+  const note = NOTE_RE.exec(raw); if (note && note[1].trim().replace(/[؟?!.،,:：\s]+/gu, "")) return { intent: "note", confidence: 1, text: text.slice(note.index + note[0].length - note[1].length).trim() };
+  // Bare note: only a note trigger, no body. Ask for the text at rule
+  // level instead of falling through to chat, where the live model
+  // answered chat and hallucinated a stored note (2026-10-30). Anchored
+  // to the whole message (trailing punctuation stripped), so a note
+  // WITH a body is never stolen. The longer "می‌خوام … ثبت کنم" forms
+  // are a closed whole-message list for the same reason.
+  const bareNote = raw.trim().replace(/[؟?!.،,:：\s]+$/u, "");
+  if (/^(?:(?:لطفا|لطفاً|ببین)\s+)?(?:یادداشت\s+کن|یادداشت\s+جدید|یادداشت)$/u.test(bareNote)
+    || /^(?:می\s*خوام|می\s*خواهم|میخوام|میخواهم)\s+(?:یک\s+)?یادداشت(?:\s+جدید)?(?:\s+و\s+جداگانه)?\s+(?:ثبت\s+کنم|بنویسم|ایجاد\s+کنم|بکنم)$/u.test(bareNote)) return { intent: "ask", confidence: 0.5, question: "note-text" };
   if (REMINDER_RE.test(raw)) { const r = parseReminder(raw, now, text); return r.ask ? { intent: "reminder", confidence: 0.5, ask: r.ask } : { intent: "reminder", confidence: 1, due: r.due, text: r.text }; }
   // Expense query: needs "how much/total" or a period word with a question
   // mark. An unknown period (e.g. last week) asks, never returns today.
