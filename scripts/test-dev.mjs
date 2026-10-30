@@ -5,6 +5,13 @@ import {
   classifyIntentSync,
   classifyIntent,
   needsConfirmation,
+  parseModelIntent,
+  classifyDailyWithModel,
+  workerBaseUrl,
+  MODEL_INTENT_ALLOW,
+  MODEL_INTENT_COMBO,
+  MODEL_INTENT_MAX_TOKENS,
+  MODEL_INTENT_TIMEOUT_MS,
 } from "../src/intent.js";
 import { runTask, EXECUTOR_NOT_CONFIGURED } from "../src/executor.js";
 import {
@@ -1358,6 +1365,86 @@ console.log("\n✓ assertهای pipeline 3i برقرار شد.");
   check(cl("۵۰۰۰ تومان بستنی گرفتم").intent === "ask" && cl("۵۰۰۰ تومان بستنی گرفتم").question === "expense-or-income", "got with a product asks expense-or-income (moved from B)");
   // Reminder body is sliced from the original text, ZWNJ preserved.
   const rb = cl("یادم بینداز فردا ساعت ۹ زنگ بزن به می‌شود"); check(rb.intent === "reminder" && rb.text === "زنگ بزن به می‌شود", `reminder body preserves ZWNJ: ${JSON.stringify(rb)}`);
+}
+
+// ── Model router Part 1: pure model-intent function + call, NO wiring ───────
+// Part 1 changes no bot behaviour: nothing here calls handleDailyText or any
+// routing path. The new function is exercised directly, with fetch mocked.
+{
+  // Parse: valid JSON for every allow-list intent.
+  for (const intent of MODEL_INTENT_ALLOW) {
+    const r = parseModelIntent(JSON.stringify({ intent, followup: null, target: null }));
+    check(r && r.intent === intent && r.followup === null && r.target === null, `model intent parses: ${intent}`);
+  }
+  check(MODEL_INTENT_ALLOW.length === 12 && !MODEL_INTENT_ALLOW.includes("task"), "allow-list has 12 intents, task excluded");
+  check(MODEL_INTENT_COMBO === "chat" && MODEL_INTENT_MAX_TOKENS === 80 && MODEL_INTENT_TIMEOUT_MS === 8000, "classifier constants: combo chat, 80 tokens, 8000ms");
+  // followup: yes/no preserved, anything else becomes null (never invalidates).
+  check(parseModelIntent('{"intent":"expense","followup":"yes"}').followup === "yes", "followup yes preserved");
+  check(parseModelIntent('{"intent":"expense","followup":"no"}').followup === "no", "followup no preserved");
+  check(parseModelIntent('{"intent":"expense","followup":"maybe"}').followup === null, "followup other value becomes null");
+  // Brace-extraction fallback, same pattern as callFastCombo.
+  check(parseModelIntent('Here: {"intent":"note","followup":null,"target":null} done').intent === "note", "brace extraction fallback");
+  check(parseModelIntent('{"intent":"note","followup":null,"target":null} extra')?.intent === "note", "trailing text after JSON still parses");
+  // Failure: never a guessed intent.
+  check(parseModelIntent("hello") === null, "plain text -> null");
+  check(parseModelIntent("") === null, "empty -> null");
+  check(parseModelIntent(null) === null, "null input -> null");
+  check(parseModelIntent("[1,2]") === null, "array JSON -> null");
+  check(parseModelIntent('{"intent":"unknown"}') === null, "out-of-allow-list intent -> null");
+  check(parseModelIntent('{"intent":"task"}') === null, "task intent -> null");
+  check(parseModelIntent('{"intent":123}') === null, "non-string intent -> null");
+  check(parseModelIntent('{"intent":"expense"') === null, "truncated JSON -> null");
+  // Confidence and amount/date/currency fields are ignored, never read back.
+  const rich = parseModelIntent('{"intent":"expense","confidence":0.99,"amount":500,"date":"2026-10-30","currency":"TOMAN","followup":null,"target":null}');
+  check(rich && rich.intent === "expense" && !("confidence" in rich) && !("amount" in rich) && !("date" in rich) && !("currency" in rich), "extra model fields ignored, never returned");
+  // Translate targets: listed codes pass, missing target is valid-but-null,
+  // out-of-list target is reported as invalid, never guessed.
+  check(parseModelIntent('{"intent":"translate","target":"fa"}').target === "fa", "translate target fa passes");
+  check(parseModelIntent('{"intent":"translate","target":"ar"}').target === "ar", "translate target ar passes");
+  check(parseModelIntent('{"intent":"translate"}').target === null, "translate without target is valid with null target");
+  const badTarget = parseModelIntent('{"intent":"translate","target":"de"}');
+  check(badTarget && badTarget.invalid === "target" && !("intent" in badTarget), "invalid translate target reported, not guessed");
+  check(parseModelIntent('{"intent":"note","target":"en"}').target === null, "target on a non-translate intent is ignored");
+  // Shared URL: the one resolution point, and both call sites use it.
+  check(workerBaseUrl() === "https://my-agent.nova-02aa82bffef8.workers.dev", "shared worker base URL");
+  // Call: fetch is mocked, following the mockWorld pattern (save + restore).
+  const origFetch = global.fetch;
+  let captured = null;
+  const mockOk = (content) => {
+    global.fetch = async (url, init = {}) => {
+      captured = { url: String(url), body: JSON.parse(String(init.body ?? "{}")), headers: init.headers ?? {}, signal: init.signal };
+      return Response.json({ choices: [{ message: { content } }] });
+    };
+  };
+  mockOk('{"intent":"reminder","followup":null,"target":null}');
+  const ok = await classifyDailyWithModel({ ROUTER_KEY: "k-test" }, "یادم بینداز فردا جلسه");
+  check(ok && ok.intent === "reminder", `model call returns parsed intent: ${JSON.stringify(ok)}`);
+  check(captured.url === `${workerBaseUrl()}/v1/chat/completions`, "model call goes to the shared worker base");
+  check(captured.body.model === "combo/chat", "model call uses combo/chat, never fast or a user pref");
+  check(captured.body.max_tokens === 80 && captured.body.temperature === 0, "model call: 80 tokens, temperature 0");
+  check(captured.body.messages.length === 2 && captured.body.messages[0].role === "system" && captured.body.messages[1].role === "user" && captured.body.messages[1].content === "یادم بینداز فردا جلسه", "payload is system instruction + current message only");
+  check(captured.signal instanceof AbortSignal, "model call carries an abort signal");
+  check(!JSON.stringify(captured.body).includes("k-test"), "request body never carries the key");
+  // 300-char cap applies to classification only.
+  mockOk('{"intent":"chat","followup":null,"target":null}');
+  await classifyDailyWithModel({ ROUTER_KEY: "k-test" }, "x".repeat(500));
+  check(captured.body.messages[1].content.length === 300, "user text capped at 300 chars for classification");
+  // Existing callFastCombo path still works through the same shared base
+  // (project-ref-only message -> dev 0.55 -> LLM fallback), model combo/fast.
+  mockOk('{"intent":"dev","confidence":0.9,"reason":"llm"}');
+  const dev = await classifyIntent("پروژه", { callLLM: true, env: { ROUTER_KEY: "k-test" } });
+  check(dev && dev.intent === "dev", `callFastCombo still routes: ${JSON.stringify(dev)}`);
+  check(captured.url === `${workerBaseUrl()}/v1/chat/completions` && captured.body.model === "combo/fast", "callFastCombo uses the same shared base, still combo/fast");
+  // Failure paths: non-OK, throw (network/abort), missing key (no fetch at all).
+  global.fetch = async () => new Response("", { status: 500 });
+  check(await classifyDailyWithModel({ ROUTER_KEY: "k-test" }, "x") === null, "non-OK response -> null");
+  global.fetch = async () => { throw new Error("boom"); };
+  check(await classifyDailyWithModel({ ROUTER_KEY: "k-test" }, "x") === null, "fetch throw -> null");
+  let called = false;
+  global.fetch = async () => { called = true; return Response.json({}); };
+  check(await classifyDailyWithModel({}, "x") === null && called === false, "missing ROUTER_KEY skips the call entirely");
+  check(await classifyDailyWithModel(null, "x") === null && called === false, "null env skips the call entirely");
+  global.fetch = origFetch;
 }
 
 if (failures.length) {
