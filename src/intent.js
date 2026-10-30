@@ -158,3 +158,9 @@ export async function classifyIntent(message, ctx = {}) {
 export function needsConfirmation(result) {
   return (result.intent === "dev" || result.intent === "task") && result.confidence < DEV_CONFIRM_THRESHOLD;
 }
+
+// Free-text dev never executes: 1b-2 suggestion text, used by index.js.
+// Only an explicit /dev dispatches a run.
+export function freeTextDevSuggestion() {
+  return "این یک درخواست تغییر کد به نظر می‌رسد. برای اجرا، آن را با /dev بفرست.\nThis looks like a code-change request. Send it with /dev to run it.";
+}

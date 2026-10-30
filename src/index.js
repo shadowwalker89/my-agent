@@ -24,7 +24,10 @@ import {
 import { tgApi, tgSend, tgBroadcast } from "./telegram.js";
 import { healthCounts } from "./health.js";
 import { ADMIN_HTML } from "./admin-page.js";
-import { classifyIntent, needsConfirmation } from "./intent.js";
+import { classifyIntent, needsConfirmation, freeTextDevSuggestion } from "./intent.js";
+import { getChatContext } from "./memory.js";
+import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders } from "./everyday.js";
+import { saveMessage } from "./db.js";
 import {
   dispatchDev,
   approveDevPR,
@@ -181,14 +184,17 @@ async function comboUsable(env, name) {
   }
 }
 
-async function answerChatText(env, chatId, userId, text, hasImage) {
+async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
   await tgApi(env, "sendChatAction", { chat_id: chatId, action: "typing" });
 
   const prefs = await getPrefs(env, userId);
   const task = classifyTask(text, { hasImage: hasImage === true });
+  // Chat context: last 50 chat-kind rows, capped at 8,000 characters.
+  const history = buildChatContext(await getChatContext(env, userId));
   const body = {
     messages: [
-      { role: "system", content: CHAT_SYSTEM_PROMPT },
+      { role: "system", content: opts.systemPrompt || CHAT_SYSTEM_PROMPT },
+      ...history,
       { role: "user", content: text },
     ],
     temperature: 0.7,
@@ -228,7 +234,7 @@ async function answerChatText(env, chatId, userId, text, hasImage) {
       .join("\n");
     await tgSend(env, chatId, `همه‌ی مدل‌ها شکست خوردند 🙁\n${lines}`);
     console.log(JSON.stringify({ combo: usedCombo, used: null, routed }));
-    return;
+    return; // failed turn stores nothing, neither side
   }
 
   const content = result.data?.choices?.[0]?.message?.content;
@@ -241,8 +247,11 @@ async function answerChatText(env, chatId, userId, text, hasImage) {
   if (!answer.trim()) {
     await tgSend(env, chatId, "پاسخ خالی بود 🙁");
     console.log(JSON.stringify({ combo: usedCombo, used: result.used ?? null, routed }));
-    return;
+    return; // empty turn stores nothing either
   }
+  // Successful turn only: save user + assistant as kind chat.
+  await saveMessage(env, { userId, role: "user", content: opts.saveText ?? text, kind: "chat" });
+  await saveMessage(env, { userId, role: "assistant", content: answer, kind: "chat" });
   // show: ترجیح هر کاربر؛ SHOW_MODEL=1 همیشه override جهانی است.
   if (prefs.show === true || env.SHOW_MODEL === "1") {
     answer += `\n- ${usedCombo} / ${result.used}`;
@@ -643,6 +652,13 @@ async function runIntent(env, chatId, userId, text, intent, hasImage) {
 async function handlePlainText(env, msg, text) {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
+  // Allow-list already checked in handleUpdate; only then create the row.
+  await ensureUserRow(env, userId);
+  // Order: explicit /dev (tgCommand) -> everyday -> chat/task/dev.
+  const daily = await handleDailyText(env, { chatId, userId, text, ...dailySenders(env, chatId),
+    chat: (modelText, copts) => answerChatText(env, chatId, userId, modelText, updateHasImage(msg), copts) });
+  if (daily !== "chat") return;
+
   const prefs = await getPrefs(env, userId);
   if (prefs.intent === false) {
     await answerChatText(env, chatId, userId, text, updateHasImage(msg));
@@ -650,6 +666,11 @@ async function handlePlainText(env, msg, text) {
   }
 
   const intent = await classifyIntent(text, { env });
+  if (intent.intent === "dev") {
+    // Free-text dev only SUGGESTS /dev now; it never dispatches.
+    await tgSend(env, chatId, freeTextDevSuggestion());
+    return;
+  }
   if (needsConfirmation(intent)) {
     await setPendingIntent(env, userId, {
       prompt: text,
@@ -688,6 +709,12 @@ async function handleCallbackQuery(env, cb) {
     // پاسخ به callback اختیاری است
   }
   if (!fromId || !chatId || !isAllowed(env.ALLOWED_TG_IDS, fromId)) return;
+
+  if (data.startsWith("daily:")) {
+    await resolveDailyCallback(env, { fromId, chatId, data, ...dailySenders(env, chatId, cb?.message?.message_id),
+      chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
+    return;
+  }
 
   const devMatch = /^dev:(approve|reject):(\d{1,12})$/.exec(data);
   if (devMatch) {
