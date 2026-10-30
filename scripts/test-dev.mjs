@@ -1004,6 +1004,14 @@ if (DatabaseSync) {
   check(cl("هفته‌ی پیش چقدر خرج کردم؟").intent === "expense-query" && cl("هفته‌ی پیش چقدر خرج کردم؟").ask === "period", "last week asks, never today");
   check(cl("چرا اینقدر خرج می‌کنم؟").intent === "chat", "bare question about spending is chat");
   check(cl("امروز چقدر خرج کردم؟").intent === "expense-query", "today query still works");
+  // Fix 1: colloquial query word.
+  { const q = cl("امروز چقد خرج کردم؟"); check(q.intent === "expense-query" && q.range?.start === "2026-10-28" && q.range?.end === "2026-10-28", `colloquial chaghad query: ${JSON.stringify(q)}`); }
+  // Fix 2: last-expense forms, each tested separately.
+  check(cl("خرج قبلی چی بود؟").intent === "last-expense", "last-expense: kharj ghabli");
+  check(cl("آخرین خرج چی بود؟").intent === "last-expense", "last-expense: akharin kharj");
+  check(cl("خرج آخر چی بود؟").intent === "last-expense", "last-expense: kharj akhar");
+  check(cl("آخرین خرج چقدر بود؟").intent === "last-expense", "last-expense beats period ask");
+  check(cl("خرج کردم ۵۰۰ تومان نان").intent === "expense", "last-expense does not steal a real expense");
   check(cl("۳۲ آبان چقدر خرج کردم؟").intent === "expense-query" && cl("۳۲ آبان چقدر خرج کردم؟").ask === "date", "invalid jalali in query asks, never weekRange(null)");
   // Normalisation first: Arabic letters, space/ZWNJ variants.
   check(normalizeText("يادداشت كتاب") === "یادداشت کتاب", "arabic letters normalised");
@@ -1263,6 +1271,46 @@ if (DatabaseSync) {
     check(String(s.sent.at(-1)?.text ?? "").includes("کدام فایل"), "outside window asks which file");
     const r = await handleDailyText(env, o(env, 4242, "سلام، چطوری؟", { ...s, nowMs: NOW }));
     check(r === "chat", "plain chat is not a file reference");
+  }
+  // Everyday fix 1: last-expense query, after a recorded expense and with none.
+  {
+    const env = mkEnv(), s = fakeSend();
+    // The section shares one in-memory DB, so "none" is tested with a
+    // fresh user id (4243) that has no expense rows yet.
+    await handleDailyText(env, o(env, 4243, "خرج قبلی چی بود؟", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("هنوز خرجی ثبت نشده"), `last-expense with none: ${JSON.stringify(s.sent.at(-1))}`);
+    await handleDailyText(env, o(env, 4242, "خرج کردم ۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    const btn = s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+    await resolveDailyCallback(env, { fromId: 4242, chatId: 4242, messageId: 11, data: btn.find((d) => d.startsWith("daily:confirm:")), send: s.send, editMarkup: async () => {}, chat: async () => {} });
+    await handleDailyText(env, o(env, 4242, "خرج قبلی چی بود؟", { ...s, nowMs: NOW }));
+    const last = String(s.sent.at(-1)?.text ?? "");
+    check(last.includes("500") && last.includes("TOMAN") && last.includes("نان"), `last-expense returns the recorded expense: ${JSON.stringify(s.sent.at(-1))}`);
+    check(!last.includes("ثبت نشده"), "last-expense does not claim nothing was recorded");
+    await handleDailyText(env, o(env, 4242, "آخرین خرج چی بود؟", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("500"), "last-expense: akharin form works in wiring");
+  }
+  // Everyday fix 2: history-free translate, even with chat history present.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await saveMessage(env, { userId: 4242, role: "user", content: "یادداشت", kind: "chat" });
+    await saveMessage(env, { userId: 4242, role: "assistant", content: "باشه، یادداشت را بفرستید", kind: "chat" });
+    let modelText = null, copts = null;
+    const chatSpy = async (mt, c) => { modelText = mt; copts = c; };
+    await handleDailyText(env, o(env, 4242, "ترجمه کن به انگلیسی: سلام دنیا", { ...s, chat: chatSpy, nowMs: NOW }));
+    check(modelText === "سلام دنیا", `translate text: ${JSON.stringify(modelText)}`);
+    check(copts?.noHistory === true, `translate carries noHistory: ${JSON.stringify(copts)}`);
+    check(copts?.saveText === "ترجمه کن به انگلیسی: سلام دنیا", "translate still saves the full request as chat");
+  }
+  // Everyday fix 3: photo reference shows "عکس", a named document keeps its name.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await handleDailyFile(env, { userId: 4242, chatId: 4242, tgFileId: "photo-1", fileName: null, fileMime: "image/jpeg", caption: null, send: s.send });
+    await handleDailyText(env, o(env, 4242, "خلاصه‌اش کن", { ...s, nowMs: NOW }));
+    const photoReply = String(s.sent.at(-1)?.text ?? "");
+    check(photoReply.includes("عکس") && !photoReply.includes("photo-1"), `photo reference label: ${JSON.stringify(s.sent.at(-1))}`);
+    await handleDailyFile(env, { userId: 4242, chatId: 4242, tgFileId: "file-2", fileName: "doc.pdf", fileMime: "application/pdf", caption: null, send: s.send });
+    await handleDailyText(env, o(env, 4242, "خلاصه‌اش کن", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("doc.pdf"), "named document keeps its name");
   }
   // Full Telegram flow: file message saved, /ping not stored, failed chat turn stores nothing.
   {
