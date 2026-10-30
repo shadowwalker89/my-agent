@@ -407,31 +407,21 @@ function newEnv(extra = {}) {
   try {
     const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
 
-    // dev با اطمینان بالا → dispatch
+    // 1b-2: free-text dev only SUGGESTS /dev now, at any confidence.
+    // It never dispatches and never stores a pending dev intent.
     await sendTg(env, msgUpdate("add a /health endpoint to the worker"));
-    const dispatch = world.calls.github.find((c) => c.url.includes("/actions/workflows/"));
-    check(Boolean(dispatch), "dev باید GitHub dispatch بفرستد");
-    check(dispatch?.body?.inputs?.prompt === "add a /health endpoint to the worker", `dispatch prompt: ${JSON.stringify(dispatch?.body)}`);
-    check(dispatch?.body?.inputs?.user_id === "4242", "dispatch باید user_id بفرستد");
+    check(world.calls.github.filter((c) => c.url.includes("/actions/workflows/")).length === 0, "free-text dev must not dispatch");
     const devMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
-    check(String(devMsg?.payload?.text ?? "").includes("🚀"), "پیام dispatch باید تأیید کند");
-    check((await env.STATE.get("dev:active:4242")) === "1", "active بعد از dispatch ست شود");
-
-    // اطمینان پایین → دکمه‌ی تأیید، بدون dispatch
-    await env.STATE.delete("dev:active:4242");
+    check(String(devMsg?.payload?.text ?? "").includes("/dev"), "free-text dev must suggest /dev");
+    check((await env.STATE.get("dev:active:4242")) === null, "free-text dev must not set active");
+    check((await env.STATE.get("intent:pending:4242")) === null, "free-text dev must not store pending");
     const ghBefore = world.calls.github.length;
     await sendTg(env, msgUpdate("worker"));
-    const confirmMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
-    const confirmKb = confirmMsg?.payload?.reply_markup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
-    check(confirmKb.includes("intent:yes") && confirmKb.includes("intent:chat"), `دکمه‌های تأیید: ${JSON.stringify(confirmKb)}`);
-    check(world.calls.github.length === ghBefore, "قبل از تأیید نباید dispatch شود");
-    check(Boolean(await env.STATE.get("intent:pending:4242")), "pending intent باید ذخیره شود");
-
-    // تأیید → dispatch با همان prompt
+    check(world.calls.github.length === ghBefore, "low-confidence dev must not dispatch either");
+    check((await env.STATE.get("intent:pending:4242")) === null, "low-confidence dev must not store pending either");
     await sendTg(env, cbUpdate("intent:yes"));
-    const dispatch2 = world.calls.github.filter((c) => c.url.includes("/actions/workflows/")).at(-1);
-    check(dispatch2?.body?.inputs?.prompt === "worker", `dispatch بعد از تأیید: ${JSON.stringify(dispatch2?.body)}`);
-    check((await env.STATE.get("intent:pending:4242")) === null, "pending بعد از تأیید پاک شود");
+    const expiredMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(expiredMsg?.payload?.text ?? "").includes("منقضی"), "stale intent:yes must say expired");
 
     // task بدون executor → پیام پیکربندی + دکمه‌ی چت
     await env.STATE.delete("dev:active:4242");
@@ -1097,6 +1087,102 @@ if (DatabaseSync) {
   check(cl("مجموع خرج‌هایم چقدر است؟").intent === "expense-query" && cl("مجموع خرج‌هایم چقدر است؟").ask === "period", "fifth: total without period asks period");
   check(ex("خرج کردم ۵۰۰ تومان پس انداز").item === "پس انداز", "fifth: پس انداز survives intact");
 }
+
+// ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, confirmExpenseDraft, CHAT_CONTEXT_CHAR_LIMIT } from "../src/everyday.js";
+{
+  check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
+  check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
+  const many = Array.from({ length: 60 }, (_, i) => ({ role: "user", content: `m${i} ` + "x".repeat(200) }));
+  const capped = buildChatContext(many);
+  const cappedChars = capped.reduce((a, m) => a + m.content.length, 0);
+  check(capped.length <= 50 && cappedChars <= CHAT_CONTEXT_CHAR_LIMIT, `context capped: ${capped.length} msgs, ${cappedChars} chars`);
+  check(capped[capped.length - 1].content.startsWith("m59"), "char cap keeps newest, drops oldest first");
+  const short = Array.from({ length: 60 }, (_, i) => ({ role: "user", content: `m${i}` }));
+  const shortCapped = buildChatContext(short);
+  check(shortCapped.length === 50 && shortCapped[0].content === "m10", "count cap keeps newest 50");
+}
+if (DatabaseSync) {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  const d1 = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
+  const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4243", DB: d1, ...extra });
+  const fakeSend = () => { const sent = []; return { sent, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, api: async () => ({ ok: true }) }; };
+  const o = (env, userId, text, extra = {}) => ({ chatId: userId, userId, text, send: extra.send, api: extra.api, chat: extra.chat ?? (async () => {}), nowMs: extra.nowMs });
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0); // Wed 2026-10-28, 15:30 Iran time
+  // User row: created once, never twice; a stranger has no row.
+  {
+    const env = mkEnv();
+    check((await ensureUserRow(env, 4242)).ok === true, "user row created");
+    await ensureUserRow(env, 4242);
+    check(rows("SELECT COUNT(*) AS n FROM users WHERE id = 4242")[0].n === 1, "user row never twice");
+    check(rows("SELECT COUNT(*) AS n FROM users WHERE id = 9999")[0].n === 0, "stranger has no row");
+  }
+  // Expense confirm flow, direct: draft -> confirm -> row -> second tap fixed.
+  {
+    const env = mkEnv(), s = fakeSend();
+    const r = await handleDailyText(env, o(env, 4242, "خرج کردم ۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    check(r === "handled", "expense handled by everyday");
+    const btn = s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+    const confirmData = btn.find((d) => d.startsWith("daily:confirm:"));
+    check(Boolean(confirmData), `confirm button: ${JSON.stringify(btn)}`);
+    check(confirmData.length <= 64, "callback_data at most 64 bytes");
+    check(rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0, "money never stored before confirm");
+    const id = confirmData.split(":")[2];
+    const edits = [];
+    const cb = { fromId: 4242, chatId: 4242, messageId: 11, data: confirmData, send: s.send, editMarkup: async () => { edits.push(1); }, chat: async () => {} };
+    check((await resolveDailyCallback(env, cb)) === true, "confirm callback handled");
+    check(rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 1, "one expense row after confirm");
+    check(edits.length === 1, "buttons removed after confirm");
+    await resolveDailyCallback(env, cb);
+    check(rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 1, "second tap creates no second row");
+    check(String(s.sent.at(-1)?.text ?? "").includes("قبلاً ثبت شد"), "second tap gets the fixed message");
+  }
+  // Callback from someone else's draft and from a stranger: silent.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await handleDailyText(env, o(env, 4242, "خرج کردم ۷۰۰ تومان کتاب", { ...s, nowMs: NOW }));
+    const btn = s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+    const confirmData = btn.find((d) => d.startsWith("daily:confirm:"));
+    const before = s.sent.length;
+    const rowsBefore = rows("SELECT COUNT(*) AS n FROM expenses")[0].n;
+    const mkCb = (fromId) => ({ fromId, chatId: fromId, messageId: 11, data: confirmData, send: s.send, editMarkup: async () => { throw new Error("must not edit"); }, chat: async () => {} });
+    check((await resolveDailyCallback(env, mkCb(4243))) === true, "other's draft callback handled");
+    check(s.sent.length === before, "other's draft sends nothing");
+    check(rows("SELECT COUNT(*) AS n FROM expenses")[0].n === rowsBefore, "other's draft stores nothing");
+    check((await resolveDailyCallback(env, mkCb(9999))) === true, "stranger callback handled");
+    check(s.sent.length === before, "stranger callback sends nothing");
+  }
+  // D1 failure mid-confirm: draft kept, "not saved" reply.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await handleDailyText(env, o(env, 4242, "خرج کردم ۳۰۰ تومان چای", { ...s, nowMs: NOW }));
+    const btn = s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+    const id = btn.find((d) => d.startsWith("daily:confirm:"))?.split(":")[2];
+    const failingEnv = { ...env, DB: { prepare() { throw new Error("boom"); } } };
+    const r = await confirmExpenseDraft(failingEnv, 4242, id);
+    check(r.status === "failed", `D1 failure mid-confirm: ${JSON.stringify(r)}`);
+    check((await env.STATE.get(`daily:draft:${id}`, "json")) !== null, "draft kept after D1 failure");
+    const cb = { fromId: 4242, chatId: 4242, messageId: 11, data: `daily:confirm:${id}`, send: s.send, editMarkup: async () => {}, chat: async () => {} };
+    await resolveDailyCallback(failingEnv, cb);
+    check(String(s.sent.at(-1)?.text ?? "").includes("ذخیره نشد"), "D1 failure replies not saved");
+  }
+  // Full Telegram flow: expense priority over dev, user row created.
+  {
+    const world = mockWorld();
+    try {
+      const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", DB: d1, GITHUB_DISPATCH_TOKEN: "gh-fake" };
+      await sendTg(env, msgUpdate("خرج کردم ۵۰۰ تومان نان"));
+      const kb = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1)?.payload?.reply_markup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+      check(kb.some((d) => d.startsWith("daily:confirm:")), "expense beats dev/task routing");
+      check(world.calls.github.filter((c) => c.url.includes("/actions/workflows/")).length === 0, "expense sends no dispatch");
+      check(rows("SELECT COUNT(*) AS n FROM users WHERE id = 4242")[0].n === 1, "full flow creates the user row");
+    } finally { world.restore(); }
+  }
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
