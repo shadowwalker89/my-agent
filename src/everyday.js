@@ -1,9 +1,9 @@
-// Step 1b-2a: money + callbacks + chat context + storage. Pure classifier
-// in daily.js; side effects here. D1 failures never throw. Part 2 adds the
-// other intents + file branch; until then they fall through to chat.
-import { classifyDaily, parseExpense, formatJalali } from "./daily.js";
+// Step 1b-2: everyday wiring (money, notes, reminders, translate,
+// remember, queries, file reference + file branch). Pure classifier in
+// daily.js; side effects here. D1 failures never throw.
+import { classifyDaily, parseExpense, formatJalali, sumByCurrency } from "./daily.js";
 import { saveMessage } from "./db.js";
-import { getDefaultCurrency } from "./memory.js";
+import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
@@ -26,6 +26,9 @@ export function buildChatContext(rows) {
 
 function dbOf(env) { const db = env && env.DB; return db && typeof db.prepare === "function" ? db : null; }
 async function runDb(env, sql, params) { const db = dbOf(env); if (!db) return { ok: false }; try { await db.prepare(sql).bind(...params).run(); return { ok: true }; } catch { return { ok: false }; } }
+async function allDb(env, sql, params) { const db = dbOf(env); if (!db) return []; try { const res = await db.prepare(sql).bind(...params).all(); return Array.isArray(res?.results) ? res.results : []; } catch { return []; } }
+async function queryExpenseSums(env, userId, range) { return sumByCurrency(await allDb(env, "SELECT amount, currency_code FROM expenses WHERE user_id = ? AND type = 'expense' AND date BETWEEN ? AND ?", [userId, range.start, range.end])); }
+async function recentMessages(env, userId, limit = 10) { return allDb(env, "SELECT role, content, kind, tg_file_id, file_name FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?", [userId, limit]); }
 
 // User row: allow-list FIRST (callers guarantee it), then INSERT OR IGNORE.
 export async function ensureUserRow(env, userId) { const id = Number(userId); if (!Number.isFinite(id)) return { ok: false }; return runDb(env, "INSERT OR IGNORE INTO users (id, telegram_id) VALUES (?, ?)", [id, String(id)]); }
@@ -88,7 +91,60 @@ export async function handleDailyText(env, o) {
     await o.send(askText(question));
     return "handled";
   }
-  return "chat"; // Part 2 intents (note, reminder, translate, remember, queries, file) — chat for now, as on main
+  if (c.intent === "translate") {
+    if (c.ask) { await o.send(askText(c.ask)); return "handled"; }
+    const targetName = c.target === "en" ? "English" : c.target === "fa" ? "Persian" : c.target;
+    await o.chat(c.text, { systemPrompt: `Translate the following text${targetName ? ` to ${targetName}` : ""}. Reply with only the translation.`, saveText: text });
+    return "handled";
+  }
+  if (c.intent === "remember") {
+    if (c.refused) { await o.send("در این قدم فقط تنظیم‌ها نگه داشته می‌شوند؛ خاطره‌های آزاد در قدم حافظه می‌آیند"); return "handled"; }
+    const r = await setSetting(env, userId, c.setting.key, c.setting.value);
+    await o.send(r.ok ? `✅ ذخیره شد: ${c.setting.key} = ${c.setting.value}` : NOT_SAVED_TEXT);
+    return "handled";
+  }
+  if (c.intent === "note") {
+    const r = await runDb(env, "INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)", [userId, c.text, "text", new Date().toISOString()]);
+    await o.send(r.ok ? "✅ یادداشت ذخیره شد." : NOT_SAVED_TEXT);
+    if (r.ok) await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+    return "handled";
+  }
+  if (c.intent === "reminder") {
+    if (c.ask) { await o.send(askText(c.ask)); return "handled"; }
+    const r = await runDb(env, "INSERT INTO reminders (user_id, text, due_at, status, created_at) VALUES (?, ?, ?, ?, ?)", [userId, c.text, c.due, "pending", new Date().toISOString()]);
+    await o.send(r.ok ? `⏰ یادآوری فقط ذخیره شد (ارسال سر وقت هنوز فعال نیست): ${c.text} — ${c.due}` : NOT_SAVED_TEXT);
+    if (r.ok) await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+    return "handled";
+  }
+  if (c.intent === "expense-query") {
+    if (c.ask) { await o.send(askText(c.ask)); return "handled"; }
+    const sums = await queryExpenseSums(env, userId, c.range);
+    const keys = Object.keys(sums);
+    await o.send(keys.length ? keys.map((k) => `${k}: ${sums[k]}`).join("\n") : "در این بازه خرجی ثبت نشده است.");
+    await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+    return "handled";
+  }
+  if (c.intent === "note-query") {
+    if (c.ask) { await o.send(askText(c.ask)); return "handled"; }
+    const rows = await allDb(env, "SELECT text FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 5", [userId]);
+    await o.send(rows.length ? rows.map((r) => `• ${r.text}`).join("\n") : "یادداشتی پیدا نشد.");
+    await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+    return "handled";
+  }
+  if (c.intent === "file-reference") {
+    const recent = await recentMessages(env, userId, 10);
+    const file = recent.find((r) => r.tg_file_id);
+    if (file) {
+      await o.send(`📎 فایل پیدا شد: ${file.file_name || file.tg_file_id} — خلاصه‌سازی با قدم فایل‌ها می‌آید، فعلاً فقط ذخیره شده است.`);
+      await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+      return "handled";
+    }
+    const prev = recent[0];
+    if (prev && prev.role === "user" && prev.kind === "chat" && !prev.tg_file_id) return "chat";
+    await o.send("کدام فایل؟ در ۱۰ پیام اخیر فایلی پیدا نشد.");
+    return "handled";
+  }
+  return "chat";
 }
 
 // daily: callbacks. Returns true when the data was a daily: callback.
@@ -126,4 +182,14 @@ export function dailySenders(env, chatId, messageId) {
     send: (msgText, opts) => tgApi(env, "sendMessage", { chat_id: chatId, text: msgText, ...(opts?.replyMarkup ? { reply_markup: opts.replyMarkup } : {}) }),
     editMarkup: () => tgApi(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
   };
+}
+
+// Non-text file message: save one messages row, kind daily, no R2 in
+// Step 1. Returns false when D1 is missing (caller keeps the old reply).
+export async function handleDailyFile(env, o) {
+  if (!dbOf(env)) return false;
+  const r = await saveMessage(env, { userId: o.userId, role: "user", content: o.caption || o.fileName || "file", kind: "daily", tgFileId: o.tgFileId, fileName: o.fileName || null, fileMime: o.fileMime || null });
+  if (!r.ok) { await o.send(NOT_SAVED_TEXT); return true; }
+  await o.send("📎 فایل ذخیره شد (فقط ذخیره؛ خلاصه‌سازی با قدم فایل‌ها می‌آید).");
+  return true;
 }
