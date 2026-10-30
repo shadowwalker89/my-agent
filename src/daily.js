@@ -58,7 +58,7 @@ export function parseRelativeDate(text, nowMs) {
   // Unify ZWNJ/space only for the relative-date phrases; full text
   // normalisation (Arabic letters, ZWNJ variants) lands in 1b-1b.
   const t = normalizeDigits(String(text ?? "")).replace(/‌/g, " "), today = iranDate(nowMs);
-  if (/پس\s+فردا/.test(t)) return addDays(today, 2);
+  if (/پس[\s‌]+فردا/.test(t)) return addDays(today, 2);
   if (/فردا/.test(t)) return addDays(today, 1);
   if (/دیروز/.test(t)) return addDays(today, -1);
   if (/امروز/.test(t)) return today;
@@ -127,20 +127,28 @@ export function parseHour(text) {
   if (hour >= 12) return { hour, minute }; if (hour >= 7) return { hour, minute };
   return { ask: "hour-ambiguous" };
 }
-const REMINDER_TRIGGERS = /(?:یادم بینداز|یادآوری کن|یادم بنداز|یادت باشه|یادآوری)/;
-export function parseReminder(text, nowMs) {
+const REMINDER_TRIGGERS = /(?:یادم بینداز|یادآوری کن|یادم بنداز|یادت باشه|یادآوری)(?![\p{L}])/u;
+export function parseReminder(text, nowMs, origText) {
   const now = nowMs ?? Date.now(), hour = parseHour(text);
   if (!hour) return { ask: "no-time" }; if (hour.ask) return { ask: hour.ask };
   const date = parseRelativeDate(text, now); if (date === null) return { ask: "date" };
   const [y, mo, d] = date.split("-").map(Number);
   if (Date.UTC(y, mo - 1, d, hour.hour, hour.minute) - IRAN_OFFSET_MIN * 60000 <= now) return { ask: "past" };
-  // Body: remove the trigger, the relative-date words, and the whole hour
-  // phrase INCLUDING a qualifier right after it, so "صبح" is not left over.
-  let body = String(text ?? "")
-    .replace(/یادم بینداز|یادآوری کن|یادم بنداز|یادت باشه|یادآوری/g, " ")
-    .replace(/پس\s+فردا|پس‌فردا|فردا|امروز|دیروز/g, " ")
-    .replace(new RegExp(`ساعت\\s*(?:[\\d۰-۹٠-٩]{1,2}|${HOUR_ALTS})(?::[\\d۰-۹٠-٩]{1,2})?(?:\\s+و\\s+(?:ربع|نیم))?(?:\\s+(?:بعد از ظهر|صبح|بامداد|ظهر|عصر|شب))?`, "g"), " ")
-    .replace(/و\s+(?:ربع|نیم)/g, " ").replace(/\s+/g, " ").trim();
+  // Body from the ORIGINAL text at the same indices: normalisation is
+  // one-to-one, so ranges found on the normalised text align exactly.
+  // Ranges removed: trigger, relative-date words, the whole hour phrase
+  // (including a qualifier right after it), and a trailing quarter/half.
+  const src = origText ?? text, ranges = [];
+  const collect = (re) => { let mm; while ((mm = re.exec(text)) !== null) ranges.push([mm.index, mm.index + mm[0].length]); };
+  collect(new RegExp(REMINDER_TRIGGERS.source, "gu"));
+  collect(/پس[\s\u200c]+فردا|فردا|امروز|دیروز/g);
+  collect(new RegExp(`ساعت\\s*(?:[\\d۰-۹٠-٩]{1,2}|${HOUR_ALTS})(?::[\\d۰-۹٠-٩]{1,2})?(?:\\s+و\\s+(?:ربع|نیم))?(?:\\s+(?:بعد از ظهر|صبح|بامداد|ظهر|عصر|شب))?`, "g"));
+  collect(/و\s+(?:ربع|نیم)/g);
+  ranges.sort((a, b) => a[0] - b[0]);
+  let body = "", pos = 0;
+  for (const [a, b] of ranges) { if (a < pos) continue; body += src.slice(pos, a); pos = b; }
+  body += src.slice(pos);
+  body = body.replace(/\s+/g, " ").trim();
   if (!body) return { ask: "empty" }; // "for what?" — never store an empty reminder
   return { due: `${date}T${pad(hour.hour)}:${pad(hour.minute)}:00+03:30`, text: body };
 }
@@ -263,11 +271,12 @@ export function parseExpense(text, opts = {}, origText) {
   return { ...amount, date, item: stripItem(text, amount, origText), category: null };
 }
 const EXPENSE_VERBS = /(?<!\p{L})(خرج کردم|پرداخت کردم|خریدم|خرید کردم)(?![\p{L}])/u, INCOME_VERBS = /(?<!\p{L})(دریافت کردم|واریز شد|حقوق گرفتم|پول گرفتم)(?![\p{L}])/u;
-const WEAK_BUY = /(?<!\p{L})(خریدم|خرید کردم)(?![\p{L}])/u;
-const NOTE_RE = /(?:یادداشت\s+کن(?![\p{L}])|یادداشت\s*[:：])\s*([\s\S]+)/u, REMINDER_RE = /(?<!\p{L})(?:یادم بینداز|یادآوری کن|یادم بنداز|یادت باشه)(?![\p{L}])/u; // NOTE: یادت باشه here is dead code until 1b-1c: the remember branch above runs first
+const WEAK_BUY = /(?<!\p{L})(خریدم|خرید کردم)(?![\p{L}])/u; const NEGATED_RE = /(?<!\p{L})(نکردم|نکرد|نخریدم|نگرفتم|نپرداختم|ندریافتم|ندادم|نخواهم|نمی\s+کنم|نمی\s+خواهم|نمی\s+خرم|نمی\s+دهم|نکنم)(?![\p{L}])/u;
+const NOTE_RE = /^\s*(?:(?:لطفا|لطفاً|ببین)\s+)?(?:یادداشت\s+کن(?![\p{L}])|یادداشت\s*[:：])\s*([\s\S]+)/u, REMINDER_RE = /(?<!\p{L})(?:یادم بینداز|یادآوری کن|یادم بنداز|یادت باشه)(?![\p{L}])/u;
 const NOTE_QUERY_RE = /(یادداشت\s+های|یادداشت\s+هام|یادداشت\s+های امروز)/;
 const FILE_RE = /(?<!\p{L})(خلاصه\s+اش\s+کن(?![\p{L}])|خلاصه\s+کن(?![\p{L}])|خلاصه\s+اش|این فایل را خلاصه\s+کن(?![\p{L}]))/u;
 const TRANSLATE_VERB = /(?<!\p{L})(?:ترجمه\s+(?:کن|کنید|بکن))(?![\p{L}])/u;
+function countAnchoredAmounts(text) { const toks = stripThousands(normalizeDigits(normalizeText(text))).replace(/[؟?!.،,]/g, " ").split(/\s+/).filter(Boolean); let n = 0; for (let ci = 0; ci < toks.length; ci++) if (CUR_WORDS.includes(toks[ci])) for (let s = Math.max(0, ci - 7); s < ci; s++) { const ph = parseNumberPhrase(toks.slice(s, ci), 0); if (ph && !ph.error && ph.consumed === ci - s) { n++; break; } } return n; }
 // Rule-only classifier. Confident = 1; ambiguous = { intent: "ask" }.
 // Never a guess, never a model call. Strict translate is checked FIRST:
 // a bare word "translate" anywhere is not a translate, only the verb is.
@@ -277,10 +286,18 @@ export function classifyDaily(text, opts = {}) {
   if (raw.trimStart().startsWith("/")) return { intent: "command", confidence: 1 };
   const trVerb = TRANSLATE_VERB.exec(raw);
   if (trVerb) {
-    const after = raw.slice(trVerb.index + trVerb[0].length).trim().replace(/^[:：]\s*/, "");
-    const targetMatch = /به\s+(انگلیسی|فارسی)/.exec(raw);
-    const target = targetMatch ? (targetMatch[1] === "انگلیسی" ? "en" : "fa") : null;
-    const body = after.replace(/^به\s+(انگلیسی|فارسی)\s*[:：]?\s*/, "").trim();
+    // Destination: a known language maps to its code; any other word after
+    // "به" with a colon passes through as written, never null with the
+    // prefix left in the text sent to the model. The body is sliced from
+    // the original text (indices align: normalisation is one-to-one).
+    const verbEnd = trVerb.index + trVerb[0].length, afterNorm = raw.slice(verbEnd);
+    const known = /^\s*[:：]?\s*به\s+(انگلیسی|فارسی|en|fa)\s*[:：]?\s*/u.exec(afterNorm);
+    const other = /^\s*[:：]?\s*به\s+(\S+)\s*[:：]\s*/u.exec(afterNorm);
+    let target = null, bodyStart = 0;
+    if (known) { target = known[1] === "انگلیسی" || known[1] === "en" ? "en" : "fa"; bodyStart = known[0].length; }
+    else if (other) { target = other[1]; bodyStart = other[0].length; }
+    else bodyStart = /^\s*[:：]?\s*/.exec(afterNorm)[0].length;
+    const body = text.slice(verbEnd + bodyStart).trim();
     if (!body) return { intent: "translate", confidence: 0.5, ask: "text" };
     return { intent: "translate", confidence: 1, target, text: body };
   }
@@ -289,16 +306,23 @@ export function classifyDaily(text, opts = {}) {
   const rem = /(?<!\p{L})(?:یادت باشد|یادت باشه|به خاطر بسپار)(?![\p{L}])\s+([\s\S]+)/u.exec(raw);
   if (rem) {
     const rest = rem[1].trim();
-    const cur = /^(?:ارز[\s\u200c]+پیش[\s\u200c]*فرضم|ارزم)\s+(\S+)/.exec(rest);
-    if (cur) { const tok = cur[1].replace(/[؟?!.،,]+$/, ""); const code = has(CUR, tok) ? CUR[tok] : (tok.endsWith("ه") && has(CUR, tok.slice(0, -1)) ? CUR[tok.slice(0, -1)] : (["TOMAN", "IRR", "USD", "EUR"].includes(tok) ? tok : null)); return code ? { intent: "remember", confidence: 1, setting: { key: "currency", value: code } } : { intent: "remember", confidence: 1, refused: true }; }
-    const lang = /^(?:زبانم|زبان)\s+(\S+)/.exec(rest);
-    if (lang) { const v = lang[1] === "انگلیسی" ? "en" : lang[1] === "فارسی" ? "fa" : (lang[1] === "en" || lang[1] === "fa" ? lang[1] : null); return v ? { intent: "remember", confidence: 1, setting: { key: "language", value: v } } : { intent: "remember", confidence: 1, refused: true }; }
-    const name = /^(?:نامم|اسمم)\s+([\s\S]+)/.exec(rest);
-    if (name) { let v = name[1].trim().replace(/\s+(است|هست)$/, "").trim(); return v && v.length <= 50 ? { intent: "remember", confidence: 1, setting: { key: "name", value: v } } : { intent: "remember", confidence: 1, refused: true }; }
-    return { intent: "remember", confidence: 1, refused: true };
+    // A remember match that is not a setting attempt falls through to
+    // the reminder check below, so "tomorrow at 9, remember ..." with
+    // the colloquial form is a reminder, not a refused setting. Only a
+    // genuine setting attempt (currency/language/name keyword) can refuse.
+    const isSetting = /^(?:ارزم|ارز[\s\u200c]|زبانم|زبان[\s\u200c]|نامم|اسمم)/.test(rest);
+    if (isSetting) {
+      const cur = /^(?:ارز[\s\u200c]+پیش[\s\u200c]*فرضم|ارزم)\s+(\S+)/u.exec(rest);
+      if (cur) { const tok = cur[1].replace(/[؟?!.،,]+$/, ""); const code = has(CUR, tok) ? CUR[tok] : (tok.endsWith("ه") && has(CUR, tok.slice(0, -1)) ? CUR[tok.slice(0, -1)] : (["TOMAN", "IRR", "USD", "EUR"].includes(tok) ? tok : null)); return code ? { intent: "remember", confidence: 1, setting: { key: "currency", value: code } } : { intent: "remember", confidence: 1, refused: true }; }
+      const lang = /^(?:زبانم|زبان)\s+(\S+)/.exec(rest);
+      if (lang) { const v = lang[1] === "انگلیسی" ? "en" : lang[1] === "فارسی" ? "fa" : (lang[1] === "en" || lang[1] === "fa" ? lang[1] : null); return v ? { intent: "remember", confidence: 1, setting: { key: "language", value: v } } : { intent: "remember", confidence: 1, refused: true }; }
+      const name = /^(?:نامم|اسمم)\s+([\s\S]+)/.exec(rest);
+      if (name) { let v = name[1].trim().replace(/\s+(است|هست)$/, "").trim(); return v && v.length <= 50 ? { intent: "remember", confidence: 1, setting: { key: "name", value: v } } : { intent: "remember", confidence: 1, refused: true }; }
+      return { intent: "remember", confidence: 1, refused: true };
+    }
   }
-  const note = NOTE_RE.exec(raw); if (note && note[1].trim()) return { intent: "note", confidence: 1, text: note[1].trim() };
-  if (REMINDER_RE.test(raw)) { const r = parseReminder(raw, now); return r.ask ? { intent: "reminder", confidence: 0.5, ask: r.ask } : { intent: "reminder", confidence: 1, due: r.due, text: r.text }; }
+  const note = NOTE_RE.exec(raw); if (note && note[1].trim()) return { intent: "note", confidence: 1, text: text.slice(note.index + note[0].length - note[1].length).trim() };
+  if (REMINDER_RE.test(raw)) { const r = parseReminder(raw, now, text); return r.ask ? { intent: "reminder", confidence: 0.5, ask: r.ask } : { intent: "reminder", confidence: 1, due: r.due, text: r.text }; }
   // Expense query: needs "how much/total" or a period word with a question
   // mark. An unknown period (e.g. last week) asks, never returns today.
   // An invalid date asks, never calls weekRange(null).
@@ -317,13 +341,14 @@ export function classifyDaily(text, opts = {}) {
     else range = { start: date, end: date };
     return { intent: "expense-query", confidence: 1, period, range };
   }
-  const hasE = EXPENSE_VERBS.test(raw) || (/(?<!\p{L})خرج(?!\p{L})/u.test(raw) && amount?.anchored);
-  const hasI = INCOME_VERBS.test(raw) || (/(?<!\p{L})درآمد(?!\p{L})/u.test(raw) && amount?.anchored) || (/(?<!\p{L})گرفتم(?![\p{L}])/u.test(raw) && amount?.anchored);
+  const hasE = !NEGATED_RE.test(raw) && (EXPENSE_VERBS.test(raw) || (/(?<!\p{L})خرج(?!\p{L})/u.test(raw) && amount?.anchored));
+  const hasI = !NEGATED_RE.test(raw) && (INCOME_VERBS.test(raw) || (/(?<!\p{L})درآمد(?!\p{L})/u.test(raw) && amount?.anchored) || (/(?<!\p{L})گرفتم(?![\p{L}])/u.test(raw) && amount?.anchored));
   if (hasE || hasI) {
+    if (countAnchoredAmounts(raw) >= 2) return { intent: "ask", confidence: 0.5, question: "amount" };
     if (amount?.error === "decimal") return { intent: "ask", confidence: 0.5, question: "decimal" };
     if (amount?.error === "amount" || amount?.error === "unknown-number") return { intent: "ask", confidence: 0.5, question: "amount" };
     const digits = amount?.anchored ? [] : bareDigits(raw); if (amount?.anchored || digits.length === 1) { const ex = parseExpense(raw, opts, text); if (ex?.error === "date") return { intent: "ask", confidence: 0.5, question: "date" }; if (ex?.error) return { intent: "ask", confidence: 0.5, question: ex.error }; // TODO 1b-2: map question "ambiguous" to "amount" before it reaches Telegram
-    return { intent: hasI && !hasE ? "income" : "expense", confidence: 1, extraction: ex }; }
+    if (hasI && !hasE && /(?<!\p{L})گرفتم(?![\p{L}])/u.test(raw) && !INCOME_VERBS.test(raw) && !/(?<!\p{L})درآمد(?![\p{L}])/u.test(raw) && ex.item) return { intent: "ask", confidence: 0.5, question: "expense-or-income" }; return { intent: hasI && !hasE ? "income" : "expense", confidence: 1, extraction: ex }; }
   return { intent: "ask", confidence: 0.5, question: WEAK_BUY.test(raw) ? "expense-or-chat" : "amount" };
   }
   if (amount?.error === "decimal") return { intent: "ask", confidence: 0.5, question: "decimal" };
@@ -338,6 +363,6 @@ export function classifyDaily(text, opts = {}) {
     return { intent: "chat", confidence: 1 };
   }
   // No verb: ask only for a short message that carries a currency word.
-  if (amount?.anchored) { if (amount.bareMultiplier) return { intent: "chat", confidence: 1 }; if (raw.split(/\s+/).some((tok) => /^ن(خریدم|خرید|گرفتم|پرداختم|دریافت|کردم)/u.test(tok))) return { intent: "chat", confidence: 1 }; const tokens = raw.split(/\s+/).filter(Boolean).length; if (tokens <= 4) return { intent: "ask", confidence: 0.5, question: "expense-or-chat" }; return { intent: "chat", confidence: 1 }; }
+  if (amount?.anchored) { if (NEGATED_RE.test(raw)) return { intent: "chat", confidence: 1 }; if (amount.bareMultiplier) return { intent: "chat", confidence: 1 }; if (raw.split(/\s+/).some((tok) => /^ن(خریدم|خرید|گرفتم|پرداختم|دریافت|کردم)/u.test(tok))) return { intent: "chat", confidence: 1 }; const tokens = raw.split(/\s+/).filter(Boolean).length; if (tokens <= 4) return { intent: "ask", confidence: 0.5, question: "expense-or-chat" }; return { intent: "chat", confidence: 1 }; }
   return { intent: "chat", confidence: 1 };
 }
