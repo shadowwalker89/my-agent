@@ -1831,16 +1831,16 @@ if (DatabaseSync) {
     const slot = await slotOf(env, 4504);
     check(lastText(s).includes("به چه زبانی؟") && slot?.kind === "language" && slot?.pendingBody === "سلام دنیا", "3b: invalid target with translate-text slot -> language ask keeps body");
   }
-  // (d1) Model failure with a note-text slot -> same question, nothing stored, slot (kind) preserved.
+  // (d1) Model failure with a note-text slot -> fallback stores the body, slot cleared.
   {
     const env = mkEnv(), s = fakeSend();
     await noteAsk(env, s, 4505);
     mockModelFail();
     const r = await handleDailyText(env, o(env, 4505, "فردا به علی زنگ بزنم", { ...s, nowMs: NOW }));
     const slot = await slotOf(env, 4505);
-    check(r === "handled" && lastText(s).includes("چه چیزی را یادداشت کنم؟") && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4505")[0].n === 0 && slot?.kind === "note-text", "3b: failure with note-text slot -> same ask, nothing stored, kind preserved");
+    check(r === "handled" && fetchCalls === 1 && lastText(s).includes("یادداشت ذخیره شد") && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4505")[0].n === 1 && rows("SELECT text FROM notes WHERE user_id = 4505")[0].text === "فردا به علی زنگ بزنم" && slot === null, "3b: failure with note-text slot -> fallback stores body, slot cleared");
   }
-  // (d2) Missing key with a note-text slot -> same question re-asked (NOT chat, NOT dropped), nothing stored.
+  // (d2) Missing key with a note-text slot -> fallback stores the body (NOT dropped), nothing re-asked.
   {
     const env = mkEnv(), s = fakeSend(); let chats = [];
     await noteAsk(env, s, 4506);
@@ -1848,9 +1848,9 @@ if (DatabaseSync) {
     mockModel(modelJson("note"));
     const r = await handleDailyText(env2, o(env2, 4506, "فردا به علی زنگ بزنم", { ...s, nowMs: NOW, chat: async (t) => { chats.push(t); } }));
     const slot = await slotOf(env, 4506);
-    check(r === "handled" && fetchCalls === 0 && lastText(s).includes("چه چیزی را یادداشت کنم؟") && chats.length === 0 && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4506")[0].n === 0 && slot?.kind === "note-text", "3b: missing key with note-text slot -> same ask, not chat, not dropped");
+    check(r === "handled" && fetchCalls === 0 && lastText(s).includes("یادداشت ذخیره شد") && chats.length === 0 && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4506")[0].n === 1 && rows("SELECT text FROM notes WHERE user_id = 4506")[0].text === "فردا به علی زنگ بزنم" && slot === null, "3b: missing key with note-text slot -> fallback stores body, not dropped");
   }
-  // (d3) Model failure with a language slot -> same language ask, body kept.
+  // (d3) Model failure with a language slot -> fallback translates the kept body, slot cleared.
   {
     const env = mkEnv(), s = fakeSend();
     mockModel(modelJson("translate", { target: "en" }));
@@ -1858,9 +1858,10 @@ if (DatabaseSync) {
     mockModel(modelJson("translate"));
     await handleDailyText(env, o(env, 4507, "سلام دنیا", { ...s, nowMs: NOW }));
     mockModelFail();
-    await handleDailyText(env, o(env, 4507, "انگلیسی", { ...s, nowMs: NOW }));
+    let chats = [];
+    const r = await handleDailyText(env, o(env, 4507, "انگلیسی", { ...s, nowMs: NOW, chat: async (text, copts) => { chats.push({ text, copts }); } }));
     const slot = await slotOf(env, 4507);
-    check(lastText(s).includes("به چه زبانی؟") && slot?.kind === "language" && slot?.pendingBody === "سلام دنیا", "3b: failure with language slot -> same ask, body kept");
+    check(r === "handled" && fetchCalls === 1 && chats[0]?.text === "سلام دنیا" && String(chats[0]?.copts?.systemPrompt ?? "").includes("English") && chats[0]?.copts?.noHistory === true && slot === null, "3b: failure with language slot -> fallback translates kept body, slot cleared");
   }
   // (e) >300-char note body is stored in full; the classification payload stays capped.
   {
@@ -1980,6 +1981,89 @@ if (DatabaseSync) {
   {
     const c1 = cl("می‌خوام یک یادداشت جدید و جداگانه ثبت کنم: خرید نان"), c2 = cl("می‌خوام یک یادداشت ثبت کنم فردا به علی زنگ بزنم");
     check(!(c1.intent === "ask" && c1.question === "note-text") && !(c2.intent === "ask" && c2.question === "note-text"), "bare-note: longer phrasing with trailing body not stolen");
+  }
+  global.fetch = origFetch;
+}
+
+// ── Fallback body-slot follow-ups: model tried first, slot decides on null ──
+// Live 2026-10-30 the free model rambles past the 80-token cap instead of
+// returning JSON, so a model-mediated body follow-up loops on re-ask when
+// the model gives nothing. The model is still tried first (chat tier only);
+// only when it returns null does the slot kind decide. The key proof below
+// is exactly one failed fetch attempt followed by the deterministic outcome.
+if (DatabaseSync) {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  const d1 = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
+  const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4531,4532,4533,4534,4535,4536", DB: d1, ROUTER_KEY: "k-test", ...extra });
+  const fakeSend = () => { const sent = []; return { sent, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, api: async () => ({ ok: true }) }; };
+  const o = (env, userId, text, extra = {}) => ({ chatId: userId, userId, text, send: extra.send, chat: extra.chat ?? (async () => {}), nowMs: extra.nowMs, hasImage: extra.hasImage });
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+  const origFetch = global.fetch;
+  let fetchCalls = 0;
+  const mockModel = (content) => { fetchCalls = 0; global.fetch = async () => { fetchCalls++; return Response.json({ choices: [{ message: { content } }] }); }; };
+  const mockModelFail = () => { fetchCalls = 0; global.fetch = async () => { fetchCalls++; throw new Error("boom"); }; };
+  const modelJson = (intent, extra = {}) => JSON.stringify({ intent, followup: null, target: null, ...extra });
+  const lastText = (s) => String(s.sent.at(-1)?.text ?? "");
+  const slotOf = async (env, uid) => env.STATE.get(`daily:pending-ask:${uid}`, "json");
+  // Note-text body stored via fallback after a failing model attempt.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await handleDailyText(env, o(env, 4531, "یادداشت", { ...s, nowMs: NOW }));
+    const before = await slotOf(env, 4531);
+    mockModelFail();
+    const r = await handleDailyText(env, o(env, 4531, "فردا به علی زنگ بزنم", { ...s, nowMs: NOW }));
+    check(before?.kind === "note-text" && r === "handled" && fetchCalls === 1 && lastText(s).includes("یادداشت ذخیره شد") && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4531")[0].n === 1 && rows("SELECT text FROM notes WHERE user_id = 4531")[0].text === "فردا به علی زنگ بزنم" && (await slotOf(env, 4531)) === null, "slot-fallback: note-text body stored after failed model attempt");
+  }
+  // Empty note body re-asks via fallback, nothing stored.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await handleDailyText(env, o(env, 4532, "یادداشت", { ...s, nowMs: NOW }));
+    mockModelFail();
+    const r = await handleDailyText(env, o(env, 4532, "   ", { ...s, nowMs: NOW }));
+    check(r === "handled" && fetchCalls === 1 && lastText(s).includes("چه چیزی را یادداشت کنم؟") && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4532")[0].n === 0 && (await slotOf(env, 4532))?.kind === "note-text", "slot-fallback: note-text empty body re-asks, nothing stored");
+  }
+  // Translate-text body asks for the language via fallback, body kept.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await handleDailyText(env, o(env, 4533, "ترجمه کن", { ...s, nowMs: NOW }));
+    const before = await slotOf(env, 4533);
+    mockModelFail();
+    const r = await handleDailyText(env, o(env, 4533, "سلام دنیا", { ...s, nowMs: NOW }));
+    const slot = await slotOf(env, 4533);
+    check(before?.kind === "translate-text" && r === "handled" && fetchCalls === 1 && lastText(s).includes("به چه زبانی؟") && slot?.kind === "language" && slot?.pendingBody === "سلام دنیا", "slot-fallback: translate-text body -> language ask keeps body");
+  }
+  // Language answer translates the KEPT body via fallback after a failing model attempt.
+  {
+    const env = mkEnv(), s = fakeSend(); let chats = [];
+    await handleDailyText(env, o(env, 4534, "ترجمه کن", { ...s, nowMs: NOW }));
+    mockModelFail();
+    await handleDailyText(env, o(env, 4534, "سلام دنیا", { ...s, nowMs: NOW }));
+    const mid = await slotOf(env, 4534);
+    mockModelFail();
+    const r = await handleDailyText(env, o(env, 4534, "انگلیسی", { ...s, nowMs: NOW, chat: async (text, copts) => { chats.push({ text, copts }); } }));
+    check(mid?.kind === "language" && mid?.pendingBody === "سلام دنیا" && r === "handled" && fetchCalls === 1 && chats[0]?.text === "سلام دنیا" && String(chats[0]?.copts?.systemPrompt ?? "").includes("English") && chats[0]?.copts?.noHistory === true && (await slotOf(env, 4534)) === null, "slot-fallback: language answer translates kept body after failed model attempt");
+  }
+  // Unmapped language answer re-asks via fallback with the body kept.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await handleDailyText(env, o(env, 4535, "ترجمه کن", { ...s, nowMs: NOW }));
+    mockModelFail();
+    await handleDailyText(env, o(env, 4535, "سلام دنیا", { ...s, nowMs: NOW }));
+    mockModelFail();
+    const r = await handleDailyText(env, o(env, 4535, "German", { ...s, nowMs: NOW }));
+    const slot = await slotOf(env, 4535);
+    check(r === "handled" && fetchCalls === 1 && lastText(s).includes("به چه زبانی؟") && slot?.kind === "language" && slot?.pendingBody === "سلام دنیا", "slot-fallback: language answer unmapped -> language re-ask, body kept");
+  }
+  // Non-body slots still go through the model: amount slot, one fetch.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await env.STATE.put("daily:pending-ask:4536", JSON.stringify({ question: "مبلغ چقدر بود؟", kind: "amount" }));
+    mockModel(modelJson("expense"));
+    const r = await handleDailyText(env, o(env, 4536, "۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    check(r === "handled" && fetchCalls === 1 && (await slotOf(env, 4536)) === null, "slot-fallback: button/amount slots still use the model path");
   }
   global.fetch = origFetch;
 }
