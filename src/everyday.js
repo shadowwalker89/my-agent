@@ -27,8 +27,10 @@ export function buildChatContext(rows) {
 function dbOf(env) { const db = env && env.DB; return db && typeof db.prepare === "function" ? db : null; }
 async function runDb(env, sql, params) { const db = dbOf(env); if (!db) return { ok: false }; try { await db.prepare(sql).bind(...params).run(); return { ok: true }; } catch { return { ok: false }; } }
 async function allDb(env, sql, params) { const db = dbOf(env); if (!db) return []; try { const res = await db.prepare(sql).bind(...params).all(); return Array.isArray(res?.results) ? res.results : []; } catch { return []; } }
+// Single-row read that distinguishes "no row" from "query failed".
+async function firstDb(env, sql, params) { const db = dbOf(env); if (!db) return { ok: false, row: null }; try { const res = await db.prepare(sql).bind(...params).first(); return { ok: true, row: res ?? null }; } catch { return { ok: false, row: null }; } }
 async function queryExpenseSums(env, userId, range) { return sumByCurrency(await allDb(env, "SELECT amount, currency_code FROM expenses WHERE user_id = ? AND type = 'expense' AND date BETWEEN ? AND ?", [userId, range.start, range.end])); }
-async function recentMessages(env, userId, limit = 10) { return allDb(env, "SELECT role, content, kind, tg_file_id, file_name FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?", [userId, limit]); }
+async function recentMessages(env, userId, limit = 10) { return allDb(env, "SELECT role, content, kind, tg_file_id, file_name, file_mime FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?", [userId, limit]); }
 
 // User row: allow-list FIRST (callers guarantee it), then INSERT OR IGNORE.
 export async function ensureUserRow(env, userId) { const id = Number(userId); if (!Number.isFinite(id)) return { ok: false }; return runDb(env, "INSERT OR IGNORE INTO users (id, telegram_id) VALUES (?, ?)", [id, String(id)]); }
@@ -94,7 +96,7 @@ export async function handleDailyText(env, o) {
   if (c.intent === "translate") {
     if (c.ask) { await o.send(askText(c.ask)); return "handled"; }
     const targetName = c.target === "en" ? "English" : c.target === "fa" ? "Persian" : c.target;
-    await o.chat(c.text, { systemPrompt: `Translate the following text${targetName ? ` to ${targetName}` : ""}. Reply with only the translation.`, saveText: text });
+    await o.chat(c.text, { systemPrompt: `Translate the following text${targetName ? ` to ${targetName}` : ""}. Reply with only the translation.`, saveText: text, noHistory: true });
     return "handled";
   }
   if (c.intent === "remember") {
@@ -124,6 +126,17 @@ export async function handleDailyText(env, o) {
     await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
     return "handled";
   }
+  if (c.intent === "last-expense") {
+    // Answered from D1 only: the chat model must never claim anything
+    // about the user's records. A failed read reports the standard error
+    // and stores nothing extra.
+    const r = await firstDb(env, "SELECT amount, currency_code, item, date FROM expenses WHERE user_id = ? AND type = 'expense' ORDER BY id DESC LIMIT 1", [userId]);
+    if (!r.ok) { await o.send(NOT_SAVED_TEXT); return "handled"; }
+    if (!r.row) { await o.send("هنوز خرجی ثبت نشده است."); }
+    else await o.send(`💰 آخرین خرج: ${r.row.amount} ${r.row.currency_code}${r.row.item ? ` — ${r.row.item}` : ""} — ${formatJalali(r.row.date) || r.row.date}`);
+    await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+    return "handled";
+  }
   if (c.intent === "note-query") {
     if (c.ask) { await o.send(askText(c.ask)); return "handled"; }
     const rows = await allDb(env, "SELECT text FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 5", [userId]);
@@ -135,7 +148,8 @@ export async function handleDailyText(env, o) {
     const recent = await recentMessages(env, userId, 10);
     const file = recent.find((r) => r.tg_file_id);
     if (file) {
-      await o.send(`📎 فایل پیدا شد: ${file.file_name || file.tg_file_id} — خلاصه‌سازی با قدم فایل‌ها می‌آید، فعلاً فقط ذخیره شده است.`);
+      const fileLabel = file.file_name || (typeof file.file_mime === "string" && file.file_mime.startsWith("image/") ? "عکس" : "فایل");
+      await o.send(`📎 فایل پیدا شد: ${fileLabel} — خلاصه‌سازی با قدم فایل‌ها می‌آید، فعلاً فقط ذخیره شده است.`);
       await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
       return "handled";
     }
