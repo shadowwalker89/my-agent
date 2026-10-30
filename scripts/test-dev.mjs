@@ -1514,7 +1514,7 @@ if (DatabaseSync) {
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("note"));
     const r = await handleDailyText(env, o(env, 4307, "یادداشت", { ...s, nowMs: NOW }));
-    check(r === "handled" && fetchCalls === 1 && lastText(s).includes("چه چیزی را یادداشت کنم؟") && rows("SELECT COUNT(*) AS n FROM notes")[0].n === 0, "chat-tier model note, no body -> note-text ask");
+    check(r === "handled" && fetchCalls === 0 && lastText(s).includes("چه چیزی را یادداشت کنم؟") && rows("SELECT COUNT(*) AS n FROM notes")[0].n === 0, "rule bare note -> note-text ask, zero model fetches");
   }
   // Chat tier + model chat: text -> chat-direct, image -> today's chat path.
   {
@@ -1909,6 +1909,77 @@ if (DatabaseSync) {
     mockModel(modelJson("chat"));
     const r = await handleDailyText(env, o(env, 4512, "سلام دنیا", { ...s, nowMs: NOW }));
     check(before?.kind === "translate-text" && r === "chat-direct" && (await slotOf(env, 4512)) === null && !s.sent.some((m) => String(m.text ?? "").includes("این خرج است یا چت؟")) && fetchCalls === 1, "3b: translate-text slot + model chat -> chat-direct, slot cleared, no expense-or-chat ask");
+  }
+  global.fetch = origFetch;
+}
+
+// ── Bare-note fix: bare note asks for the text at rule level, no model ──
+// Live 2026-10-30 a bare note fell through to chat and the chat model
+// hallucinated a stored note; the 3b slot never ran because no note-text
+// slot was created. This fix asks directly, then reuses the 3b path.
+if (DatabaseSync) {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  const d1 = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
+  const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4521,4522,4523,4524,4525,4526,4527", DB: d1, ROUTER_KEY: "k-test", ...extra });
+  const fakeSend = () => { const sent = []; return { sent, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, api: async () => ({ ok: true }) }; };
+  const o = (env, userId, text, extra = {}) => ({ chatId: userId, userId, text, send: extra.send, chat: extra.chat ?? (async () => {}), nowMs: extra.nowMs, hasImage: extra.hasImage });
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+  const origFetch = global.fetch;
+  let fetchCalls = 0;
+  const mockModel = (content) => { fetchCalls = 0; global.fetch = async () => { fetchCalls++; return Response.json({ choices: [{ message: { content } }] }); }; };
+  const modelJson = (intent, extra = {}) => JSON.stringify({ intent, followup: null, target: null, ...extra });
+  const lastText = (s) => String(s.sent.at(-1)?.text ?? "");
+  const slotOf = async (env, uid) => env.STATE.get(`daily:pending-ask:${uid}`, "json");
+  const cl = (s) => classifyDaily(s, { nowMs: NOW });
+  // Classifier: bare forms ask for the note text, never chat.
+  {
+    const forms = ["یادداشت", "یادداشت کن", "یادداشت کن.", "یادداشت جدید", "لطفا یادداشت کن", "لطفاً یادداشت", "یادداشت:", "می‌خوام یک یادداشت جدید و جداگانه ثبت کنم", "می‌خوام یادداشت بنویسم"];
+    check(forms.every((f) => { const c = cl(f); return c.intent === "ask" && c.question === "note-text"; }), "bare-note: classifyDaily bare forms -> ask note-text");
+  }
+  // End to end: bare note asks directly with zero model calls and a
+  // note-text slot, replacing any stale slot.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await env.STATE.put("daily:pending-ask:4521", JSON.stringify({ question: "مبلغ چقدر بود؟", kind: "amount" }));
+    fetchCalls = 0; global.fetch = async () => { fetchCalls++; throw new Error("model must not be called"); };
+    const r = await handleDailyText(env, o(env, 4521, "یادداشت", { ...s, nowMs: NOW }));
+    const slot = await slotOf(env, 4521);
+    check(r === "handled" && fetchCalls === 0 && lastText(s) === "چه چیزی را یادداشت کنم؟" && slot?.kind === "note-text" && slot?.question === "چه چیزی را یادداشت کنم؟", "bare-note: e2e bare note -> note-text ask, slot kind, zero model fetches");
+  }
+  // End to end: body follow-up after the rule ask stores via the 3b path.
+  {
+    const env = mkEnv(), s = fakeSend();
+    global.fetch = async () => { throw new Error("model must not be called"); };
+    await handleDailyText(env, o(env, 4522, "یادداشت کن", { ...s, nowMs: NOW }));
+    check(lastText(s) === "چه چیزی را یادداشت کنم؟" && (await slotOf(env, 4522))?.kind === "note-text", "bare-note: rule ask sets note-text slot");
+    mockModel(modelJson("note"));
+    const r = await handleDailyText(env, o(env, 4522, "بررسی اتصال Supabase به داشبورد و تست ورود کاربران در نسخه آزمایشی.", { ...s, nowMs: NOW }));
+    check(r === "handled" && lastText(s).includes("یادداشت ذخیره شد") && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4522")[0].n === 1 && rows("SELECT text FROM notes WHERE user_id = 4522")[0].text === "بررسی اتصال Supabase به داشبورد و تست ورود کاربران در نسخه آزمایشی." && (await slotOf(env, 4522)) === null, "bare-note: body follow-up stored end to end, slot cleared");
+  }
+  // Non-stealing: note with a body stays a confident note, stored at once.
+  {
+    const env = mkEnv(), s = fakeSend();
+    const c1 = cl("یادداشت کن فردا به علی زنگ بزنم"), c2 = cl("یادداشت: فردا به علی زنگ بزنم");
+    check(c1.intent === "note" && c1.text === "فردا به علی زنگ بزنم" && c2.intent === "note" && c2.text === "فردا به علی زنگ بزنم", "bare-note: note with body stays confident note");
+    const r = await handleDailyText(env, o(env, 4523, "یادداشت کن فردا به علی زنگ بزنم", { ...s, nowMs: NOW }));
+    check(r === "handled" && lastText(s) === "✅ یادداشت ذخیره شد." && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4523")[0].n === 1, "bare-note: note with body stored at once, no ask");
+  }
+  // Non-stealing: note-query stays note-query, and lists the stored note.
+  {
+    const c1 = cl("یادداشت‌هایم"), c2 = cl("یادداشت‌های امروز");
+    check(c1.intent === "note-query" && c2.intent === "note-query", "bare-note: note-query unchanged");
+    const env = mkEnv(), s = fakeSend();
+    await handleDailyText(env, o(env, 4524, "یادداشت کن فردا به علی زنگ بزنم", { ...s, nowMs: NOW }));
+    await handleDailyText(env, o(env, 4524, "یادداشت‌هایم", { ...s, nowMs: NOW }));
+    check(lastText(s).includes("فردا به علی زنگ بزنم"), "bare-note: note-query lists the stored note");
+  }
+  // Non-stealing: longer phrasing with a trailing body is not an ask.
+  {
+    const c1 = cl("می‌خوام یک یادداشت جدید و جداگانه ثبت کنم: خرید نان"), c2 = cl("می‌خوام یک یادداشت ثبت کنم فردا به علی زنگ بزنم");
+    check(!(c1.intent === "ask" && c1.question === "note-text") && !(c2.intent === "ask" && c2.question === "note-text"), "bare-note: longer phrasing with trailing body not stolen");
   }
   global.fetch = origFetch;
 }
