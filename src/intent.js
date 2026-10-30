@@ -90,6 +90,125 @@ const LLM_SYSTEM =
   "task = file processing/conversion request. " +
   "chat = everything else. No explanation, no markdown, just JSON.";
 
+// ── Worker base URL: single resolution point ───────────────────────────────
+// Part 1 investigation finding: no env variable and no request-derived URL
+// feeds the self-call anywhere in src/ — the only source is the hardcoded
+// deployed Worker URL below (previously a local const inside callFastCombo).
+// Both callFastCombo and classifyDailyWithModel use this one helper, so there
+// is still exactly one failure point, not two. A full env/request-derived
+// fix is a separate step and is NOT done here.
+export function workerBaseUrl() {
+  return "https://my-agent.nova-02aa82bffef8.workers.dev";
+}
+
+// ── Model intent classifier, Part 1: pure function + call, NO wiring ────────
+// classifyDailyWithModel is NOT called by any bot path yet (Part 2 wires it).
+// Contract (approved design): system instruction + current message only,
+// capped at 300 chars for classification; output one JSON object; no
+// confidence field; amount/date/currency fields are ignored, never read.
+// The classifier always uses combo "chat": never the user's preferred combo
+// and never "fast" (combo/fast errored in earlier combo tests; silent
+// fallback to fast is forbidden).
+export const MODEL_INTENT_COMBO = "chat";
+export const MODEL_INTENT_MAX_TOKENS = 80;
+export const MODEL_INTENT_TIMEOUT_MS = 8000;
+export const MODEL_INTENT_ALLOW = Object.freeze([
+  "expense",
+  "income",
+  "note",
+  "reminder",
+  "translate",
+  "remember",
+  "expense-query",
+  "note-query",
+  "last-expense",
+  "file-reference",
+  "dev",
+  "chat",
+]);
+export const MODEL_INTENT_TARGETS = Object.freeze(["en", "fa", "ar"]);
+export const MODEL_INTENT_SYSTEM =
+  "You are a message classifier for a personal assistant. Output ONLY valid JSON, " +
+  'no explanation, no markdown: {"intent":"...","followup":"yes"|"no"|null,"target":"en"|"fa"|"ar"|null}. ' +
+  "intents: expense = money spent; income = money received; note = save a note; " +
+  "reminder = remind later; translate = translate text; remember = save a setting; " +
+  "expense-query = ask about past spending; note-query = ask about saved notes; " +
+  "last-expense = ask about the most recent expense; file-reference = refer to a recent file; " +
+  "dev = request a code change; chat = anything else. " +
+  'followup is "yes" or "no" only when the message answers the bot\'s previous question, otherwise null. ' +
+  "target is a language code only for translate, otherwise null.";
+
+// parseModelIntent: raw model text -> {intent, followup, target}
+//   | {invalid: "target"} (translate with an out-of-list target: the caller
+//     asks for the language later, it must NOT be guessed) | null (failure).
+// Unparseable, out-of-allow-list intent (including "task"), non-object JSON,
+// and empty input are all null — never a guessed intent. A confidence field
+// and any amount/date/currency fields are ignored, never read, and never
+// appear in the returned object. followup outside yes/no becomes null.
+// The brace-extraction fallback is the same pattern as callFastCombo.
+export function parseModelIntent(raw) {
+  const s = typeof raw === "string" ? raw.trim() : "";
+  if (!s) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(s);
+  } catch {
+    const m = /\{[^}]+\}/.exec(s);
+    if (!m) return null;
+    try {
+      parsed = JSON.parse(m[0]);
+    } catch {
+      return null;
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const intent = parsed.intent;
+  if (typeof intent !== "string" || !MODEL_INTENT_ALLOW.includes(intent)) return null;
+  const followup = parsed.followup === "yes" || parsed.followup === "no" ? parsed.followup : null;
+  if (intent === "translate") {
+    if (parsed.target === undefined || parsed.target === null) return { intent, followup, target: null };
+    if (!MODEL_INTENT_TARGETS.includes(parsed.target)) return { invalid: "target" };
+    return { intent, followup, target: parsed.target };
+  }
+  return { intent, followup, target: null };
+}
+
+// classifyDailyWithModel: (env, text) -> parseModelIntent result | null.
+// Same request mechanism as callFastCombo, but combo "chat", 80 output
+// tokens, temperature 0, 8s timeout, no retries, no fallback combo.
+// Missing ROUTER_KEY -> skipped (null). Any error, non-OK status, or
+// unparseable/invalid output -> null (or the {invalid: "target"} sentinel
+// from parseModelIntent). No message text or key is ever logged here.
+export async function classifyDailyWithModel(env, text) {
+  if (!env || !env.ROUTER_KEY) return null;
+  const body = {
+    model: `combo/${MODEL_INTENT_COMBO}`,
+    messages: [
+      { role: "system", content: MODEL_INTENT_SYSTEM },
+      { role: "user", content: String(text).slice(0, 300) },
+    ],
+    max_tokens: MODEL_INTENT_MAX_TOKENS,
+    temperature: 0,
+  };
+  try {
+    const res = await fetch(`${workerBaseUrl()}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${env.ROUTER_KEY}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(MODEL_INTENT_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const raw = data?.choices?.[0]?.message?.content ?? "";
+    return parseModelIntent(raw);
+  } catch {
+    return null;
+  }
+}
+
 // callFastCombo: (env, text) -> Promise<{intent,confidence,reason}|null>
 // Worker runtime فقط — از Web Crypto و fetch استفاده میکند.
 // در صورت هر خطا null برمیگردد (caller → chat).
@@ -105,8 +224,7 @@ async function callFastCombo(env, text) {
     temperature: 0,
   };
   try {
-    const workerBase = "https://my-agent.nova-02aa82bffef8.workers.dev";
-    const res = await fetch(`${workerBase}/v1/chat/completions`, {
+    const res = await fetch(`${workerBaseUrl()}/v1/chat/completions`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
