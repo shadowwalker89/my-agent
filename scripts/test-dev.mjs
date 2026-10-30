@@ -1183,6 +1183,106 @@ if (DatabaseSync) {
   }
 }
 
+
+
+// ── Step 1b-2b: remaining intents + file branch ────────────────────────────
+import { handleDailyFile } from "../src/everyday.js";
+if (DatabaseSync) {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  const d1 = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
+  const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4243", DB: d1, ...extra });
+  const fakeSend = () => { const sent = []; return { sent, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, api: async () => ({ ok: true }) }; };
+  const o = (env, userId, text, extra = {}) => ({ chatId: userId, userId, text, send: extra.send, api: extra.api, chat: extra.chat ?? (async () => {}), nowMs: extra.nowMs });
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0); // Wed 2026-10-28, 15:30 Iran time
+  // Midnight boundary: a message at 2026-10-28T22:00Z is 2026-10-29 in Iran.
+  {
+    const env = mkEnv(), s = fakeSend();
+    const late = Date.UTC(2026, 9, 28, 22, 0, 0);
+    const r = await handleDailyText(env, o(env, 4242, "خرج کردم ۱۰۰ تومان چای", { ...s, nowMs: late }));
+    check(r === "handled", "late-night expense handled");
+    const btn = s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+    const confirmData = btn.find((d) => d.startsWith("daily:confirm:"));
+    const cb = { fromId: 4242, chatId: 4242, messageId: 11, data: confirmData, send: s.send, editMarkup: async () => {}, chat: async () => {} };
+    await resolveDailyCallback(env, cb);
+    const row = rows("SELECT date FROM expenses ORDER BY id DESC LIMIT 1")[0];
+    check(row?.date === "2026-10-29", `Iran midnight date: ${JSON.stringify(row)}`);
+  }
+  // Reminder hours: "ساعت نه" and "ساعت پنج" without qualifier ASK; missing time ASKS, never stores.
+  {
+    const env = mkEnv(), s = fakeSend();
+    // "ساعت نه" proves نه = 9 after ساعت: morning NOW -> stored for 09:00 today.
+    const morning = Date.UTC(2026, 9, 28, 4, 0, 0); // 07:30 Iran time
+    await handleDailyText(env, o(env, 4242, "یادم بنداز ساعت نه تمرین", { ...s, nowMs: morning }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("فقط ذخیره شد"), `nine stores: ${JSON.stringify(s.sent.at(-1))}`);
+    check(rows("SELECT due_at FROM reminders ORDER BY id DESC LIMIT 1")[0].due_at === "2026-10-28T09:00:00+03:30", "nine means 09:00");
+    await handleDailyText(env, o(env, 4242, "یادم بنداز ساعت پنج تماس بگیر", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("صبح یا عصر"), "ساعت پنج also asks");
+    await handleDailyText(env, o(env, 4242, "یادم بنداز که تمرین کنم", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("ساعت"), `no-time asks: ${JSON.stringify(s.sent.at(-1))}`);
+    check(rows("SELECT COUNT(*) AS n FROM reminders")[0].n === 1, "nine stored, ambiguous/no-time stored nothing more");
+    await handleDailyText(env, o(env, 4242, "یادم بنداز فردا ساعت نه صبح تمرین", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("فقط ذخیره شد"), `reminder stored-only reply: ${JSON.stringify(s.sent.at(-1))}`);
+    check(rows("SELECT COUNT(*) AS n FROM reminders")[0].n === 2, "tomorrow reminder stored as second row");
+    check(rows("SELECT due_at FROM reminders ORDER BY id DESC LIMIT 1")[0].due_at === "2026-10-29T09:00:00+03:30", `due_at: ${JSON.stringify(rows("SELECT due_at FROM reminders ORDER BY id DESC LIMIT 1"))}`);
+  }
+  // Note, remember, translate, queries (expense sum split by currency).
+  {
+    const env = mkEnv(), s = fakeSend();
+    await handleDailyText(env, o(env, 4242, "یادداشت کن ایده‌ی ربات آشپزی", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("یادداشت ذخیره شد"), `note reply: ${JSON.stringify(s.sent.at(-1))}`);
+    check(rows("SELECT COUNT(*) AS n FROM notes")[0].n === 1, "one note row");
+    const noteRow = rows("SELECT text FROM notes")[0];
+    check(noteRow?.text === "ایده‌ی ربات آشپزی", `note text: ${JSON.stringify(noteRow)}`);
+    await handleDailyText(env, o(env, 4242, "یادداشت‌هایم را بگو", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("ایده‌ی ربات آشپزی"), "note-query returns the note");
+    await handleDailyText(env, o(env, 4242, "یادت باشد ارزم بیت‌کوین است", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("فقط تنظیم‌ها"), `invalid setting refused: ${JSON.stringify(s.sent.at(-1))}`);
+    let modelText = null, saveText = null;
+    const chatSpy = async (mt, copts) => { modelText = mt; saveText = copts?.saveText; };
+    await handleDailyText(env, o(env, 4242, "ترجمه کن به انگلیسی سلام دنیا", { ...s, chat: chatSpy, nowMs: NOW }));
+    check(modelText === "سلام دنیا" && saveText === "ترجمه کن به انگلیسی سلام دنیا", `translate passes text + saveText: ${JSON.stringify({ modelText, saveText })}`);
+    await handleDailyText(env, o(env, 4242, "خرج کردم ۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    const btn = s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+    await resolveDailyCallback(env, { fromId: 4242, chatId: 4242, messageId: 11, data: btn.find((d) => d.startsWith("daily:confirm:")), send: s.send, editMarkup: async () => {}, chat: async () => {} });
+    await handleDailyText(env, o(env, 4242, "امروز چقدر خرج کردم؟", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("TOMAN: 500"), `expense-query sum: ${JSON.stringify(s.sent.at(-1))}`);
+  }
+  // File reference: inside the window names the file; outside asks; plain-text previous -> chat.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await handleDailyFile(env, { userId: 4242, chatId: 4242, tgFileId: "file-1", fileName: "doc.pdf", fileMime: "application/pdf", caption: null, send: s.send });
+    check(String(s.sent.at(-1)?.text ?? "").includes("فایل ذخیره شد"), "file saved reply");
+    check(rows("SELECT COUNT(*) AS n FROM messages WHERE tg_file_id = 'file-1'")[0].n === 1, "file row kind daily saved");
+    await handleDailyText(env, o(env, 4242, "خلاصه‌اش کن", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("فایل پیدا شد"), `file found reply: ${JSON.stringify(s.sent.at(-1))}`);
+    for (let i = 0; i < 12; i++) await saveMessage(env, { userId: 4242, role: "user", content: `پرکننده‌ی ${i}`, kind: "daily" });
+    await handleDailyText(env, o(env, 4242, "خلاصه‌اش کن", { ...s, nowMs: NOW }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("کدام فایل"), "outside window asks which file");
+    const r = await handleDailyText(env, o(env, 4242, "سلام، چطوری؟", { ...s, nowMs: NOW }));
+    check(r === "chat", "plain chat is not a file reference");
+  }
+  // Full Telegram flow: file message saved, /ping not stored, failed chat turn stores nothing.
+  {
+    const world = mockWorld();
+    try {
+      const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", DB: d1 };
+      const fileUpdate = { update_id: 2000, message: { message_id: 50, from: { id: 4242 }, chat: { id: 4242 }, date: 1790000000, document: { file_id: "file-9", file_name: "doc.pdf", mime_type: "application/pdf" } } };
+      await sendTg(env, fileUpdate);
+      const fileMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+      check(String(fileMsg?.payload?.text ?? "").includes("فایل ذخیره شد"), "file message gets the saved reply");
+      check(rows("SELECT COUNT(*) AS n FROM messages WHERE tg_file_id = 'file-9'")[0].n === 1, "file message row saved");
+      await sendTg(env, msgUpdate("/ping"));
+      check(rows("SELECT COUNT(*) AS n FROM messages WHERE content = '/ping'")[0].n === 0, "command messages not in history");
+      const before = rows("SELECT COUNT(*) AS n FROM messages WHERE kind = 'chat'")[0].n;
+      await sendTg(env, msgUpdate("سلام، چطوری؟"));
+      check(rows("SELECT COUNT(*) AS n FROM messages WHERE kind = 'chat'")[0].n === before, "failed model turn stores nothing");
+    } finally { world.restore(); }
+  }
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
