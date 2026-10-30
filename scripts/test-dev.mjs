@@ -1104,7 +1104,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, confirmExpenseDraft, CHAT_CONTEXT_CHAR_LIMIT } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, confirmExpenseDraft, runModelBranch, CHAT_CONTEXT_CHAR_LIMIT } from "../src/everyday.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
   check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
@@ -1604,6 +1604,167 @@ if (DatabaseSync) {
   }
   global.fetch = origFetch;
 }
+
+// ── Model router Part 3: pending-ask slot + follow-up ──────────────────────
+// Slot: one per user in KV, 600s TTL (platform behaviour; fakeKV does not expire, so TTL expiry is not unit-tested).
+// followup is consumed ONLY when a slot exists; without one it is ignored.
+if (DatabaseSync) {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  const d1 = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
+  const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4401,4402,4403,4404,4405,4406,4407,4408,4409,4410,4411,4412,4413,4414,4415,4416,4417", DB: d1, ROUTER_KEY: "k-test", ...extra });
+  const fakeSend = () => { const sent = []; return { sent, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, api: async () => ({ ok: true }) }; };
+  const o = (env, userId, text, extra = {}) => ({ chatId: userId, userId, text, send: extra.send, chat: extra.chat ?? (async () => {}), nowMs: extra.nowMs, hasImage: extra.hasImage });
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+  const origFetch = global.fetch;
+  let fetchCalls = 0;
+  const mockModel = (content) => { fetchCalls = 0; global.fetch = async () => { fetchCalls++; return Response.json({ choices: [{ message: { content } }] }); }; };
+  const mockModelFail = () => { fetchCalls = 0; global.fetch = async () => { fetchCalls++; throw new Error("boom"); }; };
+  const modelJson = (intent, extra = {}) => JSON.stringify({ intent, followup: null, target: null, ...extra });
+  const lastText = (s) => String(s.sent.at(-1)?.text ?? "");
+  const hasConfirm = (s) => (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).some((d) => d.startsWith("daily:confirm:"));
+  const hasAskBtn = (s) => (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).some((d) => d.startsWith("daily:ask:"));
+  const slotOf = async (env, uid) => env.STATE.get(`daily:pending-ask:${uid}`, "json");
+  const askIdOf = (s) => (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("daily:ask:"))?.split(":")[2] ?? null;
+  const amountAsk = async (env, s, uid) => { mockModel(modelJson("expense")); await handleDailyText(env, o(env, uid, "خرج", { ...s, nowMs: NOW })); };
+  const chatButtons = async (env, s, uid) => { mockModel(modelJson("chat")); await handleDailyText(env, o(env, uid, "۵۰۰ تومان نان", { ...s, nowMs: NOW })); return askIdOf(s); };
+  const incomeButtons = async (env, s, uid) => { mockModelFail(); await handleDailyText(env, o(env, uid, "۵۰۰ تومان نان گرفتم", { ...s, nowMs: NOW })); return askIdOf(s); };
+  // Follow-up amount answer -> confirm, slot cleared, timing logged (no text).
+  {
+    const env = mkEnv(), s = fakeSend();
+    await amountAsk(env, s, 4401);
+    check(lastText(s).includes("مبلغ چقدر بود؟") && (await slotOf(env, 4401))?.question === "مبلغ چقدر بود؟", "amount ask sets plain slot");
+    mockModel(modelJson("expense", { followup: "yes" }));
+    const origLog = console.log; const lines = []; console.log = (...a) => { lines.push(a.join(" ")); };
+    const r = await handleDailyText(env, o(env, 4401, "۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    console.log = origLog;
+    const entry = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((j) => j && j.modelIntent);
+    check(r === "handled" && fetchCalls === 1 && hasConfirm(s) && lastText(s).includes("500") && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0 && (await slotOf(env, 4401)) === null && entry?.outcome === "routed" && !lines.some((l) => l.includes("۵۰۰ تومان نان")), "follow-up amount -> confirm, slot cleared, timing logged without text");
+  }
+  // Follow-up call carries the bot ask text as one labelled line.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await amountAsk(env, s, 4402);
+    let body = null;
+    global.fetch = async (url, init) => { body = JSON.parse(init.body); return Response.json({ choices: [{ message: { content: modelJson("expense", { followup: "yes" }) } }] }); };
+    await handleDailyText(env, o(env, 4402, "۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    const userMsg = body?.messages?.[1]?.content ?? "";
+    check(userMsg.includes("پرسش قبلی بات") && userMsg.includes("مبلغ چقدر بود؟") && userMsg.includes("۵۰۰ تومان نان"), "follow-up call carries bot ask text + user message");
+  }
+  // Bare "yes" after an amount ask -> same amount ask, slot refreshed.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await amountAsk(env, s, 4403);
+    mockModel(modelJson("chat", { followup: "yes" }));
+    const r = await handleDailyText(env, o(env, 4403, "اره", { ...s, nowMs: NOW }));
+    check(r === "handled" && lastText(s).includes("مبلغ چقدر بود؟") && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0 && (await slotOf(env, 4403))?.question === "مبلغ چقدر بود؟", "bare yes after amount ask -> same amount ask, slot refreshed");
+  }
+  // "No" after a plain ask -> cancelled, nothing stored, no chat.
+  {
+    const env = mkEnv(), s = fakeSend(); let chats = [];
+    await amountAsk(env, s, 4404);
+    mockModel(modelJson("chat", { followup: "no" }));
+    const r = await handleDailyText(env, o(env, 4404, "نه", { ...s, nowMs: NOW, chat: async (t) => { chats.push(t); } }));
+    check(r === "handled" && lastText(s).includes("باشه، ثبت نشد.") && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0 && chats.length === 0 && (await slotOf(env, 4404)) === null, "no after plain ask -> cancelled, no chat, no record");
+  }
+  // Button follow-ups (test 15): expense-or-chat yes -> expense, no -> chat.
+  {
+    const env = mkEnv(), s = fakeSend(); const id = await chatButtons(env, s, 4405);
+    check(id && (await slotOf(env, 4405))?.askId === id, "expense-or-chat buttons set button slot");
+    mockModel(modelJson("chat", { followup: "yes" }));
+    const r = await handleDailyText(env, o(env, 4405, "اره", { ...s, nowMs: NOW }));
+    check(r === "handled" && hasConfirm(s) && lastText(s).includes("500") && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0 && (await slotOf(env, 4405)) === null, "button yes, expense-or-chat -> expense confirm");
+  }
+  {
+    const env = mkEnv(), s = fakeSend(); await chatButtons(env, s, 4406); let chats = [];
+    mockModel(modelJson("chat", { followup: "no" }));
+    const r = await handleDailyText(env, o(env, 4406, "اره", { ...s, nowMs: NOW, chat: async (t) => { chats.push(t); } }));
+    check(r === "handled" && chats[0] === "۵۰۰ تومان نان" && !hasConfirm(s) && (await slotOf(env, 4406)) === null, "button no, expense-or-chat -> original to chat, no confirm");
+  }
+  // Button follow-ups (test 15): expense-or-income yes -> expense, no -> income.
+  {
+    const env = mkEnv(), s = fakeSend(); const id = await incomeButtons(env, s, 4407);
+    check(id && (await slotOf(env, 4407))?.askId === id, "expense-or-income buttons set button slot");
+    mockModel(modelJson("chat", { followup: "yes" }));
+    await handleDailyText(env, o(env, 4407, "اره", { ...s, nowMs: NOW }));
+    check(hasConfirm(s) && lastText(s).includes("500") && (await slotOf(env, 4407)) === null, "button yes, expense-or-income -> expense confirm");
+  }
+  {
+    const env = mkEnv(), s = fakeSend(); await incomeButtons(env, s, 4408);
+    mockModel(modelJson("chat", { followup: "no" }));
+    await handleDailyText(env, o(env, 4408, "اره", { ...s, nowMs: NOW }));
+    check(hasConfirm(s) && lastText(s).includes("درآمد") && lastText(s).includes("500") && (await slotOf(env, 4408)) === null, "button no, expense-or-income -> income confirm");
+  }
+  // Chat fall-through clears the slot; a later "yes" is fresh, not followup (test 16).
+  {
+    const env = mkEnv(), s = fakeSend();
+    await amountAsk(env, s, 4409);
+    mockModel(modelJson("chat"));
+    check((await handleDailyText(env, o(env, 4409, "سلام، چطوری؟", { ...s, nowMs: NOW }))) === "chat-direct" && (await slotOf(env, 4409)) === null, "chat fall-through clears slot");
+    mockModel(modelJson("chat", { followup: "yes" }));
+    const n = s.sent.length;
+    const r = await handleDailyText(env, o(env, 4409, "اره", { ...s, nowMs: NOW }));
+    check(r === "chat-direct" && s.sent.length === n, "later yes without slot is fresh chat, not followup");
+  }
+  // Button tap clears the slot and resolves the ask.
+  {
+    const env = mkEnv(), s = fakeSend(); const id = await chatButtons(env, s, 4410); let chats = [];
+    const r = await resolveDailyCallback(env, { fromId: 4410, chatId: 4410, data: `daily:ask:${id}:chat`, send: s.send, editMarkup: async () => {}, chat: async (t) => { chats.push(t); } });
+    check(r === true && chats[0] === "۵۰۰ تومان نان" && (await slotOf(env, 4410)) === null, "button tap clears slot, original to chat");
+  }
+  // followup without a slot is ignored.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("chat", { followup: "yes" }));
+    const r = await handleDailyText(env, o(env, 4411, "اره", { ...s, nowMs: NOW }));
+    check(r === "chat-direct" && s.sent.length === 0, "followup without slot ignored, fresh chat");
+  }
+  // Fresh intent from a follow-up replaces the old slot with its own ask.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await amountAsk(env, s, 4412);
+    mockModel(modelJson("note"));
+    await handleDailyText(env, o(env, 4412, "یادداشت", { ...s, nowMs: NOW }));
+    check(lastText(s).includes("چه چیزی را یادداشت کنم؟") && (await slotOf(env, 4412))?.question === "چه چیزی را یادداشت کنم؟" && rows("SELECT COUNT(*) AS n FROM notes")[0].n === 0, "fresh note intent replaces amount slot with note-text ask");
+  }
+  // Model failure with a slot -> the SAME question re-asked (plain + button).
+  {
+    const env = mkEnv(), s = fakeSend();
+    await amountAsk(env, s, 4413);
+    mockModelFail();
+    await handleDailyText(env, o(env, 4413, "۵۰۰ تومان", { ...s, nowMs: NOW }));
+    check(lastText(s).includes("مبلغ چقدر بود؟") && (await slotOf(env, 4413))?.question === "مبلغ چقدر بود؟", "failure with plain slot -> same amount ask, slot refreshed");
+  }
+  {
+    const env = mkEnv(), s = fakeSend(); const id = await chatButtons(env, s, 4414);
+    mockModelFail();
+    await handleDailyText(env, o(env, 4414, "اره", { ...s, nowMs: NOW }));
+    check(hasAskBtn(s) && lastText(s).includes("این خرج است یا چت؟") && (await slotOf(env, 4414))?.askId === id, "failure with button slot -> same buttons, same ask id");
+  }
+  // Carried-over from the Part 2 review: model income -> income confirm, no row yet.
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("income"));
+    const r = await handleDailyText(env, o(env, 4415, "۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    check(r === "handled" && hasConfirm(s) && lastText(s).includes("درآمد") && lastText(s).includes("500") && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0, "ask-tier model income -> income confirm, no row yet");
+  }
+  // Carried-over, branch-level: model note + rule-note reclassification ->
+  // note stored. (End-to-end such a text is rule-confident and never reaches the model.)
+  {
+    const env = mkEnv(), s = fakeSend(); mockModel(modelJson("note"));
+    const r = await runModelBranch(env, { userId: 4416, text: "یادداشت کن فردا جلسه دارم", send: s.send, chat: async () => {} }, { intent: "ask", question: "amount" }, { now: NOW, remembered: "TOMAN" });
+    check(r.ret === "handled" && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4416")[0].n === 1 && rows("SELECT text FROM notes WHERE user_id = 4416")[0].text === "فردا جلسه دارم", "model-branch note + rule-note reclassification -> note stored");
+  }
+  // Confident message after an ask resolves the ask and clears the slot.
+  {
+    const env = mkEnv(), s = fakeSend();
+    await amountAsk(env, s, 4417);
+    await handleDailyText(env, o(env, 4417, "خرج کردم ۵۰۰ تومان نان", { ...s, nowMs: NOW }));
+    check(hasConfirm(s) && (await slotOf(env, 4417)) === null, "confident expense after ask clears slot, confirm shown");
+  }
+  global.fetch = origFetch;
+}
+
 
 if (failures.length) {
   console.error("\nFailures found:");
