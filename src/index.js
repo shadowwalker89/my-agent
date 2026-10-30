@@ -27,6 +27,7 @@ import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation, freeTextDevSuggestion } from "./intent.js";
 import { getChatContext } from "./memory.js";
 import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile } from "./everyday.js";
+import { handleVoice } from "./voice.js";
 import { saveMessage } from "./db.js";
 import {
   dispatchDev,
@@ -651,13 +652,13 @@ async function runIntent(env, chatId, userId, text, intent, hasImage) {
   await answerChatText(env, chatId, userId, text, hasImage);
 }
 
-async function handlePlainText(env, msg, text) {
+async function handlePlainText(env, msg, text, opts = {}) {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   // Allow-list already checked in handleUpdate; only then create the row.
   await ensureUserRow(env, userId);
   // Order: explicit /dev (tgCommand) -> everyday -> chat/task/dev.
-  const daily = await handleDailyText(env, { chatId, userId, text, hasImage: updateHasImage(msg), ...dailySenders(env, chatId),
+  const daily = await handleDailyText(env, { chatId, userId, text, source: opts.source, hasImage: updateHasImage(msg), ...dailySenders(env, chatId),
     chat: (modelText, copts) => answerChatText(env, chatId, userId, modelText, updateHasImage(msg), copts) });
   // Model already said chat for a text message: answer directly, skip
   // classifyIntent (dev was in the model allow-list and was rejected).
@@ -844,6 +845,16 @@ async function handleUpdate(env, update) {
   }
 
   if (!isAllowed(env.ALLOWED_TG_IDS, msg.from.id)) return;
+
+  // Voice input, v1: transcript goes through the plain-text path exactly as
+  // if typed. Transcription runs inside the /telegram waitUntil, so a slow
+  // transcription never blocks the webhook reply (200 is sent immediately).
+  const voice = msg.voice && typeof msg.voice === "object" ? msg.voice : null;
+  if (voice) {
+    await ensureUserRow(env, msg.from.id);
+    await handleVoice(env, { userId: msg.from.id, chatId: msg.chat.id, voice, send: (t) => tgSend(env, msg.chat.id, t), route: (transcript) => handlePlainText(env, msg, transcript, { source: "voice" }) });
+    return;
+  }
 
   if (!text) {
     // Non-text file: photo (largest size) or document. Saved as kind

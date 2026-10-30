@@ -1338,6 +1338,89 @@ if (DatabaseSync) {
   }
 }
 
+import { transcribeWithGemini, handleVoice, VOICE_FAILED_TEXT, VOICE_TOO_LONG_TEXT } from "../src/voice.js";
+
+// ── Voice input v1: Telegram voice -> Gemini 3.5-transcribe -> plain-text path ──
+if (DatabaseSync) {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  const d1 = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
+  const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", DB: d1, ROUTER_KEY: "k-test", GEMINI_API_KEY: "k-test", ...extra });
+  const fakeSend = () => { const sent = []; return { sent, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); } }; };
+  const o = (env, userId, text, extra = {}) => ({ chatId: userId, userId, text, source: extra.source, send: extra.send, chat: extra.chat ?? (async () => {}), nowMs: extra.nowMs, hasImage: false });
+  const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+  const origFetch = global.fetch;
+  const lastText = (s) => String(s.sent.at(-1)?.text ?? "");
+  // Mock Telegram getFile/download + Google Files/Interactions, routed by URL.
+  const mockVoiceFetch = (transcript, opts = {}) => {
+    let googleCalls = 0; let interactionsBody = null; let deleted = false;
+    global.fetch = async (url, init) => {
+      const u = String(url);
+      if (u.includes("generativelanguage.googleapis.com")) {
+        googleCalls++;
+        if (init?.method === "DELETE") { deleted = true; return { ok: true, json: async () => ({}) }; }
+        if (u.includes("/upload/v1beta/files")) return { ok: true, json: async () => ({ file: { name: "files/abc" } }) };
+        if (u.includes("/v1beta/files/abc")) return { ok: true, json: async () => ({ state: opts.pollState ?? "ACTIVE", uri: "https://example/audio" }) };
+        if (u.includes("/v1beta/interactions")) {
+          if (opts.failInteractions) throw new Error("boom");
+          interactionsBody = JSON.parse(init.body);
+          return { ok: true, json: async () => ({ output_text: transcript }) };
+        }
+        return { ok: true, json: async () => ({}) };
+      }
+      if (u.includes("/file/bot")) return { ok: true, arrayBuffer: async () => new ArrayBuffer(8) };
+      if (u.includes("api.telegram.org")) return { ok: true, json: async () => (opts.failGetFile ? { ok: false } : { ok: true, result: { file_path: "voice/file.ogg" } }) };
+      throw new Error(`unexpected fetch: ${u}`);
+    };
+    return { googleCalls: () => googleCalls, interactionsBody: () => interactionsBody, deleted: () => deleted };
+  };
+  const voice = (duration = 42) => ({ file_id: "voice-1", duration, mime_type: "audio/ogg" });
+  {
+    const m = mockVoiceFetch("سلام دنیا");
+    const r = await transcribeWithGemini(mkEnv(), new ArrayBuffer(8), "audio/ogg");
+    const body = m.interactionsBody();
+    check(r.ok === true && r.text === "سلام دنیا" && body?.model === "gemini-3.5-transcribe" && body?.generation_config?.transcription_config?.language_codes?.[0] === "fa-IR" && JSON.stringify(body?.generation_config?.transcription_config?.custom_vocabulary ?? []).includes("Cloudflare Workers") && m.deleted() === true, "voice: gemini transcribe returns text, fa-IR + vocab, uploaded file deleted");
+  }
+  {
+    const env = mkEnv(), s = fakeSend(); const m = mockVoiceFetch("یادداشت کن فردا جلسه دارم");
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); } });
+    check(r === "routed" && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4242")[0].n === 1 && rows("SELECT text, source FROM notes WHERE user_id = 4242")[0].text === "فردا جلسه دارم" && rows("SELECT source FROM notes WHERE user_id = 4242")[0].source === "voice", "voice: transcript -> note stored with voice source");
+  }
+  {
+    const env = mkEnv(), s = fakeSend(); mockVoiceFetch("خرج کردم ۵۰۰ تومان نان");
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); } });
+    check(r === "routed" && lastText(s).includes("تأیید می‌کنی؟") && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0, "voice: transcript -> expense confirm, no row before Confirm");
+  }
+  {
+    const env = mkEnv(), s = fakeSend(); let routed = false; mockVoiceFetch("");
+    const r = await handleVoice(env, { userId: 4243, chatId: 4243, voice: voice(), send: s.send, route: async () => { routed = true; } });
+    check(r === "failed" && routed === false && lastText(s) === VOICE_FAILED_TEXT && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4243")[0].n === 0, "voice: empty transcript -> resend reply, nothing stored");
+  }
+  {
+    const env = mkEnv(), s = fakeSend(); let routed = false; mockVoiceFetch("سلام", { failInteractions: true });
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async () => { routed = true; } });
+    check(r === "failed" && routed === false && lastText(s) === VOICE_FAILED_TEXT, "voice: google failure -> fallback reply, nothing routed");
+  }
+  {
+    const env = mkEnv({ GEMINI_API_KEY: undefined }), s = fakeSend(); let routed = false; const m = mockVoiceFetch("سلام");
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async () => { routed = true; } });
+    check(r === "failed" && routed === false && m.googleCalls() === 0 && lastText(s) === VOICE_FAILED_TEXT, "voice: missing key -> fallback reply, zero google fetches");
+  }
+  {
+    const env = mkEnv(), s = fakeSend(); let routed = false; const m = mockVoiceFetch("سلام");
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(601), send: s.send, route: async () => { routed = true; } });
+    check(r === "too-long" && routed === false && m.googleCalls() === 0 && lastText(s) === VOICE_TOO_LONG_TEXT, "voice: over-cap duration -> short-voice reply, zero google fetches");
+  }
+  {
+    const m = mockVoiceFetch("سلام", { pollState: "PROCESSING" });
+    const r = await transcribeWithGemini(mkEnv(), new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0, maxPolls: 2 });
+    check(r.ok === false && r.reason === "not-active" && m.deleted() === true, "voice: file never ACTIVE -> failure, uploaded file still deleted");
+  }
+  global.fetch = origFetch;
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
