@@ -41,6 +41,7 @@ import {
 import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder } from "../src/daily.js";
 import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
 import { buildInterpreterPrompt, parseInterpreterOutput, interpretText, callInterpreterModel, validateAmountText, validateDateTexts, matchProject, validateInterpreterAction, INTERPRETER_MAX_ACTIONS } from "../src/interpreter.js";
+import { scoreEvalResults, mapOutcome, scoreSlots, runCaseEvaluation, iranNowIso, median } from "../scripts/eval-intent.mjs";
 
 const failures = [];
 function check(cond, msg) {
@@ -1489,6 +1490,141 @@ if (DatabaseSync) {
     check(r2 === "failed" && retryBtn2 === `voice:retry:${stashId}` && (await env.STATE.get(`voice:stash:${stashId}`, "json")) !== null, "0-b3 fix: download-failing retry yields a usable Retry button, stash kept");
   }
   global.fetch = origFetch;
+}
+
+// ── Phase 0-c: synthetic eval set + scorer (offline only, no network) ──
+{
+  const cases = JSON.parse(fs.readFileSync(new URL("../eval/intent-synthetic.json", import.meta.url), "utf8"));
+  const ALLOW = ["task", "note", "expense", "income", "query", "translate", "setting", "correction", "dev_hint", "chat", "ask", "multi"];
+  const NEEDS = ["none", "type", "project", "time", "amount"];
+  check(Array.isArray(cases) && cases.length >= 60 && cases.length <= 80, `0-c: eval set has ${cases.length} cases (60-80)`);
+  check(new Set(cases.map((c) => c.id)).size === cases.length, "0-c: eval case ids are unique");
+  for (const c of cases) {
+    check(ALLOW.includes(c.expected), `0-c: ${c.id} expected is allow-listed`);
+    if (c.expected === "multi") check(Array.isArray(c.types) && c.types.length > 1 && c.types.every((t) => ALLOW.includes(t)), `0-c: ${c.id} multi has types`);
+    if (c.expected === "ask") check(NEEDS.includes(c.needs), `0-c: ${c.id} ask states its need`);
+    if (c.expected === "expense" || c.expected === "income") check(typeof c.slots?.amount_text === "string" && c.slots.amount_text, `0-c: ${c.id} money case has amount_text`);
+    if (c.expected === "query") check(["expense", "note", "task"].includes(c.slots?.query?.kind), `0-c: ${c.id} query case has a query kind`);
+    if (c.expected === "translate") check("target" in (c.slots ?? {}), `0-c: ${c.id} translate case has a target field`);
+  }
+  const fake = scoreEvalResults([
+    { id: "f1", expected: "note", got: "note", validJson: true },
+    { id: "f2", expected: "expense", got: "ask", validJson: true },
+    { id: "f3", expected: "note", got: "invalid", validJson: false },
+    { id: "f4", expected: "multi", expectedTypes: ["task", "note"], got: "multi", gotTypes: ["note", "task"], validJson: true },
+  ]);
+  check(fake.total === 4 && fake.correct === 2 && fake.accuracyPct === 50 && fake.validJson === 3 && fake.validJsonPct === 75, "0-c: scorer computes accuracy and valid-JSON % on a fake set");
+  const mapped = mapOutcome(parseInterpreterOutput(JSON.stringify([{ type: "note", text: "x", project: null, due_text: null, remind_text: null, amount_text: null, query: null, target: null, confidence: 0.9, needs: "none" }])), [{ type: "note", text: "x", project: null, due_text: null, remind_text: null, amount_text: null, query: null, target: null, confidence: 0.9, needs: "none" }], { projects: [], nowMs: Date.now(), defaultCurrency: "TOMAN" });
+  check(mapped.got === "note" && mapped.validJson, "0-c: outcome mapping passes a clean note action");
+}
+
+// ── Phase 0-c fix: slots, needs, strict counts, +03:30, error split, retry ──
+{
+  const NOW = Date.UTC(2026, 9, 31, 12, 0, 0);
+  const CTX = { projects: [{ name: "گلبهار", aliases: ["گل"] }, { name: "قرارها و ملاقات‌ها", aliases: ["قرارها"] }, { name: "عمومی", aliases: [] }], nowMs: NOW, nowIso: iranNowIso(NOW), defaultCurrency: "TOMAN" };
+  const act = (o) => ({ type: o.type, text: "x", project: o.project ?? null, due_text: o.due_text ?? null, remind_text: o.remind_text ?? null, amount_text: o.amount_text ?? null, query: o.query ?? null, target: o.target ?? null, confidence: o.confidence ?? 0.9, needs: o.needs ?? "none" });
+  const slotsOf = (slots, a) => scoreSlots(slots, a, validateInterpreterAction(a, CTX), CTX);
+  // Wrong amount despite correct expense type: slot fails, type passes.
+  check(slotsOf({ amount_text: "پانصد هزار تومان" }, act({ type: "expense", amount_text: "۵۰۰ تومان" })).pass === 0, "0-c fix: wrong amount fails its slot");
+  check(slotsOf({ amount_text: "پانصد هزار تومان" }, act({ type: "expense", amount_text: "پانصد هزار تومان" })).pass === 1, "0-c fix: same amount passes its slot");
+  // Wrong project despite correct type; alias resolves to the canonical name.
+  check(slotsOf({ project: "قرارها و ملاقات‌ها" }, act({ type: "note", project: "گلبهار" })).pass === 0, "0-c fix: wrong project fails its slot");
+  check(slotsOf({ project: "گلبهار" }, act({ type: "note", project: "گل" })).pass === 1, "0-c fix: project alias passes its slot");
+  // Wrong query kind / period; correct query passes.
+  check(slotsOf({ query: { kind: "expense", period: "امروز", project: null } }, act({ type: "query", query: { kind: "note", periodText: "امروز", project: null } })).pass === 2, "0-c fix: wrong query kind fails only its field");
+  check(slotsOf({ query: { kind: "expense", period: "امروز", project: null } }, act({ type: "query", query: { kind: "expense", periodText: "این هفته", project: null } })).pass === 2, "0-c fix: wrong query period fails only its field");
+  check(slotsOf({ query: { kind: "expense", period: "امروز", project: null } }, act({ type: "query", query: { kind: "expense", periodText: "امروز", project: null } })).pass === 3, "0-c fix: correct query passes all its slots");
+  // Wrong translation target.
+  check(slotsOf({ target: "en" }, act({ type: "translate", target: "fa" })).pass === 0, "0-c fix: wrong target fails its slot");
+  check(slotsOf({ target: "en" }, act({ type: "translate", target: "en" })).pass === 1, "0-c fix: correct target passes its slot");
+  // Wrong due/remind resolution.
+  check(slotsOf({ remind_text: "فردا ساعت ۹" }, act({ type: "task", remind_text: "فردا ساعت ۱۰" })).pass === 0, "0-c fix: wrong reminder time fails its slot");
+  check(slotsOf({ remind_text: "فردا ساعت ۹" }, act({ type: "task", remind_text: "فردا ساعت ۹" })).pass === 1, "0-c fix: same reminder time passes its slot");
+  // Null-expected fields require no claim; absent fields are not counted.
+  check(slotsOf({ project: null }, act({ type: "note", project: null })).pass === 1, "0-c fix: null project expectation passes with no claim");
+  check(slotsOf({ project: null }, act({ type: "note", project: "گلبهار" })).pass === 0, "0-c fix: null project expectation fails on a claim");
+  check(slotsOf({}, act({ type: "note", project: "گلبهار" })).total === 0, "0-c fix: absent slot fields are not counted");
+  // Correct ask, wrong need: ask accuracy yes, need accuracy and full no.
+  const needSet = scoreEvalResults([
+    { id: "n1", expected: "ask", expectedNeeds: "amount", got: "ask", gotNeeds: "type", gotActionCount: 1, validJson: true, outcome: "valid" },
+    { id: "n2", expected: "ask", expectedNeeds: "amount", got: "ask", gotNeeds: "amount", gotActionCount: 1, validJson: true, outcome: "valid" },
+  ]);
+  check(needSet.askCorrect === 2 && needSet.needCorrect === 1 && needSet.correct === 1, "0-c fix: correct ask with wrong need is not fully correct");
+  // Extra action in a single-action case: type fails.
+  const extraSet = scoreEvalResults([
+    { id: "e1", expected: "note", got: "note", gotTypes: ["note", "expense"], gotActionCount: 2, validJson: true, outcome: "valid" },
+  ]);
+  check(extraSet.typeCorrect === 0, "0-c fix: extra action fails a single-action case");
+  // Multi set mismatch: extra type and duplicate padding both fail.
+  const multiSet = scoreEvalResults([
+    { id: "m1", expected: "multi", expectedTypes: ["task", "note"], got: "note", gotTypes: ["note", "task", "expense"], gotActionCount: 3, validJson: true, outcome: "valid" },
+    { id: "m2", expected: "multi", expectedTypes: ["task", "note"], got: "note", gotTypes: ["note", "task"], gotActionCount: 3, validJson: true, outcome: "valid" },
+    { id: "m3", expected: "multi", expectedTypes: ["task", "note"], got: "note", gotTypes: ["note", "task"], gotActionCount: 2, validJson: true, outcome: "valid" },
+  ]);
+  check(multiSet.typeCorrect === 1, "0-c fix: multi set mismatch and duplicate padding fail");
+  // Standard median for even and odd counts.
+  check(median([10, 20, 30, 40]) === 25 && median([5, 1, 3]) === 3 && median([]) === 0, "0-c fix: median is standard for even and odd counts");
+  // Timestamp: explicit +03:30 offset, same instant round-trips.
+  check(iranNowIso(NOW) === "2026-10-31T15:30:00.000+03:30" && Date.parse(iranNowIso(NOW)) === NOW, "0-c fix: Iran timestamp carries +03:30 for the same instant");
+  // Request error is distinct from invalid JSON and excluded from accuracy.
+  const errCase = { id: "r1", expected: "note", text: "یادداشت کن جلسه فردا" };
+  const badCase = { id: "r2", expected: "note", text: "یادداشت کن جلسه فردا" };
+  const okCase = { id: "r3", expected: "note", text: "یادداشت کن جلسه فردا" };
+  const noteJson = JSON.stringify([act({ type: "note" })]);
+  const rErr = await runCaseEvaluation(errCase, CTX, async () => { throw new Error("boom"); });
+  const rBad = await runCaseEvaluation(badCase, CTX, async () => "not json at all");
+  const rOk = await runCaseEvaluation(okCase, CTX, async () => noteJson);
+  check(rErr.outcome === "request_error" && rBad.outcome === "invalid_json" && rOk.outcome === "valid", "0-c fix: request error is distinct from invalid JSON");
+  const errSet = scoreEvalResults([rErr, rBad, rOk]);
+  check(errSet.requestErrors === 1 && errSet.invalidJson === 1 && errSet.validJsonPct === 50 && errSet.scoredTotal === 2, "0-c fix: request errors do not distort valid-JSON % or scored totals");
+  // Retry succeeds after an invalid first response; first attempt recorded.
+  let calls = 0;
+  const rRetry = await runCaseEvaluation(okCase, CTX, async () => (++calls === 1 ? "garbage" : noteJson));
+  check(rRetry.outcome === "valid" && rRetry.retried && rRetry.recovered && rRetry.firstOutcome === "invalid_json", "0-c fix: retry succeeds after an invalid first response");
+  // Retry succeeds after a request error (production interpretText retries any failure once).
+  let calls2 = 0;
+  const rRetryErr = await runCaseEvaluation(okCase, CTX, async () => { if (++calls2 === 1) throw new Error("boom"); return noteJson; });
+  check(rRetryErr.outcome === "valid" && rRetryErr.retried && rRetryErr.requestRecovered, "0-c fix: retry succeeds after a request error");
+}
+
+// ── Phase 0-c fix2: query.project resolution, retry boundary, ms precision ──
+{
+  const NOW = Date.UTC(2026, 9, 31, 12, 0, 0);
+  const CTX = { projects: [{ name: "گلبهار", aliases: ["گل"] }, { name: "قرارها و ملاقات‌ها", aliases: ["قرارها"] }, { name: "عمومی", aliases: [] }], nowMs: NOW, nowIso: iranNowIso(NOW), defaultCurrency: "TOMAN" };
+  const act = (o) => ({ type: o.type, text: "x", project: o.project ?? null, due_text: o.due_text ?? null, remind_text: o.remind_text ?? null, amount_text: o.amount_text ?? null, query: o.query ?? null, target: o.target ?? null, confidence: o.confidence ?? 0.9, needs: o.needs ?? "none" });
+  const slotsOf = (slots, a) => scoreSlots(slots, a, validateInterpreterAction(a, CTX), CTX);
+  const qField = (r, field) => r.fields.find((f) => f.field === field)?.ok;
+  const qSlots = { query: { kind: "expense", period: "امروز", project: "گلبهار" } };
+  const qAct = (project) => act({ type: "query", query: { kind: "expense", periodText: "امروز", project } });
+  // query.project: correct passes, wrong fails, alias passes — each only its field.
+  check(qField(slotsOf(qSlots, qAct("گلبهار")), "query.project") === true, "0-c fix2: query.project correct passes");
+  check(qField(slotsOf(qSlots, qAct("آفتاب")), "query.project") === false, "0-c fix2: query.project wrong fails");
+  check(qField(slotsOf(qSlots, qAct("گل")), "query.project") === true, "0-c fix2: query.project alias passes");
+  // Contamination guard: the action-level project matches, but the query's
+  // own project is wrong — must fail (old code scored resolved.project,
+  // which for a non-query action is the action-level match).
+  const contam = act({ type: "note", project: "گلبهار", query: { kind: "expense", periodText: "امروز", project: "آفتاب" } });
+  check(qField(slotsOf(qSlots, contam), "query.project") === false, "0-c fix2: query.project is scored on the query's own project, not the action-level project");
+  // due_text correct and wrong; a wrong due_text fails only its field.
+  check(slotsOf({ due_text: "فردا", project: "گلبهار" }, act({ type: "task", due_text: "فردا", project: "گلبهار" })).pass === 2, "0-c fix2: due_text correct passes");
+  const dueWrong = slotsOf({ due_text: "فردا", project: "گلبهار" }, act({ type: "task", due_text: "پس‌فردا", project: "گلبهار" }));
+  check(qField(dueWrong, "due_text") === false && qField(dueWrong, "project") === true, "0-c fix2: due_text wrong fails only its field");
+  // Retry boundary: valid JSON with invalid validation is FINAL, no retry.
+  let vAttempts = 0;
+  const badAmountJson = JSON.stringify([act({ type: "expense", amount_text: "abc" })]);
+  const rVal = await runCaseEvaluation({ id: "v1", expected: "expense", text: "خرج کردم" }, CTX, async () => { vAttempts++; return badAmountJson; });
+  check(vAttempts === 1 && rVal.outcome === "valid" && rVal.got === "ask" && !rVal.retried && rVal.gotNeeds === "amount", "0-c fix2: valid JSON with invalid validation is final, no retry");
+  // Two transport errors in a row: request_error, no valid result.
+  let tCalls = 0;
+  const rTwoErr = await runCaseEvaluation({ id: "t1", expected: "note", text: "یادداشت کن جلسه" }, CTX, async () => { tCalls++; throw new Error("boom"); });
+  check(tCalls === 2 && rTwoErr.outcome === "request_error" && rTwoErr.retried && !rTwoErr.validJson, "0-c fix2: two transport errors -> request_error, no valid result");
+  // Transport error, then invalid JSON: invalid_json after exactly one retry.
+  let mCalls = 0;
+  const rMix = await runCaseEvaluation({ id: "t2", expected: "note", text: "یادداشت کن جلسه" }, CTX, async () => { if (++mCalls === 1) throw new Error("boom"); return "garbage"; });
+  check(mCalls === 2 && rMix.outcome === "invalid_json" && rMix.retried && rMix.firstOutcome === "request_error", "0-c fix2: transport error then invalid JSON -> invalid_json after exactly one retry");
+  // Timestamp millisecond precision: same instant, exact string + round-trip.
+  const MS = Date.UTC(2026, 9, 31, 12, 0, 0, 456);
+  check(iranNowIso(MS) === "2026-10-31T15:30:00.456+03:30" && Date.parse(iranNowIso(MS)) === MS, "0-c fix2: Iran timestamp keeps milliseconds for the same instant");
 }
 
 if (failures.length) {
