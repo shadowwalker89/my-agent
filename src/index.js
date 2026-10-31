@@ -27,7 +27,7 @@ import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation, freeTextDevSuggestion } from "./intent.js";
 import { getChatContext } from "./memory.js";
 import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback } from "./everyday.js";
-import { handleVoice } from "./voice.js";
+import { handleVoice, handleVoiceRetry } from "./voice.js";
 import { saveMessage } from "./db.js";
 import {
   dispatchDev,
@@ -738,6 +738,13 @@ async function handleCallbackQuery(env, cb) {
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
     return;
   }
+  if (data.startsWith("voice:retry:")) {
+    await handleVoiceRetry(env, { userId: fromId, stashId: data.slice("voice:retry:".length),
+      send: (t, opts) => tgSend(env, chatId, t, opts),
+      route: (transcript) => handlePlainText(env, { chat: { id: chatId }, from: { id: fromId } }, transcript, { source: "voice" }),
+      editMarkup: dailySenders(env, chatId, cb?.message?.message_id).editMarkup });
+    return;
+  }
 
   const devMatch = /^dev:(approve|reject):(\d{1,12})$/.exec(data);
   if (devMatch) {
@@ -868,7 +875,7 @@ async function handleUpdate(env, update) {
   const voice = msg.voice && typeof msg.voice === "object" ? msg.voice : null;
   if (voice) {
     await ensureUserRow(env, msg.from.id);
-    await handleVoice(env, { userId: msg.from.id, chatId: msg.chat.id, voice, send: (t) => tgSend(env, msg.chat.id, t), route: (transcript) => handlePlainText(env, msg, transcript, { source: "voice" }) });
+    await handleVoice(env, { userId: msg.from.id, chatId: msg.chat.id, voice, send: (t, opts) => tgSend(env, msg.chat.id, t, opts), route: (transcript) => handlePlainText(env, msg, transcript, { source: "voice" }) });
     return;
   }
 

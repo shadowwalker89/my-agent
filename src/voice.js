@@ -79,6 +79,37 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
   }
 }
 
+// Voice Retry (0-b3): at receipt, only the Telegram file id is stashed in
+// KV (owner-scoped, 1-hour TTL) — audio bytes are never stored. A failure
+// message carries a Retry button; tapping it (owner-checked) re-downloads
+// via the existing path and re-transcribes, then enters the normal
+// plain-text path. A missing/expired stash yields the same clear message.
+const VOICE_STASH_TTL_SEC = 3600;
+function voiceStashKey(id) { return `voice:stash:${id}`; }
+async function stashVoice(env, userId, fileId, mimeType) {
+  if (!env.STATE || !fileId) return null;
+  const id = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  try { await env.STATE.put(voiceStashKey(id), JSON.stringify({ owner: userId, file_id: fileId, mime_type: mimeType || "audio/ogg" }), { expirationTtl: VOICE_STASH_TTL_SEC }); return id; } catch { return null; }
+}
+async function sendVoiceFailure(o, stashId) {
+  if (stashId) await o.send(VOICE_FAILED_TEXT, { replyMarkup: { inline_keyboard: [[{ text: "🔄 ارسال مجدد", callback_data: `voice:retry:${stashId}` }]] } });
+  else await o.send(VOICE_FAILED_TEXT);
+}
+export async function handleVoiceRetry(env, o) {
+  let rec = null;
+  try { rec = env.STATE ? await env.STATE.get(voiceStashKey(o.stashId), "json") : null; } catch { rec = null; }
+  if (!rec) { await o.send(VOICE_FAILED_TEXT); return "missing"; }
+  if (Number(rec.owner) !== Number(o.userId)) return "forbidden";
+  if (o.editMarkup) await o.editMarkup();
+  const dl = await downloadTelegramVoice(env, rec.file_id);
+  if (!dl.ok) { await sendVoiceFailure(o, o.stashId); return "failed"; }
+  const tr = await transcribeWithGemini(env, dl.bytes, rec.mime_type, o.transcribeOpts ?? {});
+  if (!tr.ok) { await sendVoiceFailure(o, o.stashId); return "failed"; }
+  try { if (env.STATE) await env.STATE.delete(voiceStashKey(o.stashId)); } catch {}
+  await o.route(tr.text);
+  return "routed";
+}
+
 // Voice orchestration for handleUpdate. Over-cap voices get a clear reply
 // with no model call and nothing stored; every other failure gets the same
 // clear fallback reply, never a silent chat fallback that invents content.
@@ -86,10 +117,12 @@ export async function handleVoice(env, o) {
   const voice = o.voice ?? {};
   const duration = Number(voice.duration);
   if (Number.isFinite(duration) && duration > VOICE_MAX_DURATION_SEC) { await o.send(VOICE_TOO_LONG_TEXT); return "too-long"; }
+  const stashId = await stashVoice(env, o.userId, voice.file_id, voice.mime_type);
   const dl = await downloadTelegramVoice(env, voice.file_id);
-  if (!dl.ok) { await o.send(VOICE_FAILED_TEXT); return "failed"; }
+  if (!dl.ok) { await sendVoiceFailure(o, stashId); return "failed"; }
   const tr = await transcribeWithGemini(env, dl.bytes, voice.mime_type || "audio/ogg", o.transcribeOpts ?? {});
-  if (!tr.ok) { await o.send(VOICE_FAILED_TEXT); return "failed"; }
+  if (!tr.ok) { await sendVoiceFailure(o, stashId); return "failed"; }
+  try { if (env.STATE && stashId) await env.STATE.delete(voiceStashKey(stashId)); } catch {}
   await o.route(tr.text);
   return "routed";
 }
