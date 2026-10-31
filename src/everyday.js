@@ -1,9 +1,10 @@
 // Step 1b-2: everyday wiring (money, notes, reminders, translate,
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
-import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency } from "./daily.js";
+import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
-import { saveMessage } from "./db.js";
+import { saveMessage, finalizeMessageKind } from "./db.js";
+import { buildInterpreterPrompt, interpretText, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
 
@@ -110,6 +111,20 @@ export async function confirmExpenseDraft(env, userId, id) {
   return { status: "ok", draft };
 }
 
+// Save-first reconciliation (Phase 0-b fix): when handleDailyText saved an
+// entry row for this message, everyday branches finalise it instead of
+// saving a second user row; without an entry row (D1 unavailable, commands)
+// they save exactly as before. _entryFinalised keeps every exit to one
+// finalise; markChat finalises only when an entry row exists (chat answers
+// otherwise save their user row through answerChatText as before).
+async function markDaily(env, o) {
+  if (o.entryMessageId) { if (!o._entryFinalised) { o._entryFinalised = true; await finalizeMessageKind(env, o.entryMessageId, o.userId, "daily"); } return; }
+  await saveMessage(env, { userId: o.userId, role: "user", content: o.text, kind: "daily" });
+}
+async function markChat(env, o) {
+  if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; await finalizeMessageKind(env, o.entryMessageId, o.userId, "chat"); }
+}
+
 // Branch dispatch for a rule-classified intent. Returns "handled" or
 // "chat" (fall through to the normal chat/task/dev path). Confident
 // money messages are saved as kind daily; ask messages are not saved yet
@@ -119,7 +134,7 @@ export async function confirmExpenseDraft(env, userId, id) {
 async function runDailyBranch(env, o, c, ctx) {
   const { userId, text } = o;
   if (c.intent === "expense" || c.intent === "income") {
-    await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+    await markDaily(env, o);
     await startConfirm(env, o, c.intent, c.extraction);
     return "handled";
   }
@@ -139,7 +154,8 @@ async function runDailyBranch(env, o, c, ctx) {
   if (c.intent === "translate") {
     if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask === "language" ? "language" : kindForAskKey(c.ask), c.ask === "language" ? c.text : undefined); await o.send(askText(c.ask)); return "handled"; }
     const targetName = c.target === "en" ? "English" : c.target === "fa" ? "Persian" : c.target;
-    await o.chat(c.text, { systemPrompt: `Translate the following text${targetName ? ` to ${targetName}` : ""}. Reply with only the translation.`, saveText: text, noHistory: true });
+    await markChat(env, o);
+    await o.chat(c.text, { systemPrompt: `Translate the following text${targetName ? ` to ${targetName}` : ""}. Reply with only the translation.`, saveText: o.entryMessageId ? "" : text, noHistory: true });
     return "handled";
   }
   if (c.intent === "remember") {
@@ -151,14 +167,14 @@ async function runDailyBranch(env, o, c, ctx) {
   if (c.intent === "note") {
     const r = await runDb(env, "INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)", [userId, c.text, o.source === "voice" ? "voice" : "text", new Date().toISOString()]);
     await o.send(r.ok ? "✅ یادداشت ذخیره شد." : NOT_SAVED_TEXT);
-    if (r.ok) await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+    if (r.ok) await markDaily(env, o);
     return "handled";
   }
   if (c.intent === "reminder") {
     if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask); await o.send(askText(c.ask)); return "handled"; }
     const r = await runDb(env, "INSERT INTO reminders (user_id, text, due_at, status, created_at) VALUES (?, ?, ?, ?, ?)", [userId, c.text, c.due, "pending", new Date().toISOString()]);
     await o.send(r.ok ? `⏰ یادآوری فقط ذخیره شد (ارسال سر وقت هنوز فعال نیست): ${c.text} — ${c.due}` : NOT_SAVED_TEXT);
-    if (r.ok) await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+    if (r.ok) await markDaily(env, o);
     return "handled";
   }
   if (c.intent === "expense-query") {
@@ -166,7 +182,7 @@ async function runDailyBranch(env, o, c, ctx) {
     const sums = await queryExpenseSums(env, userId, c.range);
     const keys = Object.keys(sums);
     await o.send(keys.length ? keys.map((k) => `${k}: ${sums[k]}`).join("\n") : "در این بازه خرجی ثبت نشده است.");
-    await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+    await markDaily(env, o);
     return "handled";
   }
   if (c.intent === "last-expense") {
@@ -177,14 +193,14 @@ async function runDailyBranch(env, o, c, ctx) {
     if (!r.ok) { await o.send(NOT_SAVED_TEXT); return "handled"; }
     if (!r.row) { await o.send("هنوز خرجی ثبت نشده است."); }
     else await o.send(`💰 آخرین خرج: ${r.row.amount} ${r.row.currency_code}${r.row.item ? ` — ${r.row.item}` : ""} — ${formatJalali(r.row.date) || r.row.date}`);
-    await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+    await markDaily(env, o);
     return "handled";
   }
   if (c.intent === "note-query") {
     if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask); await o.send(askText(c.ask)); return "handled"; }
     const rows = await allDb(env, "SELECT text FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 5", [userId]);
     await o.send(rows.length ? rows.map((r) => `• ${r.text}`).join("\n") : "یادداشتی پیدا نشد.");
-    await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+    await markDaily(env, o);
     return "handled";
   }
   if (c.intent === "file-reference") {
@@ -193,7 +209,7 @@ async function runDailyBranch(env, o, c, ctx) {
     if (file) {
       const fileLabel = file.file_name || (typeof file.file_mime === "string" && file.file_mime.startsWith("image/") ? "عکس" : "فایل");
       await o.send(`📎 فایل پیدا شد: ${fileLabel} — خلاصه‌سازی با قدم فایل‌ها می‌آید، فعلاً فقط ذخیره شده است.`);
-      await saveMessage(env, { userId, role: "user", content: text, kind: "daily" });
+      await markDaily(env, o);
       return "handled";
     }
     const prev = recent[0];
@@ -228,7 +244,9 @@ async function resolveFollowup(env, o, slot, m, ctx) {
     if (Number(ask.owner) !== Number(o.userId)) return { ret: "handled", outcome: "routed" };
     if (ask.question !== "expense-or-chat" && ask.question !== "expense-or-income") return null;
     const choice = m.followup === "yes" ? "expense" : ask.question === "expense-or-chat" ? "chat" : "income";
-    if (choice === "chat") { await o.chat(ask.text, {}); return { ret: "handled", outcome: "chat" }; }
+    // Save-first: ask.text already has its entry row from the ask exit, so
+    // the chat answer must not save it a second time (saveText "").
+    if (choice === "chat") { await o.chat(ask.text, { saveText: "" }); return { ret: "handled", outcome: "chat" }; }
     const ex = parseExpense(ask.text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, ask.text);
     if (ex?.error) { const q = askText(mapQuestion(ex.error)); await o.send(q); await setPendingAsk(env, o.userId, q, undefined, mapQuestion(ex.error)); return { ret: "handled", outcome: "asked" }; }
     await startConfirm(env, o, choice, ex);
@@ -389,7 +407,195 @@ export async function runModelBranch(env, o, rule, ctx) {
   }
 }
 
-// Everyday text, Part 2: rule first, model only when the rule is
+// ── Phase 0-b: interpreter wiring (design v3, 3.1-3.5; cards in 0-b2) ──
+// Seed projects until migration 0003 lands (Phase 1-a swaps this constant
+// for a D1 read). Never auto-create: unknown names get type buttons.
+export const SEED_PROJECTS = [{ name: "عمومی", aliases: [] }, { name: "ایجنت", aliases: [] },
+  { name: "گلبهار", aliases: ["گل"] }, { name: "قرارها و ملاقات‌ها", aliases: ["قرارها"] }];
+const INTERP_UNAVAILABLE_TEXT = "تفسیر خودکار الان در دسترس نیست؛ خودت نوعش را بگو:";
+function interpKey(id) { return `interp:${id}`; }
+function interpTypeKeyboard(id) {
+  return [[{ text: "📋 تسک", callback_data: `interp:type:task:${id}` }, { text: "📝 یادداشت", callback_data: `interp:type:note:${id}` }], [{ text: "💰 خرج", callback_data: `interp:type:expense:${id}` }, { text: "💬 چت", callback_data: `interp:type:chat:${id}` }]];
+}
+function noteCardKeyboard(id) { return [[{ text: "🗑 لغو", callback_data: `interp:del:${id}` }]]; }
+async function newInterpRecord(env, userId, value) { const id = newId(); await putKv(env, interpKey(id), { owner: userId, ...value }); return id; }
+async function insertNoteRow(env, userId, text, source) {
+  const db = dbOf(env); if (!db) return { ok: false, id: null };
+  try { await db.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)").bind(userId, text, source, new Date().toISOString()).run(); const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first(); return { ok: true, id: row?.id ?? null }; } catch { return { ok: false, id: null }; }
+}
+function rangeForPeriod(periodText, nowMs) {
+  const t = normalizeText(periodText ?? ""), today = iranDate(nowMs);
+  if (/دیروز/.test(t)) { const d = new Date(Date.parse(today) - 86400000).toISOString().slice(0, 10); return { start: d, end: d }; }
+  if (/هفته/.test(t)) return weekRange(today);
+  if (/ماه/.test(t)) return monthRange(today);
+  return { start: today, end: today };
+}
+// Execute ONE validated interpreter action. Money/query/translate/setting/
+// dev/chat send their own reply (direct: true); note/task/query return data
+// for the caller to present. Money always re-derives from rule code and
+// goes through the existing confirm card; the model never supplies numbers.
+async function executeInterpAction(env, o, ctx, action, resolved) {
+  const { userId } = o;
+  if (action.type === "note") {
+    const r = await insertNoteRow(env, userId, action.text, o.source === "voice" ? "voice" : "text");
+    if (!r.ok) return { line: `📝 یادداشت: ${action.text} — ${NOT_SAVED_TEXT}` };
+    return { line: `📝 یادداشت: ${action.text}`, note: { id: r.id, text: action.text }, kind: "daily" };
+  }
+  // 0-b2: task card, correction, and project choice. Until then a task or
+  // correction action gets this honest line — never a silent note store.
+  if (action.type === "task") return { line: "تسک‌ها با فاز ۱ می‌آیند.", kind: "daily" };
+  if (action.type === "correction") return { line: "اصلاح با فاز ۱ می‌آید.", kind: "daily" };
+  if (action.type === "expense" || action.type === "income") {
+    const ex = parseExpense(action.text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, action.text);
+    if (ex?.error || ex.amount !== resolved.amount || ex.currency !== resolved.currency) return { line: `💰 ${action.text} — مبلغ را دوباره بگو؟`, kind: "daily" };
+    await startConfirm(env, o, action.type, ex);
+    return { line: `💰 ${action.type === "income" ? "درآمد" : "خرج"}: ${ex.amount} ${ex.currency}${ex.item ? ` — ${ex.item}` : ""} (در انتظار تایید)`, direct: true, kind: "daily" };
+  }
+  if (action.type === "query") {
+    const q = action.query;
+    if (q.kind === "task") return { line: "تسک‌ها با فاز ۱ می‌آیند.", kind: "daily" };
+    if (q.kind === "note") { const rows = await allDb(env, "SELECT text FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 5", [userId]); return { line: rows.length ? rows.map((r) => `• ${r.text}`).join("\n") : "یادداشتی پیدا نشد.", kind: "daily" }; }
+    // The query action carries its own period phrase; no rule re-derivation.
+    const sums = await queryExpenseSums(env, userId, rangeForPeriod(q.periodText, ctx.now));
+    const keys = Object.keys(sums);
+    return { line: keys.length ? keys.map((k) => `${k}: ${sums[k]}`).join("\n") : "در این بازه خرجی ثبت نشده است.", kind: "daily" };
+  }
+  if (action.type === "translate") {
+    const targetName = action.target === "en" ? "English" : action.target === "fa" ? "Persian" : action.target === "ar" ? "Arabic" : "";
+    await o.chat(action.text, { systemPrompt: `Translate the following text${targetName ? ` to ${targetName}` : ""}. Reply with only the translation.`, saveText: "", noHistory: true });
+    return { line: `🌐 ترجمه: ${action.text}`, direct: true, kind: "chat" };
+  }
+  if (action.type === "setting") {
+    const c2 = classifyDaily(action.text ?? o.text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered });
+    if (c2.intent === "remember" && !c2.refused) {
+      const r = await setSetting(env, userId, c2.setting.key, c2.setting.value);
+      await o.send(r.ok ? `✅ ذخیره شد: ${c2.setting.key} = ${c2.setting.value}` : NOT_SAVED_TEXT);
+    } else await o.send("در این قدم فقط تنظیم‌ها نگه داشته می‌شوند؛ خاطره‌های آزاد در قدم حافظه می‌آیند");
+    return { line: `⚙️ تنظیم: ${action.text}`, direct: true, kind: "daily" };
+  }
+  if (action.type === "dev_hint") { await o.send(freeTextDevSuggestion()); return { line: "💻 پیشنهاد /dev", direct: true, kind: "chat" }; }
+  if (action.type === "chat") { await o.chat(o.text, { saveText: "" }); return { line: "💬 چت", direct: true, kind: "chat" }; }
+  return { line: "⏭ موردی اجرا نشد.", kind: "daily" };
+}
+// Validate + execute actions per v3 3.5 (0-b slice: task/correction/project
+// choice arrive in 0-b2; here they get honest lines or type buttons).
+export async function runInterpPolicy(env, o, ctx, actions, finalize) {
+  const outcomes = [];
+  for (const a of actions) {
+    const v = validateInterpreterAction(a, { projects: SEED_PROJECTS, nowMs: ctx.now, defaultCurrency: ctx.remembered });
+    if (!v.ok || a.confidence < 0.6 || a.needs !== "none") { outcomes.push({ skipped: true, action: a, errors: v.errors ?? [] }); continue; }
+    outcomes.push(await executeInterpAction(env, o, ctx, a, v.resolved));
+  }
+  if (actions.length === 1) {
+    const one = outcomes[0];
+    // Unknown project falls to type buttons in 0-b; the choice card is 0-b2.
+    if (one.skipped) { await finalize("daily"); const id = await newInterpRecord(env, o.userId, { text: o.text }); await o.send("نوعش را بگو:", { replyMarkup: { inline_keyboard: interpTypeKeyboard(id) } }); return "handled"; }
+    if (one.direct) { await finalize(one.kind); return "handled"; }
+    if (one.note) { await finalize("daily"); const id = await newInterpRecord(env, o.userId, { table: "notes", id: one.note.id, text: one.note.text }); await o.send("✅ یادداشت ذخیره شد.", { replyMarkup: { inline_keyboard: noteCardKeyboard(id) } }); return "handled"; }
+    await finalize("daily");
+    await o.send(one.line);
+    return "handled";
+  }
+  await finalize("daily");
+  await o.send(outcomes.map((r) => r.line).join("\n"));
+  return "handled";
+}
+// Shared interpreter run (initial + retry): prompt -> interpret -> policy.
+// The caller owns the pending row; on failure the row STAYS pending (the
+// Phase 0 no-drop invariant) and the reply gains a Retry button. No
+// re-gating, no re-save: the retry re-runs interpretation only, and each
+// tap is a user action, so a repeated failure is not a loop.
+async function interpretAndExecute(env, o, ctx, text, rowId, finalize) {
+  const recent = (await recentMessages(env, o.userId, 4)).filter((r) => r.kind !== "pending").reverse().slice(-3).map((r) => r.content).filter((c) => typeof c === "string" && c);
+  const prompt = buildInterpreterPrompt({ text, source: o.source === "voice" ? "voice" : "text", recentTurns: recent, openQuestion: null, projects: SEED_PROJECTS, nowIso: new Date(ctx.now + 210 * 60000).toISOString(), defaultCurrency: ctx.remembered });
+  const res = await interpretText(env, o.interpreterModel ?? env.INTERPRETER_MODEL ?? null, prompt, o.interpreterCallFn ?? null);
+  if (!res.ok) { await sendInterpUnavailable(env, o, text, rowId); return "handled"; }
+  return runInterpPolicy(env, o, ctx, res.actions, finalize);
+}
+// Failure reply: the unavailable message + type buttons + a Retry button.
+// The message row IS stored (pending); only the domain action is not.
+async function sendInterpUnavailable(env, o, text, rowId) {
+  const id = await newInterpRecord(env, o.userId, { text });
+  const keyboard = [...interpTypeKeyboard(id)];
+  if (rowId) keyboard.push([{ text: "🔄 ارسال مجدد", callback_data: `retry:${rowId}` }]);
+  await o.send(INTERP_UNAVAILABLE_TEXT, { replyMarkup: { inline_keyboard: keyboard } });
+}
+// Interpreter path (v3 3.1): the entry row was already saved as pending by
+// handleDailyText, so this only finalises it. An entry-save failure falls
+// back to today's chat path with no crash, as before.
+export async function handleInterpreterText(env, o, ctx) {
+  if (o._entrySaveFailed) return "chat";
+  const { userId, text } = o;
+  const finalize = (kind) => { if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; return finalizeMessageKind(env, o.entryMessageId, userId, kind); } return Promise.resolve({ ok: false }); };
+  return interpretAndExecute(env, o, ctx, text, o.entryMessageId ?? null, finalize);
+}
+// Interpreter callbacks: type choice, note delete/change, task-note/cancel,
+// project choice. Owner-checked; expired records get the fixed message.
+// Interpreter callbacks, 0-b set: type choice and note delete. Task card,
+// change-type, and project choice are 0-b2; their buttons do not exist yet.
+export async function resolveInterpCallback(env, o) {
+  // Retry (Phase 0-b fix): callback_data retry:{pending D1 row id}. The row
+  // id is used — not the Telegram message id — because the button must sit
+  // inside the failure message itself, whose id is unknowable before it is
+  // sent, and no tg-message-id column exists without a migration (out of
+  // scope for 0-b). The original text is loaded from that pending row,
+  // scoped by user id; interpretation re-runs only, with no re-gating and
+  // no second row. A repeated failure re-shows the same reply + Retry.
+  const rm = /^retry:(\d+)$/.exec(o.data);
+  if (rm) {
+    const rowId = Number(rm[1]);
+    const row = await firstDb(env, "SELECT id, user_id, content FROM messages WHERE id = ? AND kind = 'pending'", [rowId]);
+    if (!row.ok || !row.row) {
+      const id = await newInterpRecord(env, o.fromId, { text: "" });
+      await o.send("متن پیام پیدا نشد؛ لطفاً پیام را دوباره بفرست:", { replyMarkup: { inline_keyboard: interpTypeKeyboard(id) } });
+      return true;
+    }
+    if (Number(row.row.user_id) !== Number(o.fromId)) return true;
+    if (o.editMarkup) await o.editMarkup();
+    const ctx = { now: o.nowMs ?? Date.now(), remembered: await getDefaultCurrency(env, o.fromId) };
+    const oo = { ...o, userId: o.fromId, text: row.row.content, entryMessageId: rowId };
+    const finalize = (kind) => { if (!oo._entryFinalised) { oo._entryFinalised = true; return finalizeMessageKind(env, rowId, o.fromId, kind); } return Promise.resolve({ ok: false }); };
+    await interpretAndExecute(env, oo, ctx, row.row.content, rowId, finalize);
+    return true;
+  }
+  const m = /^interp:(type|del):(.+)$/.exec(o.data);
+  if (!m) return false;
+  const [, action, rest] = m;
+  if (action === "type") {
+    const tm = /^(\w+):(.+)$/.exec(rest);
+    if (!tm) return true;
+    const [, choice, id] = tm;
+    const rec = await getKv(env, interpKey(id));
+    if (!rec) { await o.send(EXPIRED_TEXT); return true; }
+    if (Number(rec.owner) !== Number(o.fromId)) return true;
+    // Empty-text records exist only from the missing-retry-row fallback;
+    // never store or answer from them, just say the text is gone.
+    if (!rec.text?.trim()) { await o.send("متن پیام پیدا نشد؛ لطفاً پیام را دوباره بفرست:"); return true; }
+    await delKv(env, interpKey(id));
+    if (o.editMarkup) await o.editMarkup();
+    const ctx = { now: o.nowMs ?? Date.now(), remembered: await getDefaultCurrency(env, o.fromId) };
+    const oo = { ...o, userId: o.fromId, text: rec.text };
+    if (choice === "task") { await o.send("تسک‌ها با فاز ۱ می‌آیند."); return true; }
+    if (choice === "note") { const r = await insertNoteRow(env, o.fromId, rec.text, "text"); if (r.ok) { const nid = await newInterpRecord(env, o.fromId, { table: "notes", id: r.id, text: r.text }); await o.send("✅ یادداشت ذخیره شد.", { replyMarkup: { inline_keyboard: noteCardKeyboard(nid) } }); } else await o.send(NOT_SAVED_TEXT); return true; }
+    if (choice === "expense") {
+      const ex = parseExpense(rec.text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, rec.text);
+      if (ex?.error) { await setPendingAsk(env, o.fromId, askText("amount"), undefined, "amount"); await o.send(askText("amount")); return true; }
+      await startConfirm(env, oo, "expense", ex); return true;
+    }
+    await o.chat(rec.text, { saveText: "" }); return true;
+  }
+  const rec = await getKv(env, interpKey(rest));
+  if (!rec) { await o.send(EXPIRED_TEXT); return true; }
+  if (Number(rec.owner) !== Number(o.fromId)) return true;
+  await delKv(env, interpKey(rest));
+  if (o.editMarkup) await o.editMarkup();
+  if (rec.table === "notes" && rec.id) await runDb(env, "DELETE FROM notes WHERE id = ? AND user_id = ?", [rec.id, o.fromId]);
+  await o.send("🗑 حذف شد."); return true;
+}
+
+// Everyday text, Phase 0-b: deterministic gates first (commands, bare-note
+// ask, fast money, open-question answers), then the interpreter for
+// everything else — never directly to chat. Part 2 comment below kept.
 // uncertain (ask) or finds no everyday branch (chat). Confident rule
 // results never reach a model. Returns "handled", "chat" (normal
 // chat/task/dev path), or "chat-direct" (model already said chat for a
@@ -400,18 +606,39 @@ export async function handleDailyText(env, o) {
   if (!dbOf(env)) { await clearPendingAsk(env, userId); return "chat"; } // D1 unavailable: everyday off, chat keeps working
   const remembered = await getDefaultCurrency(env, userId);
   const c = classifyDaily(text, { nowMs: now, rememberedCurrency: remembered });
+  // Commands never enter the everyday path and stay unstored (Step 1b rule);
+  // the entry save below is the everyday-path entry, after command routing.
   if (c.intent === "command") { await clearPendingAsk(env, userId); return "chat"; }
   const ctx = { now, remembered };
+  // Save-first (Phase 0-b fix): the message row is saved as pending BEFORE
+  // any everyday gate (bare-note bypass, fast money, slot, rollout gate,
+  // interpreter). The expense row is untouched by this: it is still
+  // inserted only when the user taps Confirm. o.entryMessageId is visible
+  // to the caller so downstream chat answers do not save a second user row.
+  const entry = await saveMessage(env, { userId, role: "user", content: text, kind: "pending" });
+  if (entry.ok) o.entryMessageId = entry.id; else o._entrySaveFailed = true;
+  const finalizeEntry = async (kind) => { if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; await finalizeMessageKind(env, o.entryMessageId, userId, kind); } };
+  const viaBranch = async (cc) => { const r = await runDailyBranch(env, o, cc, ctx); await finalizeEntry(r === "chat" ? "chat" : "daily"); return r; };
   // Bare-note ask bypasses the model step: the model is exactly what
   // failed live for bare notes (chat verdict -> hallucinated storage).
   // runDailyBranch asks for the text and sets the note-text slot itself.
-  if (c.intent === "ask" && c.question === "note-text") { await clearPendingAsk(env, userId); return runDailyBranch(env, o, c, ctx); }
-  if (c.intent !== "chat" && c.intent !== "ask") { await clearPendingAsk(env, userId); return runDailyBranch(env, o, c, ctx); }
-  // Ask/chat tier: exactly one model call. Timing log: combo, tier,
-  // duration, outcome — never message text or keys.
-  const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx);
-  console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome }));
-  return ret;
+  if (c.intent === "ask" && c.question === "note-text") { await clearPendingAsk(env, userId); return viaBranch(c); }
+  // Fast money path (unchanged): rule-confident expense/income only.
+  if (c.intent === "expense" || c.intent === "income") { await clearPendingAsk(env, userId); return viaBranch(c); }
+  if (c.intent !== "chat" && c.intent !== "ask") { await clearPendingAsk(env, userId); return viaBranch(c); }
+  // Answers to an open bot question keep the existing slot path.
+  const slot = await getPendingAsk(env, userId);
+  if (slot) { const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx); console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome })); await finalizeEntry(ret === "handled" ? "daily" : "chat"); return ret; }
+  // Rollout gate: interpreter unconfigured -> today's model-intent path,
+  // so merging 0-b cannot break non-money messages before a model is chosen.
+  if (!o.interpreterCallFn && !o.interpreterModel && !env.INTERPRETER_MODEL) {
+    const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx);
+    console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome }));
+    await finalizeEntry(ret === "handled" ? "daily" : "chat");
+    return ret;
+  }
+  // Everything else goes to the interpreter, never directly to chat.
+  return handleInterpreterText(env, o, ctx);
 }
 
 // daily: callbacks. Returns true when the data was a daily: callback.
@@ -437,7 +664,9 @@ export async function resolveDailyCallback(env, o) {
   if (Number(ask.owner) !== Number(o.fromId)) return true;
   await delKv(env, askKey(id));
   await o.editMarkup();
-  if (choice === "chat") { await o.chat(ask.text, {}); return true; }
+  // Save-first: ask.text already has its entry row from the ask exit, so
+  // the chat answer must not save it a second time (saveText "").
+  if (choice === "chat") { await o.chat(ask.text, { saveText: "" }); return true; }
   const ex = parseExpense(ask.text, { nowMs: o.nowMs ?? Date.now() }, ask.text);
   if (ex?.error) { const q = askText(mapQuestion(ex.error)); await setPendingAsk(env, o.fromId, q, undefined, mapQuestion(ex.error)); await o.send(q); return true; }
   await startConfirm(env, o, choice, ex);

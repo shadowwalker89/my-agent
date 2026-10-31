@@ -5,7 +5,7 @@
 // can fall back to the plain chat path. Nothing here logs message
 // content, keys, or secrets — functions return only ok/rows/values.
 export function normalizeKind(kind) {
-  return kind === "daily" ? "daily" : "chat";
+  return kind === "daily" || kind === "pending" ? kind : "chat";
 }
 
 function dbOf(envOrDb) {
@@ -44,10 +44,21 @@ export async function saveMessage(envOrDb, msg) {
         typeof msg.fileMime === "string" ? msg.fileMime : null,
       )
       .run();
-    return { ok: true };
+    const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first();
+    return { ok: true, id: row?.id ?? null };
   } catch {
     return { ok: false };
   }
+}
+
+// Finalise a store-first row: pending -> chat|daily, scoped by user id. A
+// row left pending (Worker died mid-interpretation) is ignored by every
+// reader (chat context reads kind='chat' in SQL; queries read their own
+// tables) and is never resurrected by a later message.
+export async function finalizeMessageKind(envOrDb, id, userId, kind) {
+  const db = dbOf(envOrDb);
+  if (!db || !Number.isFinite(Number(id)) || validUserId(userId) === null || (kind !== "chat" && kind !== "daily")) return { ok: false };
+  try { await db.prepare("UPDATE messages SET kind = ? WHERE id = ? AND user_id = ?").bind(kind, Number(id), Number(userId)).run(); return { ok: true }; } catch { return { ok: false }; }
 }
 
 // Chat context only: kind = 'chat', newest-first from D1, returned oldest-first.

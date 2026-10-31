@@ -26,7 +26,7 @@ import { healthCounts } from "./health.js";
 import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation, freeTextDevSuggestion } from "./intent.js";
 import { getChatContext } from "./memory.js";
-import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile } from "./everyday.js";
+import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback } from "./everyday.js";
 import { handleVoice } from "./voice.js";
 import { saveMessage } from "./db.js";
 import {
@@ -252,8 +252,10 @@ async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
     console.log(JSON.stringify({ combo: usedCombo, used: result.used ?? null, routed }));
     return; // empty turn stores nothing either
   }
-  // Successful turn only: save user + assistant as kind chat.
-  await saveMessage(env, { userId, role: "user", content: opts.saveText ?? text, kind: "chat" });
+  // Successful turn only: save user + assistant as kind chat. saveText ""
+  // means the caller already owns the user row (save-first entry row), so
+  // only the assistant row is saved — never a second or empty user row.
+  if (opts.saveText !== "") await saveMessage(env, { userId, role: "user", content: opts.saveText ?? text, kind: "chat" });
   await saveMessage(env, { userId, role: "assistant", content: answer, kind: "chat" });
   // show: ترجیح هر کاربر؛ SHOW_MODEL=1 همیشه override جهانی است.
   if (prefs.show === true || env.SHOW_MODEL === "1") {
@@ -624,7 +626,7 @@ function callbackChatId(cb) {
   return cb?.message?.chat?.id ?? cb?.from?.id;
 }
 
-async function runIntent(env, chatId, userId, text, intent, hasImage) {
+async function runIntent(env, chatId, userId, text, intent, hasImage, opts = {}) {
   if (intent.intent === "dev") {
     const r = await dispatchDev(env, text, chatId, userId);
     await tgSend(env, chatId, r.text);
@@ -649,7 +651,7 @@ async function runIntent(env, chatId, userId, text, intent, hasImage) {
     });
     return;
   }
-  await answerChatText(env, chatId, userId, text, hasImage);
+  await answerChatText(env, chatId, userId, text, hasImage, opts);
 }
 
 async function handlePlainText(env, msg, text, opts = {}) {
@@ -658,17 +660,21 @@ async function handlePlainText(env, msg, text, opts = {}) {
   // Allow-list already checked in handleUpdate; only then create the row.
   await ensureUserRow(env, userId);
   // Order: explicit /dev (tgCommand) -> everyday -> chat/task/dev.
-  const daily = await handleDailyText(env, { chatId, userId, text, source: opts.source, hasImage: updateHasImage(msg), ...dailySenders(env, chatId),
-    chat: (modelText, copts) => answerChatText(env, chatId, userId, modelText, updateHasImage(msg), copts) });
+  const dailyO = { chatId, userId, text, source: opts.source, hasImage: updateHasImage(msg), ...dailySenders(env, chatId),
+    chat: (modelText, copts) => answerChatText(env, chatId, userId, modelText, updateHasImage(msg), copts) };
+  const daily = await handleDailyText(env, dailyO);
+  // Save-first entry row already owns the user message: downstream chat
+  // answers must not save it a second time (saveText "" + the guard above).
+  const skipUserSave = dailyO.entryMessageId ? { saveText: "" } : undefined;
   // Model already said chat for a text message: answer directly, skip
   // classifyIntent (dev was in the model allow-list and was rejected).
   // Image messages keep today's path (they return "chat", not "chat-direct").
-  if (daily === "chat-direct") { await answerChatText(env, chatId, userId, text, updateHasImage(msg)); return; }
+  if (daily === "chat-direct") { await answerChatText(env, chatId, userId, text, updateHasImage(msg), skipUserSave); return; }
   if (daily !== "chat") return;
 
   const prefs = await getPrefs(env, userId);
   if (prefs.intent === false) {
-    await answerChatText(env, chatId, userId, text, updateHasImage(msg));
+    await answerChatText(env, chatId, userId, text, updateHasImage(msg), skipUserSave);
     return;
   }
 
@@ -702,7 +708,7 @@ async function handlePlainText(env, msg, text, opts = {}) {
     return;
   }
 
-  await runIntent(env, chatId, userId, text, intent, updateHasImage(msg));
+  await runIntent(env, chatId, userId, text, intent, updateHasImage(msg), skipUserSave);
 }
 
 async function handleCallbackQuery(env, cb) {
@@ -719,6 +725,16 @@ async function handleCallbackQuery(env, cb) {
 
   if (data.startsWith("daily:")) {
     await resolveDailyCallback(env, { fromId, chatId, data, ...dailySenders(env, chatId, cb?.message?.message_id),
+      chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
+    return;
+  }
+  if (data.startsWith("interp:")) {
+    await resolveInterpCallback(env, { fromId, chatId, data, nowMs: Date.now(), ...dailySenders(env, chatId, cb?.message?.message_id),
+      chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
+    return;
+  }
+  if (data.startsWith("retry:")) {
+    await resolveInterpCallback(env, { fromId, chatId, data, nowMs: Date.now(), ...dailySenders(env, chatId, cb?.message?.message_id),
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
     return;
   }
