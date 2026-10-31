@@ -2400,6 +2400,106 @@ if (DatabaseSync) {
     check(String(s.sent.at(-1)?.text ?? "").includes("پیدا نشد"), "0-b fix: missing retry row yields a clear message");
     check(btnData(s).filter((d) => d.startsWith("interp:type:")).length === 4, "0-b fix: missing retry row yields type buttons");
   }
+  // ── Phase 0-b2: external backup + circuit breaker (v3 3.7) ──
+  // (a) The failure message carries the external button next to the four
+  // type buttons and Retry; nothing is stored by the failure itself.
+  {
+    const env = mkEnv0b(), s = mkS();
+    const failing = async () => { throw new Error("boom"); };
+    await handleDailyText(env, mkO(s, "متن خراب", { interpreterCallFn: failing }));
+    check(btnData(s).some((d) => d.startsWith("interp:backup:")), "0-b2: failure message carries the external backup button");
+    check(btnData(s).filter((d) => d.startsWith("interp:type:")).length === 4, "0-b2: failure message still carries all four type buttons");
+    check(btnData(s).some((d) => d.startsWith("retry:")), "0-b2: failure message still carries Retry");
+  }
+  // (b) Backup with masked input: the backup model sees only placeholders
+  // (no link, phone, or amount), the restored note stores the real values,
+  // and the pending row finalises — same policy as the Workers AI path.
+  {
+    const env = mkEnv0b(), s = mkS();
+    const orig = "یادداشت https://example.com و ۵۰۰ تومان برای 09123456789";
+    const failing = async () => { throw new Error("boom"); };
+    await handleDailyText(env, mkO(s, orig, { interpreterCallFn: failing }));
+    const backupBtn = btnData(s).find((d) => d.startsWith("interp:backup:"));
+    const rowId = Number(btnData(s).find((d) => d.startsWith("retry:"))?.split(":")[1]);
+    let seenMasked = "";
+    const backupFn = async (masked) => { seenMasked = masked; return JSON.stringify([act("note", { text: "یادداشت {U1} و {A1} تومان برای {P1}" })]); };
+    const s2 = mkS();
+    const ok = await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: backupBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b, backupCallFn: backupFn });
+    check(ok === true, "0-b2: backup callback handled");
+    check(!seenMasked.includes("https://example.com") && !seenMasked.includes("۵۰۰") && !seenMasked.includes("09123456789"), "0-b2: backup input masks link, amount, and phone");
+    check(seenMasked.includes("{U1}") && seenMasked.includes("{A1}") && seenMasked.includes("{P1}"), "0-b2: backup input carries all three placeholder classes");
+    check(s2.sent.at(-1)?.text === "✅ یادداشت ذخیره شد.", "0-b2: backup note stored via the same policy");
+    check(rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = ?", [orig])[0].n === 1, "0-b2: backup restores placeholders to the real values");
+    check(rows0b("SELECT kind FROM messages WHERE id = ?", [rowId])[0]?.kind === "daily", "0-b2: backup success finalises the pending row");
+  }
+  // (c) Backup without key/model: clear message + type buttons, never chat.
+  {
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "متن خراب", { interpreterCallFn: async () => { throw new Error("boom"); } }));
+    const backupBtn = btnData(s).find((d) => d.startsWith("interp:backup:"));
+    const s2 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: backupBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
+    check(String(s2.sent.at(-1)?.text ?? "").includes("وصل نیست"), "0-b2: unconfigured backup yields a clear message");
+    check(btnData(s2).filter((d) => d.startsWith("interp:type:")).length === 4, "0-b2: unconfigured backup yields type buttons");
+    check(s2.chats.length === 0, "0-b2: unconfigured backup never falls back to chat");
+  }
+  // (d) Backup failure: type buttons only, never chat by default.
+  {
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "متن خراب", { interpreterCallFn: async () => { throw new Error("boom"); } }));
+    const backupBtn = btnData(s).find((d) => d.startsWith("interp:backup:"));
+    const s2 = mkS();
+    const badBackup = async () => { throw new Error("backup down"); };
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: backupBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b, backupCallFn: badBackup });
+    check(String(s2.sent.at(-1)?.text ?? "").includes("هم نشد"), "0-b2: backup failure yields a clear message");
+    check(btnData(s2).filter((d) => d.startsWith("interp:type:")).length === 4, "0-b2: backup failure yields type buttons only");
+    check(s2.chats.length === 0, "0-b2: backup failure never falls back to chat");
+  }
+  // (e) Circuit breaker: 3 errors in 2 minutes suppress Workers AI calls;
+  // deleting the flag (what real KV expiry does at TTL end) lifts it.
+  {
+    const env = mkEnv0b(), s = mkS();
+    let calls = 0;
+    const failing = async () => { calls++; throw new Error("boom"); };
+    for (let i = 0; i < 3; i++) await handleDailyText(env, mkO(s, `خرابی ${i}`, { interpreterCallFn: failing }));
+    const flag = await env.STATE.get("interp:breaker:flag", "json");
+    check(flag !== null && typeof flag.until === "number", "0-b2: three errors set the breaker flag");
+    calls = 0;
+    const errsBefore = await env.STATE.get("interp:breaker:errors", "json");
+    const countingOk = async () => { calls++; return JSON.stringify([act("note", { text: "نباید برسد" })]); };
+    await handleDailyText(env, mkO(s, "پیام بعد از مدارشکن", { interpreterCallFn: countingOk }));
+    check(calls === 0, "0-b2: breaker suppresses Workers AI calls while flagged");
+    check(String(s.sent.at(-1)?.text ?? "").includes("تفسیر خودکار الان در دسترس نیست"), "0-b2: suppressed call still yields the unavailable message");
+    check(btnData(s).some((d) => d.startsWith("interp:backup:")), "0-b2: suppressed call still offers the backup button");
+    const errsAfter = await env.STATE.get("interp:breaker:errors", "json");
+    check(JSON.stringify(errsAfter) === JSON.stringify(errsBefore), "0-b2: suppressed attempt records no new breaker error");
+    const supBtn = btnData(s).filter((d) => d.startsWith("interp:backup:")).at(-1);
+    const supRec = await env.STATE.get(`interp:${supBtn.split(":")[2]}`, "json");
+    check(supRec?.text === "پیام بعد از مدارشکن", "0-b2: suppressed attempt still creates the failure record for Retry/Backup");
+    await env.STATE.delete("interp:breaker:flag");
+    await handleDailyText(env, mkO(s, "پیام بعد از رفع مدارشکن", { interpreterCallFn: fakeInterp([act("note", { text: "بعد از رفع" })]) }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("یادداشت ذخیره شد"), "0-b2: lifting the flag resumes interpretation");
+    // (g) Backup still works while the breaker is flagged (the escape hatch).
+    for (let i = 0; i < 3; i++) await handleDailyText(env, mkO(s, `خرابی دوم ${i}`, { interpreterCallFn: failing }));
+    await handleDailyText(env, mkO(s, "پیام مسدود", { interpreterCallFn: fakeInterp([act("note", { text: "نباید برسد" })]) }));
+    const backupBtn = btnData(s).find((d) => d.startsWith("interp:backup:"));
+    check(!!backupBtn, "0-b2: suppressed message still offers the backup button for the tap");
+    const s2 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: backupBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b, backupCallFn: fakeInterp([act("note", { text: "از بکاپ" })]) });
+    check(s2.sent.at(-1)?.text === "✅ یادداشت ذخیره شد.", "0-b2: backup works while the breaker is flagged");
+  }
+  // (f) A quota error flags immediately (no 3-error wait) until UTC reset.
+  {
+    const env = mkEnv0b(), s = mkS();
+    const quotaFail = async () => { throw new Error("429 quota exceeded"); };
+    await handleDailyText(env, mkO(s, "پیام سهمیه", { interpreterCallFn: quotaFail }));
+    const flag = await env.STATE.get("interp:breaker:flag", "json");
+    check(flag !== null && flag.until === "quota", "0-b2: quota error sets the quota flag at once");
+    let calls = 0;
+    const counting = async () => { calls++; return JSON.stringify([act("note", { text: "نباید برسد" })]); };
+    await handleDailyText(env, mkO(s, "پیام بعد از سهمیه", { interpreterCallFn: counting }));
+    check(calls === 0, "0-b2: quota flag suppresses Workers AI calls");
+  }
 }
 
 if (failures.length) {

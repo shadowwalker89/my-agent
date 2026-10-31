@@ -123,7 +123,7 @@ export async function interpretText(env, model, prompt, callFn = null) {
       const parsed = parseInterpreterOutput(await callInterpreterModel(env, model, prompt, callFn));
       if (parsed.ok) { const ms = Date.now() - start; console.log(JSON.stringify({ interpreter: true, ms, ok: true, reason: null })); return { ok: true, actions: parsed.actions, calls, ms }; }
       lastReason = parsed.reason || "invalid";
-    } catch (err) { lastReason = err && err.message === "interpreter timeout" ? "timeout" : "error"; }
+    } catch (err) { lastReason = err && err.message === "interpreter timeout" ? "timeout" : /quota|429|rate.?limit|exceed/i.test(String(err?.message ?? "")) ? "quota" : "error"; }
   }
   const ms = Date.now() - start; console.log(JSON.stringify({ interpreter: true, ms, ok: false, reason: lastReason }));
   return { ok: false, reason: lastReason, calls, ms };
