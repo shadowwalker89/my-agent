@@ -40,6 +40,7 @@ import {
 } from "../src/memory.js";
 import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder } from "../src/daily.js";
 import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
+import { buildInterpreterPrompt, parseInterpreterOutput, interpretText, callInterpreterModel, validateAmountText, validateDateTexts, matchProject, validateInterpreterAction, INTERPRETER_MAX_ACTIONS } from "../src/interpreter.js";
 
 const failures = [];
 function check(cond, msg) {
@@ -2170,6 +2171,80 @@ if (DatabaseSync) {
   global.fetch = origFetch;
 }
 
+
+
+// ── Phase 0-a interpreter layer (no wiring: these tests only touch src/interpreter.js) ──
+{
+  const projects = [{ name: "گلبهار", aliases: ["گل"] }, { name: "عمومی", aliases: [] }];
+  const prompt = buildInterpreterPrompt({
+    text: "فردا ساعت ۹ به علی زنگ بزنم",
+    source: "voice",
+    recentTurns: ["user: سلام"],
+    openQuestion: null,
+    projects,
+    nowIso: "2026-10-31T15:30:00+03:30",
+    defaultCurrency: "TOMAN",
+  });
+  check(prompt.user.includes("[BEGIN USER MESSAGE") && prompt.user.includes("فردا ساعت ۹ به علی زنگ بزنم") && prompt.user.includes("[END USER MESSAGE]") && prompt.user.includes("گلبهار") && prompt.user.includes("گل") && prompt.user.includes("2026-10-31T15:30:00+03:30"), "0-a: prompt delimits user text and carries projects and Iran now");
+  check(prompt.system.includes("JSON array") && prompt.system.includes("at most 6 actions"), "0-a: prompt states JSON-only, max 6 actions");
+
+  const good = JSON.stringify([
+    { type: "task", text: "به علی زنگ بزنم", project: "گلبهار", due_text: null, remind_text: "فردا ساعت ۹", amount_text: null, query: null, target: null, confidence: 0.9, needs: "none" },
+    { type: "expense", text: "نون خریدم", project: null, due_text: null, remind_text: null, amount_text: "۵۰۰ تومان", query: null, target: null, confidence: 0.8, needs: "none" },
+  ]);
+  const parsed = parseInterpreterOutput(good);
+  check(parsed.ok && parsed.actions.length === 2 && parsed.actions[0].type === "task" && parsed.actions[1].amount_text === "۵۰۰ تومان", "0-a: valid JSON parses with all fields");
+  const minimal = parseInterpreterOutput(JSON.stringify([{ type: "chat", text: "سلام", confidence: 0.7, needs: "none" }]));
+  check(minimal.ok && minimal.actions[0].project === null && minimal.actions[0].query === null, "0-a: missing optional fields normalise to null");
+
+  const badType = parseInterpreterOutput(JSON.stringify([
+    { type: "task", text: "کاری", confidence: 0.9, needs: "none" },
+    { type: "teleport", text: "چیزی", confidence: 0.9, needs: "none" },
+  ]));
+  check(!badType.ok, "0-a: unknown type invalidates the whole output, no silent drop");
+  const tooMany = parseInterpreterOutput(JSON.stringify(Array.from({ length: INTERPRETER_MAX_ACTIONS + 1 }, (_, i) => ({ type: "chat", text: `متن ${i}`, confidence: 0.5, needs: "none" }))));
+  check(!tooMany.ok, "0-a: over-long array (>6) invalid");
+  check(!parseInterpreterOutput("this is not json at all").ok, "0-a: unparseable output invalid");
+  check(!parseInterpreterOutput("").ok, "0-a: empty output invalid");
+  const wrapped = parseInterpreterOutput(`here you go: ${good} done`);
+  check(wrapped.ok && wrapped.actions.length === 2, "0-a: bracket-extracted fallback parses fenced JSON");
+
+  // Retry: invalid once, then valid -> exactly 2 model calls, success.
+  let calls = 0;
+  const flaky = async () => { calls++; return calls === 1 ? "garbage" : good; };
+  const retried = await interpretText({}, "candidate-model", prompt, flaky);
+  check(retried.ok && retried.calls === 2 && calls === 2, "0-a: retry once on invalid JSON, then success with 2 calls");
+  // Invalid twice -> failure with exactly 2 model calls.
+  let calls2 = 0;
+  const alwaysBad = async () => { calls2++; return "garbage"; };
+  const failed = await interpretText({}, "candidate-model", prompt, alwaysBad);
+  check(!failed.ok && failed.calls === 2 && calls2 === 2, "0-a: invalid twice returns failure with 2 calls");
+
+  // Model id is a parameter, not hardcoded: the fake binding sees the passed id.
+  let seenModel = null, seenTemp = null;
+  const fakeEnv = { AI: { run: async (m, opts) => { seenModel = m; seenTemp = opts.temperature; return { response: good }; } } };
+  const raw = await callInterpreterModel(fakeEnv, "some-candidate-model", prompt);
+  check(seenModel === "some-candidate-model" && seenTemp === 0 && raw === good, "0-a: model id passed through as a parameter, temperature 0");
+
+  // Validators reuse daily.js.
+  const amt = validateAmountText("۵۰۰ هزار تومان", "TOMAN");
+  check(amt.ok && amt.amount === 500000 && amt.currency === "TOMAN", "0-a: amount validator resolves a Persian amount phrase");
+  check(!validateAmountText("مبلغی نامشخص", "TOMAN").ok, "0-a: amount validator rejects an unparsable phrase");
+  check(validateAmountText(null, "TOMAN").ok, "0-a: null amount_text is valid with no resolution");
+  const NOW = Date.UTC(2026, 9, 31, 12, 0, 0); // 2026-10-31 15:30 +03:30
+  const past = validateDateTexts(null, "امروز ساعت ۹ صبح", NOW);
+  check(!past.ok && past.errors.includes("past"), "0-a: date validator rejects a past reminder");
+  const future = validateDateTexts(null, "فردا ساعت ۹ صبح", NOW);
+  check(future.ok && future.remind_at === "2026-11-01T09:00:00+03:30", "0-a: date validator resolves a future reminder to ISO +03:30");
+  const dueOnly = validateDateTexts("فردا", null, NOW);
+  check(dueOnly.ok && dueOnly.due_at === "2026-11-01T00:00:00+03:30", "0-a: date-only due resolves to midnight");
+  check(matchProject("گل", projects)?.name === "گلبهار" && matchProject("گلبهار", projects)?.name === "گلبهار", "0-a: project matcher matches an alias and a canonical name");
+  check(matchProject("ناشناخته", projects) === null, "0-a: project matcher returns null for unknown, never auto-creates");
+  const vAction = validateInterpreterAction({ type: "expense", text: "نون", project: null, amount_text: "۵۰۰ تومان", confidence: 0.9, needs: "none" }, { projects, nowMs: NOW, defaultCurrency: "TOMAN" });
+  check(vAction.ok && vAction.resolved.amount === 500 && vAction.resolved.currency === "TOMAN", "0-a: action validator composes amount resolution");
+  const vBadProject = validateInterpreterAction({ type: "task", text: "کاری", project: "ناشناخته", confidence: 0.9, needs: "none" }, { projects, nowMs: NOW, defaultCurrency: "TOMAN" });
+  check(!vBadProject.ok && vBadProject.errors.includes("project"), "0-a: action validator flags an unknown project");
+}
 
 if (failures.length) {
   console.error("\nFailures found:");
