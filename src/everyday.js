@@ -4,7 +4,7 @@
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
 import { saveMessage, finalizeMessageKind } from "./db.js";
-import { buildInterpreterPrompt, interpretText, validateInterpreterAction } from "./interpreter.js";
+import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
 
@@ -508,17 +508,110 @@ export async function runInterpPolicy(env, o, ctx, actions, finalize) {
 async function interpretAndExecute(env, o, ctx, text, rowId, finalize) {
   const recent = (await recentMessages(env, o.userId, 4)).filter((r) => r.kind !== "pending").reverse().slice(-3).map((r) => r.content).filter((c) => typeof c === "string" && c);
   const prompt = buildInterpreterPrompt({ text, source: o.source === "voice" ? "voice" : "text", recentTurns: recent, openQuestion: null, projects: SEED_PROJECTS, nowIso: new Date(ctx.now + 210 * 60000).toISOString(), defaultCurrency: ctx.remembered });
+  // Circuit breaker (0-b2): while flagged, no Workers AI call is attempted;
+  // the failure reply (with the backup button) is sent instead. A suppressed
+  // attempt records no new breaker error or breaker state — the flag's TTL
+  // governs lifting — but the failure reply still creates its KV failure
+  // record, so the Retry/Backup buttons on that message keep working.
+  if (await breakerFlag(env)) { await sendInterpUnavailable(env, o, text, rowId); return "handled"; }
   const res = await interpretText(env, o.interpreterModel ?? env.INTERPRETER_MODEL ?? null, prompt, o.interpreterCallFn ?? null);
-  if (!res.ok) { await sendInterpUnavailable(env, o, text, rowId); return "handled"; }
+  if (!res.ok) { await recordInterpError(env, res.reason); await sendInterpUnavailable(env, o, text, rowId); return "handled"; }
   return runInterpPolicy(env, o, ctx, res.actions, finalize);
 }
-// Failure reply: the unavailable message + type buttons + a Retry button.
-// The message row IS stored (pending); only the domain action is not.
+// Failure reply: the unavailable message + type buttons + a Retry button
+// + the external-backup button (0-b2). The message row IS stored
+// (pending); only the domain action is not. The record carries rowId so
+// the backup tap can finalise the same pending row on success.
 async function sendInterpUnavailable(env, o, text, rowId) {
-  const id = await newInterpRecord(env, o.userId, { text });
+  const id = await newInterpRecord(env, o.userId, { text, rowId: rowId ?? null });
   const keyboard = [...interpTypeKeyboard(id)];
+  keyboard.push([{ text: "🌐 تفسیر با مدل بیرونی", callback_data: `interp:backup:${id}` }]);
   if (rowId) keyboard.push([{ text: "🔄 ارسال مجدد", callback_data: `retry:${rowId}` }]);
   await o.send(INTERP_UNAVAILABLE_TEXT, { replyMarkup: { inline_keyboard: keyboard } });
+}
+// ── Phase 0-b2: external backup + circuit breaker (v3 3.7) ──
+// Breaker state is written ONLY on interpreter error: the error-timestamp
+// list and the breaker flag. (The failure reply's KV record, which the
+// Retry/Backup buttons need, is UI state, not breaker state, and is
+// written for suppressed attempts too.) A successful call writes nothing, so "3 consecutive
+// errors" is approximated by 3 errors inside a rolling 2-minute window
+// (a success between errors does not clear the list — see diff header).
+const BREAKER_FLAG_KEY = "interp:breaker:flag";
+const BREAKER_ERRORS_KEY = "interp:breaker:errors";
+const BREAKER_WINDOW_MS = 120000, BREAKER_MAX_ERRORS = 3, BREAKER_TTL_SEC = 300;
+async function putKvTtl(env, key, value, ttlSec) { if (!env.STATE) return; try { await env.STATE.put(key, JSON.stringify(value), { expirationTtl: ttlSec }); } catch {} }
+function quotaResetMs(now) { const d = new Date(now); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1); }
+async function breakerFlag(env) {
+  const f = await getKv(env, BREAKER_FLAG_KEY);
+  if (!f) return null;
+  if (f.until === "quota") return Date.now() < quotaResetMs(Date.now()) ? f : null;
+  return typeof f.until === "number" && Date.now() < f.until ? f : null;
+}
+async function recordInterpError(env, reason) {
+  if (!env.STATE) return;
+  const now = Date.now();
+  if (reason === "quota") { await putKvTtl(env, BREAKER_FLAG_KEY, { until: "quota" }, Math.max(60, Math.round((quotaResetMs(now) - now) / 1000))); return; }
+  const prev = (await getKv(env, BREAKER_ERRORS_KEY)) || {};
+  const list = (Array.isArray(prev.list) ? prev.list : []).filter((t) => now - t < BREAKER_WINDOW_MS);
+  list.push(now);
+  await putKvTtl(env, BREAKER_ERRORS_KEY, { list }, Math.round(BREAKER_WINDOW_MS / 1000));
+  if (list.length >= BREAKER_MAX_ERRORS) await putKvTtl(env, BREAKER_FLAG_KEY, { until: now + BREAKER_TTL_SEC * 1000 }, BREAKER_TTL_SEC);
+}
+// Backup masking: only the message itself goes out — no history, no
+// project list. Phones -> {P1}, links -> {U1}, amounts -> {A1}, in ONE
+// replace pass (so a later class can never re-mask the digit inside an
+// inserted placeholder); every placeholder is restored locally in all
+// text-like action fields BEFORE validation/policy, so validators still
+// see the real values and a dropped placeholder degrades to an ask,
+// never a wrong number.
+const SENSITIVE_RE = /https?:\/\/\S+|www\.\S+|(\+98|0098|0)?9\d{9}|[۰-۹0-9]+(?:[٬,،][۰-۹0-9]+)*/g;
+function maskSensitive(text) {
+  const table = {}; let nP = 0, nU = 0, nA = 0;
+  const masked = String(text ?? "").replace(SENSITIVE_RE, (m) => {
+    let k;
+    if (/^https?:\/\/|^www\./.test(m)) k = `{U${++nU}}`;
+    else if (/^(\+98|0098|0)?9\d{9}$/.test(m)) k = `{P${++nP}}`;
+    else k = `{A${++nA}}`;
+    table[k] = m; return k;
+  });
+  return { masked, table };
+}
+function unmaskAction(action, table) {
+  const fix = (v) => typeof v === "string" ? v.replace(/\{(?:P|U|A)\d+\}/g, (k) => table[k] ?? k) : v;
+  const out = { ...action, text: fix(action.text), due_text: fix(action.due_text), remind_text: fix(action.remind_text), amount_text: fix(action.amount_text) };
+  if (action.query) out.query = { ...action.query, periodText: fix(action.query.periodText), project: fix(action.query.project) };
+  return out;
+}
+// Backup call seam: tests inject o.backupCallFn (masked text -> raw JSON
+// string), mirroring interpreterCallFn. No provider endpoint is guessed:
+// the backup provider is still unchosen (the 3.7 human step), so without
+// a seam the production tap reports backup as not connected — never chat,
+// never a silent drop. Binding the seam to the chosen provider's endpoint
+// is one function, with no masking/policy change.
+async function callBackupModel(maskedText, callFn) {
+  if (typeof callFn === "function") { try { const raw = await callFn(maskedText); return { ok: true, text: typeof raw === "string" ? raw : "" }; } catch { return { ok: false }; } }
+  return { ok: false, reason: "no-provider-binding" };
+}
+const BACKUP_UNAVAILABLE_TEXT = "مدل بیرونی وصل نیست؛ خودت نوعش را بگو:";
+const BACKUP_FAILED_TEXT = "تفسیر با مدل بیرونی هم نشد؛ خودت نوعش را بگو:";
+async function runBackupInterpretation(env, o, text, rowId, finalize) {
+  const userId = o.fromId ?? o.userId;
+  const oo = { ...o, userId, text };
+  if (!o.backupCallFn && (!env.INTERPRETER_BACKUP_MODEL || !env.INTERPRETER_BACKUP_KEY)) {
+    const id = await newInterpRecord(env, userId, { text });
+    await oo.send(BACKUP_UNAVAILABLE_TEXT, { replyMarkup: { inline_keyboard: interpTypeKeyboard(id) } });
+    return true;
+  }
+  const { masked, table } = maskSensitive(text);
+  const raw = await callBackupModel(masked, o.backupCallFn ?? null);
+  const parsed = raw.ok ? parseInterpreterOutput(raw.text) : { ok: false };
+  if (!parsed.ok) {
+    const id = await newInterpRecord(env, userId, { text });
+    await oo.send(BACKUP_FAILED_TEXT, { replyMarkup: { inline_keyboard: interpTypeKeyboard(id) } });
+    return true;
+  }
+  const ctx = { now: o.nowMs ?? Date.now(), remembered: await getDefaultCurrency(env, userId) };
+  return runInterpPolicy(env, oo, ctx, parsed.actions.map((a) => unmaskAction(a, table)), finalize);
 }
 // Interpreter path (v3 3.1): the entry row was already saved as pending by
 // handleDailyText, so this only finalises it. An entry-save failure falls
@@ -529,10 +622,9 @@ export async function handleInterpreterText(env, o, ctx) {
   const finalize = (kind) => { if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; return finalizeMessageKind(env, o.entryMessageId, userId, kind); } return Promise.resolve({ ok: false }); };
   return interpretAndExecute(env, o, ctx, text, o.entryMessageId ?? null, finalize);
 }
-// Interpreter callbacks: type choice, note delete/change, task-note/cancel,
-// project choice. Owner-checked; expired records get the fixed message.
-// Interpreter callbacks, 0-b set: type choice and note delete. Task card,
-// change-type, and project choice are 0-b2; their buttons do not exist yet.
+// Interpreter callbacks: type choice, note delete, and (0-b2) external
+// backup. Owner-checked; expired records get the fixed message. Task card,
+// change-type, and project choice are 0-b3; their buttons do not exist yet.
 export async function resolveInterpCallback(env, o) {
   // Retry (Phase 0-b fix): callback_data retry:{pending D1 row id}. The row
   // id is used — not the Telegram message id — because the button must sit
@@ -558,9 +650,24 @@ export async function resolveInterpCallback(env, o) {
     await interpretAndExecute(env, oo, ctx, row.row.content, rowId, finalize);
     return true;
   }
-  const m = /^interp:(type|del):(.+)$/.exec(o.data);
+  const m = /^interp:(type|del|backup):(.+)$/.exec(o.data);
   if (!m) return false;
   const [, action, rest] = m;
+  // External backup (0-b2): user tap only. The record is kept, not
+  // deleted: on backup failure a fresh type-button message is sent, and
+  // the old buttons were already cleared by editMarkup below.
+  if (action === "backup") {
+    const rec = await getKv(env, interpKey(rest));
+    if (!rec) { await o.send(EXPIRED_TEXT); return true; }
+    if (Number(rec.owner) !== Number(o.fromId)) return true;
+    if (!rec.text?.trim()) { await o.send("متن پیام پیدا نشد؛ لطفاً پیام را دوباره بفرست:"); return true; }
+    if (o.editMarkup) await o.editMarkup();
+    const rowId = Number(rec.rowId) || null;
+    let done = false;
+    const finalize = (kind) => { if (!rowId || done) return Promise.resolve({ ok: false }); done = true; return finalizeMessageKind(env, rowId, o.fromId, kind); };
+    await runBackupInterpretation(env, o, rec.text, rowId, finalize);
+    return true;
+  }
   if (action === "type") {
     const tm = /^(\w+):(.+)$/.exec(rest);
     if (!tm) return true;
