@@ -1366,7 +1366,7 @@ if (DatabaseSync) {
   }
 }
 
-import { transcribeWithGemini, handleVoice, VOICE_FAILED_TEXT, VOICE_TOO_LONG_TEXT } from "../src/voice.js";
+import { transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT, VOICE_TOO_LONG_TEXT } from "../src/voice.js";
 
 // ── Voice input v1: Telegram voice -> Gemini 3.5-transcribe -> plain-text path ──
 if (DatabaseSync) {
@@ -1445,6 +1445,48 @@ if (DatabaseSync) {
     const m = mockVoiceFetch("سلام", { pollState: "PROCESSING" });
     const r = await transcribeWithGemini(mkEnv(), new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0, maxPolls: 2 });
     check(r.ok === false && r.reason === "not-active" && m.deleted() === true, "voice: file never ACTIVE -> failure, uploaded file still deleted");
+  }
+  // 0-b3 voice Retry: file id stashed at receipt (1h TTL, owner-scoped).
+  {
+    const env = mkEnv(), s = fakeSend(); mockVoiceFetch("سلام", { failInteractions: true });
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async () => {} });
+    const retryBtn = (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
+    check(r === "failed" && !!retryBtn, "0-b3 voice: failure message carries a Retry button");
+    const stashId = retryBtn.slice("voice:retry:".length);
+    const sF = fakeSend();
+    const rF = await handleVoiceRetry(env, { userId: 4243, stashId, send: sF.send, route: async () => {}, editMarkup: async () => {} });
+    check(rF === "forbidden" && sF.sent.length === 0, "0-b3 voice: Retry by another user is silent");
+    mockVoiceFetch("یادداشت کن جلسه تازه");
+    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); }, editMarkup: async () => {} });
+    check(r2 === "routed" && rows("SELECT COUNT(*) AS n FROM notes WHERE text = 'جلسه تازه' AND source = 'voice'")[0].n === 1, "0-b3 voice: Retry re-transcribes and enters the normal path");
+    const s2 = fakeSend();
+    const r3 = await handleVoiceRetry(env, { userId: 4242, stashId, send: s2.send, route: async () => {}, editMarkup: async () => {} });
+    check(r3 === "missing" && s2.sent.length === 1 && s2.sent[0].text === VOICE_FAILED_TEXT, "0-b3 voice: consumed stash yields the clear resend message");
+  }
+  // 0-b3 fix: a retry that fails again still offers a usable Retry button.
+  {
+    const env = mkEnv(), s = fakeSend(); mockVoiceFetch("سلام", { failInteractions: true });
+    await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async () => {} });
+    const retryBtn = (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
+    const stashId = retryBtn.slice("voice:retry:".length);
+    const s2 = fakeSend();
+    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, send: s2.send, route: async () => {}, editMarkup: async () => {} });
+    const retryBtn2 = (s2.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
+    check(r2 === "failed" && retryBtn2 === `voice:retry:${stashId}` && (await env.STATE.get(`voice:stash:${stashId}`, "json")) !== null, "0-b3 fix: transcription-failing retry yields a usable Retry button, stash kept");
+    mockVoiceFetch("یادداشت کن جلسه دوباره");
+    const r3 = await handleVoiceRetry(env, { userId: 4242, stashId, send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); }, editMarkup: async () => {} });
+    check(r3 === "routed" && rows("SELECT COUNT(*) AS n FROM notes WHERE text = 'جلسه دوباره' AND source = 'voice'")[0].n === 1, "0-b3 fix: retry succeeds after a failed retry");
+  }
+  {
+    // Same for a download-failing retry.
+    const env = mkEnv(), s = fakeSend(); mockVoiceFetch("سلام", { failGetFile: true });
+    await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async () => {} });
+    const retryBtn = (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
+    const stashId = retryBtn.slice("voice:retry:".length);
+    const s2 = fakeSend();
+    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, send: s2.send, route: async () => {}, editMarkup: async () => {} });
+    const retryBtn2 = (s2.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
+    check(r2 === "failed" && retryBtn2 === `voice:retry:${stashId}` && (await env.STATE.get(`voice:stash:${stashId}`, "json")) !== null, "0-b3 fix: download-failing retry yields a usable Retry button, stash kept");
   }
   global.fetch = origFetch;
 }
@@ -2337,7 +2379,7 @@ if (DatabaseSync) {
   {
     const env = mkEnv0b(), s = mkS();
     await handleDailyText(env, mkO(s, "کاری برای پروژه‌ی تازه", { interpreterCallFn: fakeInterp([act("task", { text: "کاری برای پروژه‌ی تازه", project: "پروژه‌ی تازه" })]) }));
-    check(btnData(s).filter((d) => d.startsWith("interp:type:")).length === 4, "0-b: unknown project yields type buttons, never auto-create");
+    check(btnData(s).some((d) => d.startsWith("interp:proj:")), "0-b3: unknown project yields the project-choice card, never auto-create");
     check(rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'کاری برای پروژه‌ی تازه'")[0].n === 0, "0-b: task is not silently stored as a note");
   }
   // Multi-action: one summary with both items. (Per-note delete buttons: 0-b2.)
@@ -2499,6 +2541,144 @@ if (DatabaseSync) {
     const counting = async () => { calls++; return JSON.stringify([act("note", { text: "نباید برسد" })]); };
     await handleDailyText(env, mkO(s, "پیام بعد از سهمیه", { interpreterCallFn: counting }));
     check(calls === 0, "0-b2: quota flag suppresses Workers AI calls");
+  }
+  // ── Phase 0-b3: change-type, task card, project choice, correction, multi delete ──
+  {
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "پیام یادداشت", { interpreterCallFn: fakeInterp([act("note", { text: "خرج کردم ۵۰۰ تومان نان" })]) }));
+    const changeBtn = btnData(s).find((d) => d.startsWith("interp:change:"));
+    check(!!changeBtn, "0-b3: note card carries a change-type button");
+    const s2 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: changeBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
+    const expBtn = btnData(s2).find((d) => d.startsWith("interp:type:expense:"));
+    check(!!expBtn, "0-b3: change-type offers the type choices");
+    const expBefore = rows0b("SELECT COUNT(*) AS n FROM expenses")[0].n;
+    const s3 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: expBtn, send: s3.send, editMarkup: async () => {}, chat: s3.chat, nowMs: NOW0b });
+    check(btnData(s3).some((d) => d.startsWith("daily:confirm:")), "0-b3: change-type note->expense reaches confirm");
+    check(rows0b("SELECT COUNT(*) AS n FROM expenses")[0].n === expBefore, "0-b3: change-type expense never stored before Confirm");
+  }
+  {
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "پیام یادداشت دو", { interpreterCallFn: fakeInterp([act("note", { text: "یادداشت نگه‌داشتنی" })]) }));
+    const changeBtn = btnData(s).find((d) => d.startsWith("interp:change:"));
+    const s2 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: changeBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
+    const taskBtn = btnData(s2).find((d) => d.startsWith("interp:type:task:"));
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: taskBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
+    check(String(s2.sent.at(-1)?.text ?? "").includes("فاز ۱"), "0-b3: change-type note->task yields the honesty line");
+    check(rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت نگه‌داشتنی'")[0].n === 1, "0-b3: change-type task choice stores no note-as-task");
+  }
+  {
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "کاری برای پروژه‌ی تازه", { interpreterCallFn: fakeInterp([act("note", { text: "یادداشت پروژه‌ای", project: "پروژه‌ی تازه" })]) }));
+    const projBtn = btnData(s).find((d) => d.startsWith("interp:proj:2:"));
+    check(!!projBtn && String(s.sent.at(-1)?.text ?? "").includes("پروژه‌ی تازه"), "0-b3: unknown project yields the project-choice card");
+    const s2 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: projBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
+    check(rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت پروژه‌ای'")[0].n === 1, "0-b3: project-choice re-entry stores with the chosen project");
+  }
+  {
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "یادداشت اول", { interpreterCallFn: fakeInterp([act("note", { text: "متن اول" })]) }));
+    await handleDailyText(env, mkO(s, "اصلاحش کن", { interpreterCallFn: fakeInterp([act("correction", { text: "متن اصلاح‌شده" })]) }));
+    check(rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'متن اصلاح‌شده'")[0].n === 1 && rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'متن اول'")[0].n === 0, "0-b3: correction within TTL edits the note");
+    const env2 = mkEnv0b(), s2 = mkS();
+    await handleDailyText(env2, mkO(s2, "اصلاح بدون مورد", { interpreterCallFn: fakeInterp([act("correction", { text: "متن تازه" })]) }));
+    check(String(s2.sent.at(-1)?.text ?? "").includes("۱۰ دقیقه") && rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'متن تازه'")[0].n === 0, "0-b3: correction outside TTL edits nothing");
+  }
+  {
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "دو تا یادداشت", { interpreterCallFn: fakeInterp([act("note", { text: "مورد الف" }), act("note", { text: "مورد ب" })]) }));
+    const delBtns = btnData(s).filter((d) => d.startsWith("interp:del:"));
+    check(delBtns.length === 2, "0-b3: multi-action summary carries one delete button per note");
+    const s2 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: delBtns[0], send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
+    check(rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'مورد الف'")[0].n === 0 && rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'مورد ب'")[0].n === 1, "0-b3: multi delete removes only that note");
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: delBtns[0], send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
+    check(String(s2.sent.at(-1)?.text ?? "") === "قبلاً ثبت شد یا مهلتش گذشته", "0-b3: double delete is a no-op with the fixed message");
+  }
+  {
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "تسک من", { interpreterCallFn: fakeInterp([act("task", { text: "گزارش را بفرستم", project: "گلبهار" })]) }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("ذخیره با فاز ۱ می‌آید") && btnData(s).some((d) => d.startsWith("interp:taskdismiss:")), "0-b3: task action yields a presentation-only card");
+    const disBtn = btnData(s).find((d) => d.startsWith("interp:taskdismiss:"));
+    const s2 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: disBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
+    check(String(s2.sent.at(-1)?.text ?? "").includes("کنار گذاشته شد"), "0-b3: task card dismiss stores nothing");
+  }
+  // ── Phase 0-b3 fix: correction never INSERTs, note-delete checked ──
+  {
+    // Fix 1: update failure -> failed, read failure -> failed, deleted
+    // target -> missing; none of them inserts a new expense.
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "خرج کردم ۵۰۰ تومان کتاب اصلاحی"));
+    const cBtn = btnData(s).find((d) => d.startsWith("daily:confirm:"));
+    await resolveDailyCallback(env, { fromId: 4242, chatId: 4242, data: cBtn, send: s.send, editMarkup: async () => {}, chat: s.chat, nowMs: NOW0b });
+    const target = rows0b("SELECT id FROM expenses WHERE item = 'کتاب اصلاحی'")[0].id;
+    const sC = mkS();
+    await handleDailyText(env, mkO(sC, "اصلاحش کن", { interpreterCallFn: fakeInterp([act("correction", { text: "خرج کردم ۸۰۰ تومان کتاب اصلاحی" })]) }));
+    const corrId = sC.sent.flatMap((m) => m.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("daily:confirm:"))?.split(":")[2];
+    check(!!corrId, "0-b3 fix: correction yields a confirm card");
+    const updFailEnv = { ...env, DB: { prepare(sql) { if (String(sql).includes("UPDATE expenses")) throw new Error("boom"); return d1b.prepare(sql); } } };
+    const rUpd = await confirmExpenseDraft(updFailEnv, 4242, corrId);
+    check(rUpd.status === "failed" && rows0b("SELECT amount FROM expenses WHERE id = ?", [target])[0].amount === 500 && (await env.STATE.get(`daily:draft:${corrId}`, "json")) !== null, "0-b3 fix: correction update failure -> failed, original kept, draft kept");
+    const readFailEnv = { ...env, DB: { prepare() { throw new Error("boom"); } } };
+    const rRead = await confirmExpenseDraft(readFailEnv, 4242, corrId);
+    check(rRead.status === "failed" && rows0b("SELECT COUNT(*) AS n FROM expenses WHERE item = 'کتاب اصلاحی'")[0].n === 1, "0-b3 fix: correction read failure -> failed, no new expense");
+    sqlite0b.prepare("DELETE FROM expenses WHERE id = ?").run(target);
+    const rMiss = await confirmExpenseDraft(env, 4242, corrId);
+    check(rMiss.status === "missing" && rows0b("SELECT COUNT(*) AS n FROM expenses WHERE item = 'کتاب اصلاحی'")[0].n === 0, "0-b3 fix: deleted correction target -> missing, no new expense");
+    // Malformed corrects: table set but id missing/invalid -> missing,
+    // never the normal INSERT path.
+    await env.STATE.put("daily:draft:badnull", JSON.stringify({ owner: 4242, type: "expense", amount: 100, currency: "TOMAN", item: "بدون شناسه", date: "2026-10-31", corrects: { table: "expenses", id: null } }));
+    await env.STATE.put("daily:draft:badstr", JSON.stringify({ owner: 4242, type: "expense", amount: 100, currency: "TOMAN", item: "بدون شناسه", date: "2026-10-31", corrects: { table: "expenses", id: "abc" } }));
+    const rBadNull = await confirmExpenseDraft(env, 4242, "badnull");
+    const rBadStr = await confirmExpenseDraft(env, 4242, "badstr");
+    check(rBadNull.status === "missing" && rBadStr.status === "missing" && rows0b("SELECT COUNT(*) AS n FROM expenses WHERE item = 'بدون شناسه'")[0].n === 0, "0-b3 fix: malformed corrects id -> missing, no INSERT");
+  }
+  {
+    // Fix 2a: note DELETE failure at Confirm -> failed, draft kept,
+    // expense kept once; retry succeeds once, note gone, no duplicate.
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "پیام یادداشت سه", { interpreterCallFn: fakeInterp([act("note", { text: "خرج کردم ۷۰۰ تومان چای اصلاحی" })]) }));
+    const changeBtn = btnData(s).find((d) => d.startsWith("interp:change:"));
+    const s2 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: changeBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
+    const expBtn = btnData(s2).find((d) => d.startsWith("interp:type:expense:"));
+    const s3 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: expBtn, send: s3.send, editMarkup: async () => {}, chat: s3.chat, nowMs: NOW0b });
+    const confId = btnData(s3).find((d) => d.startsWith("daily:confirm:"))?.split(":")[2];
+    const failDelEnv = { ...env, DB: { prepare(sql) { if (String(sql).includes("DELETE FROM notes")) throw new Error("boom"); return d1b.prepare(sql); } } };
+    const rFail = await confirmExpenseDraft(failDelEnv, 4242, confId);
+    check(rFail.status === "failed" && rows0b("SELECT COUNT(*) AS n FROM expenses WHERE item = 'چای اصلاحی'")[0].n === 1 && rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'خرج کردم ۷۰۰ تومان چای اصلاحی'")[0].n === 1 && (await env.STATE.get(`daily:draft:${confId}`, "json")) !== null, "0-b3 fix: note DELETE failure -> failed, draft kept, expense once, note kept");
+    const rOk = await confirmExpenseDraft(env, 4242, confId);
+    check(rOk.status === "ok" && rows0b("SELECT COUNT(*) AS n FROM expenses WHERE item = 'چای اصلاحی'")[0].n === 1 && rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'خرج کردم ۷۰۰ تومان چای اصلاحی'")[0].n === 0 && (await env.STATE.get(`daily:draft:${confId}`, "json")) === null, "0-b3 fix: retry after DELETE failure succeeds once, note gone");
+  }
+  {
+    // Fix 2b: note DELETE failure on note->chat -> no chat, clear failure.
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "پیام یادداشت چهار", { interpreterCallFn: fakeInterp([act("note", { text: "یادداشت چتی" })]) }));
+    const changeBtn = btnData(s).find((d) => d.startsWith("interp:change:"));
+    const s2 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: changeBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
+    const chatBtn = btnData(s2).find((d) => d.startsWith("interp:type:chat:"));
+    const failDelEnv = { ...env, DB: { prepare(sql) { if (String(sql).includes("DELETE FROM notes")) throw new Error("boom"); return d1b.prepare(sql); } } };
+    const s3 = mkS();
+    await resolveInterpCallback(failDelEnv, { fromId: 4242, chatId: 4242, data: chatBtn, send: s3.send, editMarkup: async () => {}, chat: s3.chat, nowMs: NOW0b });
+    check(s3.chats.length === 0 && String(s3.sent.at(-1)?.text ?? "").includes("ذخیره نشد") && rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت چتی'")[0].n === 1, "0-b3 fix: note->chat DELETE failure -> no chat, note kept, clear failure");
+  }
+  {
+    // Fix 3: unextractable amount stops the conversion, note untouched.
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "پیام یادداشت پنج", { interpreterCallFn: fakeInterp([act("note", { text: "یادداشت بدون مبلغ" })]) }));
+    const changeBtn = btnData(s).find((d) => d.startsWith("interp:change:"));
+    const s2 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: changeBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
+    const expBtn = btnData(s2).find((d) => d.startsWith("interp:type:expense:"));
+    const s3 = mkS();
+    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: expBtn, send: s3.send, editMarkup: async () => {}, chat: s3.chat, nowMs: NOW0b });
+    check(String(s3.sent.at(-1)?.text ?? "").includes("قابل استخراج نیست") && !btnData(s3).some((d) => d.startsWith("daily:confirm:")) && rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت بدون مبلغ'")[0].n === 1, "0-b3 fix: unextractable amount stops conversion, note kept, no confirm");
   }
 }
 

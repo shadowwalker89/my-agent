@@ -9,13 +9,13 @@ export async function tgApi(env, method, body) {
   return await res.json();
 }
 
-export async function tgSend(env, chatId, text) {
+export async function tgSend(env, chatId, text, opts) {
   if (!env.TG_TOKEN) return;
   try {
     await fetch(`${TG_API}/bot${env.TG_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text }),
+      body: JSON.stringify({ chat_id: chatId, text, ...(opts?.replyMarkup ? { reply_markup: opts.replyMarkup } : {}) }),
     });
   } catch (err) {
     console.error("sendMessage failed:", err && err.message);

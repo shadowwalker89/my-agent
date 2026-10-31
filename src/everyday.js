@@ -46,6 +46,9 @@ function askKey(id) { return `daily:ask:${id}`; }
 // (a stable identifier like "note-text", never a Persian-text comparison) and
 // pendingBody (a body already known while a language ask is pending).
 function pendingKey(id) { return `daily:pending-ask:${id}`; }
+// Correction pointer (0-b3): last created item, 10-minute TTL via putKv.
+// {table: "notes"|"expenses", id}: only tables that exist pre-0003.
+function correctionKey(id) { return `interp:last-item:${id}`; }
 async function setPendingAsk(env, userId, question, askId, kind, pendingBody) {
   const value = { question };
   if (askId) value.askId = askId;
@@ -100,15 +103,45 @@ export async function startConfirm(env, o, type, ex) {
   return id;
 }
 
-// Confirm: insert FIRST, delete the KV draft ONLY after success.
+// Confirm: insert FIRST, delete the KV draft ONLY after success. A draft
+// carrying corrects:{table,id} (0-b3 correction) is strictly an UPDATE: a
+// missing target returns "missing" and a read/update failure "failed" —
+// it must never fall through to INSERT (a deleted target must not
+// silently become a new expense). A draft carrying noteId (change-type)
+// deletes that note row after the expense insert, and reports failure
+// (draft kept for retry) if the delete fails. Returns the expense row id
+// for the correction pointer.
 export async function confirmExpenseDraft(env, userId, id) {
   const draft = await getKv(env, draftKey(id));
   if (!draft) return { status: "missing" };
   if (Number(draft.owner) !== Number(userId)) return { status: "forbidden" };
-  const r = await runDb(env, "INSERT OR IGNORE INTO expenses (user_id, type, amount, currency_code, item, category, date, draft_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [userId, draft.type, draft.amount, draft.currency, draft.item || null, null, draft.date, id, new Date().toISOString()]);
-  if (!r.ok) return { status: "failed" };
+  let expenseId = null;
+  if (draft.corrects?.table === "expenses") {
+    // Strict correction contract: a corrects table without a valid id
+    // returns "missing" — it must never fall through to INSERT.
+    if (!Number.isInteger(draft.corrects.id) || draft.corrects.id <= 0) return { status: "missing" };
+    const old = await firstDb(env, "SELECT id FROM expenses WHERE id = ? AND user_id = ?", [draft.corrects.id, userId]);
+    if (!old.ok) return { status: "failed" };
+    if (!old.row) return { status: "missing" };
+    const r = await runDb(env, "UPDATE expenses SET type = ?, amount = ?, currency_code = ?, item = ?, date = ? WHERE id = ? AND user_id = ?", [draft.type, draft.amount, draft.currency, draft.item || null, draft.date, draft.corrects.id, userId]);
+    if (!r.ok) return { status: "failed" };
+    expenseId = draft.corrects.id;
+  }
+  if (expenseId === null) {
+    const r = await runDb(env, "INSERT OR IGNORE INTO expenses (user_id, type, amount, currency_code, item, category, date, draft_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [userId, draft.type, draft.amount, draft.currency, draft.item || null, null, draft.date, id, new Date().toISOString()]);
+    if (!r.ok) return { status: "failed" };
+    const row = await firstDb(env, "SELECT id FROM expenses WHERE draft_id = ?", [id]);
+    expenseId = row.ok && row.row ? row.row.id : null;
+  }
+  if (draft.noteId) {
+    // Change-type replaces the note: if its delete fails, do not report
+    // success — keep the draft so Confirm can be retried (INSERT OR IGNORE
+    // on draft_id makes the retry a no-op for the expense row).
+    const d = await runDb(env, "DELETE FROM notes WHERE id = ? AND user_id = ?", [draft.noteId, userId]);
+    if (!d.ok) return { status: "failed" };
+  }
   await delKv(env, draftKey(id));
-  return { status: "ok", draft };
+  return { status: "ok", draft, id: expenseId };
 }
 
 // Save-first reconciliation (Phase 0-b fix): when handleDailyText saved an
@@ -417,11 +450,11 @@ function interpKey(id) { return `interp:${id}`; }
 function interpTypeKeyboard(id) {
   return [[{ text: "📋 تسک", callback_data: `interp:type:task:${id}` }, { text: "📝 یادداشت", callback_data: `interp:type:note:${id}` }], [{ text: "💰 خرج", callback_data: `interp:type:expense:${id}` }, { text: "💬 چت", callback_data: `interp:type:chat:${id}` }]];
 }
-function noteCardKeyboard(id) { return [[{ text: "🗑 لغو", callback_data: `interp:del:${id}` }]]; }
+function noteCardKeyboard(id) { return [[{ text: "🔄 تغییر نوع", callback_data: `interp:change:${id}` }, { text: "🗑 لغو", callback_data: `interp:del:${id}` }]]; }
 async function newInterpRecord(env, userId, value) { const id = newId(); await putKv(env, interpKey(id), { owner: userId, ...value }); return id; }
 async function insertNoteRow(env, userId, text, source) {
   const db = dbOf(env); if (!db) return { ok: false, id: null };
-  try { await db.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)").bind(userId, text, source, new Date().toISOString()).run(); const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first(); return { ok: true, id: row?.id ?? null }; } catch { return { ok: false, id: null }; }
+  try { await db.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)").bind(userId, text, source, new Date().toISOString()).run(); const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first(); const id = row?.id ?? null; if (id) await putKv(env, correctionKey(userId), { table: "notes", id }); return { ok: true, id }; } catch { return { ok: false, id: null }; }
 }
 function rangeForPeriod(periodText, nowMs) {
   const t = normalizeText(periodText ?? ""), today = iranDate(nowMs);
@@ -441,10 +474,33 @@ async function executeInterpAction(env, o, ctx, action, resolved) {
     if (!r.ok) return { line: `📝 یادداشت: ${action.text} — ${NOT_SAVED_TEXT}` };
     return { line: `📝 یادداشت: ${action.text}`, note: { id: r.id, text: action.text }, kind: "daily" };
   }
-  // 0-b2: task card, correction, and project choice. Until then a task or
-  // correction action gets this honest line — never a silent note store.
-  if (action.type === "task") return { line: "تسک‌ها با فاز ۱ می‌آیند.", kind: "daily" };
-  if (action.type === "correction") return { line: "اصلاح با فاز ۱ می‌آید.", kind: "daily" };
+  // 0-b3 task card (presentation only): no tasks table until migration
+  // 0003, so a task is never stored — the card says so plainly.
+  if (action.type === "task") {
+    const parts = [`📋 تسک: ${action.text}`, `پروژه: ${resolved.project ?? "عمومی"}`];
+    if (resolved.due_at) parts.push(`سررسید: ${resolved.due_at}`);
+    if (resolved.remind_at) parts.push(`یادآوری: ${resolved.remind_at}`);
+    return { line: `${parts.join(" — ")} — ذخیره با فاز ۱ می‌آید.`, taskCard: { text: action.text }, kind: "daily" };
+  }
+  // 0-b3 correction: edits the last created item within 10 minutes (KV
+  // pointer). Notes edit in place; expenses go through the confirm card
+  // with corrects, so Confirm replaces the old row instead of duplicating.
+  if (action.type === "correction") {
+    const ptr = await getKv(env, correctionKey(userId));
+    if (!ptr || (ptr.table !== "notes" && ptr.table !== "expenses")) return { line: "موردی برای اصلاح در ۱۰ دقیقه‌ی اخیر پیدا نشد؛ مورد را دوباره بفرست.", kind: "daily" };
+    if (ptr.table === "notes") {
+      const old = await firstDb(env, "SELECT id FROM notes WHERE id = ? AND user_id = ?", [ptr.id, userId]);
+      if (!old.ok || !old.row) return { line: "موردی برای اصلاح در ۱۰ دقیقه‌ی اخیر پیدا نشد؛ مورد را دوباره بفرست.", kind: "daily" };
+      const r = await runDb(env, "UPDATE notes SET text = ? WHERE id = ? AND user_id = ?", [action.text, ptr.id, userId]);
+      if (!r.ok) return { line: NOT_SAVED_TEXT, kind: "daily" };
+      await putKv(env, correctionKey(userId), { table: "notes", id: ptr.id });
+      return { line: `✅ یادداشت اصلاح شد: ${action.text}`, kind: "daily" };
+    }
+    const ex = parseExpense(action.text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, action.text);
+    if (ex?.error) return { line: `💰 ${action.text} — مبلغ را دوباره بگو؟`, kind: "daily" };
+    await startConfirm(env, o, "expense", { ...ex, corrects: { table: "expenses", id: ptr.id } });
+    return { line: `💰 خرج: ${ex.amount} ${ex.currency}${ex.item ? ` — ${ex.item}` : ""} (در انتظار تایید)`, direct: true, kind: "daily" };
+  }
   if (action.type === "expense" || action.type === "income") {
     const ex = parseExpense(action.text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, action.text);
     if (ex?.error || ex.amount !== resolved.amount || ex.currency !== resolved.currency) return { line: `💰 ${action.text} — مبلغ را دوباره بگو؟`, kind: "daily" };
@@ -477,27 +533,48 @@ async function executeInterpAction(env, o, ctx, action, resolved) {
   if (action.type === "chat") { await o.chat(o.text, { saveText: "" }); return { line: "💬 چت", direct: true, kind: "chat" }; }
   return { line: "⏭ موردی اجرا نشد.", kind: "daily" };
 }
-// Validate + execute actions per v3 3.5 (0-b slice: task/correction/project
-// choice arrive in 0-b2; here they get honest lines or type buttons).
+// Validate + execute actions per v3 3.5. A lone "project" validation error
+// yields the 0-b3 project-choice card (never auto-create); other skips get
+// type buttons (single) or a skipped line (multi).
 export async function runInterpPolicy(env, o, ctx, actions, finalize) {
   const outcomes = [];
   for (const a of actions) {
     const v = validateInterpreterAction(a, { projects: SEED_PROJECTS, nowMs: ctx.now, defaultCurrency: ctx.remembered });
+    if (!v.ok && v.errors.length === 1 && v.errors[0] === "project") { outcomes.push({ projectChoice: true, action: a, unknown: a.type === "query" && a.query ? a.query.project : a.project }); continue; }
     if (!v.ok || a.confidence < 0.6 || a.needs !== "none") { outcomes.push({ skipped: true, action: a, errors: v.errors ?? [] }); continue; }
     outcomes.push(await executeInterpAction(env, o, ctx, a, v.resolved));
   }
   if (actions.length === 1) {
     const one = outcomes[0];
-    // Unknown project falls to type buttons in 0-b; the choice card is 0-b2.
+    if (one.projectChoice) {
+      await finalize("daily");
+      const id = await newInterpRecord(env, o.userId, { text: o.text, action: one.action });
+      const rows = SEED_PROJECTS.map((p, i) => [{ text: p.name, callback_data: `interp:proj:${i}:${id}` }]);
+      rows.push([{ text: "➕ پروژه‌ی جدید", callback_data: `interp:proj:new:${id}` }]);
+      await o.send(`پروژه‌ی «${one.unknown}» را نمی‌شناسم؛ پروژه‌ی جدید است یا یکی از موجودها؟`, { replyMarkup: { inline_keyboard: rows } });
+      return "handled";
+    }
     if (one.skipped) { await finalize("daily"); const id = await newInterpRecord(env, o.userId, { text: o.text }); await o.send("نوعش را بگو:", { replyMarkup: { inline_keyboard: interpTypeKeyboard(id) } }); return "handled"; }
     if (one.direct) { await finalize(one.kind); return "handled"; }
     if (one.note) { await finalize("daily"); const id = await newInterpRecord(env, o.userId, { table: "notes", id: one.note.id, text: one.note.text }); await o.send("✅ یادداشت ذخیره شد.", { replyMarkup: { inline_keyboard: noteCardKeyboard(id) } }); return "handled"; }
+    if (one.taskCard) {
+      await finalize("daily");
+      const id = await newInterpRecord(env, o.userId, { task: true, text: one.taskCard.text });
+      await o.send(one.line, { replyMarkup: { inline_keyboard: [[{ text: "🔄 تغییر نوع", callback_data: `interp:changetask:${id}` }, { text: "🗑 کنار گذاشتن", callback_data: `interp:taskdismiss:${id}` }]] } });
+      return "handled";
+    }
     await finalize("daily");
     await o.send(one.line);
     return "handled";
   }
   await finalize("daily");
-  await o.send(outcomes.map((r) => r.line).join("\n"));
+  const keyboard = [];
+  let n = 0;
+  for (const r of outcomes) {
+    if (r.note) { n++; const id = await newInterpRecord(env, o.userId, { table: "notes", id: r.note.id, text: r.note.text, multi: true }); keyboard.push([{ text: `🗑 یادداشت ${n}`, callback_data: `interp:del:${id}` }]); }
+  }
+  const lines = outcomes.map((r) => r.line ?? (r.projectChoice ? `⏭ پروژه شناخته نشد: ${r.unknown}` : "⏭ موردی اجرا نشد."));
+  await o.send(lines.join("\n"), keyboard.length ? { replyMarkup: { inline_keyboard: keyboard } } : undefined);
   return "handled";
 }
 // Shared interpreter run (initial + retry): prompt -> interpret -> policy.
@@ -622,10 +699,53 @@ export async function handleInterpreterText(env, o, ctx) {
   const finalize = (kind) => { if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; return finalizeMessageKind(env, o.entryMessageId, userId, kind); } return Promise.resolve({ ok: false }); };
   return interpretAndExecute(env, o, ctx, text, o.entryMessageId ?? null, finalize);
 }
-// Interpreter callbacks: type choice, note delete, and (0-b2) external
-// backup. Owner-checked; expired records get the fixed message. Task card,
-// change-type, and project choice are 0-b3; their buttons do not exist yet.
+// Interpreter callbacks: type choice, note delete, external backup,
+// and (0-b3) change-type, task card, and project choice. Owner-checked;
+// expired records get the fixed message.
 export async function resolveInterpCallback(env, o) {
+  // 0-b3 project choice: re-run the stored action with the chosen seed
+  // project; "new" never auto-creates (projects arrive with Phase 1-a).
+  const pm = /^interp:proj:(new|\d+):(.+)$/.exec(o.data);
+  if (pm) {
+    const rec = await getKv(env, interpKey(pm[2]));
+    if (!rec) { await o.send(EXPIRED_TEXT); return true; }
+    if (Number(rec.owner) !== Number(o.fromId)) return true;
+    await delKv(env, interpKey(pm[2]));
+    if (o.editMarkup) await o.editMarkup();
+    if (pm[1] === "new" || !rec.action) { await o.send("پروژه‌های تازه با فاز ۱ می‌آیند؛ فعلاً از پروژه‌های موجود یکی را بگو."); return true; }
+    const seed = SEED_PROJECTS[Number(pm[1])];
+    if (!seed) { await o.send(EXPIRED_TEXT); return true; }
+    const a2 = seed && rec.action.query ? { ...rec.action, query: { ...rec.action.query, project: seed.name } } : { ...rec.action, project: seed.name };
+    const ctx = { now: o.nowMs ?? Date.now(), remembered: await getDefaultCurrency(env, o.fromId) };
+    await runInterpPolicy(env, { ...o, userId: o.fromId, text: rec.text }, ctx, [a2], async () => {});
+    return true;
+  }
+  // 0-b3 task card buttons: change re-routes via the type flow; dismiss
+  // drops the card (nothing was stored).
+  const tm = /^interp:(changetask|taskdismiss):(.+)$/.exec(o.data);
+  if (tm) {
+    const rec = await getKv(env, interpKey(tm[2]));
+    if (!rec) { await o.send(EXPIRED_TEXT); return true; }
+    if (Number(rec.owner) !== Number(o.fromId)) return true;
+    await delKv(env, interpKey(tm[2]));
+    if (o.editMarkup) await o.editMarkup();
+    if (tm[1] === "taskdismiss") { await o.send("باشه، تسک کنار گذاشته شد؛ ذخیره با فاز ۱ می‌آید."); return true; }
+    const id = await newInterpRecord(env, o.fromId, { text: rec.text });
+    await o.send("نوعش را بگو:", { replyMarkup: { inline_keyboard: interpTypeKeyboard(id) } });
+    return true;
+  }
+  // 0-b3 change-type on a stored note card: offer the type choices for
+  // that note's text; the type handler below applies change semantics.
+  const cm = /^interp:change:(.+)$/.exec(o.data);
+  if (cm) {
+    const rec = await getKv(env, interpKey(cm[1]));
+    if (!rec || rec.table !== "notes") { await o.send(EXPIRED_TEXT); return true; }
+    if (Number(rec.owner) !== Number(o.fromId)) return true;
+    if (o.editMarkup) await o.editMarkup();
+    const id = await newInterpRecord(env, o.fromId, { text: rec.text, changeNoteId: rec.id });
+    await o.send("نوعش را بگو:", { replyMarkup: { inline_keyboard: interpTypeKeyboard(id) } });
+    return true;
+  }
   // Retry (Phase 0-b fix): callback_data retry:{pending D1 row id}. The row
   // id is used — not the Telegram message id — because the button must sit
   // inside the failure message itself, whose id is unknowable before it is
@@ -682,6 +802,22 @@ export async function resolveInterpCallback(env, o) {
     if (o.editMarkup) await o.editMarkup();
     const ctx = { now: o.nowMs ?? Date.now(), remembered: await getDefaultCurrency(env, o.fromId) };
     const oo = { ...o, userId: o.fromId, text: rec.text };
+    // 0-b3 change-type semantics: the note is the item being re-typed.
+    // task -> honesty (note kept, it cannot become a task yet); note ->
+    // no-op (it already is one); expense -> confirm, and Confirm deletes
+    // the note (a delete failure reports failure and keeps the draft);
+    // chat -> note deleted first, chat only if the delete succeeds;
+    // unextractable amount -> conversion stops, note kept (0-b3 fix: no
+    // amount ask, which would have lost the note association).
+    // intent_feedback recording waits for migration 0003 (Phase 1-a).
+    if (rec.changeNoteId) {
+      if (choice === "task") { await o.send("تسک‌ها با فاز ۱ می‌آیند."); return true; }
+      if (choice === "note") { await o.send("این مورد همین حالا یادداشت است."); return true; }
+      if (choice === "chat") { const d = await runDb(env, "DELETE FROM notes WHERE id = ? AND user_id = ?", [rec.changeNoteId, o.fromId]); if (!d.ok) { await o.send(NOT_SAVED_TEXT); return true; } await o.chat(rec.text, { saveText: "" }); return true; }
+      const ex = parseExpense(rec.text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, rec.text);
+      if (ex?.error) { await o.send("مبلغ از متن یادداشت قابل استخراج نیست؛ تبدیل متوقف شد و یادداشت دست‌نخورده باقی ماند."); return true; }
+      await startConfirm(env, oo, "expense", { ...ex, noteId: rec.changeNoteId }); return true;
+    }
     if (choice === "task") { await o.send("تسک‌ها با فاز ۱ می‌آیند."); return true; }
     if (choice === "note") { const r = await insertNoteRow(env, o.fromId, rec.text, "text"); if (r.ok) { const nid = await newInterpRecord(env, o.fromId, { table: "notes", id: r.id, text: r.text }); await o.send("✅ یادداشت ذخیره شد.", { replyMarkup: { inline_keyboard: noteCardKeyboard(nid) } }); } else await o.send(NOT_SAVED_TEXT); return true; }
     if (choice === "expense") {
@@ -695,7 +831,10 @@ export async function resolveInterpCallback(env, o) {
   if (!rec) { await o.send(EXPIRED_TEXT); return true; }
   if (Number(rec.owner) !== Number(o.fromId)) return true;
   await delKv(env, interpKey(rest));
-  if (o.editMarkup) await o.editMarkup();
+  // Multi-item delete buttons must survive for the other items: only a
+  // single-note card clears its message's markup. A second tap on the
+  // same button finds no record and gets the fixed expired message.
+  if (!rec.multi && o.editMarkup) await o.editMarkup();
   if (rec.table === "notes" && rec.id) await runDb(env, "DELETE FROM notes WHERE id = ? AND user_id = ?", [rec.id, o.fromId]);
   await o.send("🗑 حذف شد."); return true;
 }
@@ -762,6 +901,7 @@ export async function resolveDailyCallback(env, o) {
     if (r.status === "forbidden") return true;
     if (r.status === "missing") { await o.send(EXPIRED_TEXT); return true; }
     if (r.status === "failed") { await o.send(NOT_SAVED_TEXT); return true; }
+    if (action === "confirm" && r.id) await putKv(env, correctionKey(o.fromId), { table: "expenses", id: r.id });
     await o.editMarkup();
     await o.send(action === "confirm" ? "✅ ثبت شد." : "لغو شد.");
     return true;
