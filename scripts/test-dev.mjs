@@ -29,7 +29,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages } from "../src/db.js";
 import {
   getChatContext,
   getSetting,
@@ -1124,7 +1124,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, confirmExpenseDraft, runModelBranch, CHAT_CONTEXT_CHAR_LIMIT } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, confirmExpenseDraft, runModelBranch, CHAT_CONTEXT_CHAR_LIMIT } from "../src/everyday.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
   check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
@@ -1278,7 +1278,10 @@ if (DatabaseSync) {
     let modelText = null, saveText = null;
     const chatSpy = async (mt, copts) => { modelText = mt; saveText = copts?.saveText; };
     await handleDailyText(env, o(env, 4242, "ترجمه کن به انگلیسی سلام دنیا", { ...s, chat: chatSpy, nowMs: NOW }));
-    check(modelText === "سلام دنیا" && saveText === "ترجمه کن به انگلیسی سلام دنیا", `translate passes text + saveText: ${JSON.stringify({ modelText, saveText })}`);
+    // Save-first fix: the translate request is saved as the entry row (kind
+    // chat), so the chat call no longer carries it via saveText.
+    check(modelText === "سلام دنیا" && saveText === "", `translate passes text + empty saveText: ${JSON.stringify({ modelText, saveText })}`);
+    check(rows("SELECT COUNT(*) AS n FROM messages WHERE content = 'ترجمه کن به انگلیسی سلام دنیا' AND kind = 'chat'")[0].n === 1, "translate entry row saved as chat");
     await handleDailyText(env, o(env, 4242, "خرج کردم ۵۰۰ تومان نان", { ...s, nowMs: NOW }));
     const btn = s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
     await resolveDailyCallback(env, { fromId: 4242, chatId: 4242, messageId: 11, data: btn.find((d) => d.startsWith("daily:confirm:")), send: s.send, editMarkup: async () => {}, chat: async () => {} });
@@ -1326,7 +1329,8 @@ if (DatabaseSync) {
     await handleDailyText(env, o(env, 4242, "ترجمه کن به انگلیسی: سلام دنیا", { ...s, chat: chatSpy, nowMs: NOW }));
     check(modelText === "سلام دنیا", `translate text: ${JSON.stringify(modelText)}`);
     check(copts?.noHistory === true, `translate carries noHistory: ${JSON.stringify(copts)}`);
-    check(copts?.saveText === "ترجمه کن به انگلیسی: سلام دنیا", "translate still saves the full request as chat");
+    check(copts?.saveText === "", "translate chat call carries empty saveText under save-first");
+    check(rows("SELECT COUNT(*) AS n FROM messages WHERE content = 'ترجمه کن به انگلیسی: سلام دنیا' AND kind = 'chat'")[0].n === 1, "translate still saves the full request as chat (entry row)");
   }
   // Everyday fix 3: photo reference shows "عکس", a named document keeps its name.
   {
@@ -1351,9 +1355,13 @@ if (DatabaseSync) {
       check(rows("SELECT COUNT(*) AS n FROM messages WHERE tg_file_id = 'file-9'")[0].n === 1, "file message row saved");
       await sendTg(env, msgUpdate("/ping"));
       check(rows("SELECT COUNT(*) AS n FROM messages WHERE content = '/ping'")[0].n === 0, "command messages not in history");
-      const before = rows("SELECT COUNT(*) AS n FROM messages WHERE kind = 'chat'")[0].n;
+      // Save-first fix: a failed turn keeps only its entry row (kind chat);
+      // no assistant row is stored for a turn that never answered.
+      const beforeAssistant = rows("SELECT COUNT(*) AS n FROM messages WHERE role = 'assistant'")[0].n;
+      const beforeUser = rows("SELECT COUNT(*) AS n FROM messages WHERE role = 'user' AND content = 'سلام، چطوری؟'")[0].n;
       await sendTg(env, msgUpdate("سلام، چطوری؟"));
-      check(rows("SELECT COUNT(*) AS n FROM messages WHERE kind = 'chat'")[0].n === before, "failed model turn stores nothing");
+      check(rows("SELECT COUNT(*) AS n FROM messages WHERE role = 'assistant'")[0].n === beforeAssistant, "failed model turn stores no assistant row");
+      check(rows("SELECT COUNT(*) AS n FROM messages WHERE role = 'user' AND content = 'سلام، چطوری؟' AND kind = 'chat'")[0].n === beforeUser + 1, "failed model turn keeps only its save-first entry row");
     } finally { world.restore(); }
   }
 }
@@ -2244,6 +2252,154 @@ if (DatabaseSync) {
   check(vAction.ok && vAction.resolved.amount === 500 && vAction.resolved.currency === "TOMAN", "0-a: action validator composes amount resolution");
   const vBadProject = validateInterpreterAction({ type: "task", text: "کاری", project: "ناشناخته", confidence: 0.9, needs: "none" }, { projects, nowMs: NOW, defaultCurrency: "TOMAN" });
   check(!vBadProject.ok && vBadProject.errors.includes("project"), "0-a: action validator flags an unknown project");
+}
+
+// ── Phase 0-b interpreter wiring (store-first + core policy; cards in 0-b2) ──
+if (DatabaseSync) {
+  const sqlite0b = new DatabaseSync(":memory:");
+  sqlite0b.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite0b.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  const d1b = { prepare(sql) { const stmt = sqlite0b.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  const rows0b = (sql, params = []) => sqlite0b.prepare(sql).all(...params);
+  const mkEnv0b = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4243", DB: d1b, ...extra });
+  const NOW0b = Date.UTC(2026, 9, 31, 12, 0, 0); // 2026-10-31 15:30 Iran time
+  const act = (type, extra = {}) => ({ type, text: extra.text ?? "متن", project: extra.project ?? null, due_text: extra.due_text ?? null, remind_text: extra.remind_text ?? null, amount_text: extra.amount_text ?? null, query: extra.query ?? null, target: extra.target ?? null, confidence: extra.confidence ?? 0.9, needs: extra.needs ?? "none" });
+  const fakeInterp = (actions) => async () => JSON.stringify(actions);
+  const mkS = () => { const sent = []; const chats = []; return { sent, chats, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, chat: async (text, copts) => { chats.push({ text, copts }); } }; };
+  const mkO = (s, text, extra = {}) => ({ chatId: 4242, userId: 4242, text, send: s.send, chat: s.chat, nowMs: NOW0b, ...extra });
+  const btnData = (s) => s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+  // Fast money: confirm card, zero interpreter calls, nothing stored yet.
+  {
+    const env = mkEnv0b(), s = mkS();
+    let calls = 0;
+    const counting = async () => { calls++; return JSON.stringify([act("chat")]); };
+    const r = await handleDailyText(env, mkO(s, "خرج کردم ۵۰۰ تومان نان", { interpreterCallFn: counting }));
+    check(r === "handled", "0-b: fast money handled");
+    check(btnData(s).some((d) => d.startsWith("daily:confirm:")), "0-b: fast money reaches confirm");
+    check(calls === 0, "0-b: fast money makes zero interpreter calls");
+    check(rows0b("SELECT COUNT(*) AS n FROM expenses")[0].n === 0, "0-b: money never stored before confirm");
+  }
+  // Interpreter note: stored with a cancel button, row finalised daily,
+  // no pending row left. (Change-type and correction are 0-b2.)
+  {
+    const env = mkEnv0b(), s = mkS();
+    const r = await handleDailyText(env, mkO(s, "سلام، یک چیزی به ذهنم رسید", { interpreterCallFn: fakeInterp([act("note", { text: "متن یادداشت" })]) }));
+    check(r === "handled", "0-b: interpreter note handled");
+    check(s.sent.at(-1)?.text === "✅ یادداشت ذخیره شد.", "0-b: note confirmation text");
+    check(btnData(s).some((d) => d.startsWith("interp:del:")), "0-b: note stores with a cancel button");
+    check(rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'متن یادداشت'")[0].n === 1, "0-b: note row stored");
+    check(rows0b("SELECT COUNT(*) AS n FROM messages WHERE kind = 'pending'")[0].n === 0, "0-b: no pending row left behind");
+    check(rows0b("SELECT kind FROM messages WHERE content = 'سلام، یک چیزی به ذهنم رسید'")[0]?.kind === "daily", "0-b: store-first row finalised to daily");
+  }
+  // Interpreter chat: chat path only, row finalised to chat; a stray pending
+  // row is invisible to chat context (the SQL kind='chat' filter).
+  {
+    const env = mkEnv0b(), s = mkS();
+    const r = await handleDailyText(env, mkO(s, "سلام، چطوری؟", { interpreterCallFn: fakeInterp([act("chat", { text: "سلام، چطوری؟" })]) }));
+    check(r === "handled", "0-b: interpreter chat handled");
+    check(s.chats.length === 1 && s.chats[0].copts?.saveText === "", "0-b: chat action goes to chat path with no user-row save");
+    check(rows0b("SELECT kind FROM messages WHERE content = 'سلام، چطوری؟'")[0]?.kind === "chat", "0-b: chat action finalises to chat");
+    sqlite0b.prepare("INSERT INTO messages (user_id, role, content, kind) VALUES (4242, 'user', 'پیام ناتمام', 'pending')").run();
+    const ctxRows = await getChatMessages(d1b, 4242, 50);
+    check(!ctxRows.some((m) => m.content === "پیام ناتمام"), "0-b: pending rows excluded from chat context");
+  }
+  // Low confidence: type buttons, nothing stored.
+  {
+    const env = mkEnv0b(), s = mkS();
+    const before = rows0b("SELECT COUNT(*) AS n FROM notes")[0].n;
+    await handleDailyText(env, mkO(s, "چیزی مبهم", { interpreterCallFn: fakeInterp([act("chat", { confidence: 0.3 })]) }));
+    check(btnData(s).filter((d) => d.startsWith("interp:type:")).length === 4, "0-b: low confidence yields all four type buttons");
+    check(rows0b("SELECT COUNT(*) AS n FROM notes")[0].n === before, "0-b: low confidence stores nothing");
+  }
+  // Query: answered from D1, no chat model call.
+  {
+    const env = mkEnv0b(), s = mkS();
+    sqlite0b.prepare("INSERT INTO expenses (user_id, type, amount, currency_code, date) VALUES (4242, 'expense', 400, 'TOMAN', '2026-10-31')").run();
+    await handleDailyText(env, mkO(s, "وضعیت مالی امروز چطوره؟", { interpreterCallFn: fakeInterp([act("query", { query: { kind: "expense", periodText: "امروز", project: null } })]) }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("TOMAN: 400"), "0-b: query answers from D1");
+    check(s.chats.length === 0, "0-b: query makes no chat model call");
+  }
+  // Interpreter failure: unavailable message with type buttons + Retry, and
+  // no domain action stored — the message row itself stays pending.
+  {
+    const env = mkEnv0b(), s = mkS();
+    const before = rows0b("SELECT COUNT(*) AS n FROM notes")[0].n;
+    const failing = async () => { throw new Error("boom"); };
+    await handleDailyText(env, mkO(s, "سلام، یک چیزی به ذهنم رسید", { interpreterCallFn: failing }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("تفسیر خودکار الان در دسترس نیست"), "0-b: failure yields the unavailable message");
+    check(btnData(s).filter((d) => d.startsWith("interp:type:")).length === 4, "0-b: failure yields all four type buttons");
+    check(btnData(s).some((d) => d.startsWith("retry:")), "0-b fix: failure yields a Retry button");
+    check(rows0b("SELECT COUNT(*) AS n FROM notes")[0].n === before, "0-b fix: failure stores no domain action");
+    check(rows0b("SELECT COUNT(*) AS n FROM messages WHERE content = 'سلام، یک چیزی به ذهنم رسید' AND kind = 'pending'")[0].n === 1, "0-b fix: failure leaves the row pending");
+  }
+  // Unknown project in 0-b: type buttons, never an auto-created project.
+  // (The choice card and its re-entry are 0-b2.)
+  {
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "کاری برای پروژه‌ی تازه", { interpreterCallFn: fakeInterp([act("task", { text: "کاری برای پروژه‌ی تازه", project: "پروژه‌ی تازه" })]) }));
+    check(btnData(s).filter((d) => d.startsWith("interp:type:")).length === 4, "0-b: unknown project yields type buttons, never auto-create");
+    check(rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'کاری برای پروژه‌ی تازه'")[0].n === 0, "0-b: task is not silently stored as a note");
+  }
+  // Multi-action: one summary with both items. (Per-note delete buttons: 0-b2.)
+  {
+    const env = mkEnv0b(), s = mkS();
+    await handleDailyText(env, mkO(s, "دو تا یادداشت", { interpreterCallFn: fakeInterp([act("note", { text: "مورد یک" }), act("note", { text: "مورد دو" })]) }));
+    check(String(s.sent.at(-1)?.text ?? "").includes("مورد یک") && String(s.sent.at(-1)?.text ?? "").includes("مورد دو"), "0-b: multi-action summary lists every item");
+  }
+  // Rollout gate: interpreter unconfigured -> today's path, returns chat.
+  {
+    const env = mkEnv0b(), s = mkS();
+    const r = await handleDailyText(env, mkO(s, "سلام، چطوری؟"));
+    check(r === "chat", "0-b: unconfigured interpreter falls back to today's path");
+  }
+  // ── Phase 0-b fix: save-first ordering + failure retry (request changes) ──
+  // (a) Fast money: the entry row is saved pending BEFORE classification,
+  // and the expense row count is still 0 before Confirm.
+  {
+    const sqliteFix = new DatabaseSync(":memory:");
+    sqliteFix.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sqliteFix.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    const log = [];
+    const d1log = { prepare(sql) { const stmt = sqliteFix.prepare(sql); return { bind(...params) { return { run: async () => { log.push({ sql, params }); stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+    const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4243", DB: d1log };
+    const s = mkS();
+    let calls = 0;
+    const counting = async () => { calls++; return JSON.stringify([act("chat")]); };
+    const r = await handleDailyText(env, mkO(s, "خرج کردم ۵۰۰ تومان نان", { interpreterCallFn: counting }));
+    check(r === "handled", "0-b fix: fast money handled");
+    check(btnData(s).some((d) => d.startsWith("daily:confirm:")), "0-b fix: fast money reaches confirm");
+    check(calls === 0, "0-b fix: fast money makes zero interpreter calls");
+    const firstMsgInsert = log.find((e) => e.sql.startsWith("INSERT INTO messages"));
+    check(firstMsgInsert?.params?.includes("pending") === true, "0-b fix: entry row saved pending before classification");
+    check(sqliteFix.prepare("SELECT COUNT(*) AS n FROM expenses").all()[0].n === 0, "0-b fix: expense row count is 0 before Confirm");
+    check(sqliteFix.prepare("SELECT kind FROM messages WHERE content = 'خرج کردم ۵۰۰ تومان نان'").all()[0]?.kind === "daily", "0-b fix: fast money entry row finalised to daily");
+    check(sqliteFix.prepare("SELECT COUNT(*) AS n FROM messages WHERE content = 'خرج کردم ۵۰۰ تومان نان'").all()[0].n === 1, "0-b fix: fast money saves exactly one message row");
+  }
+  // (c) Retry with the stored text succeeds and finalises kind, with no
+  // second row. (b) is the updated failure test above: pending + Retry.
+  {
+    const env = mkEnv0b(), s = mkS();
+    const failing = async () => { throw new Error("boom"); };
+    await handleDailyText(env, mkO(s, "متن قابل بازیابی", { interpreterCallFn: failing }));
+    const retryBtn = btnData(s).find((d) => d.startsWith("retry:"));
+    check(!!retryBtn, "0-b fix: failure reply carries a retry button");
+    const rowId = Number(retryBtn.split(":")[1]);
+    check(rows0b("SELECT kind FROM messages WHERE id = ?", [rowId])[0]?.kind === "pending", "0-b fix: retry target row is pending");
+    const s2 = mkS();
+    const ok = await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: retryBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b, interpreterCallFn: fakeInterp([act("note", { text: "متن قابل بازیابی" })]) });
+    check(ok === true, "0-b fix: retry callback handled");
+    check(s2.sent.at(-1)?.text === "✅ یادداشت ذخیره شد.", "0-b fix: retry success stores the note");
+    check(rows0b("SELECT kind FROM messages WHERE id = ?", [rowId])[0]?.kind === "daily", "0-b fix: retry success finalises kind");
+    check(rows0b("SELECT COUNT(*) AS n FROM messages WHERE content = 'متن قابل بازیابی'")[0].n === 1, "0-b fix: retry saves no second row");
+  }
+  // (d) Retry with a missing row yields a clear message + type buttons.
+  {
+    const env = mkEnv0b(), s = mkS();
+    const ok = await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: "retry:999999", send: s.send, editMarkup: async () => {}, chat: s.chat, nowMs: NOW0b });
+    check(ok === true, "0-b fix: missing retry row handled");
+    check(String(s.sent.at(-1)?.text ?? "").includes("پیدا نشد"), "0-b fix: missing retry row yields a clear message");
+    check(btnData(s).filter((d) => d.startsWith("interp:type:")).length === 4, "0-b fix: missing retry row yields type buttons");
+  }
 }
 
 if (failures.length) {
