@@ -136,6 +136,29 @@ function optInt(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
+
+// Positive safe-integer row id (D1 AUTOINCREMENT ids). Number or digit
+// string (trimmed) -> id; anything else -> null (the caller maps it to
+// a null result, never to a failure). Shared by getTask and
+// addProjectAlias.
+function parseRowId(v) {
+  if (typeof v === "number") return Number.isSafeInteger(v) && v > 0 ? v : null;
+  if (typeof v === "string") {
+    const t = v.trim();
+    if (/^\d+$/.test(t)) {
+      const n = Number(t);
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    }
+  }
+  return null;
+}
+
+// Alias/name normalization, identical to matchProject (interpreter.js):
+// Arabic yeh/kaf folded to Persian, ZWNJ to space, then trim. Kept
+// local so db.js stays dependency-free.
+function normalizeAliasName(v) {
+  return String(v ?? "").replace(/ي/g, "ی").replace(/ك/g, "ک").replace(/‌/g, " ").trim();
+}
 // insertTask only. Contract: omitted/null -> null (no project); a
 // positive safe integer (number, or a digit string, whitespace trimmed)
 // -> that id; anything else supplied -> false, i.e. rejected, never
@@ -268,8 +291,37 @@ export async function listOpenTasksResult(envOrDb, userId, projectId = null, lim
 // Open tasks only, oldest first, optionally filtered by project. The
 // done/deleted archive is never listed here. [] when DB/user missing/failing.
 // Thin delegate over listOpenTasksResult; observable behaviour unchanged.
-export async function listOpenTasks(envOrDb, userId, projectId = null, limit = 50) {
-  const r = await listOpenTasksResult(envOrDb, userId, projectId, limit, 0);
+export async function listOpenTasks(envOrDb, userId, projectId = null, limit = 50, offset = 0) {
+  const r = await listOpenTasksResult(envOrDb, userId, projectId, limit, offset);
+  return r.tasks ?? [];
+}
+
+// Phase 1-b-0b (Fix A, amendment 7b): result-shaped done-task read.
+// {ok: true} even when empty; {ok: false} ONLY on a real D1 failure.
+// Done only, newest first (archive reading order; open lists stay
+// oldest-first). The archive handler MUST call this core, never the
+// wrapper, so a failure is never rendered as an "empty archive".
+export async function listDoneTasksResult(envOrDb, userId, projectId = null, limit = 50, offset = 0) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  if (!db || id === null) return { ok: false, tasks: [] };
+  const n = Math.max(1, Math.min(100, Number(limit) || 50));
+  const off = Math.max(0, Math.floor(Number(offset) || 0));
+  try {
+    const pid = optInt(projectId);
+    const res = pid === null
+      ? await db.prepare("SELECT id, title, project_id, status, due_at, remind_at, reminded_at, remind_attempts, source, created_at, completed_at FROM tasks WHERE user_id = ? AND status = 'done' ORDER BY id DESC LIMIT ? OFFSET ?").bind(id, n, off).all()
+      : await db.prepare("SELECT id, title, project_id, status, due_at, remind_at, reminded_at, remind_attempts, source, created_at, completed_at FROM tasks WHERE user_id = ? AND status = 'done' AND project_id = ? ORDER BY id DESC LIMIT ? OFFSET ?").bind(id, pid, n, off).all();
+    return { ok: true, tasks: Array.isArray(res?.results) ? res.results : [] };
+  } catch {
+    return { ok: false, tasks: [] };
+  }
+}
+
+// Done tasks only, newest first. Thin delegate over the core; its []
+// must NEVER be read as "empty archive" (see the core note).
+export async function listDoneTasks(envOrDb, userId, projectId = null, limit = 50, offset = 0) {
+  const r = await listDoneTasksResult(envOrDb, userId, projectId, limit, offset);
   return r.tasks ?? [];
 }
 
@@ -293,6 +345,91 @@ export async function setTaskStatus(envOrDb, userId, taskId, status) {
     return res?.meta?.changes === 1 ? { ok: true } : { ok: false };
   } catch {
     return { ok: false };
+  }
+}
+
+// Phase 1-b-0b (Fix B, amendment 3 — single approved contract):
+// {ok: false, task: null} ONLY on a real D1 failure (missing DB, bad
+// user id, thrown query). {ok: true, task: null} for an invalid /
+// unparseable / missing / foreign-owned id (deliberately ambiguous —
+// callers treat all three identically). {ok: true, task: row} for a
+// task owned by the user, in ANY status (open, done, deleted), so
+// callers can distinguish "open" from "already consumed".
+export async function getTask(envOrDb, userId, taskId) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  if (!db || id === null) return { ok: false, task: null };
+  const tid = parseRowId(taskId);
+  if (tid === null) return { ok: true, task: null };
+  try {
+    const row = await db.prepare("SELECT id, title, project_id, status, due_at, remind_at, reminded_at, remind_attempts, source, source_message_id, created_at, completed_at FROM tasks WHERE id = ? AND user_id = ? LIMIT 1").bind(tid, id).first();
+    return { ok: true, task: row && typeof row === "object" ? row : null };
+  } catch {
+    return { ok: false, task: null };
+  }
+}
+
+// Conditional-UPDATE fallback for addProjectAlias, used ONLY when the
+// JSON form is unavailable in the binding (error "no such function").
+// 3 attempts total, each re-reading the current value first. A
+// malformed stored value is an honest {ok: false} — the corrupt value
+// is NEVER overwritten with a fresh array.
+async function addProjectAliasConditional(db, uid, pid, name) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let stored;
+    try {
+      const row = await db.prepare("SELECT aliases FROM projects WHERE id = ? AND user_id = ? LIMIT 1").bind(pid, uid).first();
+      stored = row?.aliases ?? null;
+    } catch { return { ok: false }; }
+    if (stored !== null && typeof stored !== "string") return { ok: false };
+    const text = stored === null ? "[]" : stored;
+    let list;
+    try {
+      list = JSON.parse(text);
+    } catch { return { ok: false }; }
+    if (!Array.isArray(list)) return { ok: false };
+    if (list.some((a) => normalizeAliasName(a) === name)) return { ok: true, added: false };
+    try {
+      const res = await db.prepare("UPDATE projects SET aliases = ? WHERE id = ? AND user_id = ? AND COALESCE(aliases, '[]') = ?").bind(JSON.stringify([...list, name]), pid, uid, text).run();
+      if (res?.meta?.changes === 1) return { ok: true, added: true };
+      // changes 0 -> another writer won the race; retry with a fresh read.
+    } catch { return { ok: false }; }
+  }
+  return { ok: false };
+}
+
+// Phase 1-b-0b (amendment 2): lost-update-proof alias append. The
+// alias is normalised exactly as matchProject normalises. ONE atomic
+// UPDATE appends with in-database dedupe (json_insert guarded by
+// NOT EXISTS over json_each), scoped by id AND user_id, so two
+// concurrent appends of different aliases both survive and two of
+// the same alias yield one entry. Ownership is established by a
+// user-scoped pre-read (project names never change in 1-b, so the
+// pre-read cannot race the array). Alias == name -> no-op success.
+// changes 1 -> added; changes 0 after an owned pre-read -> already
+// present. Foreign/missing project or empty alias -> {ok: false}.
+// Malformed stored JSON -> the UPDATE errors -> {ok: false}; the
+// corrupt value is never overwritten.
+export async function addProjectAlias(envOrDb, userId, projectId, alias) {
+  const db = dbOf(envOrDb);
+  const uid = validUserId(userId);
+  const pid = parseRowId(projectId);
+  const name = normalizeAliasName(alias);
+  if (!db || uid === null || pid === null || !name) return { ok: false };
+  let project;
+  try {
+    project = await db.prepare("SELECT id, name FROM projects WHERE id = ? AND user_id = ? LIMIT 1").bind(pid, uid).first();
+  } catch { return { ok: false }; }
+  if (!project || typeof project !== "object") return { ok: false };
+  if (normalizeAliasName(project.name) === name) return { ok: true, added: false };
+  try {
+    const res = await db.prepare("UPDATE projects SET aliases = json_insert(COALESCE(aliases, '[]'), '$[#]', ?) WHERE id = ? AND user_id = ? AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(aliases, '[]')) WHERE value = ?)").bind(name, pid, uid, name).run();
+    if (res?.meta?.changes === 1) return { ok: true, added: true };
+    if (res?.meta?.changes === 0) return { ok: true, added: false };
+    return { ok: false };
+  } catch (e) {
+    if (!/no such function/i.test(e?.message ?? "")) return { ok: false };
+    return addProjectAliasConditional(db, uid, pid, name);
   }
 }
 
