@@ -26,7 +26,7 @@ import { healthCounts } from "./health.js";
 import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation, freeTextDevSuggestion } from "./intent.js";
 import { getChatContext } from "./memory.js";
-import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback } from "./everyday.js";
+import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback } from "./everyday.js";
 import { handleVoice, handleVoiceRetry } from "./voice.js";
 import { saveMessage } from "./db.js";
 import {
@@ -730,6 +730,13 @@ async function handleCallbackQuery(env, cb) {
   }
   if (data.startsWith("interp:")) {
     await resolveInterpCallback(env, { fromId, chatId, data, nowMs: Date.now(), ...dailySenders(env, chatId, cb?.message?.message_id),
+      chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
+    return;
+  }
+  // 1-b-1: id-carrying task callbacks (task:del:<id>); ownership is
+  // re-checked inside via getTask (the allow-list gate already ran).
+  if (data.startsWith("task:")) {
+    await resolveTaskCallback(env, { fromId, chatId, data, nowMs: Date.now(), ...dailySenders(env, chatId, cb?.message?.message_id),
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
     return;
   }
