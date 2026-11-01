@@ -348,6 +348,26 @@ export async function setTaskStatus(envOrDb, userId, taskId, status) {
   }
 }
 
+// Phase 1-b-3 (amendment 6): run several prepared statements as ONE
+// db.batch() unit — D1's only atomicity unit (all commit or none on a
+// statement error). Follows the same safety contract as the other
+// readers: a missing/failing DB, or a binding without batch(), yields
+// {ok: false}, never a throw. The caller MUST still read the returned
+// metas and re-read state afterwards: a conditional UPDATE matching zero
+// rows is NOT a batch error, so batch success alone never proves the
+// second write landed.
+export async function runDbBatch(envOrDb, statements) {
+  const db = dbOf(envOrDb);
+  if (!db || typeof db.batch !== "function" || !Array.isArray(statements)) return { ok: false, results: [] };
+  try {
+    const prepared = statements.map((s) => db.prepare(s.sql).bind(...(s.params ?? [])));
+    const results = await db.batch(prepared);
+    return { ok: true, results: Array.isArray(results) ? results : [] };
+  } catch {
+    return { ok: false, results: [] };
+  }
+}
+
 // Phase 1-b-0b (Fix B, amendment 3 — single approved contract):
 // {ok: false, task: null} ONLY on a real D1 failure (missing DB, bad
 // user id, thrown query). {ok: true, task: null} for an invalid /

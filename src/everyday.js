@@ -3,7 +3,7 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
-import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, insertTask, setTaskStatus, addProjectAlias } from "./db.js";
+import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, insertTask, setTaskStatus, addProjectAlias, insertIntentFeedback, runDbBatch } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
@@ -111,10 +111,62 @@ export async function startConfirm(env, o, type, ex) {
 // deletes that note row after the expense insert, and reports failure
 // (draft kept for retry) if the delete fails. Returns the expense row id
 // for the correction pointer.
+// Phase 1-b-3 (amendment 6): task -> expense Confirm. Pre-check first
+// (D1 failure -> failed, draft kept; foreign/missing/not-open -> missing,
+// draft kept, NOTHING inserted), then ONE db.batch() unit: expense INSERT
+// OR IGNORE on draft_id first, conditional task delete second. Batch
+// success alone proves nothing about the second write (a zero-row
+// conditional UPDATE is not a batch error), so post-batch reading is
+// mandatory on every path, including a thrown batch (assume nothing
+// landed, re-read, apply the same branches):
+//  - stmt2 changes===1 -> full success (draft deleted, expense id found
+//    by draft_id; a retry no-op INSERT still counts as success here; a
+//    failed id lookup degrades to ok with a null id, never to "failed" —
+//    the retry would otherwise hit the missing pre-check and misreport a
+//    completed conversion as expired).
+//  - task done/deleted by another path AND expense exists -> COMPENSATE:
+//    finalize as converted-with-task-already-done (draft dropped, honest
+//    message via "converted-done"; the done task is NEVER silently
+//    deleted, the expense is NEVER duplicated, never called "missing").
+//  - task still open AND expense exists -> removal itself failed (draft
+//    kept, failed; the next Confirm re-runs the batch).
+//  - task still open AND no expense -> nothing landed (draft kept, failed).
+//  - task missing/foreign AND expense exists -> "expense-exists" (draft
+//    kept, failure reply noting the existing expense row; retry re-checks
+//    in the same order, never re-inserts).
+//  - task missing/foreign AND no expense -> missing (draft kept).
+//  - any read failure while re-reading -> failed (draft kept).
+async function confirmTaskExpense(env, userId, draftId, draft) {
+  const pre = await getTask(env, userId, draft.taskId);
+  if (!pre.ok) return { status: "failed" };
+  if (!pre.task || pre.task.status !== "open") return { status: "missing" };
+  const batch = await runDbBatch(env, [
+    { sql: "INSERT OR IGNORE INTO expenses (user_id, type, amount, currency_code, item, category, date, draft_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [userId, draft.type, draft.amount, draft.currency, draft.item || null, null, draft.date, draftId, new Date().toISOString()] },
+    { sql: "UPDATE tasks SET status = 'deleted' WHERE id = ? AND user_id = ? AND status = 'open'", params: [draft.taskId, userId] },
+  ]);
+  const stmt2Changes = batch.ok ? batch.results[1]?.meta?.changes ?? null : null;
+  if (stmt2Changes === 1) {
+    const row = await firstDb(env, "SELECT id FROM expenses WHERE draft_id = ? AND user_id = ?", [draftId, userId]);
+    await delKv(env, draftKey(draftId));
+    return { status: "ok", draft, id: row.ok && row.row ? row.row.id : null };
+  }
+  const expense = await firstDb(env, "SELECT id FROM expenses WHERE draft_id = ? AND user_id = ?", [draftId, userId]);
+  const task = await getTask(env, userId, draft.taskId);
+  if (!expense.ok || !task.ok) return { status: "failed" };
+  if (task.task && task.task.status === "open") return { status: "failed" };
+  if (task.task && expense.row) { await delKv(env, draftKey(draftId)); return { status: "converted-done", draft, id: expense.row.id }; }
+  if (!task.task && expense.row) return { status: "expense-exists" };
+  return { status: "missing" };
+}
+
 export async function confirmExpenseDraft(env, userId, id) {
   const draft = await getKv(env, draftKey(id));
   if (!draft) return { status: "missing" };
   if (Number(draft.owner) !== Number(userId)) return { status: "forbidden" };
+  // 1-b-3: a task conversion draft runs its own batch + compensation
+  // chain and ALWAYS returns here — it must never fall through to the
+  // generic insert/noteId path below.
+  if (draft.taskId) return confirmTaskExpense(env, userId, id, draft);
   let expenseId = null;
   if (draft.corrects?.table === "expenses") {
     // Strict correction contract: a corrects table without a valid id
@@ -209,8 +261,11 @@ async function runDailyBranch(env, o, c, ctx) {
   if (c.intent === "task-list") { const r = await renderTaskList(env, userId); await sendListMessage(o, r); if (r.ok) await markDaily(env, o); return "handled"; }
   if (c.intent === "reminder") {
     if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask); await o.send(askText(c.ask)); return "handled"; }
-    const r = await runDb(env, "INSERT INTO reminders (user_id, text, due_at, status, created_at) VALUES (?, ?, ?, ?, ?)", [userId, c.text, c.due, "pending", new Date().toISOString()]);
-    await o.send(r.ok ? `⏰ یادآوری فقط ذخیره شد (ارسال سر وقت هنوز فعال نیست): ${c.text} — ${c.due}` : NOT_SAVED_TEXT);
+    // 1-b-3 (decision 2): a reminder is stored as a task (title = text,
+    // remind_at = due, due_at = NULL); the legacy reminders table gains
+    // NO new rows, and no delivery is claimed before 1-c.
+    const r = await insertTask(env, { userId, title: c.text, remindAt: c.due, dueAt: null, source: o.source === "voice" ? "voice" : "text" });
+    await o.send(r.ok ? "⏰ یادآوری به‌عنوان تسک ذخیره شد؛ ارسال خودکار آن هنوز فعال نیست و در فاز ۱-ج اضافه می‌شود." : NOT_SAVED_TEXT);
     if (r.ok) await markDaily(env, o);
     return "handled";
   }
@@ -710,7 +765,11 @@ export async function runInterpPolicy(env, o, ctx, actions, finalize) {
     if (one.note) { await finalize("daily"); const id = await newInterpRecord(env, o.userId, { table: "notes", id: one.note.id, text: one.note.text }); await o.send("✅ یادداشت ذخیره شد.", { replyMarkup: { inline_keyboard: noteCardKeyboard(id) } }); return "handled"; }
     if (one.task) {
       await finalize("daily");
-      await o.send(one.line, { replyMarkup: { inline_keyboard: [[{ text: "🗑 حذف تسک", callback_data: `task:del:${one.task.id}` }]] } });
+      // 1-b-3: the stored-task card carries the change-type button (its
+      // own interp record, so interp:change can offer the type choices
+      // for this task). Multi-action summary rows keep delete-only.
+      const cardId = await newInterpRecord(env, o.userId, { table: "tasks", id: one.task.id, text: one.task.text });
+      await o.send(one.line, { replyMarkup: { inline_keyboard: [[{ text: "🗑 حذف تسک", callback_data: `task:del:${one.task.id}` }, { text: "🔄 تغییر نوع", callback_data: `interp:change:${cardId}` }]] } });
       return "handled";
     }
     // 1-b-2: a list result carries its keyboard (split at 4096 by
@@ -859,6 +918,130 @@ export async function handleInterpreterText(env, o, ctx) {
   const finalize = (kind) => { if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; return finalizeMessageKind(env, o.entryMessageId, userId, kind); } return Promise.resolve({ ok: false }); };
   return interpretAndExecute(env, o, ctx, text, o.entryMessageId ?? null, finalize);
 }
+// Phase 1-b-3: change-type feedback. Silent best-effort, D1 only, never
+// logs: a recording failure never changes the reply and never blocks
+// the re-type. Recorded ONLY on a completed re-type via a change-type
+// tap (never on every interpreter verdict, correction, or button
+// fallback; never on a no-op, a honesty-line refusal, or a failed
+// attempt). "Completed" means the target action's delivery finished:
+// chat sent, note stored + task deleted, or the expense confirm card
+// shown (the later Confirm is money safety, not the type correction).
+// project is the re-typed item's project NAME, or null.
+async function recordChangeTypeFeedback(env, userId, text, predictedType, correctType, projectId) {
+  try {
+    let project = null;
+    if (projectId !== null && projectId !== undefined) { const p = await getProject(env, userId, projectId); if (p) project = p.name; }
+    await insertIntentFeedback(env, { userId, text, predictedType, correctType, project });
+  } catch {}
+}
+
+// Phase 1-b-3 (amendment 5a): adoption check for a task -> note retry
+// whose note insert succeeded but whose progress write did not. Adopts
+// ONLY the most recent note matching the task title and project exactly
+// AND created after this conversion started; anything else re-inserts.
+// A duplicate is never risked on an unproven adoption — but note the
+// honest limit: an independent note with identical text/project created
+// inside the same window is indistinguishable from the conversion's own.
+async function adoptConversionNote(env, userId, rec, task) {
+  const rows = await allDb(env, "SELECT id, text, project_id, created_at FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 20", [userId]);
+  const started = new Date(rec.startedAtMs ?? 0).toISOString();
+  const hit = rows.find((r) => r.text === rec.text && (r.project_id ?? null) === (task.project_id ?? null) && String(r.created_at ?? "") >= started);
+  return hit ? hit.id : null;
+}
+
+// Phase 1-b-3 (amendment 5): task conversion chains, driven by the
+// changeTaskId record. The record SURVIVES failures (progress fields
+// noteId/chatSent/target) and is dropped ONLY at a defined end state:
+// converted, no-op, finally-failed (task gone with nothing to resume),
+// or a final stop (unextractable amount). Transient failures keep the
+// record and the reply carries a Retry button (interp:retrytask:<id>)
+// that resumes from the recorded stage — never restarts blindly.
+//  - task -> note: note first (task title as note text, task's project,
+//    task's source), then record noteId, then verified delete. Insert
+//    failure -> task untouched, noteId null, retry re-attempts insert
+//    (after the adoption check). Delete failure -> note stays, task
+//    stays open, record keeps noteId, retry deletes only.
+//  - task -> chat: chat first, then IMMEDIATELY chatSent:true (no other
+//    awaited work between), then verified delete. Chat failure -> task
+//    untouched, chatSent false, retry re-sends. Delete failure -> chat
+//    already delivered (cannot be unsent), task stays open, record keeps
+//    chatSent:true, retry deletes only, chat count stays 1. Residual
+//    risk (honest): if the mark-write itself fails after a successful
+//    chat-send, a later retry cannot know and would re-send — at worst
+//    a repeated chat answer, never a lost task or duplicated task.
+//  - task -> expense: amount parse first (unextractable -> stop message,
+//    task kept, no confirm card, mirroring the note rule), then the
+//    confirm card with taskId (Amendment 6 chain lives in
+//    confirmExpenseDraft); Cancel -> task untouched, draft deleted.
+//  - task -> task: no-op message. Success is reported ONLY after the
+//    full chain completes; a FAILED attempt transiently leaves both
+//    records alive with an explicit failure reply and a kept record —
+//    that is a failed attempt, not a completed conversion.
+async function runTaskConversion(env, o, rec, choice, recordId) {
+  const userId = o.userId;
+  const drop = () => delKv(env, interpKey(recordId));
+  const keep = (patch) => putKv(env, interpKey(recordId), { ...rec, ...patch });
+  const retryKeyboard = { replyMarkup: { inline_keyboard: [[{ text: "🔄 تلاش مجدد", callback_data: `interp:retrytask:${recordId}` }]] } };
+  const failRetry = async (text) => { await o.send(text, retryKeyboard); };
+  if (!rec.target) { rec = { ...rec, target: choice }; await keep({ target: choice }); }
+  const g = await getTask(env, userId, rec.changeTaskId);
+  if (!g.ok) { await failRetry(NOT_SAVED_TEXT); return true; }
+  if (!g.task) { await drop(); await o.send(EXPIRED_TEXT); return true; }
+  const task = g.task;
+  if (task.status !== "open") { await drop(); await o.send(EXPIRED_TEXT); return true; }
+  if (choice === "task") { await drop(); await o.send("این مورد همین حالا تسک است."); return true; }
+  if (choice === "expense") {
+    const ctx = { now: o.nowMs ?? Date.now(), remembered: await getDefaultCurrency(env, userId) };
+    const ex = parseExpense(rec.text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, rec.text);
+    if (ex?.error) { await drop(); await o.send("مبلغ از متن تسک قابل استخراج نیست؛ تبدیل متوقف شد و تسک دست‌نخورده باقی ماند."); return true; }
+    await startConfirm(env, o, "expense", { ...ex, taskId: task.id });
+    await recordChangeTypeFeedback(env, userId, rec.text, "task", "expense", task.project_id ?? null);
+    await drop();
+    return true;
+  }
+  if (choice === "note") {
+    let noteId = rec.noteId ?? null;
+    if (!noteId) {
+      noteId = await adoptConversionNote(env, userId, rec, task);
+      if (noteId) await keep({ noteId });
+      if (!noteId) {
+        const r = await insertNoteRow(env, userId, rec.text, task.source === "voice" ? "voice" : "text", task.project_id ?? null);
+        if (!r.ok) { await failRetry(NOT_SAVED_TEXT); return true; }
+        noteId = r.id;
+        await keep({ noteId });
+      }
+    }
+    const d = await setTaskStatus(env, userId, task.id, "deleted");
+    if (!d.ok) {
+      const g2 = await getTask(env, userId, task.id);
+      if (g2.ok && g2.task && g2.task.status !== "open") { await drop(); await recordChangeTypeFeedback(env, userId, rec.text, "task", "note", task.project_id ?? null); await o.send("✅ تسک به یادداشت تبدیل شد."); return true; }
+      await failRetry(NOT_SAVED_TEXT); return true;
+    }
+    await drop();
+    await recordChangeTypeFeedback(env, userId, rec.text, "task", "note", task.project_id ?? null);
+    await o.send("✅ تسک به یادداشت تبدیل شد.");
+    return true;
+  }
+  if (choice === "chat") {
+    if (!rec.chatSent) {
+      try { await o.chat(rec.text, { saveText: "" }); } catch { await failRetry(NOT_SAVED_TEXT); return true; }
+      await keep({ chatSent: true });
+    }
+    const d = await setTaskStatus(env, userId, task.id, "deleted");
+    if (!d.ok) {
+      const g2 = await getTask(env, userId, task.id);
+      if (g2.ok && g2.task && g2.task.status !== "open") { await drop(); await recordChangeTypeFeedback(env, userId, rec.text, "task", "chat", task.project_id ?? null); await o.send("✅ تسک به چت تبدیل شد."); return true; }
+      await o.send("💬 چت ارسال شد، ولی تسک حذف نشد؛ با «تلاش مجدد» فقط حذف انجام می‌شود و چت دوباره ارسال نمی‌شود.", retryKeyboard);
+      return true;
+    }
+    await drop();
+    await recordChangeTypeFeedback(env, userId, rec.text, "task", "chat", task.project_id ?? null);
+    await o.send("✅ تسک به چت تبدیل شد.");
+    return true;
+  }
+  await drop(); await o.send(EXPIRED_TEXT); return true;
+}
+
 // Interpreter callbacks: type choice, note delete, external backup,
 // and (0-b3) change-type, task card, and project choice. Owner-checked;
 // expired records get the fixed message.
@@ -904,12 +1087,19 @@ export async function resolveInterpCallback(env, o) {
   }
   // 0-b3 change-type on a stored note card: offer the type choices for
   // that note's text; the type handler below applies change semantics.
+  // 1-b-3: a stored TASK card offers the same choice; its record carries
+  // changeTaskId and the type handler runs the conversion chains.
   const cm = /^interp:change:(.+)$/.exec(o.data);
   if (cm) {
     const rec = await getKv(env, interpKey(cm[1]));
-    if (!rec || rec.table !== "notes") { await o.send(EXPIRED_TEXT); return true; }
+    if (!rec || (rec.table !== "notes" && rec.table !== "tasks")) { await o.send(EXPIRED_TEXT); return true; }
     if (Number(rec.owner) !== Number(o.fromId)) return true;
     if (o.editMarkup) await o.editMarkup();
+    if (rec.table === "tasks") {
+      const id = await newInterpRecord(env, o.fromId, { text: rec.text, changeTaskId: rec.id, startedAtMs: Date.now() });
+      await o.send("نوعش را بگو:", { replyMarkup: { inline_keyboard: interpTypeKeyboard(id) } });
+      return true;
+    }
     const id = await newInterpRecord(env, o.fromId, { text: rec.text, changeNoteId: rec.id });
     await o.send("نوعش را بگو:", { replyMarkup: { inline_keyboard: interpTypeKeyboard(id) } });
     return true;
@@ -936,6 +1126,21 @@ export async function resolveInterpCallback(env, o) {
     const oo = { ...o, userId: o.fromId, text: row.row.content, entryMessageId: rowId };
     const finalize = (kind) => { if (!oo._entryFinalised) { oo._entryFinalised = true; return finalizeMessageKind(env, rowId, o.fromId, kind); } return Promise.resolve({ ok: false }); };
     await interpretAndExecute(env, oo, ctx, row.row.content, rowId, finalize);
+    return true;
+  }
+  // 1-b-3: task-conversion Retry. The record carries the target and the
+  // progress fields, so the retry resumes from the recorded stage
+  // (delete-only after a note insert / chat send) — never a blind
+  // restart. A missing record or a record without a conversion target
+  // gets the fixed expired message; a foreign tap is silent.
+  const rt = /^interp:retrytask:(.+)$/.exec(o.data);
+  if (rt) {
+    const rec = await getKv(env, interpKey(rt[1]));
+    if (!rec || !rec.changeTaskId || !rec.target) { await o.send(EXPIRED_TEXT); return true; }
+    if (Number(rec.owner) !== Number(o.fromId)) return true;
+    if (o.editMarkup) await o.editMarkup();
+    const oo = { ...o, userId: o.fromId, text: rec.text };
+    await runTaskConversion(env, oo, rec, rec.target, rt[1]);
     return true;
   }
   const m = /^interp:(type|del|backup):(.+)$/.exec(o.data);
@@ -966,6 +1171,9 @@ export async function resolveInterpCallback(env, o) {
     // Empty-text records exist only from the missing-retry-row fallback;
     // never store or answer from them, just say the text is gone.
     if (!rec.text?.trim()) { await o.send("متن پیام پیدا نشد؛ لطفاً پیام را دوباره بفرست:"); return true; }
+    // 1-b-3: a task re-type owns its record lifecycle (progress fields
+    // for retry) — it must NOT go through the upfront delete below.
+    if (rec.changeTaskId) { if (o.editMarkup) await o.editMarkup(); const oo = { ...o, userId: o.fromId, text: rec.text }; await runTaskConversion(env, oo, rec, choice, id); return true; }
     await delKv(env, interpKey(id));
     if (o.editMarkup) await o.editMarkup();
     const ctx = { now: o.nowMs ?? Date.now(), remembered: await getDefaultCurrency(env, o.fromId) };
@@ -978,13 +1186,16 @@ export async function resolveInterpCallback(env, o) {
     // unextractable amount -> conversion stops, note kept (0-b3 fix: no
     // amount ask, which would have lost the note association).
     // intent_feedback recording waits for migration 0003 (Phase 1-a).
+    // 1-b-3: completed note re-types record feedback (silent best-effort;
+    // the note's project is read BEFORE the delete, which would hide it).
     if (rec.changeNoteId) {
       if (choice === "task") { await o.send("تسک‌ها با فاز ۱ می‌آیند."); return true; }
       if (choice === "note") { await o.send("این مورد همین حالا یادداشت است."); return true; }
-      if (choice === "chat") { const d = await runDb(env, "DELETE FROM notes WHERE id = ? AND user_id = ?", [rec.changeNoteId, o.fromId]); if (!d.ok) { await o.send(NOT_SAVED_TEXT); return true; } await o.chat(rec.text, { saveText: "" }); return true; }
+      if (choice === "chat") { const np = await firstDb(env, "SELECT project_id FROM notes WHERE id = ? AND user_id = ?", [rec.changeNoteId, o.fromId]); const d = await runDb(env, "DELETE FROM notes WHERE id = ? AND user_id = ?", [rec.changeNoteId, o.fromId]); if (!d.ok) { await o.send(NOT_SAVED_TEXT); return true; } await o.chat(rec.text, { saveText: "" }); await recordChangeTypeFeedback(env, o.fromId, rec.text, "note", "chat", np.row?.project_id ?? null); return true; }
       const ex = parseExpense(rec.text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, rec.text);
       if (ex?.error) { await o.send("مبلغ از متن یادداشت قابل استخراج نیست؛ تبدیل متوقف شد و یادداشت دست‌نخورده باقی ماند."); return true; }
-      await startConfirm(env, oo, "expense", { ...ex, noteId: rec.changeNoteId }); return true;
+      const np = await firstDb(env, "SELECT project_id FROM notes WHERE id = ? AND user_id = ?", [rec.changeNoteId, o.fromId]);
+      await startConfirm(env, oo, "expense", { ...ex, noteId: rec.changeNoteId }); await recordChangeTypeFeedback(env, o.fromId, rec.text, "note", "expense", np.row?.project_id ?? null); return true;
     }
     if (choice === "task") { await o.send("تسک‌ها با فاز ۱ می‌آیند."); return true; }
     if (choice === "note") { const r = await insertNoteRow(env, o.fromId, rec.text, "text"); if (r.ok) { const nid = await newInterpRecord(env, o.fromId, { table: "notes", id: r.id, text: r.text }); await o.send("✅ یادداشت ذخیره شد.", { replyMarkup: { inline_keyboard: noteCardKeyboard(nid) } }); } else await o.send(NOT_SAVED_TEXT); return true; }
@@ -1072,6 +1283,14 @@ export async function resolveDailyCallback(env, o) {
     if (r.status === "forbidden") return true;
     if (r.status === "missing") { await o.send(EXPIRED_TEXT); return true; }
     if (r.status === "failed") { await o.send(NOT_SAVED_TEXT); return true; }
+    // 1-b-3 (amendment 6): compensation — the expense is stored and the
+    // task was separately completed, so it stays in the archive; the
+    // expense becomes the correction pointer, never a delete claim.
+    if (r.status === "converted-done") { if (r.id) await putKv(env, correctionKey(o.fromId), { table: "expenses", id: r.id }); await o.editMarkup(); await o.send("💰 خرج ذخیره شد؛ تسک پیش‌تر جداگانه انجام شده بود و در بایگانی می‌ماند."); return true; }
+    // 1-b-3 (amendment 6): an expense row for this draft already exists
+    // but the task is gone — the conversion did not complete; the draft
+    // is kept and Cancel stays available, retry re-checks, never re-inserts.
+    if (r.status === "expense-exists") { await o.send("💰 خرجی برای این پیش‌نویس از قبل ثبت شده است، ولی تسک پیدا نشد؛ تبدیل کامل نشد."); return true; }
     if (action === "confirm" && r.id) await putKv(env, correctionKey(o.fromId), { table: "expenses", id: r.id });
     await o.editMarkup();
     await o.send(action === "confirm" ? "✅ ثبت شد." : "لغو شد.");
