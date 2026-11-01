@@ -1125,7 +1125,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick } from "../src/everyday.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
   check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
@@ -1256,7 +1256,7 @@ if (DatabaseSync) {
     // 1-b-3 (INTENDED BEHAVIOUR CHANGE, decision 2): a reminder is
     // stored as a task with the exact decision-2 reply; the legacy
     // reminders table gains no rows.
-    check(String(s.sent.at(-1)?.text ?? "") === "⏰ یادآوری به‌عنوان تسک ذخیره شد؛ ارسال خودکار آن هنوز فعال نیست و در فاز ۱-ج اضافه می‌شود.", `nine stores as task: ${JSON.stringify(s.sent.at(-1))}`);
+    check(String(s.sent.at(-1)?.text ?? "") === "⏰ یادآوری به‌عنوان تسک ذخیره شد.", `nine stores as task: ${JSON.stringify(s.sent.at(-1))}`);
     check(rows("SELECT remind_at, due_at FROM tasks ORDER BY id DESC LIMIT 1")[0].remind_at === "2026-10-28T09:00:00+03:30" && rows("SELECT due_at FROM tasks ORDER BY id DESC LIMIT 1")[0].due_at === null, "nine means 09:00 as task remind_at, due_at null");
     await handleDailyText(env, o(env, 4242, "یادم بنداز ساعت پنج تماس بگیر", { ...s, nowMs: NOW }));
     check(String(s.sent.at(-1)?.text ?? "").includes("صبح یا عصر"), "ساعت پنج also asks");
@@ -1264,7 +1264,7 @@ if (DatabaseSync) {
     check(String(s.sent.at(-1)?.text ?? "").includes("ساعت"), `no-time asks: ${JSON.stringify(s.sent.at(-1))}`);
     check(rows("SELECT COUNT(*) AS n FROM tasks")[0].n === 1 && rows("SELECT COUNT(*) AS n FROM reminders")[0].n === 0, "nine stored as task, ambiguous/no-time stored nothing more, zero legacy rows");
     await handleDailyText(env, o(env, 4242, "یادم بنداز فردا ساعت نه صبح تمرین", { ...s, nowMs: NOW }));
-    check(String(s.sent.at(-1)?.text ?? "") === "⏰ یادآوری به‌عنوان تسک ذخیره شد؛ ارسال خودکار آن هنوز فعال نیست و در فاز ۱-ج اضافه می‌شود.", `reminder task reply: ${JSON.stringify(s.sent.at(-1))}`);
+    check(String(s.sent.at(-1)?.text ?? "") === "⏰ یادآوری به‌عنوان تسک ذخیره شد.", `reminder task reply: ${JSON.stringify(s.sent.at(-1))}`);
     check(rows("SELECT COUNT(*) AS n FROM tasks")[0].n === 2 && rows("SELECT COUNT(*) AS n FROM reminders")[0].n === 0, "tomorrow reminder stored as second task, zero legacy rows");
     check(rows("SELECT remind_at FROM tasks ORDER BY id DESC LIMIT 1")[0].remind_at === "2026-10-29T09:00:00+03:30", `remind_at: ${JSON.stringify(rows("SELECT remind_at FROM tasks ORDER BY id DESC LIMIT 1"))}`);
   }
@@ -1844,9 +1844,9 @@ if (DatabaseSync) {
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("reminder"));
     const r = await handleDailyText(env, o(env, 4313, "فردا جلسه دارم ساعت ۹", { ...s, nowMs: NOW }));
-    // 1-b-3 (INTENDED BEHAVIOUR CHANGE, decision 2): the model reminder
-    // is stored as a task with the exact decision-2 reply; zero legacy rows.
-    check(r === "handled" && lastText(s) === "⏰ یادآوری به‌عنوان تسک ذخیره شد؛ ارسال خودکار آن هنوز فعال نیست و در فاز ۱-ج اضافه می‌شود." && rows("SELECT COUNT(*) AS n FROM tasks WHERE user_id = 4313")[0].n === 1 && rows("SELECT COUNT(*) AS n FROM reminders WHERE user_id = 4313")[0].n === 0, "1-b-3: model reminder stored as task, zero legacy rows");
+    // 1-c-2 (PLANNED 1-b -> 1-c UPGRADE): the model reminder is stored
+    // as a task with the active 1-c reply; zero legacy rows.
+    check(r === "handled" && lastText(s) === "⏰ یادآوری به‌عنوان تسک ذخیره شد." && rows("SELECT COUNT(*) AS n FROM tasks WHERE user_id = 4313")[0].n === 1 && rows("SELECT COUNT(*) AS n FROM reminders WHERE user_id = 4313")[0].n === 0, "1-b-3: model reminder stored as task, zero legacy rows");
     const mrow = rows("SELECT remind_at, due_at, status, source FROM tasks WHERE user_id = 4313")[0];
     check(mrow?.remind_at === "2026-10-29T09:00:00+03:30" && mrow?.due_at === null && mrow?.status === "open" && mrow?.source === "text", "1-b-3: model reminder task carries rule-parsed remind_at, due null");
   }
@@ -3862,6 +3862,106 @@ if (DatabaseSync) {
     check((await claimDueReminders(failDb, NOW1c1, 20)).ok === false && (await claimDueReminders(failDb, NOW1c1, 20)).reminders.length === 0, "1-c-1: claim D1 failure is honest");
     check((await releaseReminderClaim(failDb, 1)).ok === false && (await snoozeTaskReminder(failDb, 1, 1, "2026-10-31T12:10:00.000Z")).ok === false && (await purgeOldClosedTasks(failDb, "2026-10-01T00:00:00.000Z")).ok === false, "1-c-1: release/snooze/purge D1 failures are honest");
     check((await claimDueReminders(null, NOW1c1, 20)).ok === false && (await purgeOldClosedTasks(db, "not-a-date")).ok === false, "1-c-1: missing DB / bad cutoff rejected");
+  }
+}
+
+// ── Phase 1-c-2: scheduled delivery, delayed label, snooze callback, active notice ──
+if (DatabaseSync) {
+  const fresh1c2 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1'), (2, '2')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } }, rows: (sql, params = []) => sq.prepare(sql).all(...params) };
+  };
+  const seed1c2 = (sq, title, userId, extra = {}) => { sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at, completed_at, remind_at, reminded_at, remind_attempts) VALUES (?, ?, ?, 'text', ?, ?, ?, ?, ?)").run(userId, title, extra.status ?? "open", extra.createdAt ?? "2026-10-30T00:00:00.000Z", extra.completedAt ?? null, extra.remindAt ?? null, extra.remindedAt ?? null, extra.attempts ?? 0); return sq.prepare("SELECT id FROM tasks WHERE title = ? AND user_id = ?").all(title, userId)[0].id; };
+  const mkEnv1c2 = (db, kv = fakeKV()) => ({ STATE: kv, TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1,2", DB: db });
+  const NOON1c2 = Date.UTC(2026, 9, 31, 12, 0, 0); // 12:00 UTC, not the purge slot
+  const NOWISO1c2 = "2026-10-31T12:00:00.000Z";
+  // Scheduled delivery: claim -> send -> buttons; second tick sends nothing.
+  {
+    const { sq, db, rows } = fresh1c2();
+    const t1 = seed1c2(sq, "یادآوری یک", 1, { remindAt: "2026-10-31T11:59:00.000Z" });
+    const t2 = seed1c2(sq, "یادآوری دو", 2, { remindAt: "2026-10-31T11:59:30.000Z" });
+    const sent = [];
+    const send = async (chatId, text, replyMarkup) => { sent.push({ chatId, text, replyMarkup }); };
+    const r1 = await runReminderTick(mkEnv1c2(db), { nowIso: NOWISO1c2, scheduledTime: NOON1c2, sendMessage: send });
+    const b1 = sent.find((m) => m.chatId === "1")?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+    check(r1.ok === true && r1.sent === 2 && r1.failed === 0 && r1.purged === null && sent.find((m) => m.chatId === "1")?.text === "⏰ یادآوری: یادآوری یک" && sent.find((m) => m.chatId === "2")?.text === "⏰ یادآوری: یادآوری دو" && b1.includes(`task:done:${t1}`) && b1.includes(`task:snooze:${t1}`) && b1.includes(`task:done:${t2}`) === false, "1-c-2: tick claims, sends with done/snooze buttons");
+    check(rows("SELECT reminded_at FROM tasks WHERE id IN (?, ?)", [t1, t2]).every((x) => x.reminded_at === NOWISO1c2), "1-c-2: delivered rows stay claimed");
+    const r2 = await runReminderTick(mkEnv1c2(db), { nowIso: NOWISO1c2, scheduledTime: NOON1c2, sendMessage: send });
+    check(r2.sent === 0 && sent.length === 2, "1-c-2: second tick never re-sends claimed rows");
+  }
+  // Delayed label: > 5 min late -> delayed label; exactly 5 min -> normal label.
+  {
+    const { sq, db } = fresh1c2();
+    seed1c2(sq, "دیرکرده", 1, { remindAt: "2026-10-31T11:54:59.000Z" });
+    seed1c2(sq, "سر وقت", 1, { remindAt: "2026-10-31T11:55:00.000Z" });
+    const sent = [];
+    await runReminderTick(mkEnv1c2(db), { nowIso: NOWISO1c2, scheduledTime: NOON1c2, sendMessage: async (chatId, text) => { sent.push(text); } });
+    check(sent.includes("⏰ یادآوری (با تاخیر): دیرکرده") && sent.includes("⏰ یادآوری: سر وقت"), "1-c-2: delayed label only past the 5-minute boundary");
+  }
+  // Send failure releases the claim; three strikes stop delivery, successes still send.
+  {
+    const { sq, db, rows } = fresh1c2();
+    const flaky = seed1c2(sq, "ناپایدار", 1, { remindAt: "2026-10-31T11:00:00.000Z" });
+    seed1c2(sq, "پایدار", 1, { remindAt: "2026-10-31T11:00:00.000Z" });
+    const failSend = async (chatId, text) => { if (text.includes("ناپایدار")) throw new Error("tg down"); };
+    const goodSend = async () => {};
+    let r = await runReminderTick(mkEnv1c2(db), { nowIso: NOWISO1c2, scheduledTime: NOON1c2, sendMessage: failSend });
+    check(r.sent === 1 && r.failed === 1 && rows("SELECT reminded_at, remind_attempts FROM tasks WHERE id = ?", [flaky])[0].reminded_at === null && rows("SELECT remind_attempts FROM tasks WHERE id = ?", [flaky])[0].remind_attempts === 1, "1-c-2: send failure releases the claim, attempts preserved");
+    await runReminderTick(mkEnv1c2(db), { nowIso: NOWISO1c2, scheduledTime: NOON1c2, sendMessage: failSend });
+    await runReminderTick(mkEnv1c2(db), { nowIso: NOWISO1c2, scheduledTime: NOON1c2, sendMessage: failSend });
+    r = await runReminderTick(mkEnv1c2(db), { nowIso: NOWISO1c2, scheduledTime: NOON1c2, sendMessage: goodSend });
+    check(r.sent === 0 && rows("SELECT remind_attempts FROM tasks WHERE id = ?", [flaky])[0].remind_attempts === 3, "1-c-2: three strikes stop delivery");
+  }
+  // Snooze callback Fix B states.
+  {
+    const { sq, db, rows } = fresh1c2();
+    const env = mkEnv1c2(db);
+    const mkCb = (data, userId, nowMs) => { const s = { sent: [], markup: 0 }; return { s, o: { fromId: userId, chatId: userId, data, nowMs, send: async (text) => { s.sent.push(text); }, editMarkup: async () => { s.markup++; }, chat: async () => {} } }; };
+    const tid = seed1c2(sq, "قابل تعویق", 1, { remindAt: "2026-10-31T11:00:00.000Z" });
+    const done = seed1c2(sq, "تمام‌شده", 1, { status: "done", remindAt: "2026-10-31T11:00:00.000Z", completedAt: "2026-10-31T10:00:00.000Z" });
+    const other = seed1c2(sq, "دیگری", 2, { remindAt: "2026-10-31T11:00:00.000Z" });
+    let c = mkCb(`task:snooze:${tid}`, 1, NOON1c2);
+    await resolveTaskCallback(env, c.o);
+    const row = rows("SELECT remind_at, reminded_at, remind_attempts FROM tasks WHERE id = ?", [tid])[0];
+    check(c.s.sent[0] === "💤 یادآوری برای ۱۰ دقیقه‌ی دیگر تنظیم شد." && c.s.markup === 1 && row.remind_at === "2026-10-31T12:10:00.000Z" && row.reminded_at === null && row.remind_attempts === 0, "1-c-2: open snooze sets +10 min, removes buttons, exact reply");
+    c = mkCb(`task:snooze:${other}`, 1, NOON1c2);
+    await resolveTaskCallback(env, c.o);
+    check(c.s.sent.length === 0 && c.s.markup === 0, "1-c-2: foreign snooze is silent");
+    c = mkCb("task:snooze:abc", 1, NOON1c2);
+    await resolveTaskCallback(env, c.o);
+    check(c.s.sent.length === 0 && c.s.markup === 0, "1-c-2: invalid snooze id is silent");
+    c = mkCb(`task:snooze:${done}`, 1, NOON1c2);
+    await resolveTaskCallback(env, c.o);
+    check(c.s.sent[0] === "قبلاً ثبت شد یا مهلتش گذشته" && c.s.markup === 1, "1-c-2: consumed snooze removes buttons, fixed message");
+    const failEnv = { ...env, DB: { prepare(sql) { if (/SELECT .* FROM tasks WHERE id/i.test(sql)) throw new Error("boom"); return db.prepare(sql); } } };
+    c = mkCb(`task:snooze:${tid}`, 1, NOON1c2);
+    await resolveTaskCallback(failEnv, c.o);
+    check(c.s.sent[0] === "ذخیره نشد، دوباره تلاش کن" && c.s.markup === 0, "1-c-2: snooze D1 failure keeps buttons, error notice");
+  }
+  // Daily purge inside the scheduled flow: 00:00 UTC tick purges, noon tick does not, zero KV writes.
+  {
+    const { sq, db, rows } = fresh1c2();
+    seed1c2(sq, "قدیمی تمام", 1, { status: "done", completedAt: "2026-09-15T00:00:00.000Z", createdAt: "2026-09-01T00:00:00.000Z" });
+    seed1c2(sq, "تازه تمام", 1, { status: "done", completedAt: "2026-10-20T00:00:00.000Z", createdAt: "2026-09-01T00:00:00.000Z" });
+    const puts = [];
+    const countingKV = { get: async () => null, put: async (k, v) => { puts.push(k); }, delete: async () => {} };
+    const noon = await runReminderTick(mkEnv1c2(db, countingKV), { nowIso: "2026-10-31T12:00:00.000Z", scheduledTime: NOON1c2, sendMessage: async () => {} });
+    check(noon.purged === null && rows("SELECT COUNT(*) AS n FROM tasks WHERE title = 'قدیمی تمام'")[0].n === 1, "1-c-2: noon tick never purges");
+    const midnight = await runReminderTick(mkEnv1c2(db, countingKV), { nowIso: "2026-11-01T00:00:00.000Z", scheduledTime: Date.UTC(2026, 10, 1, 0, 0, 0), sendMessage: async () => {} });
+    check(midnight.purged === 1 && rows("SELECT title FROM tasks ORDER BY id").map((x) => x.title).join(",") === "تازه تمام" && puts.length === 0, "1-c-2: 00:00 UTC tick purges old closed tasks, zero KV writes");
+  }
+  // Claim failure: tick reports ok false, sends nothing.
+  {
+    const { db } = fresh1c2();
+    const failDb = { prepare(sql) { if (/UPDATE tasks SET reminded_at/i.test(sql)) throw new Error("boom"); return db.prepare(sql); } };
+    const sent = [];
+    const r = await runReminderTick({ DB: failDb }, { nowIso: NOWISO1c2, scheduledTime: NOON1c2, sendMessage: async (c, t) => { sent.push(t); } });
+    check(r.ok === false && r.sent === 0 && sent.length === 0, "1-c-2: claim failure sends nothing, honest result");
   }
 }
 
