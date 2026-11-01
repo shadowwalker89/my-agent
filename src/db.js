@@ -348,6 +348,44 @@ export async function setTaskStatus(envOrDb, userId, taskId, status) {
   }
 }
 
+// 1-b-4: task correction is UPDATE-ONLY, user-scoped, and field
+// allow-listed to {title, dueAt, remindAt}. Status is NEVER changed
+// here (status changes go only through setTaskStatus), and the row is
+// never deleted + recreated (its id, and any 1-c reminder claim on it,
+// survive). Unknown fields or invalid values -> { ok: false }, nothing
+// written. Returns { ok: true } only when the row was actually updated
+// (changes === 1), so a foreign/missing task yields { ok: false }.
+const ISO_DT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+function validIsoDt(v) { return typeof v === "string" && ISO_DT.test(v) && Number.isFinite(Date.parse(v)); }
+export async function updateTaskFields(envOrDb, userId, taskId, fields) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  const tid = optInt(taskId);
+  if (!db || id === null || tid === null || !fields || typeof fields !== "object") return { ok: false };
+  const allowed = new Set(["title", "dueAt", "remindAt"]);
+  for (const k of Object.keys(fields)) if (!allowed.has(k)) return { ok: false };
+  const sets = [], params = [];
+  if (Object.prototype.hasOwnProperty.call(fields, "title")) {
+    const title = typeof fields.title === "string" ? fields.title.trim() : "";
+    if (!title) return { ok: false };
+    sets.push("title = ?"); params.push(title);
+  }
+  for (const [key, col] of [["dueAt", "due_at"], ["remindAt", "remind_at"]]) {
+    if (Object.prototype.hasOwnProperty.call(fields, key)) {
+      const v = fields[key];
+      if (v !== null && !validIsoDt(v)) return { ok: false };
+      sets.push(`${col} = ?`); params.push(v ?? null);
+    }
+  }
+  if (sets.length === 0) return { ok: false };
+  try {
+    const res = await db.prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`).bind(...params, tid, id).run();
+    return res?.meta?.changes === 1 ? { ok: true } : { ok: false };
+  } catch {
+    return { ok: false };
+  }
+}
+
 // Phase 1-b-3 (amendment 6): run several prepared statements as ONE
 // db.batch() unit — D1's only atomicity unit (all commit or none on a
 // statement error). Follows the same safety contract as the other

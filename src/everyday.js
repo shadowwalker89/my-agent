@@ -3,7 +3,7 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
-import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, insertTask, setTaskStatus, addProjectAlias, insertIntentFeedback, runDbBatch } from "./db.js";
+import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, insertTask, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
@@ -667,8 +667,8 @@ async function executeInterpAction(env, o, ctx, action, resolved) {
   }
   // 1-b-1: a task is really stored (insertTask validates title, project
   // ownership, due/remind ISO). Failure: NOT_SAVED_TEXT, no pointer,
-  // nothing claimed. Success: correction pointer set (correction still
-  // replies not-yet-active until 1-b-4); card carries ONLY the delete button.
+  // nothing claimed. Success: correction pointer set (task correction
+  // edits in place from 1-b-4); card carries ONLY the delete button.
   if (action.type === "task") {
     const r = await insertTask(env, { userId, title: action.text, projectId: resolved.project?.id ?? null, dueAt: resolved.due_at, remindAt: resolved.remind_at, source: o.source === "voice" ? "voice" : "text", sourceMessageId: o.entryMessageId ?? null });
     if (!r.ok) return { line: NOT_SAVED_TEXT, kind: "daily" };
@@ -680,9 +680,25 @@ async function executeInterpAction(env, o, ctx, action, resolved) {
   // 0-b3 correction: edits the last created item within 10 minutes (KV
   // pointer). Notes edit in place; expenses go through the confirm card
   // with corrects, so Confirm replaces the old row instead of duplicating.
+  // 1-b-4: tasks edit in place via updateTaskFields (UPDATE-only, never
+  // delete + recreate, never INSERT); time fields the correction does
+  // not mention are left untouched, never silently cleared.
   if (action.type === "correction") {
     const ptr = await getKv(env, correctionKey(userId));
-    if (!ptr || (ptr.table !== "notes" && ptr.table !== "expenses")) return { line: "موردی برای اصلاح در ۱۰ دقیقه‌ی اخیر پیدا نشد؛ مورد را دوباره بفرست.", kind: "daily" };
+    if (!ptr || (ptr.table !== "notes" && ptr.table !== "expenses" && ptr.table !== "tasks")) return { line: "موردی برای اصلاح در ۱۰ دقیقه‌ی اخیر پیدا نشد؛ مورد را دوباره بفرست.", kind: "daily" };
+    if (ptr.table === "tasks") {
+      const g = await getTask(env, userId, ptr.id);
+      if (!g.ok) return { line: NOT_SAVED_TEXT, kind: "daily" };
+      if (!g.task) return { line: "موردی برای اصلاح در ۱۰ دقیقه‌ی اخیر پیدا نشد؛ مورد را دوباره بفرست.", kind: "daily" };
+      if (g.task.status !== "open") return { line: "این تسک باز نیست و اصلاح نمی‌شود.", kind: "daily" };
+      const fields = { title: action.text };
+      if (resolved.due_at != null) fields.dueAt = resolved.due_at;
+      if (resolved.remind_at != null) fields.remindAt = resolved.remind_at;
+      const r = await updateTaskFields(env, userId, ptr.id, fields);
+      if (!r.ok) return { line: NOT_SAVED_TEXT, kind: "daily" };
+      await putKv(env, correctionKey(userId), { table: "tasks", id: ptr.id });
+      return { line: `✅ تسک اصلاح شد: ${action.text}`, kind: "daily" };
+    }
     if (ptr.table === "notes") {
       const old = await firstDb(env, "SELECT id FROM notes WHERE id = ? AND user_id = ?", [ptr.id, userId]);
       if (!old.ok || !old.row) return { line: "موردی برای اصلاح در ۱۰ دقیقه‌ی اخیر پیدا نشد؛ مورد را دوباره بفرست.", kind: "daily" };

@@ -29,7 +29,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, insertIntentFeedback } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback } from "../src/db.js";
 import {
   getChatContext,
   getSetting,
@@ -3666,6 +3666,99 @@ if (DatabaseSync) {
       const s2 = mkS3();
       await resolveInterpCallback(env, cbI3(s2, "interp:retrytask:r9", 2));
       check(s2.sent.length === 0 && tstatus3(tid) === "open", "1-b-3: foreign conversion retry is silent, task untouched");
+    }
+  }
+  // ── Phase 1-b-4: task correction (UPDATE-only) ──
+  if (DatabaseSync) {
+    const sqlite1b4 = new DatabaseSync(":memory:");
+    sqlite1b4.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sqlite1b4.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sqlite1b4.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sqlite1b4.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1'), (2, '2')");
+    const base4 = (sql) => { const st = sqlite1b4.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    const db1b4 = { prepare(sql) { return base4(sql); } };
+    const rows4 = (sql, params = []) => sqlite1b4.prepare(sql).all(...params);
+    const NOW4 = Date.UTC(2026, 9, 31, 12, 0, 0);
+    const mkEnv4 = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1,2", DB: db1b4, ...extra });
+    const mkS4 = () => { const sent = []; const chats = []; let markup = 0; return { sent, chats, markup: () => markup, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, chat: async (text) => { chats.push(text); }, editMarkup: async () => { markup++; } }; };
+    const mkO4 = (s, text, userId, extra = {}) => ({ chatId: userId, userId, text, send: s.send, chat: s.chat, nowMs: NOW4, ...extra });
+    const act4 = (type, extra = {}) => ({ type, text: extra.text ?? "متن", project: extra.project ?? null, due_text: extra.due_text ?? null, remind_text: extra.remind_text ?? null, amount_text: extra.amount_text ?? null, query: extra.query ?? null, target: extra.target ?? null, confidence: extra.confidence ?? 0.9, needs: extra.needs ?? "none" });
+    const fakeInterp4 = (actions) => async () => JSON.stringify(actions);
+    const task4 = (title, userId = 1, extra = {}) => { sqlite1b4.prepare("INSERT INTO tasks (user_id, title, status, source, created_at, due_at, remind_at) VALUES (?, ?, ?, ?, '2026-10-30T00:00:00.000Z', ?, ?)").run(userId, title, extra.status ?? "open", extra.source ?? "text", extra.dueAt ?? null, extra.remindAt ?? null); return rows4("SELECT id FROM tasks WHERE title = ? AND user_id = ?", [title, userId])[0].id; };
+    const lastText4 = (s) => String(s.sent.at(-1)?.text ?? "");
+    const corr4 = async (env, s, text, extra = {}) => { await handleDailyText(env, mkO4(s, "اصلاحش کن", 1, { interpreterCallFn: fakeInterp4([act4("correction", { text, ...extra })]) })); };
+    // Correction edits title/due/remind in place, id preserved, pointer refreshed.
+    {
+      const env = mkEnv4(), s = mkS4(); const tid = task4("تسک قدیمی");
+      await env.STATE.put("interp:last-item:1", JSON.stringify({ table: "tasks", id: tid }));
+      await corr4(env, s, "تسک تازه", { due_text: "فردا", remind_text: "فردا ساعت ۹" });
+      const row = rows4("SELECT * FROM tasks WHERE id = ?", [tid])[0];
+      const ptr = await env.STATE.get("interp:last-item:1", "json");
+      check(lastText4(s).includes("تسک اصلاح شد") && row.title === "تسک تازه" && row.due_at === "2026-11-01T00:00:00+03:30" && row.remind_at === "2026-11-01T09:00:00+03:30" && row.status === "open" && ptr?.table === "tasks" && ptr?.id === tid && rows4("SELECT COUNT(*) AS n FROM tasks")[0].n === 1, "1-b-4: correction edits title/due/remind, id preserved, pointer refreshed");
+    }
+    // Foreign task: no edit, honest message.
+    {
+      const env = mkEnv4(), s = mkS4(); const tid = task4("مال دیگری", 2);
+      await env.STATE.put("interp:last-item:1", JSON.stringify({ table: "tasks", id: tid }));
+      await corr4(env, s, "دست‌کاری");
+      check(lastText4(s).includes("۱۰ دقیقه") && rows4("SELECT title FROM tasks WHERE id = ?", [tid])[0].title === "مال دیگری", "1-b-4: foreign task correction edits nothing, honest message");
+    }
+    // Missing task: honest message, nothing written.
+    {
+      const env = mkEnv4(), s = mkS4();
+      await env.STATE.put("interp:last-item:1", JSON.stringify({ table: "tasks", id: 99999 }));
+      await corr4(env, s, "دست‌کاری");
+      check(lastText4(s).includes("۱۰ دقیقه") && rows4("SELECT COUNT(*) AS n FROM tasks WHERE title = 'دست‌کاری'")[0].n === 0, "1-b-4: missing task correction writes nothing, honest message");
+    }
+    // Non-open task: no edit, honest message.
+    {
+      const env = mkEnv4(), s = mkS4(); const tid = task4("تسک تمام‌شده", 1, { status: "done" });
+      await env.STATE.put("interp:last-item:1", JSON.stringify({ table: "tasks", id: tid }));
+      await corr4(env, s, "دست‌کاری");
+      const row = rows4("SELECT title, status FROM tasks WHERE id = ?", [tid])[0];
+      check(lastText4(s).includes("باز نیست") && row.title === "تسک تمام‌شده" && row.status === "done", "1-b-4: non-open task correction edits nothing");
+    }
+    // Correction without time phrases preserves stored due/remind.
+    {
+      const env = mkEnv4(), s = mkS4(); const tid = task4("تسک زمان‌دار", 1, { dueAt: "2026-11-02T00:00:00+03:30", remindAt: "2026-11-02T09:00:00+03:30" });
+      await env.STATE.put("interp:last-item:1", JSON.stringify({ table: "tasks", id: tid }));
+      await corr4(env, s, "تسک زمان‌دار تازه");
+      const row = rows4("SELECT title, due_at, remind_at FROM tasks WHERE id = ?", [tid])[0];
+      check(row.title === "تسک زمان‌دار تازه" && row.due_at === "2026-11-02T00:00:00+03:30" && row.remind_at === "2026-11-02T09:00:00+03:30", "1-b-4: correction without time phrases preserves stored due/remind");
+    }
+    // Voice-created task corrects in place, source preserved.
+    {
+      const env = mkEnv4(), s = mkS4();
+      await handleDailyText(env, mkO4(s, "تسک صوتی", 1, { source: "voice", interpreterCallFn: fakeInterp4([act4("task", { text: "تسک صوتی" })]) }));
+      const row0 = rows4("SELECT id, source FROM tasks WHERE title = 'تسک صوتی'")[0];
+      const s2 = mkS4();
+      await corr4(env, s2, "تسک صوتی اصلاح‌شده");
+      const row = rows4("SELECT title, source FROM tasks WHERE id = ?", [row0.id])[0];
+      check(row0.source === "voice" && row.title === "تسک صوتی اصلاح‌شده" && row.source === "voice", "1-b-4: voice-created task corrects in place, source preserved");
+    }
+    // updateTaskFields validation: rejections leave the row byte-unchanged.
+    {
+      const tid = task4("تسک اعتبارسنجی", 1, { dueAt: "2026-11-02T00:00:00+03:30" });
+      const before = JSON.stringify(rows4("SELECT * FROM tasks WHERE id = ?", [tid])[0]);
+      check((await updateTaskFields(db1b4, 1, tid, { status: "done" })).ok === false, "1-b-4: unknown field rejected");
+      check((await updateTaskFields(db1b4, 1, tid, { title: "   " })).ok === false, "1-b-4: empty title rejected");
+      check((await updateTaskFields(db1b4, 1, tid, { dueAt: "tomorrow" })).ok === false, "1-b-4: non-ISO due rejected");
+      check((await updateTaskFields(db1b4, 1, tid, { remindAt: "2026-13-99T99:99:99Z" })).ok === false, "1-b-4: impossible remind datetime rejected");
+      check((await updateTaskFields(db1b4, 1, tid, {})).ok === false, "1-b-4: empty fields rejected");
+      check((await updateTaskFields(db1b4, 2, tid, { title: "بیگانه" })).ok === false, "1-b-4: foreign user update rejected");
+      check((await updateTaskFields(db1b4, 1, 99999, { title: "بیگانه" })).ok === false, "1-b-4: missing task update rejected");
+      check(JSON.stringify(rows4("SELECT * FROM tasks WHERE id = ?", [tid])[0]) === before, "1-b-4: all rejected updates leave the row byte-unchanged");
+      check((await updateTaskFields(db1b4, 1, tid, { title: "تسک اعتبارسنجی", dueAt: null })).ok === true, "1-b-4: null due clears the field");
+      const after = rows4("SELECT title, due_at FROM tasks WHERE id = ?", [tid])[0];
+      check(after.title === "تسک اعتبارسنجی" && after.due_at === null, "1-b-4: valid update applies, only the cleared field changes");
+    }
+    // D1 failure on correction: honest reply, row unchanged.
+    {
+      const env = mkEnv4(), s = mkS4(); const tid = task4("تسک خراب");
+      await env.STATE.put("interp:last-item:1", JSON.stringify({ table: "tasks", id: tid }));
+      const failEnv = { ...env, DB: { prepare(sql) { if (/UPDATE tasks SET/i.test(sql)) throw new Error("boom"); return db1b4.prepare(sql); } } };
+      await corr4(failEnv, s, "دست‌کاری");
+      check(lastText4(s).includes("ذخیره نشد") && rows4("SELECT title FROM tasks WHERE id = ?", [tid])[0].title === "تسک خراب", "1-b-4: D1 failure on correction is honest, row unchanged");
     }
   }
 }
