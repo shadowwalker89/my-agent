@@ -282,7 +282,11 @@ const NOTE_QUERY_RE = /(یادداشت\s*های(م|مو| امروز)?|یاددا
 // Task list (1-b-1): anchored CLOSED list of clear list-request forms
 // (spaced/ZWNJ/joined تسک‌هام / تسک‌هایم + a show verb). Bare تسک,
 // تسک جدید, تسک بساز, and any message with a task body MUST NOT match.
-const TASK_LIST_RE = /^\s*(?:تسک\s*های(?:م|مو)|تسک\s*هامو?)(?:\s+را)?(?:\s+(?:نشان\s+بده|نشون\s+بده|نمایش\s+بده))?\s*[؟?!.،,]*$/u;
+// 1-c-1 (live-QA catch): an explicit list prefix (لیست / فهرست) is part
+// of the same closed rule, so «لیست تسک‌هام» and its spacing/ZWNJ
+// variants route deterministically to D1 with zero model calls instead
+// of falling through to chat (which hallucinated a fake task table).
+const TASK_LIST_RE = /^\s*(?:(?:لیست|فهرست)\s*)?(?:تسک\s*های(?:م|مو)|تسک\s*هامو?)(?:\s+را)?(?:\s+(?:نشان\s+بده|نشون\s+بده|نمایش\s+بده))?\s*[؟?!.،,]*$/u;
 const FILE_RE = /(?<!\p{L})(خلاصه\s+اش\s+کن(?![\p{L}])|خلاصه\s+کن(?![\p{L}])|خلاصه\s+اش|این فایل را خلاصه\s+کن(?![\p{L}]))/u;
 const TRANSLATE_VERB = /(?<!\p{L})(?:ترجمه\s+(?:کن|کنید|بکن))(?![\p{L}])/u;
 function countAnchoredAmounts(text) { const toks = stripThousands(normalizeDigits(normalizeText(text))).replace(/[؟?!.،,]/g, " ").split(/\s+/).filter(Boolean); let n = 0; for (let ci = 0; ci < toks.length; ci++) if (CUR_WORDS.includes(toks[ci])) for (let s = Math.max(0, ci - 7); s < ci; s++) { const ph = parseNumberPhrase(toks.slice(s, ci), 0); if (ph && !ph.error && ph.consumed === ci - s) { n++; break; } } return n; }

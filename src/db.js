@@ -427,6 +427,89 @@ export async function getTask(envOrDb, userId, taskId) {
   }
 }
 
+// Phase 1-c-1: reminder claiming for scheduled() delivery. The claim is
+// ONE atomic UPDATE ... RETURNING: the WHERE clause re-validates every
+// claim predicate, so two concurrent ticks can never double-claim the
+// same row — the loser updates zero rows for it. RETURNING yields exactly
+// the rows THIS call claimed. Owner telegram_id is resolved by a second
+// read over the claimed user_ids only (SQLite RETURNING cannot reference
+// joined tables); claimed rows are guaranteed a non-null telegram_id by
+// the EXISTS clause, and if the mapping read itself fails the claims are
+// released again and {ok: false} is returned, so a failure never burns
+// an attempt silently. {ok: false} ONLY on a real D1 failure.
+export async function claimDueReminders(envOrDb, nowIso, limit = 20) {
+  const db = dbOf(envOrDb);
+  if (!db || typeof nowIso !== "string" || !Number.isFinite(Date.parse(nowIso))) return { ok: false, reminders: [] };
+  const n = Math.max(1, Math.min(100, Number(limit) || 20));
+  try {
+    const res = await db.prepare("UPDATE tasks SET reminded_at = ?, remind_attempts = remind_attempts + 1 WHERE id IN (SELECT t.id FROM tasks t WHERE t.status = 'open' AND t.remind_at IS NOT NULL AND t.remind_at <= ? AND t.reminded_at IS NULL AND t.remind_attempts < 3 AND EXISTS (SELECT 1 FROM users u WHERE u.id = t.user_id AND u.telegram_id IS NOT NULL) ORDER BY t.remind_at ASC, t.id ASC LIMIT ?) RETURNING id, user_id, title, remind_at, remind_attempts").bind(nowIso, nowIso, n).all();
+    const rows = Array.isArray(res?.results) ? res.results : [];
+    if (rows.length === 0) return { ok: true, reminders: [] };
+    let owners;
+    try {
+      const ores = await db.prepare(`SELECT id, telegram_id FROM users WHERE id IN (${[...new Set(rows.map((r) => r.user_id))].map(() => "?").join(",")})`).bind(...[...new Set(rows.map((r) => r.user_id))]).all();
+      owners = new Map((Array.isArray(ores?.results) ? ores.results : []).map((u) => [u.id, u.telegram_id]));
+    } catch {
+      await db.prepare(`UPDATE tasks SET reminded_at = NULL WHERE id IN (${rows.map(() => "?").join(",")}) AND status = 'open'`).bind(...rows.map((r) => r.id)).run().catch(() => {});
+      return { ok: false, reminders: [] };
+    }
+    return { ok: true, reminders: rows.filter((r) => owners.get(r.user_id) != null).map((r) => ({ id: r.id, user_id: r.user_id, telegram_id: owners.get(r.user_id), title: r.title, remind_at: r.remind_at, remind_attempts: r.remind_attempts })) };
+  } catch {
+    return { ok: false, reminders: [] };
+  }
+}
+
+// Phase 1-c-1: delivery-failure recovery. Clears reminded_at on open
+// tasks only, preserving the incremented remind_attempts, so a failed
+// send retries up to 3 total attempts and stops once attempts >= 3.
+// {ok: true} when the statement ran — a 0-change result (already
+// done/deleted, nothing left claimed) is still a success; {ok: false}
+// ONLY on a real D1 failure (missing DB, bad id, thrown query).
+export async function releaseReminderClaim(envOrDb, taskId) {
+  const db = dbOf(envOrDb);
+  const tid = parseRowId(taskId);
+  if (!db || tid === null) return { ok: false };
+  try {
+    await db.prepare("UPDATE tasks SET reminded_at = NULL WHERE id = ? AND status = 'open'").bind(tid).run();
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  }
+}
+
+// Phase 1-c-1: snooze is an atomic owner-scoped UPDATE on open tasks
+// only: new remind_at, reminded_at cleared, attempts reset to 0 (a fresh
+// 3-attempt budget for the new time). {ok: false} ONLY on a real D1
+// failure (missing DB, bad ids, invalid ISO, thrown query); {ok: true,
+// updated: false} when the row is foreign/missing/non-open.
+export async function snoozeTaskReminder(envOrDb, userId, taskId, newRemindAtIso) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  const tid = parseRowId(taskId);
+  if (!db || id === null || tid === null || !validIsoDt(newRemindAtIso)) return { ok: false, updated: false };
+  try {
+    const res = await db.prepare("UPDATE tasks SET remind_at = ?, reminded_at = NULL, remind_attempts = 0 WHERE id = ? AND user_id = ? AND status = 'open'").bind(newRemindAtIso, tid, id).run();
+    return { ok: true, updated: res?.meta?.changes === 1 };
+  } catch {
+    return { ok: false, updated: false };
+  }
+}
+
+// Phase 1-c-1: 30-day purge of closed tasks only. A done/deleted task
+// counts as old by completed_at, falling back to created_at when
+// completed_at is null (legacy rows). Open tasks are never touched.
+// {ok: false, deleted: 0} ONLY on a real D1 failure.
+export async function purgeOldClosedTasks(envOrDb, cutoffIso) {
+  const db = dbOf(envOrDb);
+  if (!db || typeof cutoffIso !== "string" || !Number.isFinite(Date.parse(cutoffIso))) return { ok: false, deleted: 0 };
+  try {
+    const res = await db.prepare("DELETE FROM tasks WHERE status IN ('done', 'deleted') AND COALESCE(completed_at, created_at) < ?").bind(cutoffIso).run();
+    return { ok: true, deleted: res?.meta?.changes ?? 0 };
+  } catch {
+    return { ok: false, deleted: 0 };
+  }
+}
+
 // Conditional-UPDATE fallback for addProjectAlias, used ONLY when the
 // JSON form is unavailable in the binding (error "no such function").
 // 3 attempts total, each re-reading the current value first. A
