@@ -29,7 +29,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, getProject, insertTask, listOpenTasks, setTaskStatus, insertIntentFeedback } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, listOpenTasks, listOpenTasksResult, setTaskStatus, insertIntentFeedback } from "../src/db.js";
 import {
   getChatContext,
   getSetting,
@@ -1125,7 +1125,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, confirmExpenseDraft, runModelBranch, CHAT_CONTEXT_CHAR_LIMIT } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT } from "../src/everyday.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
   check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
@@ -2949,6 +2949,68 @@ if (DatabaseSync) {
   check(JSON.stringify(await listOpenTasks(null, 1)) === "[]" && (await insertTask(null, { userId: 1, title: "x" })).ok === false, "null DB tasks safe");
   check((await setTaskStatus(null, 1, 1, "done")).ok === false && (await insertIntentFeedback(null, { userId: 1, text: "x", predictedType: "a", correctType: "b" })).ok === false, "null DB status/feedback safe");
   check(JSON.stringify(await listProjects(failing1a, 1)) === "[]" && (await insertTask(failing1a, { userId: 1, title: "x" })).ok === false, "failing DB safe");
+}
+
+// ── Phase 1-b-0a: result-shaped reads + resolveProjects (Fix A) ───────────
+// New functions only; resolveProjects is exported for tests but NOT yet
+// called by any runtime path in this slice (pure functions + tests).
+if (DatabaseSync) {
+  const sqlite0a = new DatabaseSync(":memory:");
+  sqlite0a.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite0a.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqlite0a.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+  sqlite0a.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  const db0a = {
+    prepare(sql) {
+      const stmt = sqlite0a.prepare(sql);
+      return {
+        bind(...params) {
+          return {
+            run: async () => { const r = stmt.run(...params); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; },
+            all: async () => ({ results: stmt.all(...params) }),
+            first: async () => stmt.get(...params) ?? null,
+          };
+        },
+      };
+    },
+  };
+  const failing0a = { prepare() { throw new Error("boom"); } };
+  // listProjectsResult: rows ok, empty ok, failures ok:false (never []-as-empty).
+  const pr = await listProjectsResult(db0a, 1);
+  check(pr.ok === true && pr.projects.length === 4 && pr.projects[0].name === "عمومی" && pr.projects[0].is_default === 1, `0a: projects ok with rows: ${JSON.stringify(pr.projects.map((p) => p.name))}`);
+  const prEmpty = await listProjectsResult(db0a, 99);
+  check(prEmpty.ok === true && prEmpty.projects.length === 0, "0a: empty success is ok:true with []");
+  check((await listProjectsResult(null, 1)).ok === false && (await listProjectsResult(failing0a, 1)).ok === false && (await listProjectsResult(db0a, "banana")).ok === false, "0a: null/throwing/bad-user projects -> ok:false");
+  // Delegation: existing listProjects behaviour unchanged.
+  check((await listProjects(db0a, 1)).length === 4 && JSON.stringify(await listProjects(null, 1)) === "[]", "0a: listProjects delegate unchanged");
+  // listOpenTasksResult: rows, offset paging, beyond-end, failures; delegate unchanged.
+  await insertTask(db0a, { userId: 1, title: "t1" });
+  await insertTask(db0a, { userId: 1, title: "t2" });
+  await insertTask(db0a, { userId: 1, title: "t3" });
+  const or1 = await listOpenTasksResult(db0a, 1, null, 2, 1);
+  check(or1.ok === true && or1.tasks.length === 2 && or1.tasks[0].title === "t2" && or1.tasks[1].title === "t3", `0a: offset page: ${JSON.stringify(or1.tasks.map((t) => t.title))}`);
+  const orEnd = await listOpenTasksResult(db0a, 1, null, 50, 99);
+  check(orEnd.ok === true && orEnd.tasks.length === 0, "0a: offset beyond end -> empty ok");
+  check((await listOpenTasksResult(null, 1)).ok === false && (await listOpenTasksResult(failing0a, 1)).ok === false, "0a: null/throwing tasks -> ok:false");
+  check((await listOpenTasks(db0a, 1)).length === 3, "0a: listOpenTasks delegate unchanged");
+  // resolveProjects: D1 rows map to ids with parsed aliases + is_default kept.
+  const rp = await resolveProjects({ DB: db0a }, 1);
+  check(rp.ok === true && rp.fallback === false && rp.projects[2].name === "گلبهار" && JSON.stringify(rp.projects[2].aliases) === '["گل"]' && rp.projects[0].is_default === 1, `0a: resolveProjects D1 rows: ${JSON.stringify(rp.projects.map((p) => p.name))}`);
+  // Malformed stored aliases JSON degrades to [], never a throw.
+  sqlite0a.exec("UPDATE projects SET aliases = 'not-json' WHERE user_id = 1 AND name = 'گلبهار'");
+  const rpBad = await resolveProjects({ DB: db0a }, 1);
+  check(rpBad.ok === true && rpBad.projects[2].aliases.length === 0, "0a: malformed aliases JSON -> []");
+  // Genuine empty success -> marked seed fallback, seed shape preserved (no D1 id).
+  const rpEmpty = await resolveProjects({ DB: db0a }, 99);
+  check(rpEmpty.ok === true && rpEmpty.fallback === true && rpEmpty.projects[0].name === "عمومی" && rpEmpty.projects[0].id === undefined, "0a: genuine empty -> marked seed fallback");
+  // D1 failure -> ok:false with NO fallback list (failure never reads as empty).
+  const rpFail = await resolveProjects({ DB: failing0a }, 1);
+  check(rpFail.ok === false && rpFail.projects.length === 0 && rpFail.fallback !== true, "0a: D1 failure -> ok:false, no fallback");
+  // is_default survives: non-default first row, default second row (fresh user, no seeds).
+  sqlite0a.exec("INSERT INTO users (id, telegram_id) VALUES (3, '3')");
+  sqlite0a.exec("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (3, 'first', '[]', 'active', 0, '2026-10-30T00:00:00.000Z'), (3, 'second', '[]', 'active', 1, '2026-10-30T00:00:00.000Z')");
+  const rp2 = await resolveProjects({ DB: db0a }, 3);
+  check(rp2.projects.length === 2 && rp2.projects[0].name === "first" && rp2.projects.find((p) => p.is_default === 1)?.name === "second", "0a: is_default lookup reads the field, not the first row");
 }
 
 if (failures.length) {

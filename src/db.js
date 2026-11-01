@@ -157,20 +157,31 @@ function parseProjectId(v) {
   return false;
 }
 
-// Active projects for a user, oldest first. [] when DB/user missing/failing.
-export async function listProjects(envOrDb, userId) {
+// Phase 1-b-0a (Fix A): result-shaped project read. {ok: true} even
+// when the list is empty; {ok: false} ONLY on a real D1 failure
+// (missing DB, bad user id, thrown query) — never for "no projects".
+// Full rows are returned (id, name, aliases, status, is_default);
+// no projection in the chain may drop is_default (amendment 7c).
+export async function listProjectsResult(envOrDb, userId) {
   const db = dbOf(envOrDb);
   const id = validUserId(userId);
-  if (!db || id === null) return [];
+  if (!db || id === null) return { ok: false, projects: [] };
   try {
     const res = await db
       .prepare("SELECT id, name, aliases, status, is_default FROM projects WHERE user_id = ? AND status = 'active' ORDER BY id ASC")
       .bind(id)
       .all();
-    return Array.isArray(res?.results) ? res.results : [];
+    return { ok: true, projects: Array.isArray(res?.results) ? res.results : [] };
   } catch {
-    return [];
+    return { ok: false, projects: [] };
   }
+}
+
+// Active projects for a user, oldest first. [] when DB/user missing/failing.
+// Thin delegate over listProjectsResult; observable behaviour unchanged.
+export async function listProjects(envOrDb, userId) {
+  const r = await listProjectsResult(envOrDb, userId);
+  return r.projects ?? [];
 }
 
 // One project by id, scoped by user. Null when missing/failing.
@@ -234,22 +245,32 @@ export async function insertTask(envOrDb, task) {
   }
 }
 
-// Open tasks only, oldest first, optionally filtered by project. The
-// done/deleted archive is never listed here. [] when DB/user missing/failing.
-export async function listOpenTasks(envOrDb, userId, projectId = null, limit = 50) {
+// Phase 1-b-0a (Fix A): result-shaped open-task read, same ok rule as
+// listProjectsResult. The offset parameter lands with the core here;
+// listOpenTasks gains it in 1-b-0b, so this slice's delegate passes 0.
+export async function listOpenTasksResult(envOrDb, userId, projectId = null, limit = 50, offset = 0) {
   const db = dbOf(envOrDb);
   const id = validUserId(userId);
-  if (!db || id === null) return [];
+  if (!db || id === null) return { ok: false, tasks: [] };
   const n = Math.max(1, Math.min(100, Number(limit) || 50));
+  const off = Math.max(0, Math.floor(Number(offset) || 0));
   try {
     const pid = optInt(projectId);
     const res = pid === null
-      ? await db.prepare("SELECT id, title, project_id, status, due_at, remind_at, reminded_at, remind_attempts, source, created_at, completed_at FROM tasks WHERE user_id = ? AND status = 'open' ORDER BY id ASC LIMIT ?").bind(id, n).all()
-      : await db.prepare("SELECT id, title, project_id, status, due_at, remind_at, reminded_at, remind_attempts, source, created_at, completed_at FROM tasks WHERE user_id = ? AND status = 'open' AND project_id = ? ORDER BY id ASC LIMIT ?").bind(id, pid, n).all();
-    return Array.isArray(res?.results) ? res.results : [];
+      ? await db.prepare("SELECT id, title, project_id, status, due_at, remind_at, reminded_at, remind_attempts, source, created_at, completed_at FROM tasks WHERE user_id = ? AND status = 'open' ORDER BY id ASC LIMIT ? OFFSET ?").bind(id, n, off).all()
+      : await db.prepare("SELECT id, title, project_id, status, due_at, remind_at, reminded_at, remind_attempts, source, created_at, completed_at FROM tasks WHERE user_id = ? AND status = 'open' AND project_id = ? ORDER BY id ASC LIMIT ? OFFSET ?").bind(id, pid, n, off).all();
+    return { ok: true, tasks: Array.isArray(res?.results) ? res.results : [] };
   } catch {
-    return [];
+    return { ok: false, tasks: [] };
   }
+}
+
+// Open tasks only, oldest first, optionally filtered by project. The
+// done/deleted archive is never listed here. [] when DB/user missing/failing.
+// Thin delegate over listOpenTasksResult; observable behaviour unchanged.
+export async function listOpenTasks(envOrDb, userId, projectId = null, limit = 50) {
+  const r = await listOpenTasksResult(envOrDb, userId, projectId, limit, 0);
+  return r.tasks ?? [];
 }
 
 // Change one task's status, only from 'open'. 'done' sets completed_at
