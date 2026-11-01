@@ -3223,7 +3223,8 @@ if (DatabaseSync) {
     await resolveTaskCallback(failGetEnv, { fromId: 1, chatId: 1, data: `task:del:${foreignId}`, send: sD4.send, editMarkup: sD4.editMarkup, chat: sD4.chat, nowMs: NOW1b1 });
     check(String(sD4.sent.at(-1)?.text ?? "") === "ذخیره نشد، دوباره تلاش کن" && sD4.markup() === 0, "1-b-1: D1 failure keeps the buttons");
     check(await resolveTaskCallback(env, { fromId: 1, chatId: 1, data: "task:del:abc", send: sD.send, editMarkup: async () => {}, chat: sD.chat, nowMs: NOW1b1 }) === false, "1-b-1: non-numeric del is not a task callback");
-    check(await resolveTaskCallback(env, { fromId: 1, chatId: 1, data: "task:more:0", send: sD.send, editMarkup: async () => {}, chat: sD.chat, nowMs: NOW1b1 }) === false, "1-b-1: pagination is not handled until 1-b-2");
+    const beforeMore = sD.sent.length;
+    check(await resolveTaskCallback(env, { fromId: 1, chatId: 1, data: "task:more:0", send: sD.send, editMarkup: async () => {}, chat: sD.chat, nowMs: NOW1b1 }) === true && sD.sent.length > beforeMore, "1-b-2 (INTENDED BEHAVIOUR CHANGE): pagination is handled now");
   }
   // Note assignment: D1 project id, seed-fallback NULL, rule-note default.
   {
@@ -3278,8 +3279,145 @@ if (DatabaseSync) {
     const env = mkEnv1b1(), s = mkS();
     await handleDailyText(env, mkO1(s, "چند مورد", 1, { interpreterCallFn: fakeInterp([act("task", { text: "تسک چندگانه" }), act("note", { text: "یادداشت چندگانه" })]) }));
     check(rows1b1("SELECT COUNT(*) AS n FROM tasks WHERE title = 'تسک چندگانه'")[0].n === 1 && rows1b1("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت چندگانه'")[0].n === 1, "1-b-1: multi-action stores both items");
-    check(!btnData(s).some((d) => d.includes("changetask") || d.startsWith("task:del:")), "1-b-1: multi summary carries no task buttons in this slice");
+    check(btnData(s).some((d) => d.startsWith("task:del:")), "1-b-2 (INTENDED BEHAVIOUR CHANGE, 1-b-1 boundary closed): multi summary now carries task delete buttons");
     check(btnData(s).some((d) => d.startsWith("interp:del:")), "1-b-1: multi summary still carries the note delete button");
+  }
+}
+
+// ── Phase 1-b-2: full list, pagination, ✅, delete, archive, filter ──
+// Fresh DB; user 1 has default عمومی + کار; user 2 has شخصی.
+if (DatabaseSync) {
+  const sqlite1b2 = new DatabaseSync(":memory:");
+  sqlite1b2.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite1b2.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqlite1b2.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  sqlite1b2.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1'), (2, '2')");
+  sqlite1b2.exec("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (1, 'عمومی', '[]', 'active', 1, '2026-10-30T00:00:00.000Z'), (1, 'کار', '[]', 'active', 0, '2026-10-30T00:00:00.000Z'), (2, 'شخصی', '[]', 'active', 0, '2026-10-30T00:00:00.000Z')");
+  const db1b2 = { prepare(sql) { const stmt = sqlite1b2.prepare(sql); return { bind(...params) { return { run: async () => { const r = stmt.run(...params); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  const rows1b2 = (sql, params = []) => sqlite1b2.prepare(sql).all(...params);
+  const mkEnv1b2 = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1,2", DB: db1b2, ...extra });
+  const NOW1b2 = Date.UTC(2026, 9, 31, 12, 0, 0);
+  const mkS2 = () => { const sent = []; const chats = []; let markup = 0; return { sent, chats, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, chat: async (text, copts) => { chats.push({ text, copts }); }, editMarkup: async () => { markup++; }, markup: () => markup }; };
+  const mkO2 = (s, text, userId, extra = {}) => ({ chatId: userId, userId, text, send: s.send, chat: s.chat, nowMs: NOW1b2, ...extra });
+  const btnData2 = (s) => s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+  const cbO2 = (s, data, userId) => ({ fromId: userId, chatId: userId, data, send: s.send, editMarkup: s.editMarkup, chat: s.chat, nowMs: NOW1b2 });
+  const act2 = (type, extra = {}) => ({ type, text: extra.text ?? "متن", project: extra.project ?? null, due_text: extra.due_text ?? null, remind_text: extra.remind_text ?? null, amount_text: extra.amount_text ?? null, query: extra.query ?? null, target: extra.target ?? null, confidence: extra.confidence ?? 0.9, needs: extra.needs ?? "none" });
+  const fakeInterp2 = (actions) => async () => JSON.stringify(actions);
+  const karId2 = rows1b2("SELECT id FROM projects WHERE user_id = 1 AND name = 'کار'")[0].id;
+  const seedTasks = () => { for (let i = 1; i <= 10; i++) sqlite1b2.exec(`INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'صفحه ${i}', 'open', 'text', '2026-10-30T00:00:00.000Z')`); sqlite1b2.exec(`INSERT INTO tasks (user_id, title, project_id, status, source, created_at) VALUES (1, 'کاری ۱', ${karId2}, 'open', 'text', '2026-10-30T00:00:00.000Z'), (1, 'کاری ۲', ${karId2}, 'open', 'text', '2026-10-30T00:00:00.000Z')`); sqlite1b2.exec("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'قدیمی تمام', 'done', 'text', '2026-10-29T00:00:00.000Z'), (1, 'تازه تمام', 'done', 'text', '2026-10-30T00:00:00.000Z'), (1, 'حذف‌شده', 'deleted', 'text', '2026-10-30T00:00:00.000Z'), (2, 'دیگری', 'open', 'text', '2026-10-30T00:00:00.000Z')"); };
+  seedTasks();
+  const openId = (title) => rows1b2("SELECT id FROM tasks WHERE title = ?", [title])[0].id;
+  // Pagination: page 1 of 8 with a more button; page 2 disjoint; beyond-end no-more, no repeat.
+  {
+    const env = mkEnv1b2(), s = mkS2();
+    await handleDailyText(env, mkO2(s, "تسک هام", 1));
+    const p1 = String(s.sent.at(-1)?.text ?? "");
+    check(p1.split("\n").length === 8 && p1.includes("صفحه 1") && p1.includes("صفحه 8") && !p1.includes("صفحه 9"), "1-b-2: page 1 has 8 rows");
+    check(btnData2(s).includes("task:more:8"), "1-b-2: full page carries a more button");
+    check(btnData2(s).some((d) => d === `task:done:${openId("صفحه 1")}`) && btnData2(s).some((d) => d === `task:del:${openId("صفحه 1")}`), "1-b-2: list rows carry done/delete buttons");
+    check(btnData2(s).some((d) => d === "task:arch:0") && btnData2(s).some((d) => d === `task:proj:${karId2}:0`), "1-b-2: list carries archive + project filter buttons");
+    const s2 = mkS2();
+    await resolveTaskCallback(env, cbO2(s2, "task:more:8", 1));
+    const p2 = String(s2.sent.at(-1)?.text ?? "");
+    check(p2.includes("صفحه 9") && p2.includes("صفحه 10") && !p2.includes("صفحه 1\n") && !btnData2(s2).some((d) => d.startsWith("task:more:")), "1-b-2: page 2 disjoint, partial page has no more button");
+    const s3 = mkS2();
+    await resolveTaskCallback(env, cbO2(s3, "task:more:16", 1));
+    check(String(s3.sent.at(-1)?.text ?? "") === "صفحه‌ی دیگری نیست." && btnData2(s3).includes("task:more:0"), "1-b-2: beyond-end renders no-more with a back button, no repeat of page 1");
+    const s4 = mkS2();
+    await resolveTaskCallback(env, cbO2(s4, "task:more:abc", 1));
+    check(String(s4.sent.at(-1)?.text ?? "").split("\n").length === 8, "1-b-2: unparseable offset falls back to page 1");
+    const s5 = mkS2();
+    await resolveTaskCallback(env, cbO2(s5, "task:more:-3", 1));
+    check(String(s5.sent.at(-1)?.text ?? "").split("\n").length === 8, "1-b-2: negative offset clamps to page 1");
+  }
+  // ✅: done + completed_at, leaves open list, appears in archive; markup removed.
+  {
+    const env = mkEnv1b2(), s = mkS2(), id = openId("صفحه 2");
+    await resolveTaskCallback(env, cbO2(s, `task:done:${id}`, 1));
+    const row = rows1b2("SELECT status, completed_at FROM tasks WHERE id = ?", [id])[0];
+    check(row.status === "done" && !!row.completed_at && s.markup() === 1 && String(s.sent.at(-1)?.text ?? "").includes("انجام شد"), "1-b-2: done sets status + completed_at, removes markup");
+    const sL = mkS2();
+    await handleDailyText(env, mkO2(sL, "تسک هام", 1));
+    check(!String(sL.sent.at(-1)?.text ?? "").includes("صفحه 2"), "1-b-2: done task leaves the open list");
+    const sA = mkS2();
+    await resolveTaskCallback(env, cbO2(sA, "task:arch:0", 1));
+    check(String(sA.sent.at(-1)?.text ?? "").includes("صفحه 2"), "1-b-2: done task appears in the archive");
+  }
+  // Delete: deleted, leaves both lists; markup removed.
+  {
+    const env = mkEnv1b2(), s = mkS2(), id = openId("صفحه 3");
+    await resolveTaskCallback(env, cbO2(s, `task:del:${id}`, 1));
+    check(rows1b2("SELECT status FROM tasks WHERE id = ?", [id])[0].status === "deleted" && s.markup() === 1, "1-b-2: delete sets deleted, removes markup");
+    const sA = mkS2();
+    await resolveTaskCallback(env, cbO2(sA, "task:arch:0", 1));
+    check(!String(sA.sent.at(-1)?.text ?? "").includes("صفحه 3"), "1-b-2: deleted task is in neither list");
+  }
+  // Archive: done-only, newest-first, never open/deleted; genuine empty vs failure distinct.
+  {
+    const env = mkEnv1b2(), s = mkS2();
+    await resolveTaskCallback(env, cbO2(s, "task:arch:0", 1));
+    const t = String(s.sent.at(-1)?.text ?? "");
+    check(t.indexOf("تازه تمام") < t.indexOf("قدیمی تمام") && !t.includes("صفحه 1") && !t.includes("حذف‌شده"), "1-b-2: archive is done-only, newest-first");
+    const failEnv = { ...mkEnv1b2(), DB: { prepare(sql) { if (/FROM tasks/i.test(sql)) throw new Error("boom"); return db1b2.prepare(sql); } } }, sF = mkS2();
+    await resolveTaskCallback(failEnv, cbO2(sF, "task:arch:0", 1));
+    check(String(sF.sent.at(-1)?.text ?? "") === "تسک‌ها خوانده نشد؛ دوباره تلاش کن" && !String(sF.sent.at(-1)?.text ?? "").includes("تمام"), "1-b-2: archive failure is honest, never an empty archive");
+  }
+  // Filter: only the chosen project's tasks; filtered more keeps the project; "همه" returns.
+  {
+    const env = mkEnv1b2(), s = mkS2();
+    await resolveTaskCallback(env, cbO2(s, `task:proj:${karId2}:0`, 1));
+    const t = String(s.sent.at(-1)?.text ?? "");
+    check(t.includes("کاری ۱") && t.includes("کاری ۲") && !t.includes("صفحه 1"), "1-b-2: filter shows only the chosen project");
+    check(btnData2(s).some((d) => d === "task:more:0"), "1-b-2: filtered page carries an all button");
+    const sF = mkS2();
+    await resolveTaskCallback(env, cbO2(sF, "task:proj:999999:0", 1));
+    check(sF.sent.length === 0, "1-b-2: foreign/missing project filter is silent, no data, no filter");
+    const sG = mkS2();
+    await resolveTaskCallback(env, cbO2(sG, "task:proj:abc:0", 1));
+    check(sG.sent.length === 0, "1-b-2: invalid project filter is silent");
+  }
+  // Callback ownership: foreign silent, consumed fixed-message, D1 failure keeps buttons, double-tap one transition.
+  {
+    const env = mkEnv1b2(), s = mkS2(), id = openId("صفحه 4"), other = openId("دیگری");
+    await resolveTaskCallback(env, cbO2(s, `task:done:${id}`, 2));
+    check(s.sent.length === 0 && s.markup() === 0 && rows1b2("SELECT status FROM tasks WHERE id = ?", [id])[0].status === "open", "1-b-2: foreign tap silent, no status change");
+    check(rows1b2("SELECT status FROM tasks WHERE id = ?", [other])[0].status === "open", "1-b-2: other user's own task untouched by the foreign test");
+    const sC = mkS2();
+    await resolveTaskCallback(env, cbO2(sC, `task:done:${id}`, 1));
+    await resolveTaskCallback(env, cbO2(sC, `task:done:${id}`, 1));
+    check(rows1b2("SELECT status FROM tasks WHERE id = ?", [id])[0].status === "done" && sC.markup() === 2, "1-b-2: double-tap yields exactly one transition, second tap consumes");
+    const failEnv = { ...mkEnv1b2(), DB: { prepare(sql) { if (/^UPDATE tasks/i.test(sql)) throw new Error("boom"); return db1b2.prepare(sql); } } }, sF = mkS2(), idF = openId("صفحه 5");
+    await resolveTaskCallback(failEnv, cbO2(sF, `task:done:${idF}`, 1));
+    check(String(sF.sent.at(-1)?.text ?? "").includes("ذخیره نشد") && sF.markup() === 0 && rows1b2("SELECT status FROM tasks WHERE id = ?", [idF])[0].status === "open", "1-b-2: D1 failure keeps buttons, failure reply, no change");
+  }
+  // 4096 split: page 2 holds a 5000-char title -> 3 sends, each <= 4096, keyboard on the last only.
+  {
+    sqlite1b2.exec(`INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, '${"x".repeat(5000)}', 'open', 'text', '2026-10-30T00:00:00.000Z')`);
+    const env = mkEnv1b2(), s = mkS2();
+    await resolveTaskCallback(env, cbO2(s, "task:more:8", 1));
+    check(s.sent.length === 3 && s.sent.every((m) => String(m.text ?? "").length <= 4096), "1-b-2: long list splits at 4096");
+    check(!!s.sent.at(-1)?.replyMarkup && !s.sent.slice(0, -1).some((m) => m.replyMarkup), "1-b-2: keyboard rides on the last chunk only");
+  }
+  // Interpreter task query: bare -> open list with buttons; resolved project -> pre-filtered; period ignored, never claimed.
+  {
+    const env = mkEnv1b2(), s = mkS2();
+    await handleDailyText(env, mkO2(s, "تسک‌هایم در هفته", 1, { interpreterCallFn: fakeInterp2([act2("query", { query: { kind: "task", periodText: "هفته", project: null } })]) }));
+    const t = String(s.sent.at(-1)?.text ?? "");
+    check(t.includes("صفحه 1") && !t.includes("هفته") && btnData2(s).some((d) => d.startsWith("task:done:")), "1-b-2: task query renders the list with buttons, period ignored and never claimed");
+    const sP = mkS2();
+    await handleDailyText(env, mkO2(sP, "تسک‌های کار", 1, { interpreterCallFn: fakeInterp2([act2("query", { query: { kind: "task", periodText: null, project: "کار" } })]) }));
+    const tP = String(sP.sent.at(-1)?.text ?? "");
+    check(tP.includes("کاری ۱") && !tP.includes("صفحه 1"), "1-b-2: task query with a resolved project pre-filters");
+  }
+  // Multi-action summary now carries task delete buttons (1-b-1 boundary closed); tap deletes.
+  {
+    const env = mkEnv1b2(), s = mkS2();
+    await handleDailyText(env, mkO2(s, "چند مورد ۲", 1, { interpreterCallFn: fakeInterp2([act2("task", { text: "تسک چندگانه ۲" }), act2("note", { text: "یادداشت چندگانه ۲" })]) }));
+    const delBtn = btnData2(s).find((d) => d.startsWith("task:del:"));
+    check(!!delBtn && btnData2(s).some((d) => d.startsWith("interp:del:")), "1-b-2: multi summary carries task + note delete buttons");
+    const sD = mkS2();
+    await resolveTaskCallback(env, cbO2(sD, delBtn, 1));
+    check(rows1b2("SELECT status FROM tasks WHERE title = 'تسک چندگانه ۲'")[0].status === "deleted", "1-b-2: multi summary task button deletes");
   }
 }
 
