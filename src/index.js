@@ -733,8 +733,8 @@ async function handleCallbackQuery(env, cb) {
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
     return;
   }
-  // 1-b-1: id-carrying task callbacks (task:del:<id>); ownership is
-  // re-checked inside via getTask (the allow-list gate already ran).
+  // 1-b-2: full task: namespace (done/del/more/arch/proj); id
+  // callbacks re-check ownership inside via getTask (allow-list gate already ran).
   if (data.startsWith("task:")) {
     await resolveTaskCallback(env, { fromId, chatId, data, nowMs: Date.now(), ...dailySenders(env, chatId, cb?.message?.message_id),
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
