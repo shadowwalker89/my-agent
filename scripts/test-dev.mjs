@@ -1227,6 +1227,7 @@ if (DatabaseSync) {
   const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
   const d1 = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
   const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
   const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4243", DB: d1, ...extra });
@@ -1252,17 +1253,20 @@ if (DatabaseSync) {
     // "ساعت نه" proves نه = 9 after ساعت: morning NOW -> stored for 09:00 today.
     const morning = Date.UTC(2026, 9, 28, 4, 0, 0); // 07:30 Iran time
     await handleDailyText(env, o(env, 4242, "یادم بنداز ساعت نه تمرین", { ...s, nowMs: morning }));
-    check(String(s.sent.at(-1)?.text ?? "").includes("فقط ذخیره شد"), `nine stores: ${JSON.stringify(s.sent.at(-1))}`);
-    check(rows("SELECT due_at FROM reminders ORDER BY id DESC LIMIT 1")[0].due_at === "2026-10-28T09:00:00+03:30", "nine means 09:00");
+    // 1-b-3 (INTENDED BEHAVIOUR CHANGE, decision 2): a reminder is
+    // stored as a task with the exact decision-2 reply; the legacy
+    // reminders table gains no rows.
+    check(String(s.sent.at(-1)?.text ?? "") === "⏰ یادآوری به‌عنوان تسک ذخیره شد؛ ارسال خودکار آن هنوز فعال نیست و در فاز ۱-ج اضافه می‌شود.", `nine stores as task: ${JSON.stringify(s.sent.at(-1))}`);
+    check(rows("SELECT remind_at, due_at FROM tasks ORDER BY id DESC LIMIT 1")[0].remind_at === "2026-10-28T09:00:00+03:30" && rows("SELECT due_at FROM tasks ORDER BY id DESC LIMIT 1")[0].due_at === null, "nine means 09:00 as task remind_at, due_at null");
     await handleDailyText(env, o(env, 4242, "یادم بنداز ساعت پنج تماس بگیر", { ...s, nowMs: NOW }));
     check(String(s.sent.at(-1)?.text ?? "").includes("صبح یا عصر"), "ساعت پنج also asks");
     await handleDailyText(env, o(env, 4242, "یادم بنداز که تمرین کنم", { ...s, nowMs: NOW }));
     check(String(s.sent.at(-1)?.text ?? "").includes("ساعت"), `no-time asks: ${JSON.stringify(s.sent.at(-1))}`);
-    check(rows("SELECT COUNT(*) AS n FROM reminders")[0].n === 1, "nine stored, ambiguous/no-time stored nothing more");
+    check(rows("SELECT COUNT(*) AS n FROM tasks")[0].n === 1 && rows("SELECT COUNT(*) AS n FROM reminders")[0].n === 0, "nine stored as task, ambiguous/no-time stored nothing more, zero legacy rows");
     await handleDailyText(env, o(env, 4242, "یادم بنداز فردا ساعت نه صبح تمرین", { ...s, nowMs: NOW }));
-    check(String(s.sent.at(-1)?.text ?? "").includes("فقط ذخیره شد"), `reminder stored-only reply: ${JSON.stringify(s.sent.at(-1))}`);
-    check(rows("SELECT COUNT(*) AS n FROM reminders")[0].n === 2, "tomorrow reminder stored as second row");
-    check(rows("SELECT due_at FROM reminders ORDER BY id DESC LIMIT 1")[0].due_at === "2026-10-29T09:00:00+03:30", `due_at: ${JSON.stringify(rows("SELECT due_at FROM reminders ORDER BY id DESC LIMIT 1"))}`);
+    check(String(s.sent.at(-1)?.text ?? "") === "⏰ یادآوری به‌عنوان تسک ذخیره شد؛ ارسال خودکار آن هنوز فعال نیست و در فاز ۱-ج اضافه می‌شود.", `reminder task reply: ${JSON.stringify(s.sent.at(-1))}`);
+    check(rows("SELECT COUNT(*) AS n FROM tasks")[0].n === 2 && rows("SELECT COUNT(*) AS n FROM reminders")[0].n === 0, "tomorrow reminder stored as second task, zero legacy rows");
+    check(rows("SELECT remind_at FROM tasks ORDER BY id DESC LIMIT 1")[0].remind_at === "2026-10-29T09:00:00+03:30", `remind_at: ${JSON.stringify(rows("SELECT remind_at FROM tasks ORDER BY id DESC LIMIT 1"))}`);
   }
   // Note, remember, translate, queries (expense sum split by currency).
   {
@@ -1746,6 +1750,7 @@ if (DatabaseSync) {
   const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
   const d1 = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
   const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
   const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4301,4302,4303,4304,4305,4306,4307,4308,4309,4310,4311,4312,4313,4314", DB: d1, ROUTER_KEY: "k-test", ...extra });
@@ -1839,7 +1844,11 @@ if (DatabaseSync) {
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("reminder"));
     const r = await handleDailyText(env, o(env, 4313, "فردا جلسه دارم ساعت ۹", { ...s, nowMs: NOW }));
-    check(r === "handled" && lastText(s).includes("2026-10-29T09:00:00+03:30") && rows("SELECT COUNT(*) AS n FROM reminders WHERE user_id = 4313")[0].n === 1, "model reminder stored with rule-parsed due");
+    // 1-b-3 (INTENDED BEHAVIOUR CHANGE, decision 2): the model reminder
+    // is stored as a task with the exact decision-2 reply; zero legacy rows.
+    check(r === "handled" && lastText(s) === "⏰ یادآوری به‌عنوان تسک ذخیره شد؛ ارسال خودکار آن هنوز فعال نیست و در فاز ۱-ج اضافه می‌شود." && rows("SELECT COUNT(*) AS n FROM tasks WHERE user_id = 4313")[0].n === 1 && rows("SELECT COUNT(*) AS n FROM reminders WHERE user_id = 4313")[0].n === 0, "1-b-3: model reminder stored as task, zero legacy rows");
+    const mrow = rows("SELECT remind_at, due_at, status, source FROM tasks WHERE user_id = 4313")[0];
+    check(mrow?.remind_at === "2026-10-29T09:00:00+03:30" && mrow?.due_at === null && mrow?.status === "open" && mrow?.source === "text", "1-b-3: model reminder task carries rule-parsed remind_at, due null");
   }
   // Chat tier + model expense-query without a period -> period ask.
   {
@@ -3193,7 +3202,10 @@ if (DatabaseSync) {
     check(row && row.source_message_id === rows1b1("SELECT id FROM messages WHERE user_id = 1 AND content = 'تسک گزارش' ORDER BY id DESC LIMIT 1")[0].id, "1-b-1: task carries its source message id");
     const ptr = await env.STATE.get("interp:last-item:1", "json");
     check(ptr?.table === "tasks" && ptr?.id === row.id, "1-b-1: task storage sets the correction pointer");
-    check(btnData(s).length === 1 && btnData(s)[0] === `task:del:${row.id}`, "1-b-1: stored-task card carries only the delete button");
+    // 1-b-3 (INTENDED BEHAVIOUR CHANGE, Plan v2 §3.3): the stored-task
+    // card gains the change-type button next to delete (it must NOT
+    // have appeared in 1-b-1); delete still works via task:del.
+    check(btnData(s).length === 2 && btnData(s)[0] === `task:del:${row.id}` && btnData(s)[1].startsWith("interp:change:"), "1-b-3: stored-task card carries delete + change-type buttons");
     await handleDailyText(mkEnv1b1(), mkO1(s, "تسک صوتی", 1, { source: "voice", interpreterCallFn: fakeInterp([act("task", { text: "یادداشت صوتی" })]) }));
     check(rows1b1("SELECT source FROM tasks WHERE title = 'یادداشت صوتی'")[0].source === "voice", "1-b-1: voice task stores voice source");
     await handleDailyText(mkEnv1b1(), mkO1(s, "تسک بی‌زمان", 1, { interpreterCallFn: fakeInterp([act("task", { text: "تسک بی‌زمان" })]) }));
@@ -3418,6 +3430,243 @@ if (DatabaseSync) {
     const sD = mkS2();
     await resolveTaskCallback(env, cbO2(sD, delBtn, 1));
     check(rows1b2("SELECT status FROM tasks WHERE title = 'تسک چندگانه ۲'")[0].status === "deleted", "1-b-2: multi summary task button deletes");
+  }
+  // ── Phase 1-b-3: task conversions, feedback, retry ──
+  if (DatabaseSync) {
+    const sqlite1b3 = new DatabaseSync(":memory:");
+    sqlite1b3.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sqlite1b3.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sqlite1b3.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sqlite1b3.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1'), (2, '2')");
+    sqlite1b3.exec("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (1, 'عمومی', '[]', 'active', 1, '2026-10-30T00:00:00.000Z'), (1, 'کار', '[]', 'active', 0, '2026-10-30T00:00:00.000Z')");
+    const F3 = { notes: false, status: false, fb: false, batch: null, raceId: null };
+    const base3 = (sql) => { const st = sqlite1b3.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    const boom3 = () => ({ bind: () => ({ run: async () => { throw new Error("boom"); }, all: async () => { throw new Error("boom"); }, first: async () => { throw new Error("boom"); } }) });
+    const db1b3 = { prepare(sql) { if (F3.notes && /INSERT INTO notes/i.test(sql)) return boom3(); if (F3.status && /UPDATE tasks SET status/i.test(sql)) return boom3(); if (F3.fb && /INSERT INTO intent_feedback/i.test(sql)) return boom3(); return base3(sql); }, batch: async (stmts) => { if (F3.batch === "all") throw new Error("boom"); const out = []; for (let i = 0; i < stmts.length; i++) { if (F3.batch === "stmt2" && i === 1) throw new Error("boom"); if (F3.raceId && i === 1) sqlite1b3.prepare("UPDATE tasks SET status = 'done', completed_at = '2026-10-31T00:00:00.000Z' WHERE id = ?").run(F3.raceId); out.push(await stmts[i].run()); } return out; } };
+    const rows3 = (sql, params = []) => sqlite1b3.prepare(sql).all(...params);
+    const NOW3 = Date.UTC(2026, 9, 31, 12, 0, 0);
+    const mkEnv3 = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1,2", DB: db1b3, ...extra });
+    const mkS3 = () => { const sent = []; const chats = []; let markup = 0, chatFail = false; return { sent, chats, markup: () => markup, setChatFail: (v) => { chatFail = v; }, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, chat: async (text) => { if (chatFail) throw new Error("boom"); chats.push(text); }, editMarkup: async () => { markup++; } }; };
+    const btn3 = (s) => s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+    const cbI3 = (s, data, userId) => ({ fromId: userId, userId, chatId: userId, data, send: s.send, editMarkup: s.editMarkup, chat: s.chat, nowMs: NOW3 });
+    const cbD3 = (s, data, userId) => ({ fromId: userId, chatId: userId, data, send: s.send, editMarkup: s.editMarkup, chat: s.chat, nowMs: NOW3 });
+    const mkO3 = (s, text, userId, extra = {}) => ({ chatId: userId, userId, text, send: s.send, chat: s.chat, nowMs: NOW3, ...extra });
+    const act3 = (type, extra = {}) => ({ type, text: extra.text ?? "متن", project: extra.project ?? null, due_text: extra.due_text ?? null, remind_text: extra.remind_text ?? null, amount_text: extra.amount_text ?? null, query: extra.query ?? null, target: extra.target ?? null, confidence: extra.confidence ?? 0.9, needs: extra.needs ?? "none" });
+    const fakeInterp3 = (actions) => async () => JSON.stringify(actions);
+    const karId3 = rows3("SELECT id FROM projects WHERE user_id = 1 AND name = 'کار'")[0].id;
+    const task3 = (title, userId = 1, projectId = null) => { sqlite1b3.prepare("INSERT INTO tasks (user_id, title, project_id, status, source, created_at) VALUES (?, ?, ?, 'open', 'text', '2026-10-30T00:00:00.000Z')").run(userId, title, projectId); return rows3("SELECT id FROM tasks WHERE title = ? AND user_id = ?", [title, userId])[0].id; };
+    const tstatus3 = (id) => rows3("SELECT status FROM tasks WHERE id = ?", [id])[0]?.status;
+    const conv3 = async (env, s, recId, choice) => { await resolveInterpCallback(env, cbI3(s, `interp:type:${choice}:${recId}`, 1)); };
+    const seedConv3 = async (env, id, title, taskId, extra = {}) => { await env.STATE.put(`interp:${id}`, JSON.stringify({ owner: 1, text: title, changeTaskId: taskId, startedAtMs: Date.now() - 60000, ...extra })); };
+    const retry3 = (s) => btn3(s).find((d) => d.startsWith("interp:retrytask:"));
+    const lastText3 = (s) => String(s.sent.at(-1)?.text ?? "");
+    // Stored-card change-type button end to end: card -> change -> note.
+    {
+      const env = mkEnv3(), s = mkS3();
+      await handleDailyText(env, mkO3(s, "تسک یادداشتی", 1, { interpreterCallFn: fakeInterp3([act3("task", { text: "یادداشت تبدیلی" })]) }));
+      const chg = btn3(s).find((d) => d.startsWith("interp:change:"));
+      check(!!chg && btn3(s).some((d) => d.startsWith("task:del:")), "1-b-3: stored-task card carries change-type button");
+      const s2 = mkS3();
+      await resolveInterpCallback(env, cbI3(s2, chg, 1));
+      const noteBtn = btn3(s2).find((d) => d.startsWith("interp:type:note:"));
+      check(!!noteBtn && lastText3(s2).includes("نوعش را بگو"), "1-b-3: change tap offers type choices");
+      const s3 = mkS3();
+      await resolveInterpCallback(env, cbI3(s3, noteBtn, 1));
+      check(lastText3(s3).includes("به یادداشت تبدیل شد") && rows3("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت تبدیلی'")[0].n === 1 && rows3("SELECT status FROM tasks WHERE title = 'یادداشت تبدیلی'")[0].status === "deleted", "1-b-3: card change to note stores note and deletes task");
+    }
+    // task->note: insert failure keeps task, retry stores once.
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("یادداشت خراب");
+      await seedConv3(env, "n1", "یادداشت خراب", tid);
+      F3.notes = true;
+      await conv3(env, s, "n1", "note");
+      check(lastText3(s).includes("ذخیره نشد") && !!retry3(s) && tstatus3(tid) === "open" && rows3("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت خراب'")[0].n === 0, "1-b-3: note insert failure keeps task, retry offered, nothing stored");
+      F3.notes = false; const s2 = mkS3();
+      await resolveInterpCallback(env, cbI3(s2, retry3(s), 1));
+      check(lastText3(s2).includes("به یادداشت تبدیل شد") && rows3("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت خراب'")[0].n === 1 && tstatus3(tid) === "deleted", "1-b-3: note retry after insert failure stores once and deletes task");
+    }
+    // task->note: delete failure keeps both records, retry deletes only.
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("یادداشت حذف‌نشدنی");
+      await seedConv3(env, "n2", "یادداشت حذف‌نشدنی", tid);
+      F3.status = true;
+      await conv3(env, s, "n2", "note");
+      check(lastText3(s).includes("ذخیره نشد") && !!retry3(s) && tstatus3(tid) === "open" && rows3("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت حذف‌نشدنی'")[0].n === 1, "1-b-3: note delete failure keeps both records, retry offered");
+      F3.status = false; const s2 = mkS3();
+      await resolveInterpCallback(env, cbI3(s2, retry3(s), 1));
+      check(lastText3(s2).includes("به یادداشت تبدیل شد") && rows3("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت حذف‌نشدنی'")[0].n === 1 && tstatus3(tid) === "deleted", "1-b-3: note retry deletes only, no duplicate note");
+    }
+    // task->note: concurrent delete before retry finalises as converted.
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("یادداشت رقابتی");
+      await seedConv3(env, "n3", "یادداشت رقابتی", tid);
+      F3.status = true;
+      await conv3(env, s, "n3", "note");
+      F3.status = false;
+      sqlite1b3.prepare("UPDATE tasks SET status = 'deleted' WHERE id = ?").run(tid);
+      const s2 = mkS3();
+      await resolveInterpCallback(env, cbI3(s2, retry3(s), 1));
+      check(lastText3(s2).includes("قبلاً ثبت شد یا مهلتش گذشته") && rows3("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت رقابتی'")[0].n === 1 && tstatus3(tid) === "deleted", "1-b-3: concurrent delete before note retry finalises as converted, no duplicate");
+    }
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("یادداشت پذیرش");
+      sqlite1b3.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, 'یادداشت پذیرش', 'text', ?)").run(new Date().toISOString());
+      await seedConv3(env, "n4", "یادداشت پذیرش", tid, { target: "note" });
+      await resolveInterpCallback(env, cbI3(s, "interp:retrytask:n4", 1));
+      check(lastText3(s).includes("به یادداشت تبدیل شد") && rows3("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت پذیرش'")[0].n === 1 && tstatus3(tid) === "deleted", "1-b-3: retry adopts the already-inserted note, no duplicate");
+    }
+    // task->chat: send failure keeps task, retry sends once.
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("چت خراب");
+      await seedConv3(env, "c1", "چت خراب", tid);
+      s.setChatFail(true);
+      await conv3(env, s, "c1", "chat");
+      check(lastText3(s).includes("ذخیره نشد") && !!retry3(s) && s.chats.length === 0 && tstatus3(tid) === "open", "1-b-3: chat send failure keeps task, retry offered, nothing sent");
+      s.setChatFail(false); const s2 = mkS3();
+      await resolveInterpCallback(env, cbI3(s2, retry3(s), 1));
+      check(s2.chats.length === 1 && lastText3(s2).includes("به چت تبدیل شد") && tstatus3(tid) === "deleted", "1-b-3: chat retry after send failure sends once and deletes task");
+    }
+    // task->chat: delete failure keeps task, retry deletes only.
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("چت حذف‌نشدنی");
+      await seedConv3(env, "c2", "چت حذف‌نشدنی", tid);
+      F3.status = true;
+      await conv3(env, s, "c2", "chat");
+      check(lastText3(s).includes("فقط حذف انجام می‌شود") && !!retry3(s) && s.chats.length === 1 && tstatus3(tid) === "open", "1-b-3: chat delete failure keeps task, chat sent once, retry offered");
+      F3.status = false; const s2 = mkS3();
+      await resolveInterpCallback(env, cbI3(s2, retry3(s), 1));
+      check(s2.chats.length === 0 && lastText3(s2).includes("به چت تبدیل شد") && tstatus3(tid) === "deleted", "1-b-3: chat retry deletes only, no re-send");
+    }
+    // task->chat: already deleted before retry finalises without re-sending.
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("چت رقابتی");
+      await seedConv3(env, "c3", "چت رقابتی", tid);
+      F3.status = true;
+      await conv3(env, s, "c3", "chat");
+      F3.status = false;
+      sqlite1b3.prepare("UPDATE tasks SET status = 'deleted' WHERE id = ?").run(tid);
+      const s2 = mkS3();
+      await resolveInterpCallback(env, cbI3(s2, retry3(s), 1));
+      check(s2.chats.length === 0 && lastText3(s2).includes("قبلاً ثبت شد یا مهلتش گذشته") && tstatus3(tid) === "deleted", "1-b-3: already-deleted chat retry finalises without re-sending");
+    }
+    // task->expense: confirm card, then Confirm stores once, task deleted.
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("نان خریدم 1500 تومن");
+      await seedConv3(env, "e1", "نان خریدم 1500 تومن", tid);
+      await conv3(env, s, "e1", "expense");
+      const conf = btn3(s).find((d) => d.startsWith("daily:confirm:"));
+      check(!!conf && lastText3(s).includes("1500"), "1-b-3: task to expense shows a confirm card with the rule amount");
+      const s2 = mkS3();
+      await resolveDailyCallback(env, cbD3(s2, conf, 1));
+      check(lastText3(s2).includes("ثبت شد") && rows3("SELECT COUNT(*) AS n FROM expenses WHERE item = 'نان'")[0].n === 1 && tstatus3(tid) === "deleted", "1-b-3: expense confirm stores once and deletes task");
+    }
+    // task->expense: batch throw fails cleanly, retry stores once.
+    {
+      const env = mkEnv3(); const tid = task3("شیر خریدم 2000 تومن");
+      await env.STATE.put("daily:draft:pd1", JSON.stringify({ owner: 1, type: "expense", amount: 2000, currency: "TOMAN", item: "شیر", date: "2026-10-31", taskId: tid }));
+      F3.batch = "all";
+      const r1 = await confirmExpenseDraft(env, 1, "pd1");
+      check(r1.status === "failed" && rows3("SELECT COUNT(*) AS n FROM expenses WHERE item = 'شیر'")[0].n === 0 && (await env.STATE.get("daily:draft:pd1", "json")) !== null, "1-b-3: batch throw fails cleanly, draft kept, nothing stored");
+      F3.batch = null;
+      const r2 = await confirmExpenseDraft(env, 1, "pd1");
+      check(r2.status === "ok" && rows3("SELECT COUNT(*) AS n FROM expenses WHERE item = 'شیر'")[0].n === 1 && tstatus3(tid) === "deleted" && (await env.STATE.get("daily:draft:pd1", "json")) === null, "1-b-3: retry after batch throw stores once and deletes task");
+    }
+    // task->expense: staged race (concurrent done inside batch) compensates.
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("کتاب خریدم 3000 تومن");
+      await env.STATE.put("daily:draft:pd2", JSON.stringify({ owner: 1, type: "expense", amount: 3000, currency: "TOMAN", item: "کتاب", date: "2026-10-31", taskId: tid }));
+      F3.raceId = tid;
+      await resolveDailyCallback(env, cbD3(s, "daily:confirm:pd2", 1));
+      F3.raceId = null;
+      check(lastText3(s).includes("پیش‌تر جداگانه انجام شده بود") && rows3("SELECT COUNT(*) AS n FROM expenses WHERE item = 'کتاب'")[0].n === 1 && tstatus3(tid) === "done" && (await env.STATE.get("daily:draft:pd2", "json")) === null, "1-b-3: staged race compensates as converted-done, task stays done, expense once");
+    }
+    // task->expense: consumed before Confirm is missing; kept draft retries.
+    {
+      const env = mkEnv3(); const tid = task3("آب خریدم 500 تومن");
+      await env.STATE.put("daily:draft:pd3", JSON.stringify({ owner: 1, type: "expense", amount: 500, currency: "TOMAN", item: "آب", date: "2026-10-31", taskId: tid }));
+      sqlite1b3.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(tid);
+      const r1 = await confirmExpenseDraft(env, 1, "pd3");
+      check(r1.status === "missing" && rows3("SELECT COUNT(*) AS n FROM expenses WHERE item = 'آب'")[0].n === 0 && (await env.STATE.get("daily:draft:pd3", "json")) !== null, "1-b-3: consumed-before-confirm is missing, nothing inserted, draft kept");
+      sqlite1b3.prepare("UPDATE tasks SET status = 'open' WHERE id = ?").run(tid);
+      const r2 = await confirmExpenseDraft(env, 1, "pd3");
+      check(r2.status === "ok" && rows3("SELECT COUNT(*) AS n FROM expenses WHERE item = 'آب'")[0].n === 1 && tstatus3(tid) === "deleted", "1-b-3: kept draft confirms after reopen");
+    }
+    // task->expense: foreign task draft is missing, nothing inserted.
+    {
+      const env = mkEnv3(); const tid2 = task3("مال دیگری", 2);
+      await env.STATE.put("daily:draft:pd4", JSON.stringify({ owner: 1, type: "expense", amount: 700, currency: "TOMAN", item: "بیگانه", date: "2026-10-31", taskId: tid2 }));
+      const r = await confirmExpenseDraft(env, 1, "pd4");
+      check(r.status === "missing" && rows3("SELECT COUNT(*) AS n FROM expenses WHERE item = 'بیگانه'")[0].n === 0 && (await env.STATE.get("daily:draft:pd4", "json")) !== null, "1-b-3: foreign task draft is missing, nothing inserted, draft kept");
+    }
+    // task->expense: unextractable amount stops, task kept, no confirm, no feedback.
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("بدون مبلغ");
+      await seedConv3(env, "e2", "بدون مبلغ", tid);
+      await conv3(env, s, "e2", "expense");
+      check(lastText3(s).includes("قابل استخراج نیست") && !btn3(s).some((d) => d.startsWith("daily:confirm:")) && tstatus3(tid) === "open" && rows3("SELECT COUNT(*) AS n FROM intent_feedback WHERE text = 'بدون مبلغ'")[0].n === 0, "1-b-3: unextractable task amount stops, task kept, no confirm, no feedback");
+    }
+    // task->expense: double Confirm stores one expense, second tap expired.
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("چای خریدم 800 تومن");
+      await seedConv3(env, "e3", "چای خریدم 800 تومن", tid);
+      await conv3(env, s, "e3", "expense");
+      const conf = btn3(s).find((d) => d.startsWith("daily:confirm:"));
+      const s2 = mkS3();
+      await resolveDailyCallback(env, cbD3(s2, conf, 1));
+      const s3 = mkS3();
+      await resolveDailyCallback(env, cbD3(s3, conf, 1));
+      check(rows3("SELECT COUNT(*) AS n FROM expenses WHERE item = 'چای'")[0].n === 1 && lastText3(s3).includes("قبلاً ثبت شد یا مهلتش گذشته") && tstatus3(tid) === "deleted", "1-b-3: double Confirm stores one expense, second tap expired");
+    }
+    // task->expense: removal failure keeps draft and task, retry deletes once.
+    {
+      const env = mkEnv3(); const tid = task3("قهوه خریدم 1200 تومن");
+      await env.STATE.put("daily:draft:pd5", JSON.stringify({ owner: 1, type: "expense", amount: 1200, currency: "TOMAN", item: "قهوه", date: "2026-10-31", taskId: tid }));
+      F3.batch = "stmt2";
+      const r1 = await confirmExpenseDraft(env, 1, "pd5");
+      check(r1.status === "failed" && rows3("SELECT COUNT(*) AS n FROM expenses WHERE item = 'قهوه'")[0].n === 1 && tstatus3(tid) === "open" && (await env.STATE.get("daily:draft:pd5", "json")) !== null, "1-b-3: removal failure keeps draft and task, expense already once");
+      F3.batch = null;
+      const r2 = await confirmExpenseDraft(env, 1, "pd5");
+      check(r2.status === "ok" && rows3("SELECT COUNT(*) AS n FROM expenses WHERE item = 'قهوه'")[0].n === 1 && tstatus3(tid) === "deleted", "1-b-3: retry after removal failure deletes task, expense still once");
+    }
+    // Feedback: correct predicted/correct/project; failure leaves reply unchanged.
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("گزارش تبدیلی", 1, karId3);
+      await seedConv3(env, "f1", "گزارش تبدیلی", tid);
+      await conv3(env, s, "f1", "note");
+      const fb = rows3("SELECT * FROM intent_feedback WHERE text = 'گزارش تبدیلی'");
+      check(fb.length === 1 && fb[0].predicted_type === "task" && fb[0].correct_type === "note" && fb[0].project === "کار", "1-b-3: completed re-type records predicted/correct/project feedback");
+      const s2 = mkS3(); const tid2 = task3("گزارش بی‌بازخورد");
+      await seedConv3(env, "f2", "گزارش بی‌بازخورد", tid2);
+      F3.fb = true;
+      await conv3(env, s2, "f2", "note");
+      F3.fb = false;
+      check(lastText3(s2).includes("به یادداشت تبدیل شد") && tstatus3(tid2) === "deleted" && rows3("SELECT COUNT(*) AS n FROM intent_feedback WHERE text = 'گزارش بی‌بازخورد'")[0].n === 0, "1-b-3: feedback failure leaves the reply and conversion unchanged");
+    }
+    {
+      const env = mkEnv3(), s = mkS3(); const tid = task3("تسک ماندنی");
+      await seedConv3(env, "f3", "تسک ماندنی", tid);
+      await conv3(env, s, "f3", "task");
+      check(lastText3(s).includes("همین حالا تسک است") && tstatus3(tid) === "open" && rows3("SELECT COUNT(*) AS n FROM intent_feedback WHERE text = 'تسک ماندنی'")[0].n === 0, "1-b-3: task to task is a no-op, task kept, nothing recorded");
+    }
+    // Pre-storage taskdismiss drops the card only, never touches tasks.
+    {
+      const env = mkEnv3(), s = mkS3();
+      await env.STATE.put("interp:td1", JSON.stringify({ owner: 1, text: "تسک قدیمی" }));
+      await resolveInterpCallback(env, cbI3(s, "interp:taskdismiss:td1", 1));
+      const s2 = mkS3();
+      await resolveInterpCallback(env, cbI3(s2, "interp:taskdismiss:td1", 1));
+      check(lastText3(s).includes("کنار گذاشته شد") && rows3("SELECT COUNT(*) AS n FROM tasks WHERE title = 'تسک قدیمی'")[0].n === 0 && rows3("SELECT status FROM tasks WHERE title = 'تسک ماندنی'")[0].status === "open" && lastText3(s2).includes("قبلاً ثبت شد یا مهلتش گذشته"), "1-b-3: pre-storage taskdismiss drops card only, tasks untouched, record consumed");
+    }
+    {
+      const env = mkEnv3(), s = mkS3();
+      await resolveInterpCallback(env, cbI3(s, "interp:retrytask:nosuch", 1));
+      check(lastText3(s).includes("قبلاً ثبت شد یا مهلتش گذشته"), "1-b-3: missing conversion retry is expired");
+      const tid = task3("تسک خارجی");
+      await seedConv3(env, "r9", "تسک خارجی", tid, { target: "note" });
+      const s2 = mkS3();
+      await resolveInterpCallback(env, cbI3(s2, "interp:retrytask:r9", 2));
+      check(s2.sent.length === 0 && tstatus3(tid) === "open", "1-b-3: foreign conversion retry is silent, task untouched");
+    }
   }
 }
 
