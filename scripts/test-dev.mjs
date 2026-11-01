@@ -1125,7 +1125,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT } from "../src/everyday.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
   check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
@@ -2437,7 +2437,11 @@ if (DatabaseSync) {
   const sqlite0b = new DatabaseSync(":memory:");
   sqlite0b.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite0b.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
-  const d1b = { prepare(sql) { const stmt = sqlite0b.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  // 1-b-1: the shared Phase 0-b DB now also carries migration 0003 (the
+  // schema production already has). No users rows exist yet, so the
+  // migration seeds nothing and the fallback seed list still governs.
+  sqlite0b.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  const d1b = { prepare(sql) { const stmt = sqlite0b.prepare(sql); return { bind(...params) { return { run: async () => { const r = stmt.run(...params); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
   const rows0b = (sql, params = []) => sqlite0b.prepare(sql).all(...params);
   const mkEnv0b = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4243", DB: d1b, ...extra });
   const NOW0b = Date.UTC(2026, 9, 31, 12, 0, 0); // 2026-10-31 15:30 Iran time
@@ -2735,13 +2739,18 @@ if (DatabaseSync) {
     check(String(s2.sent.at(-1)?.text ?? "") === "قبلاً ثبت شد یا مهلتش گذشته", "0-b3: double delete is a no-op with the fixed message");
   }
   {
+    // 1-b-1 (INTENDED BEHAVIOUR CHANGE, Plan v2 §5.5): the task card is
+    // no longer presentation-only — the task is stored, delete button only.
     const env = mkEnv0b(), s = mkS();
     await handleDailyText(env, mkO(s, "تسک من", { interpreterCallFn: fakeInterp([act("task", { text: "گزارش را بفرستم", project: "گلبهار" })]) }));
-    check(String(s.sent.at(-1)?.text ?? "").includes("ذخیره با فاز ۱ می‌آید") && btnData(s).some((d) => d.startsWith("interp:taskdismiss:")), "0-b3: task action yields a presentation-only card");
-    const disBtn = btnData(s).find((d) => d.startsWith("interp:taskdismiss:"));
+    check(String(s.sent.at(-1)?.text ?? "").includes("گزارش را بفرستم") && !String(s.sent.at(-1)?.text ?? "").includes("ذخیره با فاز ۱"), "1-b-1: task action stores a real task (no longer presentation-only)");
+    const delBtn = btnData(s).find((d) => d.startsWith("task:del:"));
+    check(!!delBtn && !btnData(s).some((d) => d.startsWith("interp:changetask:") || d.startsWith("interp:taskdismiss:")), "1-b-1: stored-task card carries only the id-carrying delete button");
+    check(rows0b("SELECT COUNT(*) AS n FROM tasks WHERE title = 'گزارش را بفرستم'")[0].n === 1, "1-b-1: task row stored");
     const s2 = mkS();
-    await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: disBtn, send: s2.send, editMarkup: async () => {}, chat: s2.chat, nowMs: NOW0b });
-    check(String(s2.sent.at(-1)?.text ?? "").includes("کنار گذاشته شد"), "0-b3: task card dismiss stores nothing");
+    let markupRemoved = false;
+    await resolveTaskCallback(env, { fromId: 4242, chatId: 4242, data: delBtn, send: s2.send, editMarkup: async () => { markupRemoved = true; }, chat: s2.chat, nowMs: NOW0b });
+    check(rows0b("SELECT status FROM tasks WHERE title = 'گزارش را بفرستم'")[0].status === "deleted" && markupRemoved && String(s2.sent.at(-1)?.text ?? "").includes("حذف شد"), "1-b-1: task delete tap deletes and removes markup");
   }
   // ── Phase 0-b3 fix: correction never INSERTs, note-delete checked ──
   {
@@ -3120,6 +3129,158 @@ if (DatabaseSync) {
   check(fb.ok === true && fb.added === true && lostOnce === true && JSON.parse((await getProject(db0b, 1, gol)).aliases).includes("پس رو"), "0b: fallback retry converges after a lost first attempt");
   const fbBad = await addProjectAlias(fallbackDb, 1, brokenId, "x");
   check(fbBad.ok === false, "0b: fallback malformed -> honest failure");
+}
+
+// ── Phase 1-b-1: task/project saving + initial list wiring ─────────────
+// Fresh DB; migration 0003 runs BEFORE any users rows, so it seeds
+// nothing — projects are explicit: user 1 has default عمومی + کار, user 2
+// has شخصی with NO default, user 3 has none (seed fallback). Unique titles
+// keep the shared-DB tests from interfering.
+if (DatabaseSync) {
+  const sqlite1b1 = new DatabaseSync(":memory:");
+  sqlite1b1.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite1b1.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqlite1b1.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  sqlite1b1.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1'), (2, '2'), (3, '3')");
+  sqlite1b1.exec("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (1, 'عمومی', '[]', 'active', 1, '2026-10-30T00:00:00.000Z'), (1, 'کار', '[\"کاری\"]', 'active', 0, '2026-10-30T00:00:00.000Z'), (2, 'شخصی', '[]', 'active', 0, '2026-10-30T00:00:00.000Z')");
+  const db1b1 = { prepare(sql) { const stmt = sqlite1b1.prepare(sql); return { bind(...params) { return { run: async () => { const r = stmt.run(...params); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
+  const rows1b1 = (sql, params = []) => sqlite1b1.prepare(sql).all(...params);
+  const mkEnv1b1 = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1,2,3", DB: db1b1, ...extra });
+  const NOW1b1 = Date.UTC(2026, 9, 31, 12, 0, 0); // 2026-10-31 15:30 Iran time
+  const act = (type, extra = {}) => ({ type, text: extra.text ?? "متن", project: extra.project ?? null, due_text: extra.due_text ?? null, remind_text: extra.remind_text ?? null, amount_text: extra.amount_text ?? null, query: extra.query ?? null, target: extra.target ?? null, confidence: extra.confidence ?? 0.9, needs: extra.needs ?? "none" });
+  const fakeInterp = (actions) => async () => JSON.stringify(actions);
+  const mkS = () => { const sent = []; const chats = []; let markup = 0; return { sent, chats, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, chat: async (text, copts) => { chats.push({ text, copts }); }, editMarkup: async () => { markup++; }, markup: () => markup }; };
+  const mkO1 = (s, text, userId, extra = {}) => ({ chatId: userId, userId, text, send: s.send, chat: s.chat, nowMs: NOW1b1, ...extra });
+  const btnData = (s) => s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+  const karId = rows1b1("SELECT id FROM projects WHERE user_id = 1 AND name = 'کار'")[0].id;
+  const omumiId = rows1b1("SELECT id FROM projects WHERE user_id = 1 AND name = 'عمومی'")[0].id;
+  // Classifier: closed list matches, bare/creation/body forms do not.
+  for (const t of ["تسک هام", "تسکهام", "تسک هایم", "تسکهایم", "تسک هامو", "تسک\u200cهام", "تسک\u200cهایم را نشان بده", "تسک هام را نشان بده", "تسک هامو نشون بده", "تسکهایم را نمایش بده"]) { const c = classifyDaily(t, { nowMs: NOW1b1, rememberedCurrency: "TOMAN" }); check(c.intent === "task-list" && c.confidence === 1, `1-b-1: task-list closed form ${t}`); }
+  for (const t of ["تسک", "تسک جدید", "تسک بساز", "تسک هام شیر بخرم", "تسک هام را ببینم"]) { check(classifyDaily(t, { nowMs: NOW1b1, rememberedCurrency: "TOMAN" }).intent !== "task-list", `1-b-1: no task-list for ${t}`); }
+  // Rule list: first page of 8, open only, project names, zero model calls. The project task is inserted FIRST so it lands on page 1 (id ASC).
+  {
+    sqlite1b1.exec(`INSERT INTO tasks (user_id, title, project_id, status, source, created_at) VALUES (1, 'پروژه‌دار', ${karId}, 'open', 'text', '2026-10-30T00:00:00.000Z')`);
+    for (let i = 1; i <= 10; i++) sqlite1b1.exec(`INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'باز ${i}', 'open', 'text', '2026-10-30T00:00:00.000Z')`);
+    sqlite1b1.exec("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'انجام‌شده', 'done', 'text', '2026-10-30T00:00:00.000Z'), (1, 'حذف‌شده', 'deleted', 'text', '2026-10-30T00:00:00.000Z')");
+    const env = mkEnv1b1(), s = mkS();
+    let calls = 0;
+    await handleDailyText(env, mkO1(s, "تسک هام", 1, { interpreterCallFn: async () => { calls++; return "[]"; } }));
+    const listText = String(s.sent.at(-1)?.text ?? "");
+    check(calls === 0, "1-b-1: rule list makes zero model calls");
+    check(listText.split("\n").length === 8, "1-b-1: list shows first page of 8");
+    check(listText.includes("پروژه‌دار — کار"), "1-b-1: list shows project names");
+    check(!listText.includes("انجام‌شده") && !listText.includes("حذف‌شده"), "1-b-1: list shows open only");
+    const sE = mkS();
+    await handleDailyText(mkEnv1b1(), mkO1(sE, "تسکهایم", 3));
+    check(String(sE.sent.at(-1)?.text ?? "") === "تسک بازی پیدا نشد.", "1-b-1: empty list is honest");
+    const failTasksEnv = { ...mkEnv1b1(), DB: { prepare(sql) { if (/FROM tasks/i.test(sql)) throw new Error("boom"); return db1b1.prepare(sql); } } }, sF = mkS();
+    await handleDailyText(failTasksEnv, mkO1(sF, "تسک هام", 1));
+    check(String(sF.sent.at(-1)?.text ?? "") === "تسک‌ها خوانده نشد؛ دوباره تلاش کن", "1-b-1: task-read failure is honest, never an empty list");
+    // Stale slot cleared by the rule list.
+    const envS = mkEnv1b1(), sS = mkS();
+    await handleDailyText(envS, mkO1(sS, "یادداشت کن", 1));
+    check(await envS.STATE.get("daily:pending-ask:1", "json") !== null, "1-b-1: bare-note ask sets a slot (precondition)");
+    await handleDailyText(envS, mkO1(sS, "تسک هام", 1));
+    check(await envS.STATE.get("daily:pending-ask:1", "json") === null, "1-b-1: rule list clears a stale slot");
+  }
+  // Interpreter task storage: D1 project id, due ISO, voice source, source message id, pointer, delete-only card.
+  {
+    const env = mkEnv1b1(), s = mkS();
+    await handleDailyText(env, mkO1(s, "تسک گزارش", 1, { interpreterCallFn: fakeInterp([act("task", { text: "گزارش هفتگی", project: "کار", due_text: "فردا" })]) }));
+    const row = rows1b1("SELECT * FROM tasks WHERE title = 'گزارش هفتگی'")[0];
+    check(row && row.project_id === karId && row.status === "open" && row.source === "text", "1-b-1: task stored with D1 project id and text source");
+    check(row && row.due_at === "2026-11-01T00:00:00+03:30" && row.remind_at === null, "1-b-1: validated due ISO stored, remind stays null");
+    check(row && row.source_message_id === rows1b1("SELECT id FROM messages WHERE user_id = 1 AND content = 'تسک گزارش' ORDER BY id DESC LIMIT 1")[0].id, "1-b-1: task carries its source message id");
+    const ptr = await env.STATE.get("interp:last-item:1", "json");
+    check(ptr?.table === "tasks" && ptr?.id === row.id, "1-b-1: task storage sets the correction pointer");
+    check(btnData(s).length === 1 && btnData(s)[0] === `task:del:${row.id}`, "1-b-1: stored-task card carries only the delete button");
+    await handleDailyText(mkEnv1b1(), mkO1(s, "تسک صوتی", 1, { source: "voice", interpreterCallFn: fakeInterp([act("task", { text: "یادداشت صوتی" })]) }));
+    check(rows1b1("SELECT source FROM tasks WHERE title = 'یادداشت صوتی'")[0].source === "voice", "1-b-1: voice task stores voice source");
+    await handleDailyText(mkEnv1b1(), mkO1(s, "تسک بی‌زمان", 1, { interpreterCallFn: fakeInterp([act("task", { text: "تسک بی‌زمان" })]) }));
+    const timeless = rows1b1("SELECT due_at, remind_at FROM tasks WHERE title = 'تسک بی‌زمان'")[0];
+    check(timeless && timeless.due_at === null && timeless.remind_at === null, "1-b-1: timeless task never invents dates");
+    const failInsEnv = { ...mkEnv1b1(), DB: { prepare(sql) { if (/INSERT INTO tasks/i.test(sql)) throw new Error("boom"); return db1b1.prepare(sql); } } }, sI = mkS();
+    await handleDailyText(failInsEnv, mkO1(sI, "تسک خراب", 1, { interpreterCallFn: fakeInterp([act("task", { text: "تسک خراب" })]) }));
+    check(String(sI.sent.at(-1)?.text ?? "") === "ذخیره نشد، دوباره تلاش کن" && rows1b1("SELECT COUNT(*) AS n FROM tasks WHERE title = 'تسک خراب'")[0].n === 0, "1-b-1: insert failure is honest and stores nothing");
+    check(await failInsEnv.STATE.get("interp:last-item:1", "json") === null, "1-b-1: no pointer on insert failure");
+  }
+  // Stored-card delete matrix: owned, consumed, foreign, D1 failure.
+  {
+    sqlite1b1.exec("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'حذف‌پذیر', 'open', 'text', '2026-10-30T00:00:00.000Z')");
+    const tid = rows1b1("SELECT id FROM tasks WHERE title = 'حذف‌پذیر'")[0].id;
+    const env = mkEnv1b1(), sD = mkS();
+    await resolveTaskCallback(env, { fromId: 1, chatId: 1, data: `task:del:${tid}`, send: sD.send, editMarkup: sD.editMarkup, chat: sD.chat, nowMs: NOW1b1 });
+    check(rows1b1("SELECT status FROM tasks WHERE id = ?", [tid])[0].status === "deleted" && sD.markup() === 1 && String(sD.sent.at(-1)?.text ?? "").includes("حذف شد"), "1-b-1: owned delete deletes and removes markup");
+    const sD2 = mkS();
+    await resolveTaskCallback(env, { fromId: 1, chatId: 1, data: `task:del:${tid}`, send: sD2.send, editMarkup: sD2.editMarkup, chat: sD2.chat, nowMs: NOW1b1 });
+    check(String(sD2.sent.at(-1)?.text ?? "") === "قبلاً ثبت شد یا مهلتش گذشته" && sD2.markup() === 1, "1-b-1: consumed tap gets the fixed message and removes markup");
+    sqlite1b1.exec("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'مال دیگری', 'open', 'text', '2026-10-30T00:00:00.000Z')");
+    const foreignId = rows1b1("SELECT id FROM tasks WHERE title = 'مال دیگری'")[0].id;
+    const sD3 = mkS();
+    await resolveTaskCallback(env, { fromId: 2, chatId: 2, data: `task:del:${foreignId}`, send: sD3.send, editMarkup: sD3.editMarkup, chat: sD3.chat, nowMs: NOW1b1 });
+    check(sD3.sent.length === 0 && sD3.markup() === 0 && rows1b1("SELECT status FROM tasks WHERE id = ?", [foreignId])[0].status === "open", "1-b-1: foreign tap is silent");
+    const failGetEnv = { ...mkEnv1b1(), DB: { prepare(sql) { if (/FROM tasks WHERE id/i.test(sql)) throw new Error("boom"); return db1b1.prepare(sql); } } }, sD4 = mkS();
+    await resolveTaskCallback(failGetEnv, { fromId: 1, chatId: 1, data: `task:del:${foreignId}`, send: sD4.send, editMarkup: sD4.editMarkup, chat: sD4.chat, nowMs: NOW1b1 });
+    check(String(sD4.sent.at(-1)?.text ?? "") === "ذخیره نشد، دوباره تلاش کن" && sD4.markup() === 0, "1-b-1: D1 failure keeps the buttons");
+    check(await resolveTaskCallback(env, { fromId: 1, chatId: 1, data: "task:del:abc", send: sD.send, editMarkup: async () => {}, chat: sD.chat, nowMs: NOW1b1 }) === false, "1-b-1: non-numeric del is not a task callback");
+    check(await resolveTaskCallback(env, { fromId: 1, chatId: 1, data: "task:more:0", send: sD.send, editMarkup: async () => {}, chat: sD.chat, nowMs: NOW1b1 }) === false, "1-b-1: pagination is not handled until 1-b-2");
+  }
+  // Note assignment: D1 project id, seed-fallback NULL, rule-note default.
+  {
+    const env = mkEnv1b1(), s = mkS();
+    await handleDailyText(env, mkO1(s, "یادداشت کاری", 1, { interpreterCallFn: fakeInterp([act("note", { text: "یادداشت کاری", project: "کار" })]) }));
+    check(rows1b1("SELECT project_id FROM notes WHERE text = 'یادداشت کاری'")[0].project_id === karId, "1-b-1: interp note stores the D1 project id");
+    await handleDailyText(mkEnv1b1(), mkO1(s, "یادداشت سه", 3, { interpreterCallFn: fakeInterp([act("note", { text: "یادداشت بدون پروژه", project: "گلبهار" })]) }));
+    check(rows1b1("SELECT project_id FROM notes WHERE text = 'یادداشت بدون پروژه'")[0].project_id === null, "1-b-1: seed-fallback note stores NULL, never a fake id");
+    await handleDailyText(mkEnv1b1(), mkO1(s, "یادداشت کن متن قانون", 1));
+    check(rows1b1("SELECT project_id FROM notes WHERE text = 'متن قانون'")[0].project_id === omumiId, "1-b-1: rule note takes the D1 default project id");
+    await handleDailyText(mkEnv1b1(), mkO1(s, "یادداشت کن متن بی‌پیش‌فرض", 2));
+    check(rows1b1("SELECT project_id FROM notes WHERE text = 'متن بی‌پیش‌فرض'")[0].project_id === null, "1-b-1: rule note with no default still stores, with NULL");
+    const failProjNoteEnv = { ...mkEnv1b1(), DB: { prepare(sql) { if (/FROM projects/i.test(sql)) throw new Error("boom"); return db1b1.prepare(sql); } } }, sRN = mkS();
+    await handleDailyText(failProjNoteEnv, mkO1(sRN, "یادداشت کن متن خراب‌پروژه", 1));
+    check(String(sRN.sent.at(-1)?.text ?? "") === "✅ یادداشت ذخیره شد." && rows1b1("SELECT project_id FROM notes WHERE text = 'متن خراب‌پروژه'")[0].project_id === null, "1-b-1: project-read failure still stores the rule note with NULL");
+  }
+  // Project-choice tap: resolved rows, tap-only alias, model-only silence.
+  {
+    const env = mkEnv1b1(), s = mkS();
+    await handleDailyText(env, mkO1(s, "یادداشت تازه", 1, { interpreterCallFn: fakeInterp([act("note", { text: "یادداشت تازه", project: "پروژه جدید" })]) }));
+    const projBtns = btnData(s).filter((d) => d.startsWith("interp:proj:"));
+    check(projBtns.length === 3, "1-b-1: project-choice rows are the resolved list plus new");
+    const sA = mkS();
+    await resolveInterpCallback(env, { fromId: 1, chatId: 1, data: projBtns[1], send: sA.send, editMarkup: async () => {}, chat: sA.chat, nowMs: NOW1b1 });
+    check(rows1b1("SELECT project_id FROM notes WHERE text = 'یادداشت تازه'")[0].project_id === karId, "1-b-1: chosen project stores the note");
+    check(JSON.parse(rows1b1("SELECT aliases FROM projects WHERE id = ?", [karId])[0].aliases).includes("پروژه جدید"), "1-b-1: alias written on the explicit tap only");
+    const sA2 = mkS();
+    await resolveInterpCallback(env, { fromId: 1, chatId: 1, data: projBtns[1], send: sA2.send, editMarkup: async () => {}, chat: sA2.chat, nowMs: NOW1b1 });
+    check(String(sA2.sent.at(-1)?.text ?? "") === "قبلاً ثبت شد یا مهلتش گذشته", "1-b-1: second project tap is consumed");
+    const before = rows1b1("SELECT aliases FROM projects WHERE id = ?", [karId])[0].aliases;
+    const sM = mkS();
+    await handleDailyText(mkEnv1b1(), mkO1(sM, "یادداشت دوم", 1, { interpreterCallFn: fakeInterp([act("note", { text: "یادداشت دوم", project: "کار" })]) }));
+    check(rows1b1("SELECT aliases FROM projects WHERE id = ?", [karId])[0].aliases === before, "1-b-1: model-matched project writes no alias");
+    const envF = { ...mkEnv1b1(), DB: { prepare(sql) { if (/UPDATE projects SET aliases/i.test(sql)) throw new Error("boom"); return db1b1.prepare(sql); } } }, sF = mkS();
+    await handleDailyText(envF, mkO1(sF, "یادداشت سوم", 1, { interpreterCallFn: fakeInterp([act("note", { text: "یادداشت سوم", project: "پروژه سوم" })]) }));
+    const projBtnsF = btnData(sF).filter((d) => d.startsWith("interp:proj:"));
+    const sF2 = mkS();
+    await resolveInterpCallback(envF, { fromId: 1, chatId: 1, data: projBtnsF[1], send: sF2.send, editMarkup: async () => {}, chat: sF2.chat, nowMs: NOW1b1 });
+    check(sF2.sent.some((m) => String(m.text ?? "").includes("نام مستعار پروژه ذخیره نشد")) && rows1b1("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت سوم'")[0].n === 1, "1-b-1: alias failure is honest and the domain action still runs");
+  }
+  // Interpreter failure path on project-read failure: no seed names, no store.
+  {
+    const failProjEnv = { ...mkEnv1b1(), DB: { prepare(sql) { if (/FROM projects/i.test(sql)) throw new Error("boom"); return db1b1.prepare(sql); } } }, sG = mkS();
+    let gCalls = 0;
+    await handleDailyText(failProjEnv, mkO1(sG, "تسک خراب پروژه", 1, { interpreterCallFn: async () => { gCalls++; return "[]"; } }));
+    const gText = sG.sent.map((m) => String(m.text ?? "")).join("\n");
+    check(gCalls === 0 && gText.includes("تفسیر خودکار الان در دسترس نیست") && !gText.includes("پروژه‌ی «") && !gText.includes("عمومی") && !btnData(sG).some((d) => d.startsWith("interp:proj:")), "1-b-1: project-read failure takes the failure path, no seed names");
+    check(rows1b1("SELECT COUNT(*) AS n FROM tasks WHERE title = 'تسک خراب پروژه'")[0].n === 0, "1-b-1: failure path stores nothing");
+  }
+  // Multi-action: both stored; no task buttons in the summary in 1-b-1 (those arrive with 1-b-2).
+  {
+    const env = mkEnv1b1(), s = mkS();
+    await handleDailyText(env, mkO1(s, "چند مورد", 1, { interpreterCallFn: fakeInterp([act("task", { text: "تسک چندگانه" }), act("note", { text: "یادداشت چندگانه" })]) }));
+    check(rows1b1("SELECT COUNT(*) AS n FROM tasks WHERE title = 'تسک چندگانه'")[0].n === 1 && rows1b1("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت چندگانه'")[0].n === 1, "1-b-1: multi-action stores both items");
+    check(!btnData(s).some((d) => d.includes("changetask") || d.startsWith("task:del:")), "1-b-1: multi summary carries no task buttons in this slice");
+    check(btnData(s).some((d) => d.startsWith("interp:del:")), "1-b-1: multi summary still carries the note delete button");
+  }
 }
 
 if (failures.length) {
