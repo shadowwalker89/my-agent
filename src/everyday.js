@@ -3,7 +3,7 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
-import { saveMessage, finalizeMessageKind } from "./db.js";
+import { saveMessage, finalizeMessageKind, listProjectsResult } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
@@ -445,6 +445,32 @@ export async function runModelBranch(env, o, rule, ctx) {
 // for a D1 read). Never auto-create: unknown names get type buttons.
 export const SEED_PROJECTS = [{ name: "عمومی", aliases: [] }, { name: "ایجنت", aliases: [] },
   { name: "گلبهار", aliases: ["گل"] }, { name: "قرارها و ملاقات‌ها", aliases: ["قرارها"] }];
+
+// Phase 1-b-0a (Fix A): resolve the user's projects from D1. Exported
+// for tests but NOT yet called by any runtime path in this slice (pure
+// functions + tests, no wiring). Returns:
+//   {ok: true, fallback: false, projects: [{id, name, aliases[], is_default}]}
+//     on a D1 read with rows (aliases JSON parsed, malformed -> []);
+//   {ok: true, fallback: true, projects: SEED_PROJECTS} on genuine
+//     empty success (seed shape preserved, entries carry no D1 id);
+//   {ok: false, projects: []} on a D1 failure — NO seed fallback, so a
+//     failure is never misread as "user has no projects".
+function parseAliasesText(raw) {
+  try {
+    const v = JSON.parse(typeof raw === "string" ? raw : "[]");
+    return Array.isArray(v) ? v.filter((a) => typeof a === "string") : [];
+  } catch { return []; }
+}
+export async function resolveProjects(env, userId) {
+  const r = await listProjectsResult(env, userId);
+  if (!r.ok) return { ok: false, projects: [] };
+  if (r.projects.length === 0) return { ok: true, fallback: true, projects: SEED_PROJECTS };
+  return {
+    ok: true,
+    fallback: false,
+    projects: r.projects.map((p) => ({ id: p.id, name: p.name, aliases: parseAliasesText(p.aliases), is_default: p.is_default })),
+  };
+}
 const INTERP_UNAVAILABLE_TEXT = "تفسیر خودکار الان در دسترس نیست؛ خودت نوعش را بگو:";
 function interpKey(id) { return `interp:${id}`; }
 function interpTypeKeyboard(id) {
