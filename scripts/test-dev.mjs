@@ -29,7 +29,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, listOpenTasks, listOpenTasksResult, setTaskStatus, insertIntentFeedback } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, insertIntentFeedback } from "../src/db.js";
 import {
   getChatContext,
   getSetting,
@@ -3011,6 +3011,115 @@ if (DatabaseSync) {
   sqlite0a.exec("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (3, 'first', '[]', 'active', 0, '2026-10-30T00:00:00.000Z'), (3, 'second', '[]', 'active', 1, '2026-10-30T00:00:00.000Z')");
   const rp2 = await resolveProjects({ DB: db0a }, 3);
   check(rp2.projects.length === 2 && rp2.projects[0].name === "first" && rp2.projects.find((p) => p.is_default === 1)?.name === "second", "0a: is_default lookup reads the field, not the first row");
+}
+
+// ── Phase 1-b-0b: offset, archive, alias, ownership (Fix B) ────────────
+// New helpers only; no runtime path calls them yet in this slice. (The
+// result-shaped open-task core already carried offset from 0a, so this
+// slice only adds it to the listOpenTasks delegate.)
+if (DatabaseSync) {
+  const sqlite0b = new DatabaseSync(":memory:");
+  sqlite0b.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite0b.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqlite0b.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+  sqlite0b.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  const db0b = {
+    prepare(sql) {
+      const stmt = sqlite0b.prepare(sql);
+      return {
+        bind(...params) {
+          return {
+            run: async () => { const r = stmt.run(...params); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; },
+            all: async () => ({ results: stmt.all(...params) }),
+            first: async () => stmt.get(...params) ?? null,
+          };
+        },
+      };
+    },
+  };
+  const failing0b = { prepare() { throw new Error("boom"); } };
+  // Seed projects for user 1: ids 1..4 (عمومی, ایجنت, گلبهار, قرارها).
+  await insertTask(db0b, { userId: 1, title: "t1" });
+  await insertTask(db0b, { userId: 1, title: "t2" });
+  await insertTask(db0b, { userId: 1, title: "t3" });
+  await insertTask(db0b, { userId: 1, title: "t4", projectId: 3 });
+  // Offset: default identical, pages disjoint, beyond end empty.
+  check(JSON.stringify((await listOpenTasks(db0b, 1)).map((t) => t.title)) === '["t1","t2","t3","t4"]', "0b: open default order");
+  check(JSON.stringify((await listOpenTasks(db0b, 1, null, 2, 1)).map((t) => t.title)) === '["t2","t3"]' && JSON.stringify((await listOpenTasks(db0b, 1, null, 2, 3)).map((t) => t.title)) === '["t4"]', "0b: offset pages disjoint");
+  check((await listOpenTasks(db0b, 1, null, 50, 99)).length === 0, "0b: offset beyond end -> []");
+  // Archive: done-only, newest-first, project filter, failure != empty.
+  await setTaskStatus(db0b, 1, 2, "done");
+  await setTaskStatus(db0b, 1, 4, "done");
+  await setTaskStatus(db0b, 1, 3, "deleted");
+  const doneAll = await listDoneTasksResult(db0b, 1);
+  check(doneAll.ok === true && JSON.stringify(doneAll.tasks.map((t) => t.title)) === '["t4","t2"]', "0b: done newest-first, never open/deleted");
+  const doneProj = await listDoneTasksResult(db0b, 1, 3);
+  check(doneProj.ok === true && doneProj.tasks.length === 1 && doneProj.tasks[0].title === "t4", "0b: done project filter");
+  check((await listDoneTasksResult(null, 1)).ok === false && (await listDoneTasksResult(failing0b, 1)).ok === false && JSON.stringify(await listDoneTasks(null, 1)) === "[]", "0b: done failure distinct from empty (core ok:false, wrapper [])");
+  const doneEmpty = await listDoneTasksResult(db0b, 99);
+  check(doneEmpty.ok === true && doneEmpty.tasks.length === 0, "0b: genuine empty archive is ok:true");
+  // getTask: any status whole; foreign/missing/invalid -> null ok; DB failure -> ok:false.
+  const gOpen = await getTask(db0b, 1, 1);
+  const gDone = await getTask(db0b, 1, 2);
+  const gDel = await getTask(db0b, 1, 3);
+  check(gOpen.ok === true && gOpen.task?.status === "open" && gDone.task?.status === "done" && gDel.task?.status === "deleted", "0b: getTask returns own rows in any status");
+  sqlite0b.exec("INSERT INTO users (id, telegram_id) VALUES (2, '2')");
+  const foreignTask = await insertTask(db0b, { userId: 2, title: "fx" });
+  check((await getTask(db0b, 1, foreignTask.id)).ok === true && (await getTask(db0b, 1, foreignTask.id)).task === null, "0b: getTask foreign -> null ok");
+  check((await getTask(db0b, 1, 9999)).task === null && (await getTask(db0b, 1, "banana")).task === null && (await getTask(db0b, 1, 1.5)).task === null && (await getTask(db0b, 1, 0)).task === null && (await getTask(db0b, 1, " 2 ")).task?.status === "done", "0b: getTask missing/invalid -> null ok, digit string ok");
+  check((await getTask(null, 1, 1)).ok === false && (await getTask(failing0b, 1, 1)).ok === false && (await getTask(db0b, "banana", 1)).ok === false, "0b: getTask DB/user failure -> ok:false");
+  // addProjectAlias: add, dedupe vs name/alias, normalization, rejects.
+  const gol = 3;
+  const a1 = await addProjectAlias(db0b, 1, gol, "کارهای سایت");
+  check(a1.ok === true && a1.added === true, "0b: alias added");
+  const aDup = await addProjectAlias(db0b, 1, gol, "کارهای سایت");
+  check(aDup.ok === true && aDup.added === false, "0b: alias dedupe same");
+  const aName = await addProjectAlias(db0b, 1, gol, "گلبهار");
+  check(aName.ok === true && aName.added === false, "0b: alias == name no-op");
+  const aOld = await addProjectAlias(db0b, 1, gol, "گل");
+  check(aOld.ok === true && aOld.added === false, "0b: alias dedupe vs existing");
+  const aAr = await addProjectAlias(db0b, 1, gol, "كارهای سايت");
+  check(aAr.ok === true && aAr.added === false, "0b: alias dedupe across Arabic-letter folding");
+  const projAfter = await getProject(db0b, 1, gol);
+  check(JSON.stringify(JSON.parse(projAfter.aliases)) === '["گل","کارهای سایت"]', "0b: aliases stored once, normalized");
+  check(matchProject("كارهای سايت", (await resolveProjects({ DB: db0b }, 1)).projects)?.name === "گلبهار", "0b: matchProject finds the new alias");
+  check((await addProjectAlias(db0b, 1, 9999, "x")).ok === false && (await addProjectAlias(db0b, 1, gol, "")).ok === false && (await addProjectAlias(db0b, 1, gol, "   ")).ok === false && (await addProjectAlias(null, 1, gol, "x")).ok === false, "0b: alias rejects missing/empty/null-DB");
+  sqlite0b.exec("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (2, 'other', '[]', 'active', 0, '2026-10-30T00:00:00.000Z')");
+  const otherId = sqlite0b.prepare("SELECT id FROM projects WHERE user_id = 2 AND name = 'other'").get().id;
+  check((await addProjectAlias(db0b, 1, otherId, "x")).ok === false, "0b: alias rejects foreign project");
+  // Malformed stored JSON: honest failure, value never overwritten.
+  sqlite0b.exec("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (1, 'broken', 'not-json', 'active', 0, '2026-10-30T00:00:00.000Z')");
+  const brokenId = sqlite0b.prepare("SELECT id FROM projects WHERE user_id = 1 AND name = 'broken'").get().id;
+  check((await addProjectAlias(db0b, 1, brokenId, "x")).ok === false && sqlite0b.prepare("SELECT aliases FROM projects WHERE id = ?").get(brokenId).aliases === "not-json", "0b: malformed aliases -> honest failure, value kept");
+  // Concurrency: different aliases both survive; same alias once.
+  const conc = await Promise.all([addProjectAlias(db0b, 1, gol, "هم‌زمان یک"), addProjectAlias(db0b, 1, gol, "هم‌زمان دو")]);
+  check(conc.every((r) => r.ok === true && r.added === true), "0b: concurrent different aliases both added");
+  await Promise.all([addProjectAlias(db0b, 1, gol, "تکراری"), addProjectAlias(db0b, 1, gol, "تکراری")]);
+  const golAfter = JSON.parse((await getProject(db0b, 1, gol)).aliases);
+  check(golAfter.filter((a) => a === "تکراری").length === 1 && golAfter.includes("هم زمان یک") && golAfter.includes("هم زمان دو"), "0b: concurrent same alias stored once");
+  // One-UPDATE proof: the primary path issues exactly one UPDATE.
+  let updates = 0;
+  const countingDb = { prepare(sql) { if (/^\s*UPDATE\s+projects\s+SET\s+aliases\s*=\s*json_insert/i.test(sql)) updates++; return db0b.prepare(sql); } };
+  await addProjectAlias(countingDb, 1, gol, "شمارشی");
+  check(updates === 1, "0b: alias append is one UPDATE, not read-modify-write");
+  // Fallback path: no JSON functions + first conditional UPDATE loses -> retry converges.
+  let lostOnce = false;
+  const fallbackDb = { prepare(sql) {
+    const stmt = db0b.prepare(sql);
+    return { bind(...params) { const bound = stmt.bind(...params); return {
+      run: async () => {
+        if (/json_insert/i.test(sql)) throw new Error("no such function: json_insert");
+        if (/COALESCE\(aliases, '\[\]'\) = \?/i.test(sql) && !lostOnce) { lostOnce = true; return { success: true, meta: { changes: 0 } }; }
+        return bound.run();
+      },
+      all: async () => bound.all(),
+      first: async () => bound.first(),
+    }; }, };
+  } };
+  const fb = await addProjectAlias(fallbackDb, 1, gol, "پس‌رو");
+  check(fb.ok === true && fb.added === true && lostOnce === true && JSON.parse((await getProject(db0b, 1, gol)).aliases).includes("پس رو"), "0b: fallback retry converges after a lost first attempt");
+  const fbBad = await addProjectAlias(fallbackDb, 1, brokenId, "x");
+  check(fbBad.ok === false, "0b: fallback malformed -> honest failure");
 }
 
 if (failures.length) {
