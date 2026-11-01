@@ -29,7 +29,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "../src/db.js";
 import {
   getChatContext,
   getSetting,
@@ -3760,6 +3760,108 @@ if (DatabaseSync) {
       await corr4(failEnv, s, "دست‌کاری");
       check(lastText4(s).includes("ذخیره نشد") && rows4("SELECT title FROM tasks WHERE id = ?", [tid])[0].title === "تسک خراب", "1-b-4: D1 failure on correction is honest, row unchanged");
     }
+  }
+}
+
+// ── Phase 1-c-1: list-prefix fix + reminder claim/release/snooze/purge ──
+if (DatabaseSync) {
+  const fresh1c1 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1'), (2, '2')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } }, rows: (sql, params = []) => sq.prepare(sql).all(...params) };
+  };
+  const mkEnv1c1 = (db, extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1,2", DB: db, ...extra });
+  const mkS1c1 = () => { const sent = []; const chats = []; let markup = 0; return { sent, chats, markup: () => markup, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, chat: async (text) => { chats.push(text); }, editMarkup: async () => { markup++; } }; };
+  const NOW1c1 = "2026-10-31T12:00:00.000Z";
+  const seed1c1 = (sq, title, userId, extra = {}) => { sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at, completed_at, remind_at, reminded_at, remind_attempts) VALUES (?, ?, ?, 'text', ?, ?, ?, ?, ?)").run(userId, title, extra.status ?? "open", extra.createdAt ?? "2026-10-30T00:00:00.000Z", extra.completedAt ?? null, extra.remindAt ?? null, extra.remindedAt ?? null, extra.attempts ?? 0); return sq.prepare("SELECT id FROM tasks WHERE title = ? AND user_id = ?").all(title, userId)[0].id; };
+  // List-prefix routing: every live-QA variant matches, bare forms never do.
+  {
+    const cl = (t) => classifyDaily(t, { nowMs: Date.UTC(2026, 9, 31, 12, 0, 0) }).intent;
+    check(cl("لیست تسک‌هام") === "task-list" && cl("فهرست تسک‌هام") === "task-list" && cl("لیست تسک هام") === "task-list" && cl("لیست تسکهام") === "task-list" && cl("فهرست تسک هام") === "task-list" && cl("فهرست تسکهام") === "task-list" && cl("لیست تسک‌هایم") === "task-list" && cl("لیست تسک‌هام را نشان بده") === "task-list", "1-c-1: list prefixes route deterministically");
+    check(cl("تسک") !== "task-list" && cl("لیست") !== "task-list" && cl("فهرست") !== "task-list" && cl("لیست تسک جدید") !== "task-list" && cl("تسک جدید") !== "task-list" && cl("لیست تسک‌هام جلسه") !== "task-list", "1-c-1: bare/ambiguous forms never auto-route");
+  }
+  // End-to-end: the previously-hallucinating input now renders the D1 list, zero chat calls.
+  {
+    const { sq, db, rows } = fresh1c1(); const env = mkEnv1c1(db), s = mkS1c1();
+    seed1c1(sq, "کار لیستی", 1);
+    await handleDailyText(env, { chatId: 1, userId: 1, text: "لیست تسک‌هام", send: s.send, chat: s.chat, nowMs: Date.UTC(2026, 9, 31, 12, 0, 0) });
+    check(String(s.sent.at(-1)?.text ?? "").includes("کار لیستی") && s.chats.length === 0 && rows("SELECT COUNT(*) AS n FROM tasks")[0].n === 1, "1-c-1: list prefix renders D1 list, zero model calls");
+  }
+  // Atomic claiming: due+open only, no double-claim, done/future/max-attempt/no-remind/foreign excluded.
+  {
+    const { sq, db, rows } = fresh1c1();
+    seed1c1(sq, "due", 1, { remindAt: "2026-10-31T11:00:00.000Z" });
+    seed1c1(sq, "future", 1, { remindAt: "2026-10-31T13:00:00.000Z" });
+    seed1c1(sq, "done-due", 1, { status: "done", remindAt: "2026-10-31T11:00:00.000Z", completedAt: "2026-10-31T10:00:00.000Z" });
+    seed1c1(sq, "maxed", 1, { remindAt: "2026-10-31T11:00:00.000Z", attempts: 3 });
+    seed1c1(sq, "no-remind", 1);
+    seed1c1(sq, "foreign-due", 2, { remindAt: "2026-10-31T11:00:00.000Z" });
+    const c1 = await claimDueReminders(db, NOW1c1, 20);
+    check(c1.ok && c1.reminders.length === 2 && c1.reminders.map((r) => r.title).sort().join(",") === "due,foreign-due" && c1.reminders.every((r) => r.telegram_id === String(r.user_id) && r.remind_attempts === 1), "1-c-1: claim takes due open rows only, with owner telegram_id");
+    check(rows("SELECT reminded_at FROM tasks WHERE title = 'due'")[0].reminded_at === NOW1c1, "1-c-1: claim stamps reminded_at");
+    const c2 = await claimDueReminders(db, NOW1c1, 20);
+    check(c2.ok && c2.reminders.length === 0, "1-c-1: second claim never double-claims");
+  }
+  // Limit 20 + order: 25 due rows -> 20 claimed (lowest ids), then the remaining 5.
+  {
+    const sq2 = new DatabaseSync(":memory:");
+    sq2.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8")); sq2.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8")); sq2.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8")); sq2.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    const b2 = (sql) => { const st = sq2.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    const db2 = { prepare(sql) { return b2(sql); } };
+    for (let i = 1; i <= 25; i++) sq2.prepare("INSERT INTO tasks (user_id, title, status, source, created_at, remind_at, remind_attempts) VALUES (1, ?, 'open', 'text', '2026-10-30T00:00:00.000Z', '2026-10-31T11:00:00.000Z', 0)").run(`bulk ${i}`);
+    const c1 = await claimDueReminders(db2, NOW1c1, 20);
+    const c2 = await claimDueReminders(db2, NOW1c1, 20);
+    check(c1.reminders.length === 20 && c2.reminders.length === 5 && c1.reminders[0].title === "bulk 1" && c1.reminders[19].title === "bulk 20" && c2.reminders[0].title === "bulk 21", "1-c-1: claim respects limit 20, ordered by remind_at/id");
+  }
+  // Completing before remind_at cancels claiming.
+  {
+    const { sq, db } = fresh1c1();
+    const tid = seed1c1(sq, "soon-done", 1, { remindAt: "2026-10-31T13:00:00.000Z" });
+    check((await setTaskStatus(db, 1, tid, "done")).ok === true, "1-c-1: setup completes the task");
+    const c = await claimDueReminders(db, "2026-10-31T14:00:00.000Z", 20);
+    check(c.ok && c.reminders.length === 0, "1-c-1: task completed before remind_at is never claimed");
+  }
+  // Claim -> fail -> release -> 3-attempt ceiling.
+  {
+    const { sq, db, rows } = fresh1c1();
+    const tid = seed1c1(sq, "flaky", 1, { remindAt: "2026-10-31T11:00:00.000Z" });
+    check((await claimDueReminders(db, NOW1c1, 20)).reminders.length === 1 && rows("SELECT remind_attempts FROM tasks WHERE id = ?", [tid])[0].remind_attempts === 1, "1-c-1: first claim attempts 1");
+    check((await releaseReminderClaim(db, tid)).ok === true && rows("SELECT reminded_at FROM tasks WHERE id = ?", [tid])[0].reminded_at === null && rows("SELECT remind_attempts FROM tasks WHERE id = ?", [tid])[0].remind_attempts === 1, "1-c-1: release clears reminded_at, preserves attempts");
+    check((await claimDueReminders(db, NOW1c1, 20)).reminders.length === 1, "1-c-1: released claim retries");
+    check((await releaseReminderClaim(db, tid)).ok === true && (await claimDueReminders(db, NOW1c1, 20)).reminders.length === 1 && rows("SELECT remind_attempts FROM tasks WHERE id = ?", [tid])[0].remind_attempts === 3, "1-c-1: third claim reaches the ceiling");
+    check((await claimDueReminders(db, NOW1c1, 20)).reminders.length === 0, "1-c-1: attempts >= 3 stops claiming");
+  }
+  // Snooze: owner-scoped, attempts reset, foreign/non-open/invalid untouched.
+  {
+    const { sq, db, rows } = fresh1c1();
+    const tid = seed1c1(sq, "snoozable", 1, { remindAt: "2026-10-31T11:00:00.000Z", remindedAt: NOW1c1, attempts: 2 });
+    const done = seed1c1(sq, "snooze-done", 1, { status: "done", remindAt: "2026-10-31T11:00:00.000Z", completedAt: "2026-10-31T10:00:00.000Z" });
+    const r = await snoozeTaskReminder(db, 1, tid, "2026-10-31T12:10:00.000Z");
+    const row = rows("SELECT remind_at, reminded_at, remind_attempts FROM tasks WHERE id = ?", [tid])[0];
+    check(r.ok === true && r.updated === true && row.remind_at === "2026-10-31T12:10:00.000Z" && row.reminded_at === null && row.remind_attempts === 0, "1-c-1: snooze resets time, clears claim, resets attempts");
+    check((await snoozeTaskReminder(db, 2, tid, "2026-10-31T12:20:00.000Z")).updated === false && (await snoozeTaskReminder(db, 1, done, "2026-10-31T12:20:00.000Z")).updated === false && (await snoozeTaskReminder(db, 1, tid, "tomorrow")).ok === false && rows("SELECT remind_at FROM tasks WHERE id = ?", [tid])[0].remind_at === "2026-10-31T12:10:00.000Z", "1-c-1: foreign/non-open/invalid snooze leaves the row untouched");
+  }
+  // Purge: 30-day cutoff on done/deleted via completed_at, created_at fallback; open/recent kept.
+  {
+    const { sq, db, rows } = fresh1c1();
+    seed1c1(sq, "old-done", 1, { status: "done", completedAt: "2026-09-15T00:00:00.000Z", createdAt: "2026-09-01T00:00:00.000Z" });
+    seed1c1(sq, "old-deleted-fallback", 1, { status: "deleted", createdAt: "2026-09-01T00:00:00.000Z" });
+    seed1c1(sq, "recent-done", 1, { status: "done", completedAt: "2026-10-20T00:00:00.000Z", createdAt: "2026-09-01T00:00:00.000Z" });
+    seed1c1(sq, "old-open", 1, { createdAt: "2026-09-01T00:00:00.000Z" });
+    const p = await purgeOldClosedTasks(db, "2026-10-01T00:00:00.000Z");
+    check(p.ok === true && p.deleted === 2 && rows("SELECT title FROM tasks ORDER BY id").map((x) => x.title).join(",") === "recent-done,old-open", "1-c-1: purge deletes only old closed tasks");
+  }
+  // D1 failure shapes: honest {ok: false}, never a throw, never a fake empty success.
+  {
+    const { db } = fresh1c1();
+    const failDb = { prepare(sql) { if (/UPDATE tasks SET reminded_at|DELETE FROM tasks|UPDATE tasks SET remind_at/i.test(sql)) throw new Error("boom"); return db.prepare(sql); } };
+    check((await claimDueReminders(failDb, NOW1c1, 20)).ok === false && (await claimDueReminders(failDb, NOW1c1, 20)).reminders.length === 0, "1-c-1: claim D1 failure is honest");
+    check((await releaseReminderClaim(failDb, 1)).ok === false && (await snoozeTaskReminder(failDb, 1, 1, "2026-10-31T12:10:00.000Z")).ok === false && (await purgeOldClosedTasks(failDb, "2026-10-01T00:00:00.000Z")).ok === false, "1-c-1: release/snooze/purge D1 failures are honest");
+    check((await claimDueReminders(null, NOW1c1, 20)).ok === false && (await purgeOldClosedTasks(db, "not-a-date")).ok === false, "1-c-1: missing DB / bad cutoff rejected");
   }
 }
 
