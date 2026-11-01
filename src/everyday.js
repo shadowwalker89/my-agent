@@ -3,7 +3,7 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
-import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, insertTask, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch } from "./db.js";
+import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, insertTask, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
@@ -263,9 +263,10 @@ async function runDailyBranch(env, o, c, ctx) {
     if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask); await o.send(askText(c.ask)); return "handled"; }
     // 1-b-3 (decision 2): a reminder is stored as a task (title = text,
     // remind_at = due, due_at = NULL); the legacy reminders table gains
-    // NO new rows, and no delivery is claimed before 1-c.
+    // NO new rows. 1-c-2: delivery is now active via scheduled(), so the
+    // notice is the active text, not the 1-b transitional text.
     const r = await insertTask(env, { userId, title: c.text, remindAt: c.due, dueAt: null, source: o.source === "voice" ? "voice" : "text" });
-    await o.send(r.ok ? "⏰ یادآوری به‌عنوان تسک ذخیره شد؛ ارسال خودکار آن هنوز فعال نیست و در فاز ۱-ج اضافه می‌شود." : NOT_SAVED_TEXT);
+    await o.send(r.ok ? "⏰ یادآوری به‌عنوان تسک ذخیره شد." : NOT_SAVED_TEXT);
     if (r.ok) await markDaily(env, o);
     return "handled";
   }
@@ -630,7 +631,64 @@ export async function resolveTaskCallback(env, o) {
     await sendListMessage(o, await renderTaskList(env, o.fromId, Number(proj[1]), parseListOffset(proj[2])));
     return true;
   }
+  // 1-c-2: snooze follows the same Fix B ordering as done/del: getTask
+  // first, then the atomic snooze; markup removed ONLY after success.
+  const snooze = /^task:snooze:(\d+)$/.exec(o.data);
+  if (snooze) {
+    const id = Number(snooze[1]);
+    const g = await getTask(env, o.fromId, id);
+    if (!g.ok) { await o.send(NOT_SAVED_TEXT); return true; } // D1 failure: buttons kept
+    if (!g.task) return true; // foreign/missing/invalid: silent
+    if (g.task.status !== "open") { await o.send(EXPIRED_TEXT); if (o.editMarkup) await o.editMarkup(); return true; } // consumed: fixed message + markup removed
+    const r = await snoozeTaskReminder(env, o.fromId, id, new Date((o.nowMs ?? Date.now()) + 10 * 60 * 1000).toISOString());
+    if (!r.ok) { await o.send(NOT_SAVED_TEXT); return true; } // D1 failure on write: buttons kept
+    if (!r.updated) { const g2 = await getTask(env, o.fromId, id); if (g2.ok && g2.task && g2.task.status !== "open") { await o.send(EXPIRED_TEXT); if (o.editMarkup) await o.editMarkup(); return true; } await o.send(NOT_SAVED_TEXT); return true; } // lost race: re-read once, else buttons kept
+    if (o.editMarkup) await o.editMarkup();
+    await o.send("💤 یادآوری برای ۱۰ دقیقه‌ی دیگر تنظیم شد.");
+    return true;
+  }
   return false;
+}
+
+// Phase 1-c-2: scheduled reminder delivery, called from scheduled() in
+// index.js. Claim limit 20 bounds the sends; worst-case subrequests per
+// tick under the most conservative counting: 2 claim reads + 20 sends +
+// 20 failure releases + 1 purge = 43, under the 50 ceiling (catalog
+// crons never run in the same invocation — scheduled() dispatches
+// exclusively). The daily purge runs on the 00:00 UTC tick only, derived
+// from event.scheduledTime with ZERO KV writes: a per-minute cron fires
+// exactly one 00:00 tick per day, so the purge runs at most once daily
+// (a missed 00:00 tick simply skips that day's purge). Delivery failure
+// releases the claim and logs only the error reason + task id, never
+// user text. sendMessage is injectable for offline tests; the default
+// sends via tgApi.
+export async function runReminderTick(env, opts = {}) {
+  const nowMs = opts.nowMs ?? Date.now();
+  const nowIso = opts.nowIso ?? new Date(nowMs).toISOString();
+  const send = opts.sendMessage ?? ((chatId, text, replyMarkup) => tgApi(env, "sendMessage", { chat_id: chatId, text, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) }));
+  const claim = await claimDueReminders(env, nowIso, 20);
+  if (!claim.ok) return { ok: false, sent: 0, failed: 0, purged: null };
+  let sent = 0, failed = 0;
+  for (const r of claim.reminders) {
+    const delayed = Date.parse(nowIso) - Date.parse(r.remind_at) > 5 * 60 * 1000;
+    const text = `${delayed ? "⏰ یادآوری (با تاخیر):" : "⏰ یادآوری:"} ${r.title}`;
+    const replyMarkup = { inline_keyboard: [[{ text: "✅", callback_data: `task:done:${r.id}` }, { text: "💤 ۱۰ دقیقه‌ی دیگر", callback_data: `task:snooze:${r.id}` }]] };
+    try {
+      await send(r.telegram_id, text, replyMarkup);
+      sent++;
+    } catch (err) {
+      failed++;
+      await releaseReminderClaim(env, r.id);
+      console.error(`reminder send failed: task ${r.id}:`, err && err.message);
+    }
+  }
+  let purged = null;
+  const d = new Date(opts.scheduledTime ?? nowMs);
+  if (d.getUTCHours() === 0 && d.getUTCMinutes() === 0) {
+    const p = await purgeOldClosedTasks(env, new Date(Date.parse(nowIso) - 30 * 86400000).toISOString());
+    purged = p.ok ? p.deleted : null;
+  }
+  return { ok: true, sent, failed, purged };
 }
 const INTERP_UNAVAILABLE_TEXT = "تفسیر خودکار الان در دسترس نیست؛ خودت نوعش را بگو:";
 function interpKey(id) { return `interp:${id}`; }

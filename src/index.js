@@ -26,7 +26,7 @@ import { healthCounts } from "./health.js";
 import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation, freeTextDevSuggestion } from "./intent.js";
 import { getChatContext } from "./memory.js";
-import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback } from "./everyday.js";
+import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback, runReminderTick } from "./everyday.js";
 import { handleVoice, handleVoiceRetry } from "./voice.js";
 import { saveMessage } from "./db.js";
 import {
@@ -1694,13 +1694,29 @@ export default {
   },
   async scheduled(event, env, ctx) {
     const provider = CRON_PROVIDER[event.cron];
-    if (!provider) return;
+    if (provider) {
+      ctx.waitUntil(
+        (async () => {
+          try {
+            await syncProvider(env, provider);
+          } catch (err) {
+            console.error(`syncProvider(${provider}) failed:`, err && err.message);
+          }
+        })(),
+      );
+      return;
+    }
+    // 1-c-2: any non-catalog cron is the reminder tick (Siem adds the
+    // per-minute trigger to wrangler.jsonc manually at Level 3; this
+    // code never assumes a cron line it cannot see). The tick is
+    // idempotent (atomic claims), so an unexpected cron firing it is
+    // harmless; the daily purge inside runs only on the 00:00 UTC tick.
     ctx.waitUntil(
       (async () => {
         try {
-          await syncProvider(env, provider);
+          await runReminderTick(env, { scheduledTime: event.scheduledTime });
         } catch (err) {
-          console.error(`syncProvider(${provider}) failed:`, err && err.message);
+          console.error("reminder tick failed:", err && err.message);
         }
       })(),
     );
