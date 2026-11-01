@@ -279,6 +279,10 @@ const NOTE_RE = /^\s*(?:(?:لطفا|لطفاً|ببین)\s+)?(?:یادداشت\s
 // chat. Note creation (NOTE_RE) is checked before this, so a یادداشت کن
 // + body message still goes to note, never to note-query.
 const NOTE_QUERY_RE = /(یادداشت\s*های(م|مو| امروز)?|یادداشت\s*هامو?)/;
+// Task list (1-b-1): anchored CLOSED list of clear list-request forms
+// (spaced/ZWNJ/joined تسک‌هام / تسک‌هایم + a show verb). Bare تسک,
+// تسک جدید, تسک بساز, and any message with a task body MUST NOT match.
+const TASK_LIST_RE = /^\s*(?:تسک\s*های(?:م|مو)|تسک\s*هامو?)(?:\s+را)?(?:\s+(?:نشان\s+بده|نشون\s+بده|نمایش\s+بده))?\s*[؟?!.،,]*$/u;
 const FILE_RE = /(?<!\p{L})(خلاصه\s+اش\s+کن(?![\p{L}])|خلاصه\s+کن(?![\p{L}])|خلاصه\s+اش|این فایل را خلاصه\s+کن(?![\p{L}]))/u;
 const TRANSLATE_VERB = /(?<!\p{L})(?:ترجمه\s+(?:کن|کنید|بکن))(?![\p{L}])/u;
 function countAnchoredAmounts(text) { const toks = stripThousands(normalizeDigits(normalizeText(text))).replace(/[؟?!.،,]/g, " ").split(/\s+/).filter(Boolean); let n = 0; for (let ci = 0; ci < toks.length; ci++) if (CUR_WORDS.includes(toks[ci])) for (let s = Math.max(0, ci - 7); s < ci; s++) { const ph = parseNumberPhrase(toks.slice(s, ci), 0); if (ph && !ph.error && ph.consumed === ci - s) { n++; break; } } return n; }
@@ -402,6 +406,7 @@ export function classifyDaily(text, opts = {}) {
   if (amount?.error === "decimal") return { intent: "ask", confidence: 0.5, question: "decimal" };
   if (amount?.error === "amount") return { intent: "ask", confidence: 0.5, question: "amount" };
   if (amount?.error === "unknown-number") return { intent: "chat", confidence: 1 }; // no verb: a bare-thousand statement is chat, not an amount question
+  if (TASK_LIST_RE.test(raw)) return { intent: "task-list", confidence: 1 };
   if (NOTE_QUERY_RE.test(raw)) { const date = parseRelativeDate(raw, now); if (date === null) return { intent: "note-query", confidence: 0.5, ask: "date" }; return { intent: "note-query", confidence: 1, date }; }
   if (FILE_RE.test(raw)) {
     // File reference only for a short message with no accompanying text:

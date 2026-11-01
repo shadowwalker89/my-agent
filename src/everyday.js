@@ -3,7 +3,7 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
-import { saveMessage, finalizeMessageKind, listProjectsResult } from "./db.js";
+import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, getTask, insertTask, setTaskStatus, addProjectAlias } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
@@ -198,11 +198,15 @@ async function runDailyBranch(env, o, c, ctx) {
     return "handled";
   }
   if (c.intent === "note") {
-    const r = await runDb(env, "INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)", [userId, c.text, o.source === "voice" ? "voice" : "text", new Date().toISOString()]);
+    // 1-b-1 (decision 5): attach the D1 default project when one exists;
+    // the legacy INSERT runs when it does not, so a note is still stored.
+    const pid = await defaultProjectId(env, userId);
+    const r = pid === null ? await runDb(env, "INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)", [userId, c.text, o.source === "voice" ? "voice" : "text", new Date().toISOString()]) : await runDb(env, "INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (?, ?, ?, ?, ?)", [userId, c.text, o.source === "voice" ? "voice" : "text", new Date().toISOString(), pid]);
     await o.send(r.ok ? "✅ یادداشت ذخیره شد." : NOT_SAVED_TEXT);
     if (r.ok) await markDaily(env, o);
     return "handled";
   }
+  if (c.intent === "task-list") { const r = await renderTaskListText(env, userId); await o.send(r.text); if (r.ok) await markDaily(env, o); return "handled"; }
   if (c.intent === "reminder") {
     if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask); await o.send(askText(c.ask)); return "handled"; }
     const r = await runDb(env, "INSERT INTO reminders (user_id, text, due_at, status, created_at) VALUES (?, ?, ?, ?, ?)", [userId, c.text, c.due, "pending", new Date().toISOString()]);
@@ -471,6 +475,45 @@ export async function resolveProjects(env, userId) {
     projects: r.projects.map((p) => ({ id: p.id, name: p.name, aliases: parseAliasesText(p.aliases), is_default: p.is_default })),
   };
 }
+
+// 1-b-1 (decision 5): the rule note's default project — the D1 row with
+// is_default = 1, else NULL. A project lookup never fails a note.
+async function defaultProjectId(env, userId) {
+  const rp = await resolveProjects(env, userId);
+  if (!rp.ok || rp.fallback) return null;
+  return rp.projects.find((p) => p.is_default === 1)?.id ?? null;
+}
+
+const TASK_LIST_FAILED_TEXT = "تسک‌ها خوانده نشد؛ دوباره تلاش کن";
+// 1-b-1: first-page list text — 8 rows, open only, with project names.
+// {ok:false} ONLY on a task-read failure (Fix A); name resolution
+// degrades to titles only when IT fails, since names are decoration.
+async function renderTaskListText(env, userId, projectId = null, offset = 0) {
+  const r = await listOpenTasksResult(env, userId, projectId, 8, offset);
+  if (!r.ok) return { ok: false, text: TASK_LIST_FAILED_TEXT };
+  if (r.tasks.length === 0) return { ok: true, text: "تسک بازی پیدا نشد." };
+  const rp = await resolveProjects(env, userId);
+  const names = new Map();
+  if (rp.ok && !rp.fallback) for (const p of rp.projects) if (p.id != null) names.set(p.id, p.name);
+  return { ok: true, text: r.tasks.map((t) => `• ${t.title}${t.project_id != null && names.get(t.project_id) ? ` — ${names.get(t.project_id)}` : ""}`).join("\n") };
+}
+
+// 1-b-1: task: callbacks (Fix B ordering, amendment 1/3/7a). ONLY
+// task:del here; pagination/archive/filter arrive in 1-b-2.
+export async function resolveTaskCallback(env, o) {
+  const m = /^task:del:(\d+)$/.exec(o.data);
+  if (!m) return false;
+  const id = Number(m[1]);
+  const g = await getTask(env, o.fromId, id);
+  if (!g.ok) { await o.send(NOT_SAVED_TEXT); return true; } // D1 failure: buttons kept
+  if (!g.task) return true; // foreign/missing/invalid: silent
+  if (g.task.status !== "open") { await o.send(EXPIRED_TEXT); if (o.editMarkup) await o.editMarkup(); return true; } // consumed: fixed message + markup removed
+  const r = await setTaskStatus(env, o.fromId, id, "deleted");
+  if (!r.ok) { const g2 = await getTask(env, o.fromId, id); if (g2.ok && g2.task && g2.task.status !== "open") { await o.send(EXPIRED_TEXT); if (o.editMarkup) await o.editMarkup(); return true; } await o.send(NOT_SAVED_TEXT); return true; } // lost race: re-read once, else buttons kept
+  if (o.editMarkup) await o.editMarkup();
+  await o.send("🗑 حذف شد.");
+  return true;
+}
 const INTERP_UNAVAILABLE_TEXT = "تفسیر خودکار الان در دسترس نیست؛ خودت نوعش را بگو:";
 function interpKey(id) { return `interp:${id}`; }
 function interpTypeKeyboard(id) {
@@ -478,9 +521,13 @@ function interpTypeKeyboard(id) {
 }
 function noteCardKeyboard(id) { return [[{ text: "🔄 تغییر نوع", callback_data: `interp:change:${id}` }, { text: "🗑 لغو", callback_data: `interp:del:${id}` }]]; }
 async function newInterpRecord(env, userId, value) { const id = newId(); await putKv(env, interpKey(id), { owner: userId, ...value }); return id; }
-async function insertNoteRow(env, userId, text, source) {
+async function insertNoteRow(env, userId, text, source, projectId = null) {
   const db = dbOf(env); if (!db) return { ok: false, id: null };
-  try { await db.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)").bind(userId, text, source, new Date().toISOString()).run(); const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first(); const id = row?.id ?? null; if (id) await putKv(env, correctionKey(userId), { table: "notes", id }); return { ok: true, id }; } catch { return { ok: false, id: null }; }
+  try {
+    if (projectId === null || projectId === undefined) await db.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)").bind(userId, text, source, new Date().toISOString()).run();
+    else await db.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (?, ?, ?, ?, ?)").bind(userId, text, source, new Date().toISOString(), projectId).run();
+    const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first(); const id = row?.id ?? null; if (id) await putKv(env, correctionKey(userId), { table: "notes", id }); return { ok: true, id };
+  } catch { return { ok: false, id: null }; }
 }
 function rangeForPeriod(periodText, nowMs) {
   const t = normalizeText(periodText ?? ""), today = iranDate(nowMs);
@@ -496,17 +543,21 @@ function rangeForPeriod(periodText, nowMs) {
 async function executeInterpAction(env, o, ctx, action, resolved) {
   const { userId } = o;
   if (action.type === "note") {
-    const r = await insertNoteRow(env, userId, action.text, o.source === "voice" ? "voice" : "text");
+    const r = await insertNoteRow(env, userId, action.text, o.source === "voice" ? "voice" : "text", resolved.project?.id ?? null);
     if (!r.ok) return { line: `📝 یادداشت: ${action.text} — ${NOT_SAVED_TEXT}` };
     return { line: `📝 یادداشت: ${action.text}`, note: { id: r.id, text: action.text }, kind: "daily" };
   }
-  // 0-b3 task card (presentation only): no tasks table until migration
-  // 0003, so a task is never stored — the card says so plainly.
+  // 1-b-1: a task is really stored (insertTask validates title, project
+  // ownership, due/remind ISO). Failure: NOT_SAVED_TEXT, no pointer,
+  // nothing claimed. Success: correction pointer set (correction still
+  // replies not-yet-active until 1-b-4); card carries ONLY the delete button.
   if (action.type === "task") {
-    const parts = [`📋 تسک: ${action.text}`, `پروژه: ${resolved.project ?? "عمومی"}`];
-    if (resolved.due_at) parts.push(`سررسید: ${resolved.due_at}`);
-    if (resolved.remind_at) parts.push(`یادآوری: ${resolved.remind_at}`);
-    return { line: `${parts.join(" — ")} — ذخیره با فاز ۱ می‌آید.`, taskCard: { text: action.text }, kind: "daily" };
+    const r = await insertTask(env, { userId, title: action.text, projectId: resolved.project?.id ?? null, dueAt: resolved.due_at, remindAt: resolved.remind_at, source: o.source === "voice" ? "voice" : "text", sourceMessageId: o.entryMessageId ?? null });
+    if (!r.ok) return { line: NOT_SAVED_TEXT, kind: "daily" };
+    await putKv(env, correctionKey(userId), { table: "tasks", id: r.id });
+    const parts = [`📋 تسک: ${action.text}`, `پروژه: ${resolved.project?.name ?? "عمومی"}`];
+    if (resolved.due_at) parts.push(`سررسید: ${resolved.due_at}`); if (resolved.remind_at) parts.push(`یادآوری: ${resolved.remind_at}`);
+    return { line: parts.join(" — "), task: { id: r.id, text: action.text }, kind: "daily" };
   }
   // 0-b3 correction: edits the last created item within 10 minutes (KV
   // pointer). Notes edit in place; expenses go through the confirm card
@@ -563,9 +614,15 @@ async function executeInterpAction(env, o, ctx, action, resolved) {
 // yields the 0-b3 project-choice card (never auto-create); other skips get
 // type buttons (single) or a skipped line (multi).
 export async function runInterpPolicy(env, o, ctx, actions, finalize) {
+  // 1-b-1: validation and card rows use the resolved list (D1 rows, or
+  // the seed fallback on genuine empty). On a project-read failure the
+  // failure path runs — no seed names, no assumed project, row stays pending.
+  const rp = await resolveProjects(env, o.userId);
+  if (!rp.ok) { await sendInterpUnavailable(env, o, o.text, o.entryMessageId ?? null); return "handled"; }
+  const projects = rp.projects;
   const outcomes = [];
   for (const a of actions) {
-    const v = validateInterpreterAction(a, { projects: SEED_PROJECTS, nowMs: ctx.now, defaultCurrency: ctx.remembered });
+    const v = validateInterpreterAction(a, { projects, nowMs: ctx.now, defaultCurrency: ctx.remembered });
     if (!v.ok && v.errors.length === 1 && v.errors[0] === "project") { outcomes.push({ projectChoice: true, action: a, unknown: a.type === "query" && a.query ? a.query.project : a.project }); continue; }
     if (!v.ok || a.confidence < 0.6 || a.needs !== "none") { outcomes.push({ skipped: true, action: a, errors: v.errors ?? [] }); continue; }
     outcomes.push(await executeInterpAction(env, o, ctx, a, v.resolved));
@@ -575,7 +632,7 @@ export async function runInterpPolicy(env, o, ctx, actions, finalize) {
     if (one.projectChoice) {
       await finalize("daily");
       const id = await newInterpRecord(env, o.userId, { text: o.text, action: one.action });
-      const rows = SEED_PROJECTS.map((p, i) => [{ text: p.name, callback_data: `interp:proj:${i}:${id}` }]);
+      const rows = projects.map((p, i) => [{ text: p.name, callback_data: `interp:proj:${i}:${id}` }]);
       rows.push([{ text: "➕ پروژه‌ی جدید", callback_data: `interp:proj:new:${id}` }]);
       await o.send(`پروژه‌ی «${one.unknown}» را نمی‌شناسم؛ پروژه‌ی جدید است یا یکی از موجودها؟`, { replyMarkup: { inline_keyboard: rows } });
       return "handled";
@@ -583,10 +640,9 @@ export async function runInterpPolicy(env, o, ctx, actions, finalize) {
     if (one.skipped) { await finalize("daily"); const id = await newInterpRecord(env, o.userId, { text: o.text }); await o.send("نوعش را بگو:", { replyMarkup: { inline_keyboard: interpTypeKeyboard(id) } }); return "handled"; }
     if (one.direct) { await finalize(one.kind); return "handled"; }
     if (one.note) { await finalize("daily"); const id = await newInterpRecord(env, o.userId, { table: "notes", id: one.note.id, text: one.note.text }); await o.send("✅ یادداشت ذخیره شد.", { replyMarkup: { inline_keyboard: noteCardKeyboard(id) } }); return "handled"; }
-    if (one.taskCard) {
+    if (one.task) {
       await finalize("daily");
-      const id = await newInterpRecord(env, o.userId, { task: true, text: one.taskCard.text });
-      await o.send(one.line, { replyMarkup: { inline_keyboard: [[{ text: "🔄 تغییر نوع", callback_data: `interp:changetask:${id}` }, { text: "🗑 کنار گذاشتن", callback_data: `interp:taskdismiss:${id}` }]] } });
+      await o.send(one.line, { replyMarkup: { inline_keyboard: [[{ text: "🗑 حذف تسک", callback_data: `task:del:${one.task.id}` }]] } });
       return "handled";
     }
     await finalize("daily");
@@ -610,13 +666,17 @@ export async function runInterpPolicy(env, o, ctx, actions, finalize) {
 // tap is a user action, so a repeated failure is not a loop.
 async function interpretAndExecute(env, o, ctx, text, rowId, finalize) {
   const recent = (await recentMessages(env, o.userId, 4)).filter((r) => r.kind !== "pending").reverse().slice(-3).map((r) => r.content).filter((c) => typeof c === "string" && c);
-  const prompt = buildInterpreterPrompt({ text, source: o.source === "voice" ? "voice" : "text", recentTurns: recent, openQuestion: null, projects: SEED_PROJECTS, nowIso: new Date(ctx.now + 210 * 60000).toISOString(), defaultCurrency: ctx.remembered });
   // Circuit breaker (0-b2): while flagged, no Workers AI call is attempted;
   // the failure reply (with the backup button) is sent instead. A suppressed
   // attempt records no new breaker error or breaker state — the flag's TTL
   // governs lifting — but the failure reply still creates its KV failure
   // record, so the Retry/Backup buttons on that message keep working.
   if (await breakerFlag(env)) { await sendInterpUnavailable(env, o, text, rowId); return "handled"; }
+  // 1-b-1: the prompt uses the resolved list; on a project-read failure
+  // the failure path runs instead (no seed names shown).
+  const rp = await resolveProjects(env, o.userId);
+  if (!rp.ok) { await sendInterpUnavailable(env, o, text, rowId); return "handled"; }
+  const prompt = buildInterpreterPrompt({ text, source: o.source === "voice" ? "voice" : "text", recentTurns: recent, openQuestion: null, projects: rp.projects, nowIso: new Date(ctx.now + 210 * 60000).toISOString(), defaultCurrency: ctx.remembered });
   const res = await interpretText(env, o.interpreterModel ?? env.INTERPRETER_MODEL ?? null, prompt, o.interpreterCallFn ?? null);
   if (!res.ok) { await recordInterpError(env, res.reason); await sendInterpUnavailable(env, o, text, rowId); return "handled"; }
   return runInterpPolicy(env, o, ctx, res.actions, finalize);
@@ -736,12 +796,20 @@ export async function resolveInterpCallback(env, o) {
     const rec = await getKv(env, interpKey(pm[2]));
     if (!rec) { await o.send(EXPIRED_TEXT); return true; }
     if (Number(rec.owner) !== Number(o.fromId)) return true;
+    // 1-b-1: rows re-indexed to the resolved list; the alias is written
+    // ONLY on this explicit tap (decision 6), never for a seed-fallback
+    // row (no id). A project-read failure keeps record + buttons (retryable);
+    // a genuine alias-write failure is said honestly, action still runs.
+    const rp = pm[1] === "new" || !rec.action ? null : await resolveProjects(env, o.fromId);
+    if (rp && !rp.ok) { await o.send(NOT_SAVED_TEXT); return true; }
     await delKv(env, interpKey(pm[2]));
     if (o.editMarkup) await o.editMarkup();
     if (pm[1] === "new" || !rec.action) { await o.send("پروژه‌های تازه با فاز ۱ می‌آیند؛ فعلاً از پروژه‌های موجود یکی را بگو."); return true; }
-    const seed = SEED_PROJECTS[Number(pm[1])];
-    if (!seed) { await o.send(EXPIRED_TEXT); return true; }
-    const a2 = seed && rec.action.query ? { ...rec.action, query: { ...rec.action.query, project: seed.name } } : { ...rec.action, project: seed.name };
+    const chosen = rp.projects[Number(pm[1])];
+    if (!chosen) { await o.send(EXPIRED_TEXT); return true; }
+    const unknown = rec.action.query ? rec.action.query.project : rec.action.project;
+    if (unknown && chosen.id != null) { const want = normalizeText(unknown).trim(); const same = normalizeText(chosen.name).trim() === want || (Array.isArray(chosen.aliases) && chosen.aliases.some((a) => normalizeText(a).trim() === want)); if (want && !same) { const ar = await addProjectAlias(env, o.fromId, chosen.id, unknown); if (!ar.ok) await o.send("نام مستعار پروژه ذخیره نشد."); } }
+    const a2 = chosen && rec.action.query ? { ...rec.action, query: { ...rec.action.query, project: chosen.name } } : { ...rec.action, project: chosen.name };
     const ctx = { now: o.nowMs ?? Date.now(), remembered: await getDefaultCurrency(env, o.fromId) };
     await runInterpPolicy(env, { ...o, userId: o.fromId, text: rec.text }, ctx, [a2], async () => {});
     return true;
@@ -897,6 +965,9 @@ export async function handleDailyText(env, o) {
   if (c.intent === "ask" && c.question === "note-text") { await clearPendingAsk(env, userId); return viaBranch(c); }
   // Fast money path (unchanged): rule-confident expense/income only.
   if (c.intent === "expense" || c.intent === "income") { await clearPendingAsk(env, userId); return viaBranch(c); }
+  // Rule task list (1-b-1): direct to the list render, never to the model
+  // step or the interpreter gate; clears any stale slot first.
+  if (c.intent === "task-list") { await clearPendingAsk(env, userId); return viaBranch(c); }
   if (c.intent !== "chat" && c.intent !== "ask") { await clearPendingAsk(env, userId); return viaBranch(c); }
   // Answers to an open bot question keep the existing slot path.
   const slot = await getPendingAsk(env, userId);
