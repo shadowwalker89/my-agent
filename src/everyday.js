@@ -3,7 +3,7 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
-import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, getTask, insertTask, setTaskStatus, addProjectAlias } from "./db.js";
+import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, insertTask, setTaskStatus, addProjectAlias } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
@@ -206,7 +206,7 @@ async function runDailyBranch(env, o, c, ctx) {
     if (r.ok) await markDaily(env, o);
     return "handled";
   }
-  if (c.intent === "task-list") { const r = await renderTaskListText(env, userId); await o.send(r.text); if (r.ok) await markDaily(env, o); return "handled"; }
+  if (c.intent === "task-list") { const r = await renderTaskList(env, userId); await sendListMessage(o, r); if (r.ok) await markDaily(env, o); return "handled"; }
   if (c.intent === "reminder") {
     if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask); await o.send(askText(c.ask)); return "handled"; }
     const r = await runDb(env, "INSERT INTO reminders (user_id, text, due_at, status, created_at) VALUES (?, ?, ?, ?, ?)", [userId, c.text, c.due, "pending", new Date().toISOString()]);
@@ -485,34 +485,97 @@ async function defaultProjectId(env, userId) {
 }
 
 const TASK_LIST_FAILED_TEXT = "تسک‌ها خوانده نشد؛ دوباره تلاش کن";
-// 1-b-1: first-page list text — 8 rows, open only, with project names.
-// {ok:false} ONLY on a task-read failure (Fix A); name resolution
-// degrades to titles only when IT fails, since names are decoration.
-async function renderTaskListText(env, userId, projectId = null, offset = 0) {
+// 1-b-2: full list render — 8 rows, open only, with project names,
+// per-task ✅/🗑 buttons, more/archive/filter navigation. {ok:false}
+// ONLY on a task-read failure (Fix A); name resolution degrades to
+// titles only when IT fails, since names are decoration. The more
+// button renders ONLY on a full page; beyond-end renders no-more.
+async function renderTaskList(env, userId, projectId = null, offset = 0) {
   const r = await listOpenTasksResult(env, userId, projectId, 8, offset);
-  if (!r.ok) return { ok: false, text: TASK_LIST_FAILED_TEXT };
-  if (r.tasks.length === 0) return { ok: true, text: "تسک بازی پیدا نشد." };
+  if (!r.ok) return { ok: false, text: TASK_LIST_FAILED_TEXT, keyboard: null };
+  if (r.tasks.length === 0) return { ok: true, text: offset > 0 ? "صفحه‌ی دیگری نیست." : "تسک بازی پیدا نشد.", keyboard: offset > 0 ? [[{ text: "↩ فهرست", callback_data: projectId == null ? "task:more:0" : `task:more:0:${projectId}` }]] : null };
   const rp = await resolveProjects(env, userId);
   const names = new Map();
   if (rp.ok && !rp.fallback) for (const p of rp.projects) if (p.id != null) names.set(p.id, p.name);
-  return { ok: true, text: r.tasks.map((t) => `• ${t.title}${t.project_id != null && names.get(t.project_id) ? ` — ${names.get(t.project_id)}` : ""}`).join("\n") };
+  const text = r.tasks.map((t) => `• ${t.title}${t.project_id != null && names.get(t.project_id) ? ` — ${names.get(t.project_id)}` : ""}`).join("\n");
+  const keyboard = r.tasks.map((t) => [{ text: "✅", callback_data: `task:done:${t.id}` }, { text: "🗑", callback_data: `task:del:${t.id}` }]);
+  if (r.tasks.length === 8) keyboard.push([{ text: "بیشتر", callback_data: projectId == null ? `task:more:${offset + 8}` : `task:more:${offset + 8}:${projectId}` }]);
+  keyboard.push([{ text: "📦 آرشیو", callback_data: "task:arch:0" }]);
+  if (rp.ok && !rp.fallback) {
+    const row = rp.projects.filter((p) => p.id != null).map((p) => ({ text: p.name, callback_data: `task:proj:${p.id}:0` }));
+    if (row.length) keyboard.push(row);
+    if (projectId != null) keyboard.push([{ text: "همه", callback_data: "task:more:0" }]);
+  }
+  return { ok: true, text, keyboard };
 }
 
-// 1-b-1: task: callbacks (Fix B ordering, amendment 1/3/7a). ONLY
-// task:del here; pagination/archive/filter arrive in 1-b-2.
-export async function resolveTaskCallback(env, o) {
-  const m = /^task:del:(\d+)$/.exec(o.data);
-  if (!m) return false;
-  const id = Number(m[1]);
+// 1-b-2: archive render — done only, newest-first (listDoneTasks
+// core, never the wrapper, so a failure is never an "empty archive").
+async function renderTaskArchive(env, userId, offset = 0) {
+  const r = await listDoneTasksResult(env, userId, null, 8, offset);
+  if (!r.ok) return { ok: false, text: TASK_LIST_FAILED_TEXT, keyboard: null };
+  if (r.tasks.length === 0) return { ok: true, text: offset > 0 ? "صفحه‌ی دیگری نیست." : "تسک آرشیوشده‌ای پیدا نشد.", keyboard: offset > 0 ? [[{ text: "↩ آرشیو", callback_data: "task:arch:0" }]] : null };
+  const keyboard = [];
+  if (r.tasks.length === 8) keyboard.push([{ text: "بیشتر", callback_data: `task:arch:${offset + 8}` }]);
+  keyboard.push([{ text: "↩ فهرست باز", callback_data: "task:more:0" }]);
+  return { ok: true, text: r.tasks.map((t) => `• ${t.title}`).join("\n"), keyboard };
+}
+
+// 1-b-2: send a list render, splitting at Telegram's 4096-character
+// cap on line boundaries (a single over-long line is hard-split);
+// the keyboard rides on the LAST chunk only.
+async function sendListMessage(o, rendered) {
+  const chunks = [];
+  for (const line of rendered.text.split("\n")) {
+    if (line.length > 4096) { for (let i = 0; i < line.length; i += 4096) chunks.push(line.slice(i, i + 4096)); continue; }
+    const last = chunks[chunks.length - 1];
+    if (last !== undefined && last.length + 1 + line.length <= 4096) chunks[chunks.length - 1] = `${last}\n${line}`;
+    else chunks.push(line);
+  }
+  for (let i = 0; i < chunks.length; i++) await o.send(chunks[i], i === chunks.length - 1 && rendered.keyboard ? { replyMarkup: { inline_keyboard: rendered.keyboard } } : undefined);
+}
+
+// Amendment 1: unparseable offset -> page 0; negative -> clamped to 0.
+function parseListOffset(raw) {
+  if (!/^-?\d+$/.test(String(raw ?? ""))) return 0;
+  return Math.max(0, Number(raw));
+}
+
+// Fix B ordering shared by task:done and task:del: getTask first,
+// then the atomic status change; markup removed ONLY after success.
+async function actTaskStatus(env, o, id, status, successText) {
   const g = await getTask(env, o.fromId, id);
   if (!g.ok) { await o.send(NOT_SAVED_TEXT); return true; } // D1 failure: buttons kept
   if (!g.task) return true; // foreign/missing/invalid: silent
   if (g.task.status !== "open") { await o.send(EXPIRED_TEXT); if (o.editMarkup) await o.editMarkup(); return true; } // consumed: fixed message + markup removed
-  const r = await setTaskStatus(env, o.fromId, id, "deleted");
+  const r = await setTaskStatus(env, o.fromId, id, status);
   if (!r.ok) { const g2 = await getTask(env, o.fromId, id); if (g2.ok && g2.task && g2.task.status !== "open") { await o.send(EXPIRED_TEXT); if (o.editMarkup) await o.editMarkup(); return true; } await o.send(NOT_SAVED_TEXT); return true; } // lost race: re-read once, else buttons kept
   if (o.editMarkup) await o.editMarkup();
-  await o.send("🗑 حذف شد.");
+  await o.send(successText);
   return true;
+}
+
+// 1-b-2: full task: namespace. done/del act on one row via getTask
+// (amendment 3); more/arch/proj carry NO row and never call getTask
+// (amendment 1: allow-list gate already ran; proj validates the
+// project user-scoped, foreign/missing -> silent, no data, no filter).
+export async function resolveTaskCallback(env, o) {
+  const done = /^task:(done|del):(\d+)$/.exec(o.data);
+  if (done) return actTaskStatus(env, o, Number(done[2]), done[1] === "done" ? "done" : "deleted", done[1] === "done" ? "✅ انجام شد." : "🗑 حذف شد.");
+  const more = /^task:more:([^:]+)(?::(\d+))?$/.exec(o.data);
+  if (more) { await sendListMessage(o, await renderTaskList(env, o.fromId, more[2] !== undefined ? Number(more[2]) : null, parseListOffset(more[1]))); return true; }
+  const arch = /^task:arch:([^:]+)$/.exec(o.data);
+  if (arch) { await sendListMessage(o, await renderTaskArchive(env, o.fromId, parseListOffset(arch[1]))); return true; }
+  const proj = /^task:proj:([^:]+):([^:]+)$/.exec(o.data);
+  if (proj) {
+    if (!/^\d+$/.test(proj[1])) return true; // invalid project id: silent, like foreign/missing
+    const rp = await listProjectsResult(env, o.fromId);
+    if (!rp.ok) { await o.send(TASK_LIST_FAILED_TEXT); return true; }
+    if (!rp.projects.some((p) => String(p.id) === proj[1])) return true; // foreign/missing: silent, no data, no filter
+    await sendListMessage(o, await renderTaskList(env, o.fromId, Number(proj[1]), parseListOffset(proj[2])));
+    return true;
+  }
+  return false;
 }
 const INTERP_UNAVAILABLE_TEXT = "تفسیر خودکار الان در دسترس نیست؛ خودت نوعش را بگو:";
 function interpKey(id) { return `interp:${id}`; }
@@ -586,7 +649,12 @@ async function executeInterpAction(env, o, ctx, action, resolved) {
   }
   if (action.type === "query") {
     const q = action.query;
-    if (q.kind === "task") return { line: "تسک‌ها با فاز ۱ می‌آیند.", kind: "daily" };
+    // 1-b-2: task query renders the paginated list — bare request ->
+    // open list, resolved project -> pre-filtered list. Decision 4:
+    // the period phrase is IGNORED and the reply never implies a
+    // period filter was applied. Unresolved projects never reach
+    // here (they take the lone-project card path in runInterpPolicy).
+    if (q.kind === "task") { const rendered = await renderTaskList(env, userId, resolved.project?.id ?? null, 0); return { line: rendered.text, keyboard: rendered.keyboard, kind: "daily" }; }
     if (q.kind === "note") { const rows = await allDb(env, "SELECT text FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 5", [userId]); return { line: rows.length ? rows.map((r) => `• ${r.text}`).join("\n") : "یادداشتی پیدا نشد.", kind: "daily" }; }
     // The query action carries its own period phrase; no rule re-derivation.
     const sums = await queryExpenseSums(env, userId, rangeForPeriod(q.periodText, ctx.now));
@@ -645,15 +713,21 @@ export async function runInterpPolicy(env, o, ctx, actions, finalize) {
       await o.send(one.line, { replyMarkup: { inline_keyboard: [[{ text: "🗑 حذف تسک", callback_data: `task:del:${one.task.id}` }]] } });
       return "handled";
     }
+    // 1-b-2: a list result carries its keyboard (split at 4096 by
+    // sendListMessage); other single results send plain as before.
+    if (one.keyboard) { await finalize("daily"); await sendListMessage(o, { text: one.line, keyboard: one.keyboard }); return "handled"; }
     await finalize("daily");
     await o.send(one.line);
     return "handled";
   }
   await finalize("daily");
   const keyboard = [];
-  let n = 0;
+  let n = 0, m = 0;
   for (const r of outcomes) {
     if (r.note) { n++; const id = await newInterpRecord(env, o.userId, { table: "notes", id: r.note.id, text: r.note.text, multi: true }); keyboard.push([{ text: `🗑 یادداشت ${n}`, callback_data: `interp:del:${id}` }]); }
+    // 1-b-2: per-task summary buttons arrive with the list keyboard
+    // work (the 1-b-1 boundary); delete via task:del like single cards.
+    if (r.task) { m++; keyboard.push([{ text: `🗑 تسک ${m}`, callback_data: `task:del:${r.task.id}` }]); }
   }
   const lines = outcomes.map((r) => r.line ?? (r.projectChoice ? `⏭ پروژه شناخته نشد: ${r.unknown}` : "⏭ موردی اجرا نشد."));
   await o.send(lines.join("\n"), keyboard.length ? { replyMarkup: { inline_keyboard: keyboard } } : undefined);
