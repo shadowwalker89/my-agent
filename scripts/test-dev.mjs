@@ -29,7 +29,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, getProject, insertTask, listOpenTasks, setTaskStatus, insertIntentFeedback } from "../src/db.js";
 import {
   getChatContext,
   getSetting,
@@ -2816,6 +2816,139 @@ if (DatabaseSync) {
     await resolveInterpCallback(env, { fromId: 4242, chatId: 4242, data: expBtn, send: s3.send, editMarkup: async () => {}, chat: s3.chat, nowMs: NOW0b });
     check(String(s3.sent.at(-1)?.text ?? "").includes("قابل استخراج نیست") && !btnData(s3).some((d) => d.startsWith("daily:confirm:")) && rows0b("SELECT COUNT(*) AS n FROM notes WHERE text = 'یادداشت بدون مبلغ'")[0].n === 1, "0-b3 fix: unextractable amount stops conversion, note kept, no confirm");
   }
+}
+
+// ── Phase 1-a: migration 0003 + task/project D1 functions (no wiring) ───
+// Fresh in-memory DB: user + note rows exist BEFORE 0003, so the migration
+// itself must seed projects and attach old notes to عمومی.
+if (DatabaseSync) {
+  const sqlite1a = new DatabaseSync(":memory:");
+  sqlite1a.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite1a.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqlite1a.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+  sqlite1a.exec("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, 'old note', 'text', '2026-10-30T00:00:00.000Z')");
+  sqlite1a.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  const db1a = {
+    prepare(sql) {
+      const stmt = sqlite1a.prepare(sql);
+      return {
+        bind(...params) {
+          return {
+            // Mirror D1's run() shape (meta.changes) so the atomic
+            // setTaskStatus transition can be decided from it.
+            run: async () => { const r = stmt.run(...params); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; },
+            all: async () => ({ results: stmt.all(...params) }),
+            first: async () => stmt.get(...params) ?? null,
+          };
+        },
+      };
+    },
+  };
+  const failing1a = { prepare() { throw new Error("boom"); } };
+
+  // Seed: four projects, عمومی default, aliases match SEED_PROJECTS.
+  const seeds = await listProjects(db1a, 1);
+  check(seeds.length === 4, `seed projects: ${JSON.stringify(seeds.map((p) => p.name))}`);
+  check(seeds[0].name === "عمومی" && seeds[0].is_default === 1, "عمومی is default");
+  check(seeds[2].name === "گلبهار" && seeds[2].aliases === '["گل"]', "گلبهار alias kept");
+  check(seeds[3].name === "قرارها و ملاقات‌ها" && seeds[3].aliases === '["قرارها"]', "قرارها alias kept");
+  check((await listProjects(db1a, 99)).length === 0, "unknown user -> no projects");
+  check((await getProject(db1a, 1, seeds[0].id))?.name === "عمومی", "getProject by id");
+  check((await getProject(db1a, 1, 9999)) === null && (await getProject(db1a, 99, seeds[0].id)) === null, "getProject wrong id/owner -> null");
+
+  // Old note attached to عمومی by the migration itself.
+  const oldNote = sqlite1a.prepare("SELECT project_id FROM notes WHERE text = 'old note'").get();
+  check(oldNote?.project_id === seeds[0].id, `old note -> عمومی: ${JSON.stringify(oldNote)}`);
+
+  // Task insert/list: open only, project filter, due/remind kept separate.
+  const t1 = await insertTask(db1a, { userId: 1, title: "buy milk", projectId: seeds[0].id, dueAt: "2026-11-02", remindAt: "2026-11-01T09:00:00+03:30", source: "text" });
+  const t2 = await insertTask(db1a, { userId: 1, title: "call Ali", projectId: seeds[2].id, source: "voice" });
+  check(t1.ok === true && t1.id !== null && t2.ok === true, "task inserts ok");
+  check((await insertTask(db1a, { userId: 1, title: "   " })).ok === false, "empty title refused");
+  check((await insertTask(db1a, { userId: 99, title: "x" })).ok === true, "insert does not check user existence (caller allow-lists)");
+  const openAll = await listOpenTasks(db1a, 1);
+  check(openAll.length === 2 && openAll[0].title === "buy milk" && openAll[0].remindAt === undefined && openAll[0].remind_at === "2026-11-01T09:00:00+03:30" && openAll[0].due_at === "2026-11-02", "open list keeps due/remind separate");
+  check((await listOpenTasks(db1a, 1, seeds[2].id)).length === 1, "project filter works");
+  check((await listOpenTasks(db1a, 1, seeds[0].id, 1)).length === 1, "limit applies");
+
+  // Status: open -> done sets completed_at and leaves the open list;
+  // a second transition, a bad status, and a wrong owner all fail.
+  check((await setTaskStatus(db1a, 1, t1.id, "done")).ok === true, "done ok");
+  const doneRow = sqlite1a.prepare("SELECT status, completed_at FROM tasks WHERE id = ?").get(t1.id);
+  check(doneRow?.status === "done" && typeof doneRow?.completed_at === "string" && doneRow.completed_at !== "", "done sets completed_at");
+  check((await listOpenTasks(db1a, 1)).length === 1, "done task leaves open list");
+  check((await setTaskStatus(db1a, 1, t1.id, "done")).ok === false, "done -> done refused");
+  check((await setTaskStatus(db1a, 1, t2.id, "archived")).ok === false, "unknown status refused");
+  check((await setTaskStatus(db1a, 99, t2.id, "done")).ok === false, "wrong owner refused");
+  check((await setTaskStatus(db1a, 1, t2.id, "deleted")).ok === true, "deleted ok");
+  const delRow = sqlite1a.prepare("SELECT status, completed_at FROM tasks WHERE id = ?").get(t2.id);
+  check(delRow?.status === "deleted" && delRow?.completed_at === null, "deleted keeps completed_at null");
+  check((await listOpenTasks(db1a, 1)).length === 0, "deleted task leaves open list");
+
+  // Fix delta 1: project ownership is validated in the DB layer.
+  sqlite1a.exec("INSERT INTO users (id, telegram_id) VALUES (99, '99')");
+  sqlite1a.exec("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (99, 'other', '[]', 'active', 1, '2026-10-30T00:00:00.000Z')");
+  const otherProj = sqlite1a.prepare("SELECT id FROM projects WHERE user_id = 99").get();
+  check((await insertTask(db1a, { userId: 1, title: "own project", projectId: seeds[0].id })).ok === true, "fix: own project accepted");
+  const fixCount = () => sqlite1a.prepare("SELECT COUNT(*) AS n FROM tasks").get().n;
+  const countBefore = fixCount();
+  check((await insertTask(db1a, { userId: 1, title: "other user project", projectId: otherProj.id })).ok === false, "fix: other user's project rejected");
+  check((await insertTask(db1a, { userId: 1, title: "ghost project", projectId: 9999 })).ok === false, "fix: nonexistent project rejected");
+  check(fixCount() === countBefore, "fix: rejected project inserts add zero tasks");
+  check((await insertTask(db1a, { userId: 1, title: "no project" })).ok === true, "fix: null project accepted");
+
+  // Fix delta 3: omitted status -> open; provided invalid status rejected.
+  const omitted = await insertTask(db1a, { userId: 1, title: "omitted status" });
+  check(omitted.ok === true && sqlite1a.prepare("SELECT status FROM tasks WHERE id = ?").get(omitted.id).status === "open", "fix: omitted status -> open");
+  check((await insertTask(db1a, { userId: 1, title: "bad status", status: "banana" })).ok === false, "fix: invalid status rejected");
+  check(fixCount() === countBefore + 2, "fix: invalid status adds zero tasks");
+  const explicit = await insertTask(db1a, { userId: 1, title: "explicit deleted", status: "deleted" });
+  check(explicit.ok === true && sqlite1a.prepare("SELECT status FROM tasks WHERE id = ?").get(explicit.id).status === "deleted", "fix: valid explicit status accepted");
+
+  // Fix2: omitted/null projectId -> no project (accepted); an explicitly
+  // supplied non-integer projectId -> rejected, never silently null.
+  // Placed after the fix-delta-3 count check so its count is untouched.
+  check((await insertTask(db1a, { userId: 1, title: "explicit null project", projectId: null })).ok === true, "fix2: explicit null project accepted");
+  const countBeforeBanana = fixCount();
+  check((await insertTask(db1a, { userId: 1, title: "banana project", projectId: "banana" })).ok === false, "fix2: invalid projectId rejected");
+  check((await insertTask(db1a, { userId: 1, title: "float project", projectId: 1.5 })).ok === false, "fix2: non-integer projectId rejected");
+  check(fixCount() === countBeforeBanana, "fix2: rejected projectId inserts add zero tasks");
+
+  // Fix3: parseProjectId contract — positive safe integers only.
+  const spaced = await insertTask(db1a, { userId: 1, title: "spaced string id", projectId: ` ${seeds[0].id} ` });
+  check(spaced.ok === true && sqlite1a.prepare("SELECT project_id FROM tasks WHERE id = ?").get(spaced.id).project_id === seeds[0].id, "fix3: trimmed digit string accepted");
+  const strId = await insertTask(db1a, { userId: 1, title: "string id", projectId: String(seeds[0].id) });
+  check(strId.ok === true && sqlite1a.prepare("SELECT project_id FROM tasks WHERE id = ?").get(strId.id).project_id === seeds[0].id, "fix3: digit string accepted");
+  const countBeforeFix3 = fixCount();
+  check((await insertTask(db1a, { userId: 1, title: "unsafe id", projectId: 9007199254740992 })).ok === false, "fix3: unsafe integer rejected");
+  check((await insertTask(db1a, { userId: 1, title: "infinity id", projectId: Infinity })).ok === false, "fix3: Infinity rejected");
+  check((await insertTask(db1a, { userId: 1, title: "object id", projectId: {} })).ok === false, "fix3: object projectId rejected");
+  check((await insertTask(db1a, { userId: 1, title: "empty id", projectId: "" })).ok === false, "fix3: empty string rejected");
+  check((await insertTask(db1a, { userId: 1, title: "negative id", projectId: -5 })).ok === false, "fix3: negative id rejected");
+  check((await insertTask(db1a, { userId: 1, title: "zero id", projectId: 0 })).ok === false, "fix3: zero id rejected");
+  check(fixCount() === countBeforeFix3, "fix3: rejected projectId inserts add zero tasks");
+
+  // Fix4: defensive null-task access in insertTask (task?.projectId).
+  check((await insertTask(db1a, null)).ok === false, "fix4: null task rejected without throw");
+  check((await insertTask(db1a, undefined)).ok === false, "fix4: undefined task rejected without throw");
+
+  // Fix delta 2: atomic transition — after one success, no second
+  // transition from open may succeed, and the row is unchanged by it.
+  const t3 = await insertTask(db1a, { userId: 1, title: "atomic task" });
+  check((await setTaskStatus(db1a, 1, t3.id, "done")).ok === true, "fix: atomic first transition ok");
+  check((await setTaskStatus(db1a, 1, t3.id, "deleted")).ok === false, "fix: atomic second transition refused");
+  check(sqlite1a.prepare("SELECT status FROM tasks WHERE id = ?").get(t3.id).status === "done", "fix: refused transition leaves row done");
+
+  // intent_feedback: insert ok, counted in D1, never in logs (no log here).
+  check((await insertIntentFeedback(db1a, { userId: 1, text: "note text", predictedType: "note", correctType: "task", project: "عمومی" })).ok === true, "feedback insert ok");
+  check(sqlite1a.prepare("SELECT COUNT(*) AS n FROM intent_feedback").get().n === 1, "feedback row in D1");
+  check((await insertIntentFeedback(db1a, { userId: 1, text: "", predictedType: "note", correctType: "task" })).ok === false, "empty feedback text refused");
+
+  // DB unavailable or failing: safe empty/false, never a throw.
+  check(JSON.stringify(await listProjects(null, 1)) === "[]" && (await getProject(null, 1, 1)) === null, "null DB projects safe");
+  check(JSON.stringify(await listOpenTasks(null, 1)) === "[]" && (await insertTask(null, { userId: 1, title: "x" })).ok === false, "null DB tasks safe");
+  check((await setTaskStatus(null, 1, 1, "done")).ok === false && (await insertIntentFeedback(null, { userId: 1, text: "x", predictedType: "a", correctType: "b" })).ok === false, "null DB status/feedback safe");
+  check(JSON.stringify(await listProjects(failing1a, 1)) === "[]" && (await insertTask(failing1a, { userId: 1, title: "x" })).ok === false, "failing DB safe");
 }
 
 if (failures.length) {
