@@ -1,7 +1,7 @@
 // Step 1b-2: everyday wiring (money, notes, reminders, translate,
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
-import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange } from "./daily.js";
+import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
 import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, insertTask, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
@@ -260,7 +260,11 @@ async function runDailyBranch(env, o, c, ctx) {
   }
   if (c.intent === "task-list") { const r = await renderTaskList(env, userId); await sendListMessage(o, r); if (r.ok) await markDaily(env, o); return "handled"; }
   if (c.intent === "reminder") {
-    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask); await o.send(askText(c.ask)); return "handled"; }
+    // 1-c-3: an hour-ambiguous ask stores the ORIGINAL message in
+    // pendingBody, so a bare daypart (or time + daypart) follow-up can
+    // be resolved deterministically in the rule tier. Other reminder
+    // asks keep the old slot shape (question + kind only).
+    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask, c.ask === "hour-ambiguous" ? text : undefined); await o.send(askText(c.ask)); return "handled"; }
     // 1-b-3 (decision 2): a reminder is stored as a task (title = text,
     // remind_at = due, due_at = NULL); the legacy reminders table gains
     // NO new rows. 1-c-2: delivery is now active via scheduled(), so the
@@ -1330,6 +1334,18 @@ export async function handleDailyText(env, o) {
   if (c.intent !== "chat" && c.intent !== "ask") { await clearPendingAsk(env, userId); return viaBranch(c); }
   // Answers to an open bot question keep the existing slot path.
   const slot = await getPendingAsk(env, userId);
+  // 1-c-3: deterministic rule-tier fill for a pending hour-ambiguous
+  // reminder slot, BEFORE the model branch. The slot kind stays
+  // "hour-ambiguous" (no new "time" kind is introduced). Only the two
+  // follow-up shapes resolve (bare daypart; time + daypart); anything
+  // else falls through to the existing routing unchanged, so a
+  // brand-new unambiguous command/query is never trapped here
+  // (task-list and other non-chat/non-ask intents already returned
+  // above with the slot cleared).
+  if (slot && slotKind(slot) === "hour-ambiguous" && typeof slot.pendingBody === "string" && slot.pendingBody) {
+    const filled = resolveHourAmbiguousFollowup(text, slot.pendingBody, now);
+    if (filled) { await clearPendingAsk(env, userId); return viaBranch({ intent: "reminder", text: filled.text, due: filled.due }); }
+  }
   if (slot) { const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx); console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome })); await finalizeEntry(ret === "handled" ? "daily" : "chat"); return ret; }
   // Rollout gate: interpreter unconfigured -> today's model-intent path,
   // so merging 0-b cannot break non-money messages before a model is chosen.
