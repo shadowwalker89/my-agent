@@ -29,7 +29,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, insertProject, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "../src/db.js";
 import {
   getChatContext,
   getSetting,
@@ -38,7 +38,7 @@ import {
   CHAT_CONTEXT_LIMIT,
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
-import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag } from "../src/daily.js";
+import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, parseNoteQuery } from "../src/daily.js";
 import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
 import { buildInterpreterPrompt, parseInterpreterOutput, interpretText, callInterpreterModel, validateAmountText, validateDateTexts, matchProject, validateInterpreterAction, INTERPRETER_MAX_ACTIONS } from "../src/interpreter.js";
 import { scoreEvalResults, mapOutcome, scoreSlots, runCaseEvaluation, iranNowIso, median } from "../scripts/eval-intent.mjs";
@@ -1129,7 +1129,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard } from "../src/everyday.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
   check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
@@ -2244,6 +2244,7 @@ if (DatabaseSync) {
   const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
   const d1 = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...params) { return { run: async () => { stmt.run(...params); return { success: true }; }, all: async () => ({ results: stmt.all(...params) }), first: async () => stmt.get(...params) ?? null }; } }; } };
   const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
   const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242,4521,4522,4523,4524,4525,4526,4527", DB: d1, ROUTER_KEY: "k-test", ...extra });
@@ -4258,6 +4259,128 @@ if (DatabaseSync) {
     const f3 = await flow1d2("یادداشت کن خرید نان");
     const n3 = f3.rows("SELECT project_id FROM notes WHERE user_id = 1")[0];
     check(f3.s.sent.at(-1) === "✅ یادداشت ذخیره شد." && n3.project_id === f3.om, "1-d-2: untagged note keeps default project + exact old reply");
+  }
+}
+
+// ── Phase 1-d-3: rich notes (filtering, Jalali + badge display, paging, delete) ──
+{
+  const NOW = Date.UTC(2026, 10, 2, 12, 0, 0); // Tehran 2026-11-02 15:30
+  const cl = (s) => classifyDaily(s, { nowMs: NOW });
+  check(cl("لیست یادداشت‌ها").intent === "note-query" && cl("لیست یادداشت‌ها").date == null && cl("لیست یادداشت‌ها").projectName == null, "1-d-3: list form queries all notes");
+  check(cl("یادداشت‌های پروژه گلبهار").projectName === "گلبهار" && cl("یادداشت‌های گل").projectName === "گل" && cl("یادداشت‌های پروژه گل را نشان بده").projectName === "گل", "1-d-3: project forms incl. show-verb strip");
+  check(cl("یادداشت‌های قرارها و ملاقات‌ها").projectName === "قرارها و ملاقات ها", "1-d-3: multi-word project name survives normalization");
+  check(cl("یادداشت‌های امروز").date === "2026-11-02" && cl("یادداشت‌های دیروز").date === "2026-11-01" && cl("لیست یادداشت‌های دیروز").date === "2026-11-01", "1-d-3: date forms map to Tehran days");
+  check(cl("یادداشت‌های من").projectName == null && cl("یادداشتهامو نشون بده").intent === "note-query" && cl("یادداشتهایم را نشان بده").projectName == null, "1-d-3: possessive forms stay unfiltered; joined transcription still queries");
+  check(cl("یادداشت کن خرید نان").intent === "note" && cl("یادداشت‌هایم دیروز").date === "2026-11-01", "1-d-3: note creation not stolen; date word beats a possessive tail");
+}
+if (DatabaseSync) {
+  const fresh1d3 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1'), (2, '2')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } }, rows: (sql, params = []) => sq.prepare(sql).all(...params) };
+  };
+  const seedProj3 = (sq, uid, name, aliases = [], isDefault = 0) => { sq.prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (?, ?, ?, 'active', ?, '2026-11-01T00:00:00.000Z')").run(uid, name, JSON.stringify(aliases), isDefault); return sq.prepare("SELECT id FROM projects WHERE user_id = ? AND name = ?").all(uid, name)[0].id; };
+  const seedNote3 = (sq, uid, text, pid, created) => { sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (?, ?, 'text', ?, ?)").run(uid, text, created, pid); return sq.prepare("SELECT id FROM notes WHERE user_id = ? AND text = ?").all(uid, text)[0].id; };
+  const mkS1d3 = () => { const sent = []; let edits = 0; return { sent, edits: () => edits, send: async (t, opts) => { sent.push({ text: t, opts }); }, chat: async () => {}, editMarkup: async () => { edits++; } }; };
+  const T = Date.UTC(2026, 10, 2, 12, 0, 0);
+  // 9 notes for user 1: 3 Tehran-today (mixed +03:30/Z), 2 Tehran-yesterday (mixed), 4 older; mixed projects.
+  const scenario3 = () => {
+    const { sq, db, rows } = fresh1d3();
+    const om = seedProj3(sq, 1, "عمومی", [], 1), gol = seedProj3(sq, 1, "گلبهار", ["گل"]);
+    const foreignProj = seedProj3(sq, 2, "بیگانه", []);
+    const ids = {};
+    ids.a = seedNote3(sq, 1, "صبحانه امروز", gol, "2026-11-02T01:24:00+03:30");
+    ids.b = seedNote3(sq, 1, "تماس امروز", null, "2026-11-01T23:00:00Z");
+    ids.c = seedNote3(sq, 1, "خرید امروز", om, "2026-11-02T10:00:00Z");
+    ids.d = seedNote3(sq, 1, "جلسه دیروز", gol, "2026-11-01T05:00:00+03:30");
+    ids.e = seedNote3(sq, 1, "کتاب دیروز", null, "2026-10-31T22:00:00Z");
+    ids.f = seedNote3(sq, 1, "قدیمی یک", null, "2026-10-30T09:00:00+03:30");
+    ids.g = seedNote3(sq, 1, "قدیمی دو", gol, "2026-10-29T09:00:00+03:30");
+    ids.h = seedNote3(sq, 1, "قدیمی سه", null, "2026-10-28T09:00:00+03:30");
+    ids.i = seedNote3(sq, 1, "قدیمی چهار", null, "2026-10-27T09:00:00+03:30");
+    const foreignNote = seedNote3(sq, 2, "مال دیگری", null, "2026-11-02T08:00:00+03:30");
+    return { sq, db, rows, om, gol, foreignProj, ids, foreignNote };
+  };
+  const flow3 = async (sc, text) => { const s = mkS1d3(); const r = await handleDailyText({ STATE: fakeKV(), DB: sc.db }, { chatId: 1, userId: 1, text, send: s.send, chat: s.chat, nowMs: T }); return { r, s }; };
+  const tap3 = async (sc, data, fromId = 1) => { const s = mkS1d3(); const r = await resolveNoteCallback({ STATE: fakeKV(), DB: sc.db }, { fromId, data, send: s.send, editMarkup: s.editMarkup, nowMs: T }); return { r, s }; };
+  const kbOf = (s) => s.sent.at(-1)?.opts?.replyMarkup?.inline_keyboard ?? [];
+  const flatKb = (s) => kbOf(s).flat().map((b) => b.callback_data);
+  // listNotesResult: newest-first, paging, project + Tehran-day filters, failure vs empty.
+  {
+    const sc = scenario3();
+    const all = await listNotesResult(sc.db, 1);
+    check(all.ok === true && all.notes.length === 8 && all.notes[0].text === "قدیمی چهار" && all.notes[7].text === "تماس امروز" && all.notes[0].id != null && all.notes[0].project_id !== undefined && all.notes[0].created_at, "1-d-3: listNotesResult newest-first, 8/page, full row shape");
+    const p2 = await listNotesResult(sc.db, 1, { offset: 8 });
+    check(p2.notes.length === 1 && p2.notes[0].text === "صبحانه امروز", "1-d-3: listNotesResult offset page holds the oldest note");
+    const gp = await listNotesResult(sc.db, 1, { projectId: sc.gol });
+    check(gp.notes.length === 3 && gp.notes.every((n) => n.project_id === sc.gol), "1-d-3: listNotesResult project filter");
+    const today = await listNotesResult(sc.db, 1, { sinceIso: "2026-11-01T20:30:00.000Z", untilIso: "2026-11-02T20:30:00.000Z" });
+    const yday = await listNotesResult(sc.db, 1, { sinceIso: "2026-10-31T20:30:00.000Z", untilIso: "2026-11-01T20:30:00.000Z" });
+    check(today.notes.length === 3 && today.notes.some((n) => n.text === "صبحانه امروز") && today.notes.some((n) => n.text === "تماس امروز") && yday.notes.length === 2, "1-d-3: Tehran-day filter normalizes mixed +03:30/Z created_at");
+    const bad = await listNotesResult({ prepare() { throw new Error("boom"); } }, 1);
+    const empty = await listNotesResult(sc.db, 1, { projectId: sc.foreignProj });
+    check(bad.ok === false && bad.notes.length === 0 && empty.ok === true && empty.notes.length === 0, "1-d-3: listNotesResult failure vs empty distinguished");
+  }
+  // deleteNote: own, foreign, invalid, D1 error.
+  {
+    const sc = scenario3();
+    const d = await deleteNote(sc.db, 1, sc.ids.f);
+    const foreign = await deleteNote(sc.db, 1, sc.foreignNote);
+    check(d.ok === true && d.deleted === true && sc.rows("SELECT COUNT(*) AS c FROM notes WHERE id = ?", [sc.ids.f])[0].c === 0, "1-d-3: deleteNote removes the own note");
+    check(foreign.ok === true && foreign.deleted === false && sc.rows("SELECT COUNT(*) AS c FROM notes WHERE id = ?", [sc.foreignNote])[0].c === 1, "1-d-3: deleteNote refuses a foreign note, row remains");
+    check((await deleteNote(sc.db, 1, 0)).ok === false && (await deleteNote(sc.db, 1, 1.5)).ok === false && (await deleteNote(sc.db, 1, "x")).ok === false, "1-d-3: deleteNote rejects invalid ids");
+    check((await deleteNote({ prepare() { throw new Error("boom"); } }, 1, 1)).ok === false, "1-d-3: deleteNote D1 error -> ok:false");
+  }
+  // Rich branch render: numbering, Jalali + Tehran time, badge, 8/page + more button.
+  {
+    const sc = scenario3();
+    const { s } = await flow3(sc, "یادداشت‌هام");
+    const first = s.sent[0].text;
+    check(first.startsWith("1. ") && first.includes("۵ آبان ۱۴۰۵") && first.includes("09:00") && first.includes("قدیمی چهار") && first.includes("[📁 گلبهار]"), "1-d-3: first row renders number + Jalali + Tehran time; a project note carries its badge");
+    check(first.includes("8. ") && !first.includes("9. ") && flatKb(s).includes("note:more:all:8") && flatKb(s).some((c) => c.startsWith("note:del:")), "1-d-3: first page holds 8 rows with delete + more buttons");
+  }
+  // Date + project filters via the branch; unknown project; empty; D1 failure.
+  {
+    const sc = scenario3();
+    const t = await flow3(sc, "یادداشت‌های امروز");
+    check(t.s.sent[0].text.includes("صبحانه امروز") && t.s.sent[0].text.includes("تماس امروز") && !t.s.sent[0].text.includes("جلسه دیروز"), "1-d-3: today filter shows only Tehran-today notes");
+    const y = await flow3(sc, "یادداشت‌های دیروز");
+    check(y.s.sent[0].text.includes("جلسه دیروز") && y.s.sent[0].text.includes("کتاب دیروز") && !y.s.sent[0].text.includes("صبحانه امروز"), "1-d-3: yesterday filter shows only Tehran-yesterday notes");
+    const g = await flow3(sc, "یادداشت‌های پروژه گل");
+    check(g.s.sent[0].text.includes("صبحانه امروز") && !g.s.sent[0].text.includes("تماس امروز"), "1-d-3: alias project filter resolves to the canonical project");
+    const nf = await flow3(sc, "یادداشت‌های پروژه ناشناخته");
+    check(nf.s.sent[0].text === "📁 پروژه «ناشناخته» پیدا نشد.", "1-d-3: unknown project reports not-found, never an empty list");
+    const e = await flow3(fresh1d3(), "یادداشت‌هام");
+    check(e.s.sent[0].text === "یادداشتی پیدا نشد.", "1-d-3: empty store keeps the exact old empty text");
+    const badS = mkS1d3();
+    await handleDailyText({ STATE: fakeKV(), DB: { prepare() { throw new Error("boom"); } } }, { chatId: 1, userId: 1, text: "یادداشت‌هام", send: badS.send, chat: badS.chat, nowMs: T });
+    check(badS.sent[0].text === "یادداشت‌ها خوانده نشد؛ دوباره تلاش کن.", "1-d-3: branch D1 failure reports a read failure");
+  }
+  // Callbacks: paging, project filter + all, foreign silence, delete + markup removal, date paging.
+  {
+    const sc = scenario3();
+    const pg = await tap3(sc, "note:more:all:8");
+    check(pg.s.sent[0].text.startsWith("9. ") && pg.s.sent[0].text.includes("صبحانه امروز") && pg.s.sent[0].text.includes("۱۱ آبان ۱۴۰۵") && pg.s.sent[0].text.includes("01:24") && pg.s.sent[0].text.includes("[📁 گلبهار]") && !flatKb(pg.s).some((c) => c.startsWith("note:more:")), "1-d-3: page 2 renders the oldest note (Jalali + Tehran time + badge) with no more button");
+    const pf = await tap3(sc, `note:proj:${sc.gol}`);
+    check(pf.s.sent[0].text.includes("صبحانه امروز") && !pf.s.sent[0].text.includes("تماس امروز") && flatKb(pf.s).includes("note:proj:all"), "1-d-3: project filter tap shows only that project + an all button");
+    const pa = await tap3(sc, "note:proj:all");
+    check(pa.s.sent[0].text.includes("تماس امروز"), "1-d-3: all button restores the unfiltered list");
+    const fs = await tap3(sc, `note:proj:${sc.foreignProj}`);
+    const fdel = await tap3(sc, `note:del:${sc.foreignNote}`);
+    check(fs.s.sent.length === 0 && fdel.s.sent.length === 0, "1-d-3: foreign project filter and foreign delete stay silent");
+    const del = await tap3(sc, `note:del:${sc.ids.f}`);
+    check(del.s.sent[0].text === "🗑 یادداشت حذف شد." && del.s.edits() === 1 && sc.rows("SELECT COUNT(*) AS c FROM notes WHERE id = ?", [sc.ids.f])[0].c === 0, "1-d-3: own delete confirms, removes markup, deletes the row");
+    const dp = await tap3(sc, "note:more:all:0:2026-11-01");
+    check(dp.s.sent[0].text.includes("جلسه دیروز") && !dp.s.sent[0].text.includes("صبحانه امروز"), "1-d-3: date filter survives paging via the 4th callback segment");
+    const be = await tap3(sc, "note:more:all:16");
+    check(be.s.sent[0].text === "صفحه‌ی دیگری نیست." && flatKb(be.s).includes("note:more:all:0"), "1-d-3: beyond-end page reports no further page + back button");
+    const badDel = mkS1d3();
+    await resolveNoteCallback({ STATE: fakeKV(), DB: { prepare() { throw new Error("boom"); } } }, { fromId: 1, data: `note:del:${sc.ids.g}`, send: badDel.send, editMarkup: badDel.editMarkup, nowMs: T });
+    check(badDel.sent[0].text === "ذخیره نشد، دوباره تلاش کن" && badDel.edits() === 0, "1-d-3: delete D1 failure reports failure, buttons kept");
   }
 }
 
