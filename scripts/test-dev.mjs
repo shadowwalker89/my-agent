@@ -38,7 +38,7 @@ import {
   CHAT_CONTEXT_LIMIT,
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
-import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, parseNoteQuery } from "../src/daily.js";
+import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, parseNoteQuery, parseSummaryQuery } from "../src/daily.js";
 import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
 import { buildInterpreterPrompt, parseInterpreterOutput, interpretText, callInterpreterModel, validateAmountText, validateDateTexts, matchProject, validateInterpreterAction, INTERPRETER_MAX_ACTIONS } from "../src/interpreter.js";
 import { scoreEvalResults, mapOutcome, scoreSlots, runCaseEvaluation, iranNowIso, median } from "../scripts/eval-intent.mjs";
@@ -4381,6 +4381,87 @@ if (DatabaseSync) {
     const badDel = mkS1d3();
     await resolveNoteCallback({ STATE: fakeKV(), DB: { prepare() { throw new Error("boom"); } } }, { fromId: 1, data: `note:del:${sc.ids.g}`, send: badDel.send, editMarkup: badDel.editMarkup, nowMs: T });
     check(badDel.sent[0].text === "ذخیره نشد، دوباره تلاش کن" && badDel.edits() === 0, "1-d-3: delete D1 failure reports failure, buttons kept");
+  }
+}
+
+// ── Phase 1-d-4: D1-grounded summary & table over notes & tasks ──
+{
+  const NOW = Date.UTC(2026, 10, 2, 12, 0, 0);
+  const cl = (s) => classifyDaily(s, { nowMs: NOW });
+  check(cl("یادداشت‌هام رو خلاصه کن").intent === "summary" && cl("یادداشت‌هام رو خلاصه کن").kind === "note" && cl("یادداشت‌هام رو خلاصه کن").projectName == null, "1-d-4: bare note summary");
+  check(cl("یادداشت‌های گلبهار رو خلاصه کن").kind === "note" && cl("یادداشت‌های گلبهار رو خلاصه کن").projectName === "گلبهار", "1-d-4: project note summary");
+  check(cl("یادداشت‌های پروژه گل رو جدول کن").projectName === "گل" && cl("تسک‌های گلبهار رو خلاصه و جدول کن").kind === "task" && cl("تسک‌های گلبهار رو خلاصه و جدول کن").projectName === "گلبهار", "1-d-4: alias + combined-verb + task summary forms");
+  check(cl("تسک‌هام رو جدول کن").intent !== "summary" && cl("یادداشت‌های امروز رو خلاصه کن").projectName == null, "1-d-4: bare task request is not a summary (spec lists task summaries as project forms only); bare date word degrades to unfiltered");
+  check(cl("خلاصه کن").intent !== "summary" && cl("یادداشت کن خرید نان").intent === "note" && cl("یادداشت‌های گلبهار").intent === "note-query", "1-d-4: no subject / note creation / plain query not stolen by summary");
+}
+if (DatabaseSync) {
+  const fresh1d4 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1'), (2, '2')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } }, rows: (sql, params = []) => sq.prepare(sql).all(...params) };
+  };
+  const seedProj4 = (sq, uid, name, aliases = [], isDefault = 0) => { sq.prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (?, ?, ?, 'active', ?, '2026-11-01T00:00:00.000Z')").run(uid, name, JSON.stringify(aliases), isDefault); return sq.prepare("SELECT id FROM projects WHERE user_id = ? AND name = ?").all(uid, name)[0].id; };
+  const mkS1d4 = () => { const sent = []; const chats = []; let edits = 0; return { sent, chats, edits: () => edits, send: async (t, opts) => { sent.push({ text: t, opts }); }, chat: async (t, copts) => { chats.push({ text: t, opts: copts }); }, editMarkup: async () => { edits++; } }; };
+  const T = Date.UTC(2026, 10, 2, 12, 0, 0);
+  const scenario4 = () => {
+    const { sq, db, rows } = fresh1d4();
+    const om = seedProj4(sq, 1, "عمومی", [], 1), gol = seedProj4(sq, 1, "گلبهار", ["گل"]);
+    const foreignProj = seedProj4(sq, 2, "بیگانه", []);
+    sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'صبحانه گلبهار', 'text', '2026-11-02T01:24:00+03:30', ?)").run(gol);
+    sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'تماس عمومی', 'text', '2026-11-01T23:00:00Z', ?)").run(om);
+    sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'بدون پروژه', 'text', '2026-11-02T10:00:00Z', NULL)").run();
+    sq.prepare("INSERT INTO tasks (user_id, title, status, project_id, remind_at, created_at) VALUES (1, 'تمرین گلبهار', 'open', ?, '2026-11-03T09:00:00+03:30', '2026-11-02T00:00:00Z')").run(gol);
+    sq.prepare("INSERT INTO tasks (user_id, title, status, project_id, created_at) VALUES (1, 'خرید عمومی', 'open', ?, '2026-11-02T00:00:00Z')").run(om);
+    return { sq, db, rows, om, gol, foreignProj };
+  };
+  const flow4 = async (sc, text) => { const s = mkS1d4(); const r = await handleDailyText({ STATE: fakeKV(), DB: sc.db }, { chatId: 1, userId: 1, text, send: s.send, chat: s.chat, nowMs: T }); return { r, s }; };
+  const tap4 = async (sc, data, resolver, fromId = 1) => { const s = mkS1d4(); const r = await resolver({ STATE: fakeKV(), DB: sc.db }, { fromId, data, send: s.send, chat: s.chat, editMarkup: s.editMarkup, nowMs: T }); return { r, s }; };
+  const kbOf4 = (s) => s.sent.at(-1)?.opts?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+  // Grounded note summary: only the project's verified rows, Jalali dates, strict chat options.
+  {
+    const sc = scenario4();
+    const { s } = await flow4(sc, "یادداشت‌های گلبهار رو خلاصه کن");
+    check(s.chats.length === 1 && s.chats[0].text.includes("صبحانه گلبهار") && !s.chats[0].text.includes("تماس عمومی") && !s.chats[0].text.includes("بدون پروژه"), "1-d-4: project note summary passes ONLY that project's rows");
+    check(s.chats[0].text.includes("۱۱ آبان ۱۴۰۵") && s.chats[0].opts.systemPrompt && s.chats[0].opts.noHistory === true && s.chats[0].opts.saveText === "" && s.chats[0].opts.maxTokens === 700, "1-d-4: summary input carries Jalali dates + grounded chat options (noHistory, no save, 700 tokens)");
+    const all = await flow4(sc, "یادداشت‌هام رو خلاصه کن");
+    check(all.s.chats.length === 1 && all.s.chats[0].text.includes("صبحانه گلبهار") && all.s.chats[0].text.includes("تماس عمومی") && all.s.chats[0].text.includes("بدون پروژه"), "1-d-4: unfiltered note summary passes all rows");
+  }
+  // Task summary, empty zero-model-call, D1 failure zero-model-call, unknown project.
+  {
+    const sc = scenario4();
+    const t = await flow4(sc, "تسک‌های گلبهار رو جدول کن");
+    check(t.s.chats.length === 1 && t.s.chats[0].text.includes("تمرین گلبهار") && !t.s.chats[0].text.includes("خرید عمومی") && t.s.chats[0].text.includes("یادآوری"), "1-d-4: project task summary passes only that project's open tasks + remind time");
+    const e = await flow4(fresh1d4(), "یادداشت‌هام رو خلاصه کن");
+    check(e.s.sent[0].text === "موردی برای خلاصه‌سازی پیدا نشد." && e.s.chats.length === 0, "1-d-4: empty folder reports none found with zero model calls");
+    const bad = mkS1d4();
+    await handleDailyText({ STATE: fakeKV(), DB: { prepare() { throw new Error("boom"); } } }, { chatId: 1, userId: 1, text: "یادداشت‌هام رو خلاصه کن", send: bad.send, chat: bad.chat, nowMs: T });
+    check(bad.sent[0].text === "یادداشت‌ها خوانده نشد؛ دوباره تلاش کن." && bad.chats.length === 0, "1-d-4: D1 failure reports a read failure with zero model calls");
+    const nf = await flow4(sc, "یادداشت‌های پروژه ناشناخته رو خلاصه کن");
+    check(nf.s.sent[0].text === "📁 پروژه «ناشناخته» پیدا نشد." && nf.s.chats.length === 0, "1-d-4: unknown project reports not-found with zero model calls");
+  }
+  // 30-row cap + inline buttons + callback triggers (incl. foreign silence).
+  {
+    const { sq, db } = fresh1d4();
+    seedProj4(sq, 1, "عمومی", [], 1);
+    for (let i = 1; i <= 31; i++) sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, ?, 'text', '2026-11-02T00:00:00Z', NULL)").run(`یادداشت ${i}`);
+    const s = mkS1d4();
+    await handleDailyText({ STATE: fakeKV(), DB: db }, { chatId: 1, userId: 1, text: "یادداشت‌هام رو خلاصه کن", send: s.send, chat: s.chat, nowMs: T });
+    check(s.chats[0].text.includes("30. ") && !s.chats[0].text.includes("31. "), "1-d-4: summary caps at 30 rows");
+    const sc = scenario4();
+    const nl = await flow4(sc, "یادداشت‌هام");
+    check(kbOf4(nl.s).includes("note:sum:all"), "1-d-4: note list card carries the summary button");
+    const tl = await flow4(sc, "لیست تسک‌هام");
+    check(kbOf4(tl.s).includes("task:sum:all"), "1-d-4: task list card carries the summary button");
+    const ns = await tap4(sc, "note:sum:all", resolveNoteCallback);
+    check(ns.s.chats.length === 1 && ns.s.chats[0].text.includes("صبحانه گلبهار"), "1-d-4: note summary button triggers a grounded summary");
+    const ts = await tap4(sc, `task:sum:${sc.gol}`, resolveTaskCallback);
+    check(ts.s.chats.length === 1 && ts.s.chats[0].text.includes("تمرین گلبهار") && !ts.s.chats[0].text.includes("خرید عمومی"), "1-d-4: task summary button triggers a project-scoped summary");
+    const fs = await tap4(sc, `note:sum:${sc.foreignProj}`, resolveNoteCallback);
+    check(fs.s.sent.length === 0 && fs.s.chats.length === 0, "1-d-4: foreign project summary tap stays silent");
   }
 }
 
