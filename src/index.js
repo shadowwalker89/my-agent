@@ -26,7 +26,7 @@ import { healthCounts } from "./health.js";
 import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation } from "./intent.js";
 import { getChatContext } from "./memory.js";
-import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, runReminderTick, quickConvertKeyboard } from "./everyday.js";
+import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, chatFailureNotice, runReminderTick, quickConvertKeyboard } from "./everyday.js";
 import { handleVoice, handleVoiceRetry } from "./voice.js";
 import { saveMessage } from "./db.js";
 import {
@@ -236,7 +236,14 @@ async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
     const lines = result.errors
       .map((e) => `${e.target}: ${e.status ?? e.reason}`)
       .join("\n");
-    await tgSend(env, chatId, `همه‌ی مدل‌ها شکست خوردند 🙁\n${lines}`);
+    // 1-d-5: the failure notice names the failed stage (chat, or the
+    // summary stage via opts.failureLabel) and carries retry +
+    // quick-convert buttons when the caller supplied the ids (a failed
+    // summary retries via its sum re-tap, not via a chat retry — see
+    // the handleDailyText chat wrap). A voice turn still shows what was
+    // heard, because the notice IS the bot's response.
+    const notice = chatFailureNotice(opts.failureLabel || "چت", lines, opts);
+    await tgSend(env, chatId, (opts.voiceHeader || "") + notice.text, notice.replyMarkup ? { replyMarkup: notice.replyMarkup } : undefined);
     console.log(JSON.stringify({ combo: usedCombo, used: null, routed }));
     return; // failed turn stores nothing, neither side
   }
@@ -249,7 +256,10 @@ async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
         ? content.map((p) => p?.text ?? "").join("")
         : "";
   if (!answer.trim()) {
-    await tgSend(env, chatId, "پاسخ خالی بود 🙁");
+    // 1-d-5: an empty answer is a pipeline failure too — it gets the
+    // same stage notice (with the same buttons), never a silent drop.
+    const notice = chatFailureNotice(opts.failureLabel || "چت", "پاسخ خالی بود.", opts);
+    await tgSend(env, chatId, (opts.voiceHeader || "") + notice.text, notice.replyMarkup ? { replyMarkup: notice.replyMarkup } : undefined);
     console.log(JSON.stringify({ combo: usedCombo, used: result.used ?? null, routed }));
     return; // empty turn stores nothing either
   }
@@ -265,7 +275,9 @@ async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
   console.log(JSON.stringify({ combo: usedCombo, used: result.used, routed }));
   // 1-d-1: a quick-convert keyboard rides on the LAST chunk only
   // (mirroring sendListMessage), so multi-chunk answers keep one button row.
-  const chunks = splitMessage(answer);
+  // 1-d-5: a voice header prepends to the answer BEFORE chunking, so it
+  // rides the first chunk only (later chunks stay clean).
+  const chunks = splitMessage((opts.voiceHeader || "") + answer);
   for (let i = 0; i < chunks.length; i++) {
     await tgSend(env, chatId, chunks[i], i === chunks.length - 1 && opts.replyMarkup ? { replyMarkup: opts.replyMarkup } : undefined);
   }
@@ -673,7 +685,12 @@ async function handlePlainText(env, msg, text, opts = {}) {
   // 1-d-1: chat replies carry 1-tap quick-convert buttons for the saved
   // user message (qconv: handlers land in 1-d-5); no buttons when the
   // entry row failed to save.
-  const chatOpts = dailyO.entryMessageId ? { ...skipUserSave, replyMarkup: { inline_keyboard: quickConvertKeyboard(dailyO.entryMessageId) } } : skipUserSave;
+  // 1-d-5: voice turns carry the transcript echo (the header) plus the
+  // retry/quick-convert ids for the saved entry, so a failed chat turn
+  // offers retry + quick-convert instead of dropping silently.
+  const voiceHeader = opts.source === "voice" ? `🎙 «${text}»\n\n` : undefined;
+  if (voiceHeader) dailyO.voiceHeader = voiceHeader;
+  const chatOpts = dailyO.entryMessageId ? { ...skipUserSave, ...(voiceHeader ? { voiceHeader } : {}), retryEntryId: dailyO.entryMessageId, quickConvertId: dailyO.entryMessageId, replyMarkup: { inline_keyboard: quickConvertKeyboard(dailyO.entryMessageId) } } : skipUserSave;
   // Model already said chat for a text message: answer directly, skip
   // classifyIntent (dev was in the model allow-list and was rejected).
   // Image messages keep today's path (they return "chat", not "chat-direct").
@@ -751,9 +768,21 @@ async function handleCallbackQuery(env, cb) {
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
     return;
   }
-  // 1-d-3: note: namespace (del/more/proj); del re-checks ownership inside (allow-list gate already ran).
+  // 1-d-3: note: namespace (del/more/proj/sum); del re-checks ownership inside (allow-list gate already ran).
   if (data.startsWith("note:")) {
     await resolveNoteCallback(env, { fromId, chatId, data, nowMs: Date.now(), ...dailySenders(env, chatId, cb?.message?.message_id),
+      chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
+    return;
+  }
+  // 1-d-5: quick-convert + chat-retry namespaces (ownership re-checked
+  // inside via the user-scoped message read; allow-list gate already ran).
+  if (data.startsWith("qconv:")) {
+    await resolveQuickConvertCallback(env, { fromId, chatId, data, nowMs: Date.now(), ...dailySenders(env, chatId, cb?.message?.message_id),
+      chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
+    return;
+  }
+  if (data.startsWith("chat:retry:")) {
+    await resolveChatRetryCallback(env, { fromId, chatId, data, nowMs: Date.now(), ...dailySenders(env, chatId, cb?.message?.message_id),
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
     return;
   }
