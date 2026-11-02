@@ -350,6 +350,19 @@ async function runDailyBranch(env, o, c, ctx) {
     if (r.ok) await markDaily(env, o);
     return "handled";
   }
+  if (c.intent === "summary") {
+    let projectId = null;
+    if (c.projectName) {
+      const rp = await listProjectsResult(env, userId);
+      if (!rp.ok) { await o.send(c.kind === "note" ? NOTE_LIST_FAILED_TEXT : TASK_LIST_FAILED_TEXT); return "handled"; }
+      const hit = findProjectByName(rp.projects, c.projectName);
+      if (!hit) { await o.send(`📁 پروژه «${c.projectName}» پیدا نشد.`); await markDaily(env, o); return "handled"; }
+      projectId = hit.id;
+    }
+    const ok = await runSummary(env, o, c.kind, projectId, userId);
+    if (ok) await markDaily(env, o);
+    return "handled";
+  }
   if (c.intent === "file-reference") {
     const recent = await recentMessages(env, userId, 10);
     const file = recent.find((r) => r.tg_file_id);
@@ -575,6 +588,12 @@ function parseAliasesText(raw) {
     return Array.isArray(v) ? v.filter((a) => typeof a === "string") : [];
   } catch { return []; }
 }
+// 1-d-4: shared name/alias resolution (used by renderNoteList and the
+// summary branch, so the two never drift apart). Null when unresolved.
+function findProjectByName(projects, name) {
+  const norm = normalizeText(name).trim();
+  return (projects || []).filter((p) => p.id != null).find((p) => normalizeText(p.name).trim() === norm || parseAliasesText(p.aliases).some((a) => normalizeText(a).trim() === norm)) || null;
+}
 export async function resolveProjects(env, userId) {
   const r = await listProjectsResult(env, userId);
   if (!r.ok) return { ok: false, projects: [] };
@@ -651,6 +670,7 @@ async function renderTaskList(env, userId, projectId = null, offset = 0) {
   const keyboard = r.tasks.map((t) => [{ text: "✅", callback_data: `task:done:${t.id}` }, { text: "🗑", callback_data: `task:del:${t.id}` }]);
   if (r.tasks.length === 8) keyboard.push([{ text: "بیشتر", callback_data: projectId == null ? `task:more:${offset + 8}` : `task:more:${offset + 8}:${projectId}` }]);
   keyboard.push([{ text: "📦 آرشیو", callback_data: "task:arch:0" }]);
+  keyboard.push([{ text: "📊 خلاصه و جدول", callback_data: `task:sum:${projectId == null ? "all" : projectId}` }]);
   if (rp.ok && !rp.fallback) {
     const row = rp.projects.filter((p) => p.id != null).map((p) => ({ text: p.name, callback_data: `task:proj:${p.id}:0` }));
     if (row.length) keyboard.push(row);
@@ -688,8 +708,7 @@ async function renderNoteList(env, userId, { projectName = null, projectId = nul
   const rp = await listProjectsResult(env, userId);
   if (projectName) {
     if (!rp.ok) return { ok: false, text: NOTE_LIST_FAILED_TEXT, keyboard: null };
-    const norm = normalizeText(projectName).trim();
-    const hit = rp.projects.filter((p) => p.id != null).find((p) => normalizeText(p.name).trim() === norm || parseAliasesText(p.aliases).some((a) => normalizeText(a).trim() === norm));
+    const hit = findProjectByName(rp.projects, projectName);
     if (!hit) return { ok: true, text: `📁 پروژه «${projectName}» پیدا نشد.`, keyboard: null };
     projectId = hit.id;
   }
@@ -710,12 +729,41 @@ async function renderNoteList(env, userId, { projectName = null, projectId = nul
   }).join("\n");
   const keyboard = r.notes.map((n) => [{ text: "🗑", callback_data: `note:del:${n.id}` }]);
   if (r.notes.length === 8) keyboard.push([{ text: "بیشتر", callback_data: moreTag(offset + 8) }]);
+  keyboard.push([{ text: "📊 خلاصه و جدول", callback_data: `note:sum:${pidTag}` }]);
   if (rp.ok) {
     const row = rp.projects.filter((p) => p.id != null).map((p) => ({ text: p.name, callback_data: `note:proj:${p.id}` }));
     if (row.length) keyboard.push(row);
     if (projectId != null) keyboard.push([{ text: "همه", callback_data: "note:proj:all" }]);
   }
   return { ok: true, text, keyboard };
+}
+
+// 1-d-4: D1-grounded summary/table. Verified rows are fetched FIRST
+// (up to 30, newest-first for notes, open order for tasks); a D1
+// failure reports the failure, 0 rows reports none found — both with
+// ZERO model calls. Otherwise ONLY the verified rows (Jalali dates,
+// project names) go to the chat combo with no history (history would
+// pollute grounding, as it did for translate), no user-row save (the
+// caller owns the entry, or the tap owns none), and a 700-token cap.
+// Returns false ONLY on a D1 failure (the branch gates markDaily on it).
+const SUMMARY_SYSTEM = "فقط از روی ردیف‌هایی که در پیام کاربر آمده خلاصه بساز. هیچ ردیفی را اضافه، حذف یا حدس نزن و هیچ دانسته‌ی بیرونی را قاطی نکن؛ تاریخ‌ها و نام پروژه‌ها را دقیقاً همان‌طور که داده شده بنویس. خروجی: اول یک خلاصه‌ی ساخت‌یافته‌ی کوتاه به فارسی، بعد یک جدول مارک‌داون با همان ردیف‌ها.";
+async function runSummary(env, o, kind, projectId, userId) {
+  const rp = await listProjectsResult(env, userId);
+  const names = new Map();
+  if (rp.ok) for (const p of rp.projects) if (p.id != null) names.set(p.id, p.name);
+  const r = kind === "note" ? await listNotesResult(env, userId, { projectId, limit: 30, offset: 0 }) : await listOpenTasksResult(env, userId, projectId, 30, 0);
+  if (!r.ok) { await o.send(kind === "note" ? NOTE_LIST_FAILED_TEXT : TASK_LIST_FAILED_TEXT); return false; }
+  const rows = kind === "note" ? r.notes : r.tasks;
+  if (rows.length === 0) { await o.send("موردی برای خلاصه‌سازی پیدا نشد."); return true; }
+  const scope = projectId != null && names.get(projectId) ? `پروژه «${names.get(projectId)}»` : "همه";
+  const lines = rows.map((row, i) => {
+    const badge = row.project_id != null && names.get(row.project_id) ? ` [📁 ${names.get(row.project_id)}]` : "";
+    if (kind === "note") { const tp = tehranParts(row.created_at); const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : ""; return `${i + 1}. ${when ? `${when} ` : ""}${badge ? `${badge} ` : ""}${row.text}`; }
+    const whenOf = (iso, label) => { const tp = tehranParts(iso); return tp ? ` (${label}: ${formatJalali(tp.date) || tp.date} ${tp.hhmm})` : ""; };
+    return `${i + 1}. ${badge ? `${badge} ` : ""}${row.title}${row.remind_at ? whenOf(row.remind_at, "یادآوری") : ""}${row.due_at ? whenOf(row.due_at, "مهلت") : ""}`;
+  }).join("\n");
+  await o.chat(`${kind === "note" ? "یادداشت‌ها" : "تسک‌ها"} (${scope}، ${rows.length} ردیف):\n${lines}`, { systemPrompt: SUMMARY_SYSTEM, saveText: "", noHistory: true, maxTokens: 700 });
+  return true;
 }
 
 // 1-d-3: note: namespace. del re-checks ownership via the user-scoped delete (foreign/missing -> silent; D1 failure -> buttons kept); more/proj validate the project user-scoped.
@@ -752,6 +800,17 @@ export async function resolveNoteCallback(env, o) {
       if (!rp.projects.some((p) => String(p.id) === more[1])) return true; // foreign/missing: silent
     }
     await sendListMessage(o, await renderNoteList(env, o.fromId, { projectId: more[1] === "all" ? null : Number(more[1]), date, offset: parseListOffset(more[2]) }));
+    return true;
+  }
+  const sum = /^note:sum:([^:]+)$/.exec(o.data);
+  if (sum) {
+    if (sum[1] !== "all" && !/^\d+$/.test(sum[1])) return true; // invalid: silent
+    if (sum[1] !== "all") {
+      const rp = await listProjectsResult(env, o.fromId);
+      if (!rp.ok) { await o.send(NOTE_LIST_FAILED_TEXT); return true; }
+      if (!rp.projects.some((p) => String(p.id) === sum[1])) return true; // foreign/missing: silent
+    }
+    await runSummary(env, o, "note", sum[1] === "all" ? null : Number(sum[1]), o.fromId);
     return true;
   }
   return false;
@@ -809,6 +868,18 @@ export async function resolveTaskCallback(env, o) {
     if (!rp.ok) { await o.send(TASK_LIST_FAILED_TEXT); return true; }
     if (!rp.projects.some((p) => String(p.id) === proj[1])) return true; // foreign/missing: silent, no data, no filter
     await sendListMessage(o, await renderTaskList(env, o.fromId, Number(proj[1]), parseListOffset(proj[2])));
+    return true;
+  }
+  // 1-d-4: task summary button (task:sum:<id|all>); same validation as proj.
+  const tsum = /^task:sum:([^:]+)$/.exec(o.data);
+  if (tsum) {
+    if (tsum[1] !== "all" && !/^\d+$/.test(tsum[1])) return true; // invalid: silent
+    if (tsum[1] !== "all") {
+      const rp = await listProjectsResult(env, o.fromId);
+      if (!rp.ok) { await o.send(TASK_LIST_FAILED_TEXT); return true; }
+      if (!rp.projects.some((p) => String(p.id) === tsum[1])) return true; // foreign/missing: silent
+    }
+    await runSummary(env, o, "task", tsum[1] === "all" ? null : Number(tsum[1]), o.fromId);
     return true;
   }
   // 1-c-2: snooze follows the same Fix B ordering as done/del: getTask
