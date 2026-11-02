@@ -324,6 +324,28 @@ const NOTE_RE = /^\s*(?:(?:لطفا|لطفاً|ببین)\s+)?(?:یادداشت\s
 // transcription (یادداشتهامو، یادداشتهایم) reach note-query instead of
 // chat. Note creation (NOTE_RE) is checked before this, so a یادداشت کن
 // + body message still goes to note, never to note-query.
+// 1-d-3: rich note queries. Anchored forms (optional list prefix): list/possessive -> all; today/yesterday -> that Tehran day;
+// project forms -> the named project (bare name, or after the project word); a trailing show verb and trailing punctuation
+// are stripped from the name. The old unanchored possessive match stays as a fallback, so joined transcriptions still reach
+// note-query. Date words are explicit only — no today default. Precedence: date beats project; no combined filter.
+const NOTE_SHOW_TAIL = /(?:\s+را)?(?:\s+(?:نشان\s+بده|نشون\s+بده|نمایش\s+بده|بگو|بگوید|بگویید))?\s*$/u;
+export function parseNoteQuery(raw, now) {
+  const t = String(raw ?? "").trim().replace(/[؟?!.،,]+$/u, "");
+  const day = /دیروز/.test(t) ? addDays(iranDate(now), -1) : /امروز/.test(t) ? iranDate(now) : null;
+  const head = /^(?:(?:لیست|فهرست)\s+)?یادداشت\s*های?/u.exec(t);
+  if (head) {
+    const rest = t.slice(head[0].length).trim().replace(NOTE_SHOW_TAIL, "").replace(/[؟?!.،,]+$/u, "").trim();
+    if (/^(?:امروز|دیروز)(?:\s|$)/.test(rest)) return { intent: "note-query", confidence: 1, date: day, projectName: null };
+    if (day && /(?:امروز|دیروز)/.test(rest)) return { intent: "note-query", confidence: 1, date: day, projectName: null };
+    if (/^(?:م|مو|من)(?:\s|$)/.test(rest)) return { intent: "note-query", confidence: 1, date: day, projectName: null };
+    const pm = /^پروژه\s+(.+)$/u.exec(rest);
+    if (pm && pm[1].trim()) return { intent: "note-query", confidence: 1, date: null, projectName: pm[1].trim() };
+    if (rest) return { intent: "note-query", confidence: 1, date: null, projectName: rest };
+    return { intent: "note-query", confidence: 1, date: day, projectName: null };
+  }
+  if (NOTE_QUERY_RE.test(raw)) return { intent: "note-query", confidence: 1, date: day, projectName: null };
+  return null;
+}
 const NOTE_QUERY_RE = /(یادداشت\s*های(م|مو| امروز)?|یادداشت\s*هامو?)/;
 // Task list (1-b-1): anchored CLOSED list of clear list-request forms
 // (spaced/ZWNJ/joined تسک‌هام / تسک‌هایم + a show verb). Bare تسک,
@@ -472,7 +494,7 @@ export function classifyDaily(text, opts = {}) {
   if (amount?.error === "amount") return { intent: "ask", confidence: 0.5, question: "amount" };
   if (amount?.error === "unknown-number") return { intent: "chat", confidence: 1 }; // no verb: a bare-thousand statement is chat, not an amount question
   if (TASK_LIST_RE.test(raw)) return { intent: "task-list", confidence: 1 };
-  if (NOTE_QUERY_RE.test(raw)) { const date = parseRelativeDate(raw, now); if (date === null) return { intent: "note-query", confidence: 0.5, ask: "date" }; return { intent: "note-query", confidence: 1, date }; }
+  const nq = parseNoteQuery(raw, now); if (nq) return nq;
   if (FILE_RE.test(raw)) {
     // File reference only for a short message with no accompanying text:
     // a colon followed by text means the user is asking about that text.

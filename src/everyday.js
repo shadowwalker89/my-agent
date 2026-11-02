@@ -1,9 +1,9 @@
 // Step 1b-2: everyday wiring (money, notes, reminders, translate,
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
-import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, extractFolderTag } from "./daily.js";
+import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, extractFolderTag, IRAN_OFFSET_MIN } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
-import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, insertTask, insertProject, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
+import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
@@ -345,9 +345,9 @@ async function runDailyBranch(env, o, c, ctx) {
   }
   if (c.intent === "note-query") {
     if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask); await o.send(askText(c.ask)); return "handled"; }
-    const rows = await allDb(env, "SELECT text FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 5", [userId]);
-    await o.send(rows.length ? rows.map((r) => `• ${r.text}`).join("\n") : "یادداشتی پیدا نشد.");
-    await markDaily(env, o);
+    const r = await renderNoteList(env, userId, { projectName: c.projectName ?? null, date: c.date ?? null, offset: 0 });
+    await sendListMessage(o, r);
+    if (r.ok) await markDaily(env, o);
     return "handled";
   }
   if (c.intent === "file-reference") {
@@ -544,7 +544,7 @@ export async function runModelBranch(env, o, rule, ctx) {
       const ret = await runDailyBranch(env, o, { intent: "expense-query", ask: "period" }, ctx);
       return { ret, outcome: "asked", ms: ms() };
     }
-    case "note-query": return { ret: await runDailyBranch(env, o, { intent: "note-query" }, ctx), outcome: "routed", ms: ms() };
+    case "note-query": return { ret: await runDailyBranch(env, o, { intent: "note-query", date: c.date ?? null, projectName: c.projectName ?? null }, ctx), outcome: "routed", ms: ms() };
     case "last-expense": return { ret: await runDailyBranch(env, o, { intent: "last-expense" }, ctx), outcome: "routed", ms: ms() };
     case "file-reference": {
       const ret = await runDailyBranch(env, o, { intent: "file-reference" }, ctx);
@@ -669,6 +669,92 @@ async function renderTaskArchive(env, userId, offset = 0) {
   if (r.tasks.length === 8) keyboard.push([{ text: "بیشتر", callback_data: `task:arch:${offset + 8}` }]);
   keyboard.push([{ text: "↩ فهرست باز", callback_data: "task:more:0" }]);
   return { ok: true, text: r.tasks.map((t) => `• ${t.title}`).join("\n"), keyboard };
+}
+
+// 1-d-3: Tehran wall-clock parts of a stored ISO timestamp (live rows mix +03:30 and Z forms).
+function tehranParts(isoStr) {
+  const ms = Date.parse(isoStr);
+  if (!Number.isFinite(ms)) return null;
+  const s = new Date(ms + IRAN_OFFSET_MIN * 60000).toISOString();
+  return { date: s.slice(0, 10), hhmm: s.slice(11, 16) };
+}
+
+const NOTE_LIST_FAILED_TEXT = "یادداشت‌ها خوانده نشد؛ دوباره تلاش کن.";
+// 1-d-3: rich note render — 8 rows newest-first, row number + Jalali date + Tehran HH:MM + folder badge + text,
+// per-note delete, project filter, pagination. {ok:false} ONLY on a note-read failure (Fix A); names degrade to
+// no badge when THEIR read fails. The more callback carries the date filter as an optional 4th segment (the spec
+// shape note:more:<pid|all>:<offset> still parses): without it, paging a date-filtered list would drop the filter.
+async function renderNoteList(env, userId, { projectName = null, projectId = null, date = null, offset = 0 } = {}) {
+  const rp = await listProjectsResult(env, userId);
+  if (projectName) {
+    if (!rp.ok) return { ok: false, text: NOTE_LIST_FAILED_TEXT, keyboard: null };
+    const norm = normalizeText(projectName).trim();
+    const hit = rp.projects.filter((p) => p.id != null).find((p) => normalizeText(p.name).trim() === norm || parseAliasesText(p.aliases).some((a) => normalizeText(a).trim() === norm));
+    if (!hit) return { ok: true, text: `📁 پروژه «${projectName}» پیدا نشد.`, keyboard: null };
+    projectId = hit.id;
+  }
+  const names = new Map();
+  if (rp.ok) for (const p of rp.projects) if (p.id != null) names.set(p.id, p.name);
+  let sinceIso = null, untilIso = null;
+  if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) { const [y, m, d] = date.split("-").map(Number); const start = Date.UTC(y, m - 1, d) - IRAN_OFFSET_MIN * 60000; sinceIso = new Date(start).toISOString(); untilIso = new Date(start + 86400000).toISOString(); }
+  const r = await listNotesResult(env, userId, { projectId, sinceIso, untilIso, limit: 8, offset });
+  if (!r.ok) return { ok: false, text: NOTE_LIST_FAILED_TEXT, keyboard: null };
+  const pidTag = projectId == null ? "all" : projectId;
+  const moreTag = (off) => `note:more:${pidTag}:${off}${date ? `:${date}` : ""}`;
+  if (r.notes.length === 0) return { ok: true, text: offset > 0 ? "صفحه‌ی دیگری نیست." : "یادداشتی پیدا نشد.", keyboard: offset > 0 ? [[{ text: "↩ فهرست", callback_data: moreTag(0) }]] : null };
+  const text = r.notes.map((n, i) => {
+    const tp = tehranParts(n.created_at);
+    const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : "";
+    const badge = n.project_id != null && names.get(n.project_id) ? ` [📁 ${names.get(n.project_id)}]` : "";
+    return `${offset + i + 1}. ${when ? `${when} ` : ""}${badge ? `${badge} ` : ""}${n.text}`;
+  }).join("\n");
+  const keyboard = r.notes.map((n) => [{ text: "🗑", callback_data: `note:del:${n.id}` }]);
+  if (r.notes.length === 8) keyboard.push([{ text: "بیشتر", callback_data: moreTag(offset + 8) }]);
+  if (rp.ok) {
+    const row = rp.projects.filter((p) => p.id != null).map((p) => ({ text: p.name, callback_data: `note:proj:${p.id}` }));
+    if (row.length) keyboard.push(row);
+    if (projectId != null) keyboard.push([{ text: "همه", callback_data: "note:proj:all" }]);
+  }
+  return { ok: true, text, keyboard };
+}
+
+// 1-d-3: note: namespace. del re-checks ownership via the user-scoped delete (foreign/missing -> silent; D1 failure -> buttons kept); more/proj validate the project user-scoped.
+export async function resolveNoteCallback(env, o) {
+  const del = /^note:del:(\d+)$/.exec(o.data);
+  if (del) {
+    const id = Number(del[1]);
+    if (!Number.isSafeInteger(id) || id <= 0) return true; // invalid: silent
+    const r = await deleteNote(env, o.fromId, id);
+    if (!r.ok) { await o.send(NOT_SAVED_TEXT); return true; } // D1 failure: buttons kept
+    if (!r.deleted) return true; // foreign/missing: silent
+    if (o.editMarkup) await o.editMarkup();
+    await o.send("🗑 یادداشت حذف شد.");
+    return true;
+  }
+  const proj = /^note:proj:([^:]+)$/.exec(o.data);
+  if (proj) {
+    if (proj[1] !== "all" && !/^\d+$/.test(proj[1])) return true; // invalid: silent
+    if (proj[1] !== "all") {
+      const rp = await listProjectsResult(env, o.fromId);
+      if (!rp.ok) { await o.send(NOTE_LIST_FAILED_TEXT); return true; }
+      if (!rp.projects.some((p) => String(p.id) === proj[1])) return true; // foreign/missing: silent
+    }
+    await sendListMessage(o, await renderNoteList(env, o.fromId, { projectId: proj[1] === "all" ? null : Number(proj[1]) }));
+    return true;
+  }
+  const more = /^note:more:([^:]+):([^:]+)(?::([^:]+))?$/.exec(o.data);
+  if (more) {
+    const date = more[3] && /^\d{4}-\d{2}-\d{2}$/.test(more[3]) ? more[3] : null;
+    if (more[1] !== "all" && !/^\d+$/.test(more[1])) return true; // invalid: silent
+    if (more[1] !== "all") {
+      const rp = await listProjectsResult(env, o.fromId);
+      if (!rp.ok) { await o.send(NOTE_LIST_FAILED_TEXT); return true; }
+      if (!rp.projects.some((p) => String(p.id) === more[1])) return true; // foreign/missing: silent
+    }
+    await sendListMessage(o, await renderNoteList(env, o.fromId, { projectId: more[1] === "all" ? null : Number(more[1]), date, offset: parseListOffset(more[2]) }));
+    return true;
+  }
+  return false;
 }
 
 // 1-b-2: send a list render, splitting at Telegram's 4096-character
