@@ -89,6 +89,13 @@ function askKeyboard(question, id) {
     ? [[{ text: "💰 خرج", callback_data: `daily:ask:${id}:expense` }, { text: "💬 چت", callback_data: `daily:ask:${id}:chat` }]]
     : [[{ text: "💰 خرج", callback_data: `daily:ask:${id}:expense` }, { text: "📥 درآمد", callback_data: `daily:ask:${id}:income` }]];
 }
+// 1-d-1: 1-tap quick-convert buttons for chat replies. The callback
+// handlers (qconv:note:<msgId> / qconv:task:<msgId>) land in 1-d-5;
+// messageId is the saved user message row id (o.entryMessageId), never
+// user text, so the tap saves exactly that stored message.
+export function quickConvertKeyboard(messageId) {
+  return [[{ text: "📝 ذخیره یادداشت", callback_data: `qconv:note:${messageId}` }, { text: "☑️ ثبت تسک", callback_data: `qconv:task:${messageId}` }]];
+}
 function newId() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
 async function putKv(env, key, value) { if (!env.STATE) return; try { await env.STATE.put(key, JSON.stringify(value), { expirationTtl: DRAFT_TTL_SEC }); } catch {} }
 async function getKv(env, key) { if (!env.STATE) return null; try { const raw = await env.STATE.get(key, "json"); return raw && typeof raw === "object" ? raw : null; } catch { return null; } }
@@ -457,7 +464,7 @@ export async function runModelBranch(env, o, rule, ctx) {
       if (rule.intent === "ask") { const ret = await runDailyBranch(env, o, { intent: "ask", question: "expense-or-chat" }, ctx); return { ret, outcome: "asked", ms: ms() }; }
       if (o.hasImage) return { ret: "chat", outcome: "chat", ms: ms() };
       return { ret: "chat-direct", outcome: "chat", ms: ms() };
-    case "dev": await o.send(freeTextDevSuggestion()); return { ret: "handled", outcome: "routed", ms: ms() };
+    case "dev": return { ret: "chat-direct", outcome: "chat", ms: ms() }; // 1-d-1: free-text dev is never blocked by the /dev suggestion — it flows to normal chat. chat-direct makes the caller answer directly and skip classifyIntent, so the suggestion loop cannot re-intercept it. Only an explicit /dev command dispatches a run (tgCommand path in index.js); the interpreter's explicit dev_hint action still uses freeTextDevSuggestion.
     case "expense": case "income": {
       const ex = parseExpense(text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered }, text);
       if (ex?.error) { const ret = await runDailyBranch(env, o, { intent: "ask", question: ex.error }, ctx); return { ret, outcome: "asked", ms: ms() }; }
@@ -1347,9 +1354,16 @@ export async function handleDailyText(env, o) {
     if (filled) { await clearPendingAsk(env, userId); return viaBranch({ intent: "reminder", text: filled.text, due: filled.due }); }
   }
   if (slot) { const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx); console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome })); await finalizeEntry(ret === "handled" ? "daily" : "chat"); return ret; }
-  // Rollout gate: interpreter unconfigured -> today's model-intent path,
-  // so merging 0-b cannot break non-money messages before a model is chosen.
+  // 1-d-1: interpreter unconfigured -> NO model classifier for UNMATCHED
+  // (chat-tier) messages. The 80-token classifyDailyWithModel misroutes
+  // voice/chat messages, so an unmatched message goes straight to the
+  // chat combo (the caller builds full buildChatContext) with zero
+  // model calls. Ask-tier messages DID match a deterministic rule, so
+  // above (runModelBranch), where a model verdict is only a branch
+  // picker re-validated by rule code. Ask-tier messages DID match a
+  // deterministic rule (the ask), so they keep the model path below.
   if (!o.interpreterCallFn && !o.interpreterModel && !env.INTERPRETER_MODEL) {
+    if (c.intent === "chat") { await finalizeEntry("chat"); return "chat"; }
     const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx);
     console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome }));
     await finalizeEntry(ret === "handled" ? "daily" : "chat");
