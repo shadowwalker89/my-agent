@@ -1,9 +1,9 @@
 // Step 1b-2: everyday wiring (money, notes, reminders, translate,
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
-import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup } from "./daily.js";
+import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, extractFolderTag } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
-import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, insertTask, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
+import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, insertTask, insertProject, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
@@ -259,25 +259,68 @@ async function runDailyBranch(env, o, c, ctx) {
   if (c.intent === "note") {
     // 1-b-1 (decision 5): attach the D1 default project when one exists;
     // the legacy INSERT runs when it does not, so a note is still stored.
-    const pid = await defaultProjectId(env, userId);
-    const r = pid === null ? await runDb(env, "INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)", [userId, c.text, o.source === "voice" ? "voice" : "text", new Date().toISOString()]) : await runDb(env, "INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (?, ?, ?, ?, ?)", [userId, c.text, o.source === "voice" ? "voice" : "text", new Date().toISOString(), pid]);
-    await o.send(r.ok ? "✅ یادداشت ذخیره شد." : NOT_SAVED_TEXT);
+    // 1-d-2: an explicit folder phrase overrides the default (re-classified
+    // body must stay a note, else the tag is ignored and the original stores).
+    const tag = await resolveFolderTag(env, userId, text);
+    let body = c.text, pid = await defaultProjectId(env, userId), pname = null;
+    if (tag) {
+      const c2 = classifyDaily(tag.body, { nowMs: ctx.now, rememberedCurrency: ctx.remembered });
+      if (c2.intent === "note" && c2.text) { body = c2.text; pid = tag.project.id; pname = tag.project.name; }
+    }
+    const r = pid === null ? await runDb(env, "INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)", [userId, body, o.source === "voice" ? "voice" : "text", new Date().toISOString()]) : await runDb(env, "INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (?, ?, ?, ?, ?)", [userId, body, o.source === "voice" ? "voice" : "text", new Date().toISOString(), pid]);
+    await o.send(r.ok ? `✅ یادداشت ذخیره شد.${pname ? ` [📁 ${pname}]` : ""}` : NOT_SAVED_TEXT);
     if (r.ok) await markDaily(env, o);
     return "handled";
   }
   if (c.intent === "task-list") { const r = await renderTaskList(env, userId); await sendListMessage(o, r); if (r.ok) await markDaily(env, o); return "handled"; }
+  // 1-d-2: natural project creation / listing / deterministic task creation.
+  if (c.intent === "project-create") {
+    const r = await insertProject(env, userId, c.name);
+    if (!r.ok) { await o.send(NOT_SAVED_TEXT); return "handled"; }
+    await o.send(r.created ? `📁 پروژه «${r.project.name}» ساخته شد.` : `📁 پروژه «${r.project.name}» از قبل وجود دارد.`);
+    await markDaily(env, o);
+    return "handled";
+  }
+  if (c.intent === "project-list") {
+    const r = await listProjectsResult(env, userId);
+    if (!r.ok) { await o.send("پروژه‌ها خوانده نشد؛ دوباره تلاش کن."); return "handled"; }
+    if (r.projects.length === 0) await o.send("پروژه‌ای پیدا نشد.");
+    else await o.send(`📁 پروژه‌ها:\n${r.projects.map((p) => `📁 ${p.name}`).join("\n")}`);
+    await markDaily(env, o);
+    return "handled";
+  }
+  if (c.intent === "task-create") {
+    const tag = await resolveFolderTag(env, userId, text);
+    let body = c.text, pid = null, pname = null;
+    if (tag) {
+      const c2 = classifyDaily(tag.body, { nowMs: ctx.now, rememberedCurrency: ctx.remembered });
+      if (c2.intent === "task-create" && c2.text) { body = c2.text; pid = tag.project.id; pname = tag.project.name; }
+    }
+    const r = await insertTask(env, { userId, title: body, projectId: pid, source: o.source === "voice" ? "voice" : "text" });
+    await o.send(r.ok ? `✅ تسک ثبت شد.${pname ? ` [📁 ${pname}]` : ""}` : NOT_SAVED_TEXT);
+    if (r.ok) await markDaily(env, o);
+    return "handled";
+  }
   if (c.intent === "reminder") {
     // 1-c-3: an hour-ambiguous ask stores the ORIGINAL message in
     // pendingBody, so a bare daypart (or time + daypart) follow-up can
     // be resolved deterministically in the rule tier. Other reminder
     // asks keep the old slot shape (question + kind only).
     if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask, c.ask === "hour-ambiguous" ? text : undefined); await o.send(askText(c.ask)); return "handled"; }
+    // 1-d-2: an explicit folder phrase attaches the resolved project
+    // (re-classified body must stay a clean reminder, else ignored).
+    const tag = await resolveFolderTag(env, userId, text);
+    let body = c.text, due = c.due, pid = null, pname = null;
+    if (tag) {
+      const c2 = classifyDaily(tag.body, { nowMs: ctx.now, rememberedCurrency: ctx.remembered });
+      if (c2.intent === "reminder" && !c2.ask && c2.text && c2.due) { body = c2.text; due = c2.due; pid = tag.project.id; pname = tag.project.name; }
+    }
     // 1-b-3 (decision 2): a reminder is stored as a task (title = text,
     // remind_at = due, due_at = NULL); the legacy reminders table gains
     // NO new rows. 1-c-2: delivery is now active via scheduled(), so the
     // notice is the active text, not the 1-b transitional text.
-    const r = await insertTask(env, { userId, title: c.text, remindAt: c.due, dueAt: null, source: o.source === "voice" ? "voice" : "text" });
-    await o.send(r.ok ? "⏰ یادآوری به‌عنوان تسک ذخیره شد." : NOT_SAVED_TEXT);
+    const r = await insertTask(env, { userId, title: body, remindAt: due, dueAt: null, projectId: pid, source: o.source === "voice" ? "voice" : "text" });
+    await o.send(r.ok ? `⏰ یادآوری به‌عنوان تسک ذخیره شد.${pname ? ` [📁 ${pname}]` : ""}` : NOT_SAVED_TEXT);
     if (r.ok) await markDaily(env, o);
     return "handled";
   }
@@ -549,6 +592,46 @@ async function defaultProjectId(env, userId) {
   const rp = await resolveProjects(env, userId);
   if (!rp.ok || rp.fallback) return null;
   return rp.projects.find((p) => p.is_default === 1)?.id ?? null;
+}
+
+// 1-d-2: resolve an explicit folder phrase against D1 active projects
+// (listProjectsResult — real rows with ids only; a seed fallback has no
+// id and is never attached). Start form: longest project name/alias
+// prefix of rest, with a word boundary (space/colon/end) after the name;
+// end form: exact normalized name/alias match of the tail. Returns
+// { project, body } or null. The caller re-classifies body and only
+// uses the tag when the intent family is preserved, so a false prefix
+// (e.g. a name that is a prefix of another word) can never mis-store.
+async function resolveFolderTag(env, userId, fullText) {
+  const tag = extractFolderTag(fullText);
+  if (!tag) return null;
+  const rp = await listProjectsResult(env, userId);
+  if (!rp.ok || rp.projects.length === 0) return null;
+  const cands = [];
+  for (const p of rp.projects) {
+    if (p.id == null) continue;
+    cands.push({ name: normalizeText(p.name).trim(), project: p });
+    for (const a of parseAliasesText(p.aliases)) cands.push({ name: normalizeText(a).trim(), project: p });
+  }
+  cands.sort((a, b) => b.name.length - a.name.length);
+  if (tag.at === "end") {
+    const hit = cands.find((c) => c.name && c.name === normalizeText(tag.name).trim());
+    return hit ? { project: hit.project, body: tag.body } : null;
+  }
+  const rest = normalizeText(tag.rest).trim();
+  const origRest = tag.rest.trim();
+  for (const c of cands) {
+    if (!c.name) continue;
+    if (rest === c.name) return { project: c.project, body: "" };
+    if (rest.startsWith(c.name)) {
+      // Lengths agree (normalisation is one-to-one), so the original
+      // remainder is sliced by the normalized name's length — ZWNJ
+      // survives in the returned body.
+      const after = origRest.slice(c.name.length);
+      if (/^[\s:：]/.test(after)) return { project: c.project, body: after.replace(/^[\s:：]+/u, "").trim() };
+    }
+  }
+  return null;
 }
 
 const TASK_LIST_FAILED_TEXT = "تسک‌ها خوانده نشد؛ دوباره تلاش کن";

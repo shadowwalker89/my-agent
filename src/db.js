@@ -224,6 +224,51 @@ export async function getProject(envOrDb, userId, projectId) {
   }
 }
 
+// 1-d-2: parse a stored aliases JSON value into a string list; malformed -> [].
+function parseAliasesJson(raw) {
+  try {
+    const v = JSON.parse(typeof raw === "string" ? raw : "[]");
+    return Array.isArray(v) ? v.filter((a) => typeof a === "string") : [];
+  } catch { return []; }
+}
+
+// 1-d-2: insert one project. Validates owner + normalized non-empty
+// name; a duplicate normalized name OR alias among the user's ACTIVE
+// projects returns { ok: true, created: false, duplicate: true,
+// project: existing } (no insert attempted). Otherwise inserts with
+// status = 'active', is_default = 0 and returns { ok: true,
+// created: true, project } (the stored row). Any D1 failure, bad user,
+// or empty name returns { ok: false }. The stored name is the
+// normalized form, so duplicate detection and display agree.
+export async function insertProject(envOrDb, userId, name, aliases = []) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  const norm = normalizeAliasName(name);
+  if (!db || id === null || !norm) return { ok: false };
+  const cleanAliases = (Array.isArray(aliases) ? aliases : []).map((a) => normalizeAliasName(a)).filter(Boolean);
+  try {
+    const res = await db
+      .prepare("SELECT id, name, aliases, status, is_default FROM projects WHERE user_id = ? AND status = 'active' ORDER BY id ASC")
+      .bind(id)
+      .all();
+    const rows = Array.isArray(res?.results) ? res.results : [];
+    for (const p of rows) {
+      if (normalizeAliasName(p.name) === norm || parseAliasesJson(p.aliases).some((a) => normalizeAliasName(a) === norm)) {
+        return { ok: true, created: false, duplicate: true, project: p };
+      }
+    }
+    await db
+      .prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (?, ?, ?, 'active', 0, ?)")
+      .bind(id, norm, JSON.stringify(cleanAliases), new Date().toISOString())
+      .run();
+    const row = await db.prepare("SELECT id, name, aliases, status, is_default FROM projects WHERE id = last_insert_rowid() AND user_id = ? LIMIT 1").bind(id).first();
+    if (!row || typeof row !== "object") return { ok: false };
+    return { ok: true, created: true, project: row };
+  } catch {
+    return { ok: false };
+  }
+}
+
 // Insert one task. Omitted status defaults to 'open'; a provided but
 // invalid status is rejected, never silently coerced (a silent 'open'
 // would hide wiring bugs in 1-b). Likewise, an omitted/null project_id
