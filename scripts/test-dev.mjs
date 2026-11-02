@@ -3965,6 +3965,96 @@ if (DatabaseSync) {
   }
 }
 
+// ── Phase 1-c-3: offset-aware claiming + deterministic daypart slot fill ──
+if (DatabaseSync) {
+  const fresh1c3 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1'), (2, '2')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } }, rows: (sql, params = []) => sq.prepare(sql).all(...params) };
+  };
+  const seed1c3 = (sq, title, userId, extra = {}) => { sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at, completed_at, remind_at, reminded_at, remind_attempts) VALUES (?, ?, ?, 'text', ?, ?, ?, ?, ?)").run(userId, title, extra.status ?? "open", extra.createdAt ?? "2026-10-30T00:00:00.000Z", extra.completedAt ?? null, extra.remindAt ?? null, extra.remindedAt ?? null, extra.attempts ?? 0); return sq.prepare("SELECT id FROM tasks WHERE title = ? AND user_id = ?").all(title, userId)[0].id; };
+  // Cross-midnight claim: a +03:30 row due at 01:24 Tehran claims exactly
+  // at its true UTC instant (21:54Z), not one minute earlier.
+  {
+    const { sq, db, rows } = fresh1c3();
+    const id = seed1c3(sq, "cross-midnight", 1, { remindAt: "2026-11-02T01:24:00+03:30" });
+    const early = await claimDueReminders(db, "2026-11-01T21:53:00.000Z", 20);
+    check(early.ok === true && early.reminders.length === 0, "1-c-3: +03:30 row NOT claimed one minute before its true instant");
+    const onTime = await claimDueReminders(db, "2026-11-01T21:54:00.000Z", 20);
+    check(onTime.ok === true && onTime.reminders.length === 1 && onTime.reminders[0].id === id && rows("SELECT reminded_at, remind_attempts FROM tasks WHERE id = ?", [id])[0].reminded_at === "2026-11-01T21:54:00.000Z", "1-c-3: +03:30 row claimed exactly at its true UTC instant");
+  }
+  // Mixed-format ordering follows true chronological instant, not string
+  // order. ORDER BY decides WHICH rows the limit takes (RETURNING order
+  // itself is not guaranteed by SQLite), so the test binds limit 1: the
+  // offset row is earlier in real time (21:54Z) than the Z row (22:30Z)
+  // although its string sorts later — old string ordering would claim
+  // the Z row first.
+  {
+    const { sq, db } = fresh1c3();
+    seed1c3(sq, "z-later", 1, { remindAt: "2026-11-01T22:30:00.000Z" });
+    seed1c3(sq, "offset-earlier", 1, { remindAt: "2026-11-02T01:24:00+03:30" });
+    const one = await claimDueReminders(db, "2026-11-01T23:00:00.000Z", 1);
+    check(one.ok === true && one.reminders.length === 1 && one.reminders[0].remind_at === "2026-11-02T01:24:00+03:30", "1-c-3: with limit 1, the earliest true instant claims first across offset/Z forms");
+    const rest = await claimDueReminders(db, "2026-11-01T23:00:00.000Z", 20);
+    check(rest.ok === true && rest.reminders.length === 1 && rest.reminders[0].remind_at === "2026-11-01T22:30:00.000Z", "1-c-3: second claim takes the remaining row, no double-claim");
+  }
+  // Purge cutoff is offset-safe: an offset-stored completion before the Z
+  // cutoff purges, while a recent Z-form completion survives.
+  {
+    const { sq, db, rows } = fresh1c3();
+    seed1c3(sq, "offset-old", 1, { status: "done", completedAt: "2026-10-01T01:00:00+03:30" });
+    seed1c3(sq, "recent", 1, { status: "done", completedAt: "2026-10-31T00:00:00.000Z" });
+    const p = await purgeOldClosedTasks(db, "2026-10-01T00:00:00.000Z");
+    check(p.ok === true && p.deleted === 1 && rows("SELECT title FROM tasks")[0].title === "recent", "1-c-3: purge cutoff compares true instants across offset/Z forms");
+  }
+  // Ambiguous-hour follow-ups end to end, zero model calls: the env
+  // carries no ROUTER_KEY and no interpreter function, and the chat stub
+  // records any call (it must stay at zero).
+  const mkEnv1c3 = (db, kv) => ({ STATE: kv, TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1,2", DB: db });
+  const mkS1c3 = () => { const sent = []; const chats = []; return { sent, chats, send: async (text) => { sent.push(text); }, chat: async (text) => { chats.push(text); } }; };
+  const T1646 = Date.UTC(2026, 10, 1, 21, 46, 0); // 01:16 Tehran, Nov 2
+  const flow1c3 = async (followup) => {
+    const { db, rows } = fresh1c3();
+    const kv = fakeKV(); const env = mkEnv1c3(db, kv); const s = mkS1c3();
+    const msg = (text) => ({ chatId: 1, userId: 1, text, send: s.send, chat: s.chat, nowMs: T1646 });
+    await handleDailyText(env, msg("یادآوری کن امروز ساعت ۰1:17 تست کرون فاز یک ج"));
+    const asked = s.sent.at(-1);
+    await handleDailyText(env, msg(followup));
+    return { s, rows, kv, asked };
+  };
+  {
+    const { s, rows, kv, asked } = await flow1c3("صبح");
+    const t = rows("SELECT remind_at, title FROM tasks WHERE user_id = 1");
+    check(asked === "ساعت را با صبح یا عصر مشخص کن." && s.sent.at(-1) === "⏰ یادآوری به‌عنوان تسک ذخیره شد." && s.chats.length === 0 && t.length === 1 && t[0].remind_at === "2026-11-02T01:17:00+03:30" && t[0].title === "تست کرون فاز یک ج" && !kv.store.has("daily:pending-ask:1"), "1-c-3: bare صبح fills the pending hour, stores 01:17+03:30, clears slot, zero model calls");
+  }
+  {
+    const { s, rows, kv } = await flow1c3("01:17 صبح");
+    const t = rows("SELECT remind_at FROM tasks WHERE user_id = 1");
+    check(s.sent.at(-1) === "⏰ یادآوری به‌عنوان تسک ذخیره شد." && s.chats.length === 0 && t.length === 1 && t[0].remind_at === "2026-11-02T01:17:00+03:30" && !kv.store.has("daily:pending-ask:1"), "1-c-3: 01:17 صبح without ساعت fills the pending hour, zero model calls");
+  }
+  {
+    // A brand-new list query while the slot is pending routes to the
+    // list, never trapped in the pending loop.
+    const { sq, db } = fresh1c3();
+    seed1c3(sq, "کار لیستی", 1);
+    const kv = fakeKV(); const env = mkEnv1c3(db, kv); const s = mkS1c3();
+    const msg = (text) => ({ chatId: 1, userId: 1, text, send: s.send, chat: s.chat, nowMs: T1646 });
+    await handleDailyText(env, msg("یادآوری کن امروز ساعت ۰1:17 تست کرون فاز یک ج"));
+    await handleDailyText(env, msg("لیست تسک‌هام"));
+    check(String(s.sent.at(-1) ?? "").includes("کار لیستی") && s.chats.length === 0, "1-c-3: لیست تسک‌هام while slot pending routes to the list, not trapped");
+  }
+  {
+    // A non-matching follow-up stores nothing and falls through to the
+    // existing routing unchanged.
+    const { rows } = await flow1c3("سلام");
+    check(rows("SELECT COUNT(*) AS n FROM tasks WHERE user_id = 1")[0].n === 0, "1-c-3: non-matching follow-up stores no task");
+  }
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
