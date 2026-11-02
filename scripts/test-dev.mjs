@@ -416,12 +416,16 @@ function newEnv(extra = {}) {
   try {
     const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
 
-    // 1b-2: free-text dev only SUGGESTS /dev now, at any confidence.
-    // It never dispatches and never stores a pending dev intent.
+    // 1-d-1 (intentional expectation upgrade, spec-required): free-text
+    // dev is NEVER blocked by the /dev suggestion any more — it flows
+    // to normal chat (here the mock combo fails, so the reply is the
+    // chat failure notice, not the suggestion). It still never
+    // dispatches and never stores a pending dev intent.
     await sendTg(env, msgUpdate("add a /health endpoint to the worker"));
     check(world.calls.github.filter((c) => c.url.includes("/actions/workflows/")).length === 0, "free-text dev must not dispatch");
     const devMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
-    check(String(devMsg?.payload?.text ?? "").includes("/dev"), "free-text dev must suggest /dev");
+    check(!String(devMsg?.payload?.text ?? "").includes("با /dev بفرست"), "1-d-1: free-text dev must not get the /dev suggestion");
+    check(String(devMsg?.payload?.text ?? "").includes("همه‌ی مدل‌ها شکست خوردند"), "1-d-1: free-text dev flows to the chat path");
     check((await env.STATE.get("dev:active:4242")) === null, "free-text dev must not set active");
     check((await env.STATE.get("intent:pending:4242")) === null, "free-text dev must not store pending");
     const ghBefore = world.calls.github.length;
@@ -1125,7 +1129,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard } from "../src/everyday.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
   check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
@@ -1798,11 +1802,13 @@ if (DatabaseSync) {
     await handleDailyText(env, o(env, 4305, "۵۰۰ تومان نان", { ...s, nowMs: NOW }));
     check(lastText(s).includes("500") && !lastText(s).includes("999"), "model amount field ignored, rule amount used");
   }
-  // Chat tier + model expense without an amount -> amount ask, no record.
+  // 1-d-1 (intentional expectation upgrade, spec-required): chat tier
+  // no longer consults the model at all — "خرج" goes straight to chat
+  // with zero model calls, no amount ask, no record.
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("expense"));
     const r = await handleDailyText(env, o(env, 4306, "خرج", { ...s, nowMs: NOW }));
-    check(r === "handled" && fetchCalls === 1 && lastText(s).includes("مبلغ چقدر بود؟") && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0, "chat-tier model expense, no amount -> amount ask");
+    check(r === "chat" && fetchCalls === 0 && s.sent.length === 0 && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0, "1-d-1: chat-tier goes straight to chat, zero model calls");
   }
   // Chat tier + model note (bare) -> note-text ask, nothing stored.
   {
@@ -1810,51 +1816,57 @@ if (DatabaseSync) {
     const r = await handleDailyText(env, o(env, 4307, "یادداشت", { ...s, nowMs: NOW }));
     check(r === "handled" && fetchCalls === 0 && lastText(s).includes("چه چیزی را یادداشت کنم؟") && rows("SELECT COUNT(*) AS n FROM notes")[0].n === 0, "rule bare note -> note-text ask, zero model fetches");
   }
-  // Chat tier + model chat: text -> chat-direct, image -> today's chat path.
+  // 1-d-1 (upgrade): chat tier goes straight to chat for text and
+  // image alike, zero model calls; the caller still runs classifyIntent
+  // on a "chat" return (the normal path).
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("chat"));
-    check((await handleDailyText(env, o(env, 4308, "سلام، چطوری؟", { ...s, nowMs: NOW }))) === "chat-direct" && fetchCalls === 1, "chat-tier model chat, text -> chat-direct");
-    check((await handleDailyText(env, o(env, 4308, "سلام، چطوری؟", { ...s, nowMs: NOW, hasImage: true }))) === "chat" && fetchCalls === 2, "chat-tier model chat, image -> chat (classifyIntent still runs)");
+    check((await handleDailyText(env, o(env, 4308, "سلام، چطوری؟", { ...s, nowMs: NOW }))) === "chat" && fetchCalls === 0, "1-d-1: chat-tier text goes straight to chat, zero model calls");
+    check((await handleDailyText(env, o(env, 4308, "سلام، چطوری؟", { ...s, nowMs: NOW, hasImage: true }))) === "chat" && fetchCalls === 0, "1-d-1: chat-tier image goes straight to chat, zero model calls");
   }
-  // Chat tier + model failure -> chat path, no ask spam.
+  // 1-d-1 (upgrade): chat tier never calls the model, so there is no
+  // failure to fall back from — still the chat path, zero fetches.
   {
     const env = mkEnv(), s = fakeSend(); mockModelFail();
-    check((await handleDailyText(env, o(env, 4309, "سلام، چطوری؟", { ...s, nowMs: NOW }))) === "chat" && fetchCalls === 1, "chat-tier failure -> chat path");
+    check((await handleDailyText(env, o(env, 4309, "سلام، چطوری؟", { ...s, nowMs: NOW }))) === "chat" && fetchCalls === 0, "1-d-1: chat-tier never calls the model, chat path with zero fetches");
   }
-  // Chat tier + model dev -> suggestion only, never a dispatch (no github fetch).
+  // 1-d-1 (upgrade, spec core): chat tier never reaches the model dev
+  // verdict, so no /dev suggestion is ever sent — straight to chat.
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("dev"));
     const r = await handleDailyText(env, o(env, 4310, "پروژه", { ...s, nowMs: NOW }));
-    check(r === "handled" && lastText(s).includes("/dev") && fetchCalls === 1, "model dev -> suggestion only");
+    check(r === "chat" && fetchCalls === 0 && s.sent.length === 0, "1-d-1: chat-tier dev-looking text goes straight to chat, no suggestion");
   }
-  // Chat tier + model translate: history-free, colon body, model target wins.
+  // 1-d-1 (upgrade): chat tier no longer routes via the model translate
+  // verdict — the message goes straight to chat (the chat combo itself
+  // can translate conversationally); no history-free translate call.
   {
     const env = mkEnv(), s = fakeSend(); let chats = [];
     mockModel(modelJson("translate", { target: "en" }));
     const r = await handleDailyText(env, o(env, 4311, "اینو انگلیسیش کن: سلام دنیا", { ...s, nowMs: NOW, chat: async (text, copts) => { chats.push({ text, copts }); } }));
-    check(r === "handled" && chats[0]?.text === "سلام دنیا" && chats[0]?.copts?.noHistory === true && String(chats[0]?.copts?.systemPrompt ?? "").includes("English"), "model translate: history-free, colon body, en target");
+    check(r === "chat" && fetchCalls === 0 && chats.length === 0 && s.sent.length === 0, "1-d-1: chat-tier translate-looking text goes straight to chat, zero model calls");
   }
-  // Model translate with an invalid target -> language ask, never a guess.
+  // 1-d-1 (upgrade): chat tier never reaches the model, so an invalid
+  // model target cannot arise here — straight to chat, no language ask.
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("translate", { target: "de" }));
-    await handleDailyText(env, o(env, 4312, "اینو انگلیسیش کن: سلام دنیا", { ...s, nowMs: NOW }));
-    check(lastText(s).includes("به چه زبانی؟"), "invalid model target -> language ask");
+    const r = await handleDailyText(env, o(env, 4312, "اینو انگلیسیش کن: سلام دنیا", { ...s, nowMs: NOW }));
+    check(r === "chat" && fetchCalls === 0 && s.sent.length === 0, "1-d-1: chat-tier never reaches the model, no language ask");
   }
-  // Chat tier + model reminder without a trigger verb -> stored from the rule parse.
+  // 1-d-1 (upgrade): chat tier no longer routes via the model reminder
+  // verdict — "فردا جلسه دارم ساعت ۹" has no reminder trigger verb, so
+  // it goes straight to chat and stores nothing.
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("reminder"));
     const r = await handleDailyText(env, o(env, 4313, "فردا جلسه دارم ساعت ۹", { ...s, nowMs: NOW }));
-    // 1-c-2 (PLANNED 1-b -> 1-c UPGRADE): the model reminder is stored
-    // as a task with the active 1-c reply; zero legacy rows.
-    check(r === "handled" && lastText(s) === "⏰ یادآوری به‌عنوان تسک ذخیره شد." && rows("SELECT COUNT(*) AS n FROM tasks WHERE user_id = 4313")[0].n === 1 && rows("SELECT COUNT(*) AS n FROM reminders WHERE user_id = 4313")[0].n === 0, "1-b-3: model reminder stored as task, zero legacy rows");
-    const mrow = rows("SELECT remind_at, due_at, status, source FROM tasks WHERE user_id = 4313")[0];
-    check(mrow?.remind_at === "2026-10-29T09:00:00+03:30" && mrow?.due_at === null && mrow?.status === "open" && mrow?.source === "text", "1-b-3: model reminder task carries rule-parsed remind_at, due null");
+    check(r === "chat" && fetchCalls === 0 && s.sent.length === 0 && rows("SELECT COUNT(*) AS n FROM tasks WHERE user_id = 4313")[0].n === 0, "1-d-1: chat-tier reminder-looking text goes straight to chat, nothing stored");
   }
-  // Chat tier + model expense-query without a period -> period ask.
+  // 1-d-1 (upgrade): chat tier no longer routes via the model
+  // expense-query verdict — straight to chat, no period ask.
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("expense-query"));
-    await handleDailyText(env, o(env, 4314, "خرج‌ها رو بگو", { ...s, nowMs: NOW }));
-    check(lastText(s).includes("برای کدام دوره؟"), "model expense-query, no period -> period ask");
+    const r = await handleDailyText(env, o(env, 4314, "خرج‌ها رو بگو", { ...s, nowMs: NOW }));
+    check(r === "chat" && fetchCalls === 0 && s.sent.length === 0, "1-d-1: chat-tier expense-query-looking text goes straight to chat, no period ask");
   }
   // Model file-reference: in-window finds the file, out-of-window asks.
   {
@@ -1879,13 +1891,16 @@ if (DatabaseSync) {
     check((await handleDailyText(env, o(env, 4318, "سلام، چطوری؟", { ...s, nowMs: NOW }))) === "chat" && fetchCalls === 0, "missing key, chat tier -> chat, no fetch");
   }
   // Timing log: combo, tier, ms, outcome — never the message text.
+  // 1-d-1 (upgrade): the surviving model path is ask-tier (chat tier
+  // no longer calls the model), so the timing proof moves to an
+  // ask-tier message: model chat verdict -> expense-or-chat ask.
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("chat"));
     const origLog = console.log; const lines = []; console.log = (...a) => { lines.push(a.join(" ")); };
-    await handleDailyText(env, o(env, 4319, "سلام، چطوری؟", { ...s, nowMs: NOW }));
+    await handleDailyText(env, o(env, 4319, "۵۰۰ تومان نان", { ...s, nowMs: NOW }));
     console.log = origLog;
     const entry = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((j) => j && j.modelIntent);
-    check(Boolean(entry) && entry.modelIntent === "chat" && entry.tier === "chat" && typeof entry.ms === "number" && entry.outcome === "chat" && !lines.some((l) => l.includes("سلام، چطوری؟")), "timing log: combo/tier/ms/outcome, no message text");
+    check(Boolean(entry) && entry.modelIntent === "chat" && entry.tier === "ask" && typeof entry.ms === "number" && entry.outcome === "asked" && !lines.some((l) => l.includes("۵۰۰ تومان نان")), "1-d-1: timing log on the ask-tier model path: combo/tier/ms/outcome, no message text");
   }
   // Full flow: model chat verdict skips classifyIntent (a dev-looking
   // message must NOT get the /dev suggestion; the chat answer is attempted).
@@ -1926,7 +1941,16 @@ if (DatabaseSync) {
   const hasAskBtn = (s) => (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).some((d) => d.startsWith("daily:ask:"));
   const slotOf = async (env, uid) => env.STATE.get(`daily:pending-ask:${uid}`, "json");
   const askIdOf = (s) => (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("daily:ask:"))?.split(":")[2] ?? null;
-  const amountAsk = async (env, s, uid) => { mockModel(modelJson("expense")); await handleDailyText(env, o(env, uid, "خرج", { ...s, nowMs: NOW })); };
+  // 1-d-1 (setup upgrade): the amount slot is now built from "خرج
+  // کردم" (ask amount) with a pinned model-expense mock — the old
+  // setup rode the retired chat-tier model path ("خرج" -> model
+  // expense). Pinning the mock matters: ask-tier still consults the
+  // model, so an unpinned leftover mock verdict would hijack the slot
+  // (model note -> note-text ask). The expense verdict re-derives the
+  // amount ask from rule code (ambiguous -> amount), so the resulting
+  // slot shape is identical (question + kind "amount") and every
+  // follow-up assertion below is unchanged.
+  const amountAsk = async (env, s, uid) => { mockModel(modelJson("expense")); await handleDailyText(env, o(env, uid, "خرج کردم", { ...s, nowMs: NOW })); };
   const chatButtons = async (env, s, uid) => { mockModel(modelJson("chat")); await handleDailyText(env, o(env, uid, "۵۰۰ تومان نان", { ...s, nowMs: NOW })); return askIdOf(s); };
   const incomeButtons = async (env, s, uid) => { mockModelFail(); await handleDailyText(env, o(env, uid, "۵۰۰ تومان نان گرفتم", { ...s, nowMs: NOW })); return askIdOf(s); };
   // Follow-up amount answer -> confirm, slot cleared, timing logged (no text).
@@ -2004,7 +2028,7 @@ if (DatabaseSync) {
     mockModel(modelJson("chat", { followup: "yes" }));
     const n = s.sent.length;
     const r = await handleDailyText(env, o(env, 4409, "اره", { ...s, nowMs: NOW }));
-    check(r === "chat-direct" && s.sent.length === n, "later yes without slot is fresh chat, not followup");
+    check(r === "chat" && s.sent.length === n, "later yes without slot is fresh chat, not followup");
   }
   // Button tap clears the slot and resolves the ask.
   {
@@ -2016,7 +2040,7 @@ if (DatabaseSync) {
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("chat", { followup: "yes" }));
     const r = await handleDailyText(env, o(env, 4411, "اره", { ...s, nowMs: NOW }));
-    check(r === "chat-direct" && s.sent.length === 0, "followup without slot ignored, fresh chat");
+    check(r === "chat" && s.sent.length === 0, "followup without slot ignored, fresh chat");
   }
   // Fresh intent from a follow-up replaces the old slot with its own ask.
   {
@@ -4052,6 +4076,75 @@ if (DatabaseSync) {
     // existing routing unchanged.
     const { rows } = await flow1c3("سلام");
     check(rows("SELECT COUNT(*) AS n FROM tasks WHERE user_id = 1")[0].n === 0, "1-c-3: non-matching follow-up stores no task");
+  }
+}
+
+// ── Phase 1-d-1: no /dev loop, no 80-token classifier misfires, multi-turn chat ──
+{
+  // buildChatContext keeps prior assistant + user turns, oldest first.
+  const built = buildChatContext([
+    { role: "user", content: "سلام" },
+    { role: "assistant", content: "سلام! چطور می‌توانم کمک کنم؟" },
+    { role: "user", content: "ادامه بده" },
+    { role: "assistant", content: "حتماً." },
+  ]);
+  check(built.length === 4 && built[0].role === "user" && built[1].role === "assistant" && built[2].role === "user" && built[3].role === "assistant" && built[1].content.includes("کمک"), "1-d-1: buildChatContext keeps prior assistant + user turns in order");
+  // Quick-convert keyboard: exactly the two qconv buttons for the message id, no text.
+  const kb = quickConvertKeyboard(42);
+  check(kb.length === 1 && kb[0].length === 2 && kb[0][0].text === "📝 ذخیره یادداشت" && kb[0][0].callback_data === "qconv:note:42" && kb[0][1].text === "☑️ ثبت تسک" && kb[0][1].callback_data === "qconv:task:42", "1-d-1: quickConvertKeyboard carries the two qconv buttons for the message id");
+}
+if (DatabaseSync) {
+  const fresh1d1 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } }, rows: (sql, params = []) => sq.prepare(sql).all(...params) };
+  };
+  // Two consecutive technical free-text turns: both reach chat, zero
+  // model calls (env HAS a ROUTER_KEY and fetch counts — the old path
+  // would have called classifyDailyWithModel for each turn), no /dev
+  // suggestion, entries saved as chat for multi-turn context.
+  {
+    const { db, rows } = fresh1d1();
+    const kv = fakeKV(); const env = { STATE: kv, DB: db, ROUTER_KEY: "fake-key" };
+    const sent = []; const chats = [];
+    const msg = (text) => ({ chatId: 1, userId: 1, text, send: async (t) => { sent.push(t); }, chat: async (t) => { chats.push(t); }, nowMs: Date.UTC(2026, 10, 2, 12, 0, 0) });
+    const realFetch = globalThis.fetch; let fetchCalls = 0;
+    globalThis.fetch = async () => { fetchCalls++; throw new Error("must not fetch"); };
+    let r1, r2;
+    try {
+      r1 = await handleDailyText(env, msg("explain how Workers KV caching works"));
+      r2 = await handleDailyText(env, msg("and how do I add a health endpoint to the worker"));
+    } finally { globalThis.fetch = realFetch; }
+    const kinds = rows("SELECT role, kind FROM messages WHERE user_id = 1 ORDER BY id");
+    check(r1 === "chat" && r2 === "chat" && fetchCalls === 0 && chats.length === 0 && sent.length === 0 && kinds.length === 2 && kinds.every((r) => r.role === "user" && r.kind === "chat"), "1-d-1: consecutive technical turns both reach chat, zero model calls, entries saved as chat");
+  }
+  // A model dev verdict no longer blocks: runModelBranch returns
+  // chat-direct with no suggestion sent.
+  {
+    const kv = fakeKV(); const env = { STATE: kv, ROUTER_KEY: "fake-key" };
+    const sent = []; const chats = [];
+    const o = { userId: 1, text: "add a health endpoint to the worker", send: async (t) => { sent.push(t); }, chat: async (t) => { chats.push(t); } };
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: '{"intent":"dev","followup":null}' } }] }) });
+    let res;
+    try { res = await runModelBranch(env, o, { intent: "chat" }, { now: Date.UTC(2026, 10, 2, 12, 0, 0), remembered: "TOMAN" }); } finally { globalThis.fetch = realFetch; }
+    check(res.ret === "chat-direct" && sent.length === 0 && !sent.join("").includes("/dev"), "1-d-1: model dev verdict flows to chat-direct, no /dev suggestion sent");
+  }
+  // Ask-tier keeps the model path (it matched a deterministic rule):
+  // a model failure falls back to the rule ask, still handled.
+  {
+    const { db } = fresh1d1();
+    const kv = fakeKV(); const env = { STATE: kv, DB: db, ROUTER_KEY: "fake-key" };
+    const sent = []; const chats = [];
+    const realFetch = globalThis.fetch; let fetchCalls = 0;
+    globalThis.fetch = async () => { fetchCalls++; throw new Error("boom"); };
+    let r;
+    try { r = await handleDailyText(env, { chatId: 1, userId: 1, text: "۵۰۰۰ تومان", send: async (t) => { sent.push(t); }, chat: async (t) => { chats.push(t); }, nowMs: Date.UTC(2026, 10, 2, 12, 0, 0) }); } finally { globalThis.fetch = realFetch; }
+    check(r === "handled" && fetchCalls === 1 && chats.length === 0 && sent.length === 1 && sent[0] === askText("expense-or-chat"), "1-d-1: ask-tier keeps the model path; a model failure falls back to the rule ask");
   }
 }
 
