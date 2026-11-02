@@ -509,6 +509,23 @@ export async function getTask(envOrDb, userId, taskId) {
   }
 }
 
+// 1-d-5: user-scoped message read for quick-convert + chat retry. The id
+// is validated before SQL; a foreign/missing row yields row null (the
+// caller stays silent), a D1 throw yields ok false.
+export async function getMessageRow(envOrDb, userId, messageId) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  if (!db || id === null) return { ok: false, row: null };
+  const mid = parseRowId(messageId);
+  if (mid === null) return { ok: false, row: null };
+  try {
+    const row = await db.prepare("SELECT id, role, content FROM messages WHERE id = ? AND user_id = ? LIMIT 1").bind(mid, id).first();
+    return { ok: true, row: row && typeof row === "object" ? row : null };
+  } catch {
+    return { ok: false, row: null };
+  }
+}
+
 // Phase 1-c-1: reminder claiming for scheduled() delivery. The claim is
 // ONE atomic UPDATE ... RETURNING: the WHERE clause re-validates every
 // claim predicate, so two concurrent ticks can never double-claim the

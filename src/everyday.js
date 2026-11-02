@@ -3,7 +3,7 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, extractFolderTag, IRAN_OFFSET_MIN } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
-import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
+import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi } from "./telegram.js";
@@ -95,6 +95,19 @@ function askKeyboard(question, id) {
 // user text, so the tap saves exactly that stored message.
 export function quickConvertKeyboard(messageId) {
   return [[{ text: "📝 ذخیره یادداشت", callback_data: `qconv:note:${messageId}` }, { text: "☑️ ثبت تسک", callback_data: `qconv:task:${messageId}` }]];
+}
+// 1-d-5: pure stage failure notice. label names the failed stage
+// ("chat" or "summary stage"); detail carries the model error when known.
+// retryEntryId -> a chat:retry button; retryData -> a raw callback_data
+// retry (the sum re-tap); quickConvertId -> the quick-convert row. No ids
+// -> text only, so a notice is never dropped silently for lack of buttons.
+export function chatFailureNotice(label, detail, opts = {}) {
+  const text = `❌ مرحله‌ی ${label} شکست خورد.${detail ? `\n${detail}` : ""}`;
+  const keyboard = [];
+  if (opts.retryEntryId) keyboard.push([{ text: "🔄 تلاش دوباره", callback_data: `chat:retry:${opts.retryEntryId}` }]);
+  if (opts.retryData) keyboard.push([{ text: "🔄 تلاش دوباره", callback_data: opts.retryData }]);
+  if (opts.quickConvertId) keyboard.push(...quickConvertKeyboard(opts.quickConvertId));
+  return { text, replyMarkup: keyboard.length ? { inline_keyboard: keyboard } : undefined };
 }
 function newId() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
 async function putKv(env, key, value) { if (!env.STATE) return; try { await env.STATE.put(key, JSON.stringify(value), { expirationTtl: DRAFT_TTL_SEC }); } catch {} }
@@ -359,7 +372,7 @@ async function runDailyBranch(env, o, c, ctx) {
       if (!hit) { await o.send(`📁 پروژه «${c.projectName}» پیدا نشد.`); await markDaily(env, o); return "handled"; }
       projectId = hit.id;
     }
-    const ok = await runSummary(env, o, c.kind, projectId, userId);
+    const ok = await runSummary(env, o, c.kind, projectId, userId, `${c.kind === "note" ? "note" : "task"}:sum:${projectId == null ? "all" : projectId}`);
     if (ok) await markDaily(env, o);
     return "handled";
   }
@@ -747,7 +760,7 @@ async function renderNoteList(env, userId, { projectName = null, projectId = nul
 // caller owns the entry, or the tap owns none), and a 700-token cap.
 // Returns false ONLY on a D1 failure (the branch gates markDaily on it).
 const SUMMARY_SYSTEM = "فقط از روی ردیف‌هایی که در پیام کاربر آمده خلاصه بساز. هیچ ردیفی را اضافه، حذف یا حدس نزن و هیچ دانسته‌ی بیرونی را قاطی نکن؛ تاریخ‌ها و نام پروژه‌ها را دقیقاً همان‌طور که داده شده بنویس. خروجی: اول یک خلاصه‌ی ساخت‌یافته‌ی کوتاه به فارسی، بعد یک جدول مارک‌داون با همان ردیف‌ها.";
-async function runSummary(env, o, kind, projectId, userId) {
+async function runSummary(env, o, kind, projectId, userId, retryData = null) {
   const rp = await listProjectsResult(env, userId);
   const names = new Map();
   if (rp.ok) for (const p of rp.projects) if (p.id != null) names.set(p.id, p.name);
@@ -762,7 +775,7 @@ async function runSummary(env, o, kind, projectId, userId) {
     const whenOf = (iso, label) => { const tp = tehranParts(iso); return tp ? ` (${label}: ${formatJalali(tp.date) || tp.date} ${tp.hhmm})` : ""; };
     return `${i + 1}. ${badge ? `${badge} ` : ""}${row.title}${row.remind_at ? whenOf(row.remind_at, "یادآوری") : ""}${row.due_at ? whenOf(row.due_at, "مهلت") : ""}`;
   }).join("\n");
-  await o.chat(`${kind === "note" ? "یادداشت‌ها" : "تسک‌ها"} (${scope}، ${rows.length} ردیف):\n${lines}`, { systemPrompt: SUMMARY_SYSTEM, saveText: "", noHistory: true, maxTokens: 700 });
+  await o.chat(`${kind === "note" ? "یادداشت‌ها" : "تسک‌ها"} (${scope}، ${rows.length} ردیف):\n${lines}`, { systemPrompt: SUMMARY_SYSTEM, saveText: "", noHistory: true, maxTokens: 700, failureLabel: "خلاصه‌سازی", ...(retryData ? { retryData } : {}) });
   return true;
 }
 
@@ -810,10 +823,67 @@ export async function resolveNoteCallback(env, o) {
       if (!rp.ok) { await o.send(NOTE_LIST_FAILED_TEXT); return true; }
       if (!rp.projects.some((p) => String(p.id) === sum[1])) return true; // foreign/missing: silent
     }
-    await runSummary(env, o, "note", sum[1] === "all" ? null : Number(sum[1]), o.fromId);
+    await runSummary(env, o, "note", sum[1] === "all" ? null : Number(sum[1]), o.fromId, o.data);
     return true;
   }
   return false;
+}
+
+// 1-d-5: 1-tap quick convert (qconv:note:<msgId> / qconv:task:<msgId>).
+// The tap carries only the message id; the row is re-read user-scoped
+// and must be a non-empty USER row — foreign/missing/assistant/empty
+// taps stay silent (no data leak). A note lands in the D1 default
+// project when one exists (same rule as the note branch); a task does
+// the same (the spec's "default/resolved project"). D1 failure ->
+// standard not-saved text, buttons kept so the user can retry; success
+// -> buttons removed, then the spec-exact confirmation. Normal double-
+// tap is prevented by markup removal; a replayed/forged tap could
+// duplicate (no conversion record exists, and adding one would need a
+// migration, which is forbidden) — the realistic exposure is nil
+// (Telegram dedupes callback deliveries; the allow-list gate ran first).
+export async function resolveQuickConvertCallback(env, o) {
+  const m = /^qconv:(note|task):(\d+)$/.exec(o.data);
+  if (!m) return false;
+  const id = Number(m[2]);
+  if (!Number.isSafeInteger(id) || id <= 0) return true; // invalid: silent
+  const g = await getMessageRow(env, o.fromId, id);
+  if (!g.ok) { await o.send(NOT_SAVED_TEXT); return true; } // D1 failure: buttons kept
+  if (!g.row || g.row.role !== "user" || !(g.row.content ?? "").trim()) return true; // foreign/missing/assistant/empty: silent
+  const pid = await defaultProjectId(env, o.fromId);
+  if (m[1] === "note") {
+    const r = pid == null ? await runDb(env, "INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, 'text', ?)", [o.fromId, g.row.content, new Date(o.nowMs ?? Date.now()).toISOString()]) : await runDb(env, "INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (?, ?, 'text', ?, ?)", [o.fromId, g.row.content, new Date(o.nowMs ?? Date.now()).toISOString(), pid]);
+    if (!r.ok) { await o.send(NOT_SAVED_TEXT); return true; } // write failure: buttons kept
+    if (o.editMarkup) await o.editMarkup();
+    await o.send("✅ به یادداشت تبدیل شد.");
+    return true;
+  }
+  const t = await insertTask(env, { userId: o.fromId, title: g.row.content, projectId: pid, source: "text", sourceMessageId: null });
+  if (!t.ok) { await o.send(NOT_SAVED_TEXT); return true; } // write failure: buttons kept
+  if (o.editMarkup) await o.editMarkup();
+  await o.send("✅ به تسک تبدیل شد.");
+  return true;
+}
+
+// 1-d-5: chat retry (chat:retry:<msgId>), distinct from the interpreter
+// retry:<rowId>. Same ownership rules as quick convert. The entry
+// already owns the user row (save-first), so the retry saves no second
+// user row (saveText ""); its answer carries fresh quick-convert
+// buttons, and a second failure still offers retry + quick-convert (the
+// ids ride along in the retry's own chat options). The transcript
+// header is NOT re-echoed on retry: messages rows carry no source
+// column, so a retry cannot know the original was voice (the original
+// failure notice already carried it).
+export async function resolveChatRetryCallback(env, o) {
+  const m = /^chat:retry:(\d+)$/.exec(o.data);
+  if (!m) return false;
+  const id = Number(m[1]);
+  if (!Number.isSafeInteger(id) || id <= 0) return true; // invalid: silent
+  const g = await getMessageRow(env, o.fromId, id);
+  if (!g.ok) { await o.send(NOT_SAVED_TEXT); return true; } // D1 failure: buttons kept
+  if (!g.row || g.row.role !== "user" || !(g.row.content ?? "").trim()) return true; // foreign/missing/assistant/empty: silent
+  if (o.editMarkup) await o.editMarkup();
+  await o.chat(g.row.content, { saveText: "", retryEntryId: id, quickConvertId: id, replyMarkup: { inline_keyboard: quickConvertKeyboard(id) } });
+  return true;
 }
 
 // 1-b-2: send a list render, splitting at Telegram's 4096-character
@@ -879,7 +949,7 @@ export async function resolveTaskCallback(env, o) {
       if (!rp.ok) { await o.send(TASK_LIST_FAILED_TEXT); return true; }
       if (!rp.projects.some((p) => String(p.id) === tsum[1])) return true; // foreign/missing: silent
     }
-    await runSummary(env, o, "task", tsum[1] === "all" ? null : Number(tsum[1]), o.fromId);
+    await runSummary(env, o, "task", tsum[1] === "all" ? null : Number(tsum[1]), o.fromId, o.data);
     return true;
   }
   // 1-c-2: snooze follows the same Fix B ordering as done/del: getTask
@@ -1567,6 +1637,17 @@ export async function handleDailyText(env, o) {
   // to the caller so downstream chat answers do not save a second user row.
   const entry = await saveMessage(env, { userId, role: "user", content: text, kind: "pending" });
   if (entry.ok) o.entryMessageId = entry.id; else o._entrySaveFailed = true;
+  // 1-d-5 voice echo + chat wrap (placed AFTER the entry save so the
+  // entry id is known, BEFORE any branch sends):
+  // (a) send wrap: the voice header prepends to the FIRST o.send only
+  // (a flag, not per-call), so list chunks after the first stay clean.
+  // (b) chat wrap: every model call's options inherit the voice header
+  // and the retry/quick-convert ids (the entry id) UNLESS the call site
+  // set them explicitly; a call site that set retryData (the summary
+  // re-tap) suppresses the chat retry, so a failed summary offers exactly
+  // one retry — the summary itself — plus quick-convert for the entry.
+  if (o.voiceHeader && o.send) { const rawSend = o.send; let headerSent = false; o.send = async (t, sopts) => { if (!headerSent) { headerSent = true; return rawSend(o.voiceHeader + t, sopts); } return rawSend(t, sopts); }; }
+  if (o.chat) { const rawChat = o.chat; o.chat = (t, copts = {}) => rawChat(t, { ...copts, ...(o.voiceHeader && !copts.voiceHeader ? { voiceHeader: o.voiceHeader } : {}), ...(o.entryMessageId && !copts.retryEntryId && !copts.retryData ? { retryEntryId: o.entryMessageId } : {}), ...(o.entryMessageId && !copts.quickConvertId ? { quickConvertId: o.entryMessageId } : {}) }); }
   const finalizeEntry = async (kind) => { if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; await finalizeMessageKind(env, o.entryMessageId, userId, kind); } };
   const viaBranch = async (cc) => { const r = await runDailyBranch(env, o, cc, ctx); await finalizeEntry(r === "chat" ? "chat" : "daily"); return r; };
   // Bare-note ask bypasses the model step: the model is exactly what

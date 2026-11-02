@@ -29,7 +29,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "../src/db.js";
 import {
   getChatContext,
   getSetting,
@@ -421,11 +421,13 @@ function newEnv(extra = {}) {
     // to normal chat (here the mock combo fails, so the reply is the
     // chat failure notice, not the suggestion). It still never
     // dispatches and never stores a pending dev intent.
+    // 1-d-5 (intentional expectation upgrade, spec-required): the chat
+    // failure notice now names the failed stage (stage-specific notice).
     await sendTg(env, msgUpdate("add a /health endpoint to the worker"));
     check(world.calls.github.filter((c) => c.url.includes("/actions/workflows/")).length === 0, "free-text dev must not dispatch");
     const devMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
     check(!String(devMsg?.payload?.text ?? "").includes("با /dev بفرست"), "1-d-1: free-text dev must not get the /dev suggestion");
-    check(String(devMsg?.payload?.text ?? "").includes("همه‌ی مدل‌ها شکست خوردند"), "1-d-1: free-text dev flows to the chat path");
+    check(String(devMsg?.payload?.text ?? "").includes("مرحله‌ی چت شکست خورد"), "1-d-1: free-text dev flows to the chat path");
     check((await env.STATE.get("dev:active:4242")) === null, "free-text dev must not set active");
     check((await env.STATE.get("intent:pending:4242")) === null, "free-text dev must not store pending");
     const ghBefore = world.calls.github.length;
@@ -1129,7 +1131,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, chatFailureNotice, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard } from "../src/everyday.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
   check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
@@ -1912,7 +1914,7 @@ if (DatabaseSync) {
       const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", DB: d1, ROUTER_KEY: "k-test", GITHUB_DISPATCH_TOKEN: "gh-fake" };
       await sendTg(env, msgUpdate("پروژه"));
       const texts = world.calls.telegram.filter((c) => c.method === "sendMessage").map((c) => String(c.payload?.text ?? ""));
-      check(texts.some((x) => x.includes("همه‌ی مدل‌ها شکست خوردند")) && !texts.some((x) => x.includes("با /dev بفرست")), "full flow: model chat skips classifyIntent, no dev suggestion");
+      check(texts.some((x) => x.includes("مرحله‌ی چت شکست خورد")) && !texts.some((x) => x.includes("با /dev بفرست")), "full flow: model chat skips classifyIntent, no dev suggestion");
     } finally { global.fetch = prevFetch; world.restore(); }
   }
   global.fetch = origFetch;
@@ -4462,6 +4464,131 @@ if (DatabaseSync) {
     check(ts.s.chats.length === 1 && ts.s.chats[0].text.includes("تمرین گلبهار") && !ts.s.chats[0].text.includes("خرید عمومی"), "1-d-4: task summary button triggers a project-scoped summary");
     const fs = await tap4(sc, `note:sum:${sc.foreignProj}`, resolveNoteCallback);
     check(fs.s.sent.length === 0 && fs.s.chats.length === 0, "1-d-4: foreign project summary tap stays silent");
+  }
+}
+
+// ── Phase 1-d-5: voice echo, 1-tap quick convert, stage failure notice ──
+{
+  // Pure failure-notice helper: stage label, detail lines, button shapes.
+  const n1 = chatFailureNotice("چت", "targetA: 500", { retryEntryId: 42, quickConvertId: 42 });
+  const n1kb = n1.replyMarkup.inline_keyboard.flat().map((b) => b.callback_data);
+  check(n1.text === "❌ مرحله‌ی چت شکست خورد.\ntargetA: 500" && n1kb.includes("chat:retry:42") && n1kb.includes("qconv:note:42") && n1kb.includes("qconv:task:42"), "1-d-5: failure notice names the stage + retry + quick-convert buttons");
+  const n2 = chatFailureNotice("خلاصه‌سازی", null, { retryData: "note:sum:all" });
+  check(n2.text === "❌ مرحله‌ی خلاصه‌سازی شکست خورد." && n2.replyMarkup.inline_keyboard.flat().map((b) => b.callback_data).includes("note:sum:all"), "1-d-5: summary failure notice carries a re-tap retry button");
+  const n3 = chatFailureNotice("چت", null, {});
+  check(n3.replyMarkup === undefined, "1-d-5: failure notice without ids carries no buttons");
+}
+if (DatabaseSync) {
+  const fresh1d5 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1'), (2, '2')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } }, rows: (sql, params = []) => sq.prepare(sql).all(...params) };
+  };
+  const seedProj5 = (sq, uid, name, isDefault = 0) => { sq.prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (?, ?, '[]', 'active', ?, '2026-11-01T00:00:00.000Z')").run(uid, name, isDefault); return sq.prepare("SELECT id FROM projects WHERE user_id = ? AND name = ?").all(uid, name)[0].id; };
+  const mkS1d5 = () => { const sent = []; const chats = []; let edits = 0; return { sent, chats, edits: () => edits, send: async (t, opts) => { sent.push({ text: t, opts }); }, chat: async (t, copts) => { chats.push({ text: t, opts: copts }); }, editMarkup: async () => { edits++; } }; };
+  const T = Date.UTC(2026, 10, 2, 12, 0, 0);
+  // getMessageRow: own, foreign, invalid, D1 error.
+  {
+    const { sq, db, rows } = fresh1d5();
+    await saveMessage(db, { userId: 1, role: "user", content: "متن من", kind: "chat" });
+    await saveMessage(db, { userId: 2, role: "user", content: "مال دیگری", kind: "chat" });
+    const mine = rows("SELECT id FROM messages WHERE user_id = 1")[0].id;
+    const theirs = rows("SELECT id FROM messages WHERE user_id = 2")[0].id;
+    const g1 = await getMessageRow(db, 1, mine);
+    const g2 = await getMessageRow(db, 1, theirs);
+    check(g1.ok === true && g1.row.content === "متن من" && g1.row.role === "user" && g2.ok === true && g2.row === null, "1-d-5: getMessageRow returns the own row, null for a foreign row");
+    check((await getMessageRow(db, 1, 0)).ok === false && (await getMessageRow(db, 1, 1.5)).ok === false && (await getMessageRow({ prepare() { throw new Error("boom"); } }, 1, 1)).ok === false, "1-d-5: getMessageRow rejects invalid ids and D1 errors");
+  }
+  // Voice header on daily replies: first send only.
+  {
+    const { sq, db, rows } = fresh1d5();
+    const s = mkS1d5();
+    const header = "🎙 «یادداشت کن خرید نان»\n\n";
+    await handleDailyText({ STATE: fakeKV(), DB: db }, { chatId: 1, userId: 1, text: "یادداشت کن خرید نان", send: s.send, chat: s.chat, nowMs: T, source: "voice", voiceHeader: header });
+    check(s.sent[0].text === `${header}✅ یادداشت ذخیره شد.`, "1-d-5: voice daily reply prepends the transcript echo");
+    const long = "x".repeat(3000);
+    sq.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, ?, 'text', '2026-11-02T00:00:00Z')").run(long + "A");
+    sq.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, ?, 'text', '2026-11-02T00:00:00Z')").run(long + "B");
+    const s2 = mkS1d5();
+    await handleDailyText({ STATE: fakeKV(), DB: db }, { chatId: 1, userId: 1, text: "یادداشت‌هام", send: s2.send, chat: s2.chat, nowMs: T, source: "voice", voiceHeader: "🎙 «یادداشت‌هام»\n\n" });
+    check(s2.sent.length === 2 && s2.sent[0].text.startsWith("🎙 «یادداشت‌هام»") && !s2.sent[1].text.includes("🎙"), "1-d-5: voice header rides the first chunk only");
+  }
+  // Chat wrap: voice summary passes the header + sum retry data (no chat retry alongside it).
+  {
+    const { sq, db } = fresh1d5();
+    const gol = seedProj5(sq, 1, "گلبهار", 1);
+    sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'صبحانه', 'text', '2026-11-02T00:00:00Z', ?)").run(gol);
+    const s = mkS1d5();
+    await handleDailyText({ STATE: fakeKV(), DB: db }, { chatId: 1, userId: 1, text: "یادداشت‌های گلبهار رو خلاصه کن", send: s.send, chat: s.chat, nowMs: T, source: "voice", voiceHeader: "🎙 «خلاصه»\n\n" });
+    check(s.chats.length === 1 && s.chats[0].opts.voiceHeader === "🎙 «خلاصه»\n\n" && s.chats[0].opts.retryData === `note:sum:${gol}` && s.chats[0].opts.retryEntryId == null && s.chats[0].opts.failureLabel === "خلاصه‌سازی", "1-d-5: voice summary chat call carries header + sum retry (no chat retry)");
+  }
+  // qconv: note/task success (default project), no-default, foreign/missing/assistant/invalid/D1 failure.
+  {
+    const { sq, db, rows } = fresh1d5();
+    const om = seedProj5(sq, 1, "عمومی", 1);
+    await saveMessage(db, { userId: 1, role: "user", content: "متن قابل تبدیل", kind: "chat" });
+    await saveMessage(db, { userId: 2, role: "user", content: "مال دیگری", kind: "chat" });
+    await saveMessage(db, { userId: 1, role: "assistant", content: "پاسخ مدل", kind: "chat" });
+    const mine = rows("SELECT id FROM messages WHERE user_id = 1 AND role = 'user'")[0].id;
+    const theirs = rows("SELECT id FROM messages WHERE user_id = 2")[0].id;
+    const asst = rows("SELECT id FROM messages WHERE user_id = 1 AND role = 'assistant'")[0].id;
+    const tap5 = async (data, resolver, fromId = 1, d = db) => { const s = mkS1d5(); const r = await resolver({ STATE: fakeKV(), DB: d }, { fromId, data, send: s.send, chat: s.chat, editMarkup: s.editMarkup, nowMs: T }); return { r, s }; };
+    const n = await tap5(`qconv:note:${mine}`, resolveQuickConvertCallback);
+    const noteRow = rows("SELECT text, project_id FROM notes WHERE user_id = 1")[0];
+    check(n.s.sent[0].text === "✅ به یادداشت تبدیل شد." && n.s.edits() === 1 && noteRow.text === "متن قابل تبدیل" && noteRow.project_id === om, "1-d-5: qconv:note saves the stored text into the default project + confirms + removes buttons");
+    const t = await tap5(`qconv:task:${mine}`, resolveQuickConvertCallback);
+    const taskRow = rows("SELECT title, project_id FROM tasks WHERE user_id = 1")[0];
+    check(t.s.sent[0].text === "✅ به تسک تبدیل شد." && t.s.edits() === 1 && taskRow.title === "متن قابل تبدیل" && taskRow.project_id === om, "1-d-5: qconv:task saves the stored text as a task in the default project");
+    const f1 = await tap5(`qconv:note:${theirs}`, resolveQuickConvertCallback);
+    const f2 = await tap5(`qconv:note:99999`, resolveQuickConvertCallback);
+    const f3 = await tap5(`qconv:note:${asst}`, resolveQuickConvertCallback);
+    const f4 = await tap5(`qconv:note:0`, resolveQuickConvertCallback);
+    check(f1.s.sent.length === 0 && f2.s.sent.length === 0 && f3.s.sent.length === 0 && f4.s.sent.length === 0, "1-d-5: foreign/missing/assistant/invalid qconv taps stay silent");
+    const bad = await tap5(`qconv:note:${mine}`, resolveQuickConvertCallback, 1, { prepare() { throw new Error("boom"); } });
+    check(bad.s.sent[0].text === "ذخیره نشد، دوباره تلاش کن" && bad.s.edits() === 0, "1-d-5: qconv D1 failure reports failure, buttons kept");
+    const nd = fresh1d5();
+    seedProj5(nd.sq, 1, "بدون پیش‌فرض", 0);
+    await saveMessage(nd.db, { userId: 1, role: "user", content: "بدون پروژه", kind: "chat" });
+    const nid = nd.rows("SELECT id FROM messages WHERE user_id = 1")[0].id;
+    const sNd = mkS1d5();
+    await resolveQuickConvertCallback({ STATE: fakeKV(), DB: nd.db }, { fromId: 1, data: `qconv:note:${nid}`, send: sNd.send, chat: sNd.chat, editMarkup: sNd.editMarkup, nowMs: T });
+    check(nd.rows("SELECT project_id FROM notes WHERE user_id = 1")[0].project_id === null, "1-d-5: qconv without a default project stores with no project");
+  }
+  // chat:retry: re-runs the stored text with fresh buttons; foreign/missing/D1 failure.
+  {
+    const { db, rows } = fresh1d5();
+    await saveMessage(db, { userId: 1, role: "user", content: "سؤال دوباره", kind: "chat" });
+    await saveMessage(db, { userId: 2, role: "user", content: "مال دیگری", kind: "chat" });
+    const mine = rows("SELECT id FROM messages WHERE user_id = 1")[0].id;
+    const theirs = rows("SELECT id FROM messages WHERE user_id = 2")[0].id;
+    const tapR = async (data, fromId = 1, d = db) => { const s = mkS1d5(); const r = await resolveChatRetryCallback({ STATE: fakeKV(), DB: d }, { fromId, data, send: s.send, chat: s.chat, editMarkup: s.editMarkup, nowMs: T }); return { r, s }; };
+    const ok = await tapR(`chat:retry:${mine}`);
+    const kb = ok.s.chats[0]?.opts?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+    check(ok.s.chats.length === 1 && ok.s.chats[0].text === "سؤال دوباره" && ok.s.chats[0].opts.saveText === "" && ok.s.chats[0].opts.retryEntryId === mine && ok.s.chats[0].opts.quickConvertId === mine && kb.includes(`qconv:note:${mine}`) && ok.s.edits() === 1, "1-d-5: chat:retry re-runs the stored text with fresh buttons + removes old markup");
+    const f1 = await tapR(`chat:retry:${theirs}`);
+    const f2 = await tapR(`chat:retry:99999`);
+    check(f1.s.chats.length === 0 && f1.s.sent.length === 0 && f2.s.chats.length === 0, "1-d-5: foreign/missing chat:retry taps stay silent");
+    const bad = await tapR(`chat:retry:${mine}`, 1, { prepare() { throw new Error("boom"); } });
+    check(bad.s.sent[0].text === "ذخیره نشد، دوباره تلاش کن", "1-d-5: chat:retry D1 failure reports failure");
+  }
+  // Worker-level: a failing chat turn names the stage and carries retry + quick-convert buttons.
+  // (The env needs a DB: without one, handleDailyText takes the D1-unavailable path and no entry
+  // row exists to attach the buttons to — the notice text still names the stage in that case.)
+  {
+    const world = mockWorld();
+    try {
+      const { db } = fresh1d5();
+      const env = { ...newEnv(), DB: db };
+      await sendTg(env, msgUpdate("add a /health endpoint to the worker"));
+      const failMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+      check(String(failMsg?.payload?.text ?? "").includes("مرحله‌ی چت شکست خورد"), "1-d-5: worker chat failure notice names the stage");
+      const kb = failMsg?.payload?.reply_markup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+      check(kb.some((c) => c.startsWith("chat:retry:")) && kb.some((c) => c.startsWith("qconv:note:")) && kb.some((c) => c.startsWith("qconv:task:")), "1-d-5: worker chat failure notice carries retry + quick-convert buttons");
+    } finally { world.restore(); }
   }
 }
 
