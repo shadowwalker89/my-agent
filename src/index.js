@@ -201,6 +201,7 @@ async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
       { role: "user", content: text },
     ],
     temperature: 0.7,
+    ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
   };
 
   const cfg = await getConfig(env);
