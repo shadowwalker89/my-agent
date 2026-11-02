@@ -29,7 +29,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, insertTask, insertProject, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "../src/db.js";
 import {
   getChatContext,
   getSetting,
@@ -38,7 +38,7 @@ import {
   CHAT_CONTEXT_LIMIT,
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
-import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder } from "../src/daily.js";
+import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag } from "../src/daily.js";
 import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
 import { buildInterpreterPrompt, parseInterpreterOutput, interpretText, callInterpreterModel, validateAmountText, validateDateTexts, matchProject, validateInterpreterAction, INTERPRETER_MAX_ACTIONS } from "../src/interpreter.js";
 import { scoreEvalResults, mapOutcome, scoreSlots, runCaseEvaluation, iranNowIso, median } from "../scripts/eval-intent.mjs";
@@ -4145,6 +4145,119 @@ if (DatabaseSync) {
     let r;
     try { r = await handleDailyText(env, { chatId: 1, userId: 1, text: "۵۰۰۰ تومان", send: async (t) => { sent.push(t); }, chat: async (t) => { chats.push(t); }, nowMs: Date.UTC(2026, 10, 2, 12, 0, 0) }); } finally { globalThis.fetch = realFetch; }
     check(r === "handled" && fetchCalls === 1 && chats.length === 0 && sent.length === 1 && sent[0] === askText("expense-or-chat"), "1-d-1: ask-tier keeps the model path; a model failure falls back to the rule ask");
+  }
+}
+
+// ── Phase 1-d-2: natural projects, deterministic tasks, folder tagging ──
+{
+  // Pure classifier + tag extraction (no D1).
+  const NOW = Date.UTC(2026, 10, 2, 12, 0, 0);
+  const cl = (s) => classifyDaily(s, { nowMs: NOW });
+  check(cl("پروژه گلبهار رو بساز").intent === "project-create" && cl("پروژه گلبهار رو بساز").name === "گلبهار", "1-d-2: project-create رو-form keeps the name");
+  check(cl("پروژه جدید: سفر").name === "سفر" && cl("یه پروژه جدید تعریف کن به اسم سفر").name === "سفر", "1-d-2: project-create colon + phrase forms");
+  check(cl("پروژه‌هام").intent === "project-list" && cl("لیست پروژه‌ها").intent === "project-list" && cl("پروژه‌های من").intent === "project-list", "1-d-2: project-list joined forms");
+  check(cl("تسک: خرید نان").intent === "task-create" && cl("تسک: خرید نان").text === "خرید نان" && cl("به تسک‌هام اضافه کن: کتاب").text === "کتاب", "1-d-2: task-create prefixes");
+  check(cl("تسک: خریدم نان ۵۰۰ تومان").intent === "task-create", "1-d-2: explicit task prefix wins over expense inference");
+  const tS = extractFolderTag("توی پروژه گلبهار یادداشت کن خرید نان"), tE = extractFolderTag("یادداشت کن خرید نان در پروژه گل"), tM = extractFolderTag("یادداشت کن خرید نان توی پروژه گلبهار فردا"), tB = extractFolderTag("توی پروژه گلبهار");
+  check(tS?.at === "start" && tS.rest === "گلبهار یادداشت کن خرید نان" && tE?.at === "end" && tE.body === "یادداشت کن خرید نان" && tE.name === "گل", "1-d-2: folder tag start/end extraction");
+  check(tM?.at === "end" && tM.name === "گلبهار فردا" && tB?.at === "start" && tB.rest === "گلبهار", "1-d-2: folder tag tail is the whole trailing name; bare tag still extracts");
+}
+if (DatabaseSync) {
+  const fresh1d2 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } }, rows: (sql, params = []) => sq.prepare(sql).all(...params) };
+  };
+  const seedProj = (sq, name, aliases = [], isDefault = 0) => { sq.prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (1, ?, ?, 'active', ?, '2026-11-01T00:00:00.000Z')").run(name, JSON.stringify(aliases), isDefault); return sq.prepare("SELECT id FROM projects WHERE user_id = 1 AND name = ?").all(name)[0].id; };
+  const mkEnv1d2 = (db, kv) => ({ STATE: kv, DB: db });
+  const mkS1d2 = () => { const sent = []; const chats = []; return { sent, chats, send: async (t) => { sent.push(t); }, chat: async (t) => { chats.push(t); } }; };
+  const T = Date.UTC(2026, 10, 2, 12, 0, 0);
+  const flow1d2 = async (text, seed = true) => {
+    const { sq, db, rows } = fresh1d2();
+    let gol = null, om = null;
+    if (seed) { om = seedProj(sq, "عمومی", [], 1); gol = seedProj(sq, "گلبهار", ["گل"]); }
+    const kv = fakeKV(); const env = mkEnv1d2(db, kv); const s = mkS1d2();
+    const r = await handleDailyText(env, { chatId: 1, userId: 1, text, send: s.send, chat: s.chat, nowMs: T });
+    return { r, s, rows, gol, om };
+  };
+  // insertProject: new + duplicate name/alias/normalized + empty + bad user + D1 error.
+  {
+    const { sq, db, rows } = fresh1d2();
+    seedProj(sq, "عمومی", [], 1); seedProj(sq, "گلبهار", ["گل"]);
+    const n = await insertProject(db, 1, "سفر");
+    check(n.ok === true && n.created === true && n.project.name === "سفر" && n.project.status === "active" && n.project.is_default === 0 && rows("SELECT COUNT(*) AS c FROM projects WHERE user_id = 1")[0].c === 3, "1-d-2: insertProject inserts active non-default");
+    const d1 = await insertProject(db, 1, "گلبهار");
+    const d2 = await insertProject(db, 1, "گل");
+    const d3 = await insertProject(db, 1, "  گلبهار  ");
+    check(d1.ok === true && d1.created === false && d1.duplicate === true && d1.project.name === "گلبهار" && d2.duplicate === true && d2.project.name === "گلبهار" && d3.duplicate === true, "1-d-2: insertProject duplicates on name, alias, and normalized name");
+    check((await insertProject(db, 1, "   ")).ok === false && (await insertProject(db, "nope", "x")).ok === false, "1-d-2: insertProject rejects empty name and bad user");
+    const badDb = { prepare() { throw new Error("boom"); } };
+    check((await insertProject(badDb, 1, "x")).ok === false, "1-d-2: insertProject D1 error -> ok:false");
+  }
+  // Natural project creation + duplicate via the rule tier.
+  {
+    const { s, rows } = await flow1d2("پروژه جدید: سفر");
+    check(s.sent.at(-1) === "📁 پروژه «سفر» ساخته شد." && rows("SELECT name FROM projects WHERE user_id = 1 AND name = 'سفر'").length === 1, "1-d-2: natural project creation stores + confirms");
+    const f2 = await flow1d2("پروژه گلبهار رو بساز");
+    check(f2.s.sent.at(-1) === "📁 پروژه «گلبهار» از قبل وجود دارد.", "1-d-2: natural duplicate project reports already-exists");
+  }
+  // Project listing: seeded list + empty list.
+  {
+    const { s } = await flow1d2("پروژه‌هام");
+    check(s.sent.at(-1) === "📁 پروژه‌ها:\n📁 عمومی\n📁 گلبهار", "1-d-2: project list renders the folder list");
+    const e = await flow1d2("لیست پروژه‌ها", false);
+    check(e.s.sent.at(-1) === "پروژه‌ای پیدا نشد.", "1-d-2: empty project list reports none");
+    const badEnv = { STATE: fakeKV(), DB: { prepare() { throw new Error("boom"); } } };
+    const bs = mkS1d2();
+    const br = await handleDailyText(badEnv, { chatId: 1, userId: 1, text: "پروژه‌هام", send: bs.send, chat: bs.chat, nowMs: T });
+    check(br === "handled" && bs.sent.at(-1) === "پروژه‌ها خوانده نشد؛ دوباره تلاش کن.", "1-d-2: project-list D1 failure reports a read failure, never an empty list");
+  }
+  // Deterministic task creation, zero model calls (counting fetch stub throws).
+  {
+    const { db, rows } = fresh1d2();
+    const kv = fakeKV(); const env = mkEnv1d2(db, kv); const s = mkS1d2();
+    const realFetch = globalThis.fetch; let fetchCalls = 0;
+    globalThis.fetch = async () => { fetchCalls++; throw new Error("must not fetch"); };
+    let r;
+    try { r = await handleDailyText(env, { chatId: 1, userId: 1, text: "تسک: خرید نان", send: s.send, chat: s.chat, nowMs: T }); } finally { globalThis.fetch = realFetch; }
+    check(r === "handled" && fetchCalls === 0 && s.chats.length === 0 && s.sent.at(-1) === "✅ تسک ثبت شد." && rows("SELECT title, project_id FROM tasks WHERE user_id = 1")[0].title === "خرید نان", "1-d-2: deterministic task creation, zero model calls");
+  }
+  // Folder tagging: note end-form (گلبهار), task end-form (new project), reminder start-form (گلبهار), alias -> canonical name.
+  {
+    const { s, rows, gol } = await flow1d2("یادداشت کن خرید نان توی پروژه گلبهار");
+    const n = rows("SELECT text, project_id FROM notes WHERE user_id = 1")[0];
+    check(s.sent.at(-1) === "✅ یادداشت ذخیره شد. [📁 گلبهار]" && n.text === "خرید نان" && n.project_id === gol, "1-d-2: note end-form tag attaches گلبهار + badge");
+    const f2 = await flow1d2("یادداشت کن تماس با علی در پروژه گل");
+    const n2 = f2.rows("SELECT text, project_id FROM notes WHERE user_id = 1")[0];
+    check(f2.s.sent.at(-1) === "✅ یادداشت ذخیره شد. [📁 گلبهار]" && n2.project_id === f2.gol, "1-d-2: alias گل resolves to canonical گلبهار");
+  }
+  {
+    const { sq, db, rows } = fresh1d2();
+    seedProj(sq, "عمومی", [], 1); const safar = seedProj(sq, "سفر", []);
+    const kv = fakeKV(); const env = mkEnv1d2(db, kv); const s = mkS1d2();
+    await handleDailyText(env, { chatId: 1, userId: 1, text: "تسک: تماس با علی توی پروژه سفر", send: s.send, chat: s.chat, nowMs: T });
+    const t = rows("SELECT title, project_id FROM tasks WHERE user_id = 1")[0];
+    check(s.sent.at(-1) === "✅ تسک ثبت شد. [📁 سفر]" && t.title === "تماس با علی" && t.project_id === safar, "1-d-2: task end-form tag attaches a newly created project");
+  }
+  {
+    const { s, rows, gol } = await flow1d2("توی پروژه گلبهار یادآوری کن فردا ساعت ۹ تمرین");
+    const t = rows("SELECT title, remind_at, project_id FROM tasks WHERE user_id = 1")[0];
+    check(s.sent.at(-1) === "⏰ یادآوری به‌عنوان تسک ذخیره شد. [📁 گلبهار]" && t.title === "تمرین" && t.remind_at === "2026-11-03T09:00:00+03:30" && t.project_id === gol, "1-d-2: reminder start-form tag attaches گلبهار + keeps the due time");
+  }
+  // No-tag guards: middle phrase (unresolvable tail) and unknown project store plain, no badge; untagged note keeps the default + exact old reply.
+  {
+    const { s, rows, om } = await flow1d2("یادداشت کن خرید نان توی پروژه گلبهار فردا");
+    const n = rows("SELECT text, project_id FROM notes WHERE user_id = 1")[0];
+    check(!s.sent.at(-1).includes("[📁") && n.text === "خرید نان توی پروژه گلبهار فردا" && n.project_id === om, "1-d-2: middle phrase does not tag; note keeps full text + default project");
+    const f2 = await flow1d2("یادداشت کن خرید نان توی پروژه ناشناخته");
+    check(!f2.s.sent.at(-1).includes("[📁"), "1-d-2: unknown project does not tag");
+    const f3 = await flow1d2("یادداشت کن خرید نان");
+    const n3 = f3.rows("SELECT project_id FROM notes WHERE user_id = 1")[0];
+    check(f3.s.sent.at(-1) === "✅ یادداشت ذخیره شد." && n3.project_id === f3.om, "1-d-2: untagged note keeps default project + exact old reply");
   }
 }
 
