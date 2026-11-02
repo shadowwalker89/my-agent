@@ -24,9 +24,9 @@ import {
 import { tgApi, tgSend, tgBroadcast } from "./telegram.js";
 import { healthCounts } from "./health.js";
 import { ADMIN_HTML } from "./admin-page.js";
-import { classifyIntent, needsConfirmation, freeTextDevSuggestion } from "./intent.js";
+import { classifyIntent, needsConfirmation } from "./intent.js";
 import { getChatContext } from "./memory.js";
-import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback, runReminderTick } from "./everyday.js";
+import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback, runReminderTick, quickConvertKeyboard } from "./everyday.js";
 import { handleVoice, handleVoiceRetry } from "./voice.js";
 import { saveMessage } from "./db.js";
 import {
@@ -262,8 +262,11 @@ async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
     answer += `\n- ${usedCombo} / ${result.used}`;
   }
   console.log(JSON.stringify({ combo: usedCombo, used: result.used, routed }));
-  for (const chunk of splitMessage(answer)) {
-    await tgSend(env, chatId, chunk);
+  // 1-d-1: a quick-convert keyboard rides on the LAST chunk only
+  // (mirroring sendListMessage), so multi-chunk answers keep one button row.
+  const chunks = splitMessage(answer);
+  for (let i = 0; i < chunks.length; i++) {
+    await tgSend(env, chatId, chunks[i], i === chunks.length - 1 && opts.replyMarkup ? { replyMarkup: opts.replyMarkup } : undefined);
   }
 }
 
@@ -666,22 +669,29 @@ async function handlePlainText(env, msg, text, opts = {}) {
   // Save-first entry row already owns the user message: downstream chat
   // answers must not save it a second time (saveText "" + the guard above).
   const skipUserSave = dailyO.entryMessageId ? { saveText: "" } : undefined;
+  // 1-d-1: chat replies carry 1-tap quick-convert buttons for the saved
+  // user message (qconv: handlers land in 1-d-5); no buttons when the
+  // entry row failed to save.
+  const chatOpts = dailyO.entryMessageId ? { ...skipUserSave, replyMarkup: { inline_keyboard: quickConvertKeyboard(dailyO.entryMessageId) } } : skipUserSave;
   // Model already said chat for a text message: answer directly, skip
   // classifyIntent (dev was in the model allow-list and was rejected).
   // Image messages keep today's path (they return "chat", not "chat-direct").
-  if (daily === "chat-direct") { await answerChatText(env, chatId, userId, text, updateHasImage(msg), skipUserSave); return; }
+  if (daily === "chat-direct") { await answerChatText(env, chatId, userId, text, updateHasImage(msg), chatOpts); return; }
   if (daily !== "chat") return;
 
   const prefs = await getPrefs(env, userId);
   if (prefs.intent === false) {
-    await answerChatText(env, chatId, userId, text, updateHasImage(msg), skipUserSave);
+    await answerChatText(env, chatId, userId, text, updateHasImage(msg), chatOpts);
     return;
   }
 
   const intent = await classifyIntent(text, { env });
   if (intent.intent === "dev") {
-    // Free-text dev only SUGGESTS /dev now; it never dispatches.
-    await tgSend(env, chatId, freeTextDevSuggestion());
+    // 1-d-1: free-text dev is NEVER blocked by the /dev suggestion —
+    // only an explicit /dev command dispatches a run (tgCommand path
+    // above); free text flows to normal chat, so a technical question
+    // cannot loop on the suggestion across consecutive turns.
+    await answerChatText(env, chatId, userId, text, updateHasImage(msg), chatOpts);
     return;
   }
   if (needsConfirmation(intent)) {
@@ -708,7 +718,7 @@ async function handlePlainText(env, msg, text, opts = {}) {
     return;
   }
 
-  await runIntent(env, chatId, userId, text, intent, updateHasImage(msg), skipUserSave);
+  await runIntent(env, chatId, userId, text, intent, updateHasImage(msg), chatOpts);
 }
 
 async function handleCallbackQuery(env, cb) {
