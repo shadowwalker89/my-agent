@@ -152,6 +152,52 @@ export function parseReminder(text, nowMs, origText) {
   if (!body) return { ask: "empty" }; // "for what?" — never store an empty reminder
   return { due: `${date}T${pad(hour.hour)}:${pad(hour.minute)}:00+03:30`, text: body };
 }
+// Phase 1-c-3: deterministic rule-tier fill for a pending hour-ambiguous
+// reminder slot. The slot's pendingBody carries the ORIGINAL reminder
+// message; the answer supplies only what was missing. Two shapes resolve,
+// both by re-running parseReminder on a merged text (so its qualifier
+// rules decide, never a second time parser, and AM/PM is never guessed):
+//   Shape 1 — bare daypart ("صبح", "بامداد", "ظهر", "عصر", "بعدازظهر",
+//     "بعد از ظهر", "شب"): the qualifier is spliced onto the original
+//     ambiguous hour, replacing any stale qualifier it already carried.
+//   Shape 2 — time + daypart, with or without "ساعت" ("01:17 صبح",
+//     "۱:۱۷ صبح", "ساعت ۱:۱۷ عصر"): the whole original hour phrase is
+//     replaced by the clarified time + daypart.
+// Returns { text, due } on a clean parse, else null: the caller falls
+// through to the existing routing unchanged (a still-ambiguous merge
+// re-asks through the normal path; a non-matching answer is untouched).
+// The merged hour phrase also absorbs a trailing half/quarter tail so a
+// body never keeps a stray "و نیم". "بعدازظهر"/"بعداز ظهر" are spelled
+// "بعد از ظهر" in the merge because qualifierNearHour only recognises
+// the spaced form.
+const DAYPART_ALT = "بعد از ظهر|بعدازظهر|بعداز ظهر|بامداد|صبح|ظهر|عصر|شب";
+function normalizeDaypartToken(s) { return s === "بعدازظهر" || s === "بعداز ظهر" ? "بعد از ظهر" : s; }
+export function resolveHourAmbiguousFollowup(answer, original, nowMs) {
+  const ans = normalizeDigits(normalizeText(answer ?? "")).trim().replace(/[؟?!.،,:：\s]+$/u, "");
+  if (!ans) return null;
+  const m2 = new RegExp(`^(?:ساعت\\s+)?(\\d{1,2}):(\\d{1,2})\\s+(${DAYPART_ALT})$`).exec(ans);
+  let bare = null;
+  if (!m2) { const bm = new RegExp(`^(${DAYPART_ALT})$`).exec(ans); if (bm) bare = normalizeDaypartToken(bm[1]); }
+  if (!m2 && !bare) return null;
+  const orig = normalizeDigits(normalizeText(original ?? ""));
+  const phrase = new RegExp(`ساعت\\s*(?:\\d{1,2}|${HOUR_ALTS})(?::\\d{1,2})?(?:\\s+و\\s+(?:ربع|نیم))?(?:\\s+(?:${DAYPART_ALT}))?`).exec(orig);
+  if (!phrase) return null;
+  let merged;
+  if (m2) {
+    const hh = Number(m2[1]), mm = Number(m2[2]);
+    if (hh > 23 || mm > 59) return null;
+    merged = orig.slice(0, phrase.index) + `ساعت ${pad(hh)}:${pad(mm)} ${normalizeDaypartToken(m2[3])}` + orig.slice(phrase.index + phrase[0].length);
+  } else {
+    merged = orig.slice(0, phrase.index + phrase[0].length) + ` ${bare}` + orig.slice(phrase.index + phrase[0].length);
+  }
+  const r = parseReminder(merged, nowMs, merged);
+  if (r.ask || !r.due) return null;
+  // Defensive bound: parseHour does not bound minutes, so never store a
+  // due with an impossible HH:MM even if the splice produced one.
+  const dm = /^\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2}):00\+03:30$/.exec(r.due);
+  if (!dm || Number(dm[1]) > 23 || Number(dm[2]) > 59) return null;
+  return { text: r.text, due: r.due };
+}
 export { REMINDER_TRIGGERS };
 // ── Step 1b-1b: amount and classifier (on top of 1b-1a) ─────────────────
 // Normalisation runs FIRST, before every pattern in this section.
