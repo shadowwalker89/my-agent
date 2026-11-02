@@ -391,6 +391,21 @@ export function classifyDaily(text, opts = {}) {
   if (/^(?:(?:لطفا|لطفاً|ببین)\s+)?(?:یادداشت\s+کن|یادداشت\s+جدید|یادداشت)$/u.test(bareNote)
     || /^(?:می\s*خوام|می\s*خواهم|میخوام|میخواهم)\s+(?:یک\s+)?یادداشت(?:\s+جدید)?(?:\s+و\s+جداگانه)?\s+(?:ثبت\s+کنم|بنویسم|ایجاد\s+کنم|بکنم)$/u.test(bareNote)) return { intent: "ask", confidence: 0.5, question: "note-text" };
   if (REMINDER_RE.test(raw)) { const r = parseReminder(raw, now, text); return r.ask ? { intent: "reminder", confidence: 0.5, ask: r.ask } : { intent: "reminder", confidence: 1, due: r.due, text: r.text }; }
+  // 1-d-2: natural project creation, project listing, deterministic
+  // task creation. Placed before expense inference so an explicit
+  // "task:" / "project" prefix wins over a verb/amount reading. Bodies
+  // are sliced from the original text (normalisation is one-to-one, so
+  // indices align); names strip trailing punctuation.
+  const stripPunct = (s) => String(s ?? "").replace(/[؟?!.،,:：\s]+$/u, "").trim();
+  for (const re of [/^پروژه جدید\s*[:：]\s*(.+)$/ud, /^پروژه جدید به اسم\s+(.+)$/ud, /^یه پروژه جدید تعریف کن به اسم\s+(.+)$/ud, /^پروژه\s+(.+?)\s+رو\s+(?:بساز|تعریف کن)\s*[؟?!.،,]*$/ud]) {
+    const m = re.exec(raw);
+    if (m) { const name = stripPunct(text.slice(m.indices[1][0], m.indices[1][1])); if (name) return { intent: "project-create", confidence: 1, name }; }
+  }
+  if (/^(?:پروژه\s+ها\s*(?:م|یم|ی\s+من|من)?|پروژه\s+هام|لیست\s+پروژه\s+ها|فهرست\s+پروژه\s+ها)\s*[؟?!.،,]*$/u.test(raw)) return { intent: "project-list", confidence: 1 };
+  for (const re of [/^تسک\s*[:：]\s*(.+)$/ud, /^تسک جدید\s*[:：]\s*(.+)$/ud, /^تسک ثبت کن\s*[:：]\s*(.+)$/ud, /^به تسک\s*هامو?\s+اضافه کن\s*[:：]\s*(.+)$/ud]) {
+    const m = re.exec(raw);
+    if (m) { const body = text.slice(m.indices[1][0], m.indices[1][1]).trim(); if (body) return { intent: "task-create", confidence: 1, text: body }; }
+  }
   // Expense query: needs "how much/total" or a period word with a question
   // mark. An unknown period (e.g. last week) asks, never returns today.
   // An invalid date asks, never calls weekRange(null).
@@ -468,4 +483,24 @@ export function classifyDaily(text, opts = {}) {
   // No verb: ask only for a short message that carries a currency word.
   if (amount?.anchored) { if (NEGATED_RE.test(raw)) return { intent: "chat", confidence: 1 }; if (amount.bareMultiplier) return { intent: "chat", confidence: 1 }; if (raw.split(/\s+/).some((tok) => /^ن(خریدم|خرید|گرفتم|پرداختم|دریافت|کردم)/u.test(tok))) return { intent: "chat", confidence: 1 }; const tokens = raw.split(/\s+/).filter(Boolean).length; if (tokens <= 4) return { intent: "ask", confidence: 0.5, question: "expense-or-chat" }; return { intent: "chat", confidence: 1 }; }
   return { intent: "chat", confidence: 1 };
+}
+
+// 1-d-2: explicit folder phrase at the START or END only (a phrase in
+// the middle never tags). Start form returns { at: "start", rest } —
+// the text after the phrase, for longest-name-prefix resolution in
+// everyday.js; end form returns { at: "end", body, name } — the body
+// before the phrase and the trailing name, for exact resolution.
+const FOLDER_START_RE = /^(?:توی|در|برای)\s+پروژه\s+([\s\S]+)$/u;
+const FOLDER_END_RE = /^([\s\S]+?)\s+(?:توی|در|برای)\s+پروژه\s+(.+?)\s*[؟?!.،,]*$/u;
+export function extractFolderTag(text) {
+  const raw = normalizeText(text);
+  const orig = String(text ?? "");
+  const s = FOLDER_START_RE.exec(raw);
+  // normalisation is one-to-one, so raw spans map onto orig spans of
+  // the same length: the start rest is the tail of orig, the end body
+  // is the head of orig — ZWNJ survives in the returned body/rest.
+  if (s) { const rest = orig.slice(orig.length - s[1].length).trim(); if (rest) return { at: "start", rest }; }
+  const e = FOLDER_END_RE.exec(raw);
+  if (e) { const body = orig.slice(0, e[1].length).trim(); const name = e[2].trim(); if (body && name) return { at: "end", body, name }; }
+  return null;
 }
