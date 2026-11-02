@@ -269,6 +269,43 @@ export async function insertProject(envOrDb, userId, name, aliases = []) {
   }
 }
 
+// 1-d-3: newest-first notes with project/date paging. created_at mixes +03:30 and Z forms in live rows (1-c-3 Issue A),
+// so date bounds use datetime() normalization, never raw text comparison. {ok:false} ONLY on a read failure.
+export async function listNotesResult(envOrDb, userId, { projectId = null, sinceIso = null, untilIso = null, limit = 8, offset = 0 } = {}) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  if (!db || id === null) return { ok: false, notes: [] };
+  const n = Math.max(1, Math.min(100, Number(limit) || 8));
+  const off = Math.max(0, Math.floor(Number(offset) || 0));
+  const pid = optInt(projectId);
+  let sql = "SELECT id, project_id, created_at, text FROM notes WHERE user_id = ?";
+  const params = [id];
+  if (pid !== null) { sql += " AND project_id = ?"; params.push(pid); }
+  if (sinceIso) { sql += " AND datetime(created_at) >= datetime(?)"; params.push(sinceIso); }
+  if (untilIso) { sql += " AND datetime(created_at) < datetime(?)"; params.push(untilIso); }
+  sql += " ORDER BY id DESC LIMIT ? OFFSET ?";
+  params.push(n, off);
+  try {
+    const res = await db.prepare(sql).bind(...params).all();
+    return { ok: true, notes: Array.isArray(res?.results) ? res.results : [] };
+  } catch {
+    return { ok: false, notes: [] };
+  }
+}
+
+// 1-d-3: owner-scoped note delete. Invalid ids never reach SQL; a foreign/missing row deletes 0 rows.
+export async function deleteNote(envOrDb, userId, noteId) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  if (!db || id === null || !(Number.isSafeInteger(noteId) && noteId > 0)) return { ok: false, deleted: false };
+  try {
+    const res = await db.prepare("DELETE FROM notes WHERE id = ? AND user_id = ?").bind(noteId, id).run();
+    return { ok: true, deleted: (res?.meta?.changes ?? 0) > 0 };
+  } catch {
+    return { ok: false, deleted: false };
+  }
+}
+
 // Insert one task. Omitted status defaults to 'open'; a provided but
 // invalid status is rejected, never silently coerced (a silent 'open'
 // would hide wiring bugs in 1-b). Likewise, an omitted/null project_id
