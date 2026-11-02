@@ -437,12 +437,19 @@ export async function getTask(envOrDb, userId, taskId) {
 // the EXISTS clause, and if the mapping read itself fails the claims are
 // released again and {ok: false} is returned, so a failure never burns
 // an attempt silently. {ok: false} ONLY on a real D1 failure.
+// Phase 1-c-3: remind_at is compared through datetime() normalization,
+// NOT as raw text: parseReminder stores Tehran offset strings (+03:30)
+// while runReminderTick binds a UTC Z string, and raw text comparison
+// delayed every fresh reminder by exactly 3.5 hours (live QA). datetime()
+// compares true UTC instants across both forms, so no data migration is
+// needed for the already-stored +03:30 rows; rows datetime() cannot
+// parse are excluded from claiming rather than mis-claimed.
 export async function claimDueReminders(envOrDb, nowIso, limit = 20) {
   const db = dbOf(envOrDb);
   if (!db || typeof nowIso !== "string" || !Number.isFinite(Date.parse(nowIso))) return { ok: false, reminders: [] };
   const n = Math.max(1, Math.min(100, Number(limit) || 20));
   try {
-    const res = await db.prepare("UPDATE tasks SET reminded_at = ?, remind_attempts = remind_attempts + 1 WHERE id IN (SELECT t.id FROM tasks t WHERE t.status = 'open' AND t.remind_at IS NOT NULL AND t.remind_at <= ? AND t.reminded_at IS NULL AND t.remind_attempts < 3 AND EXISTS (SELECT 1 FROM users u WHERE u.id = t.user_id AND u.telegram_id IS NOT NULL) ORDER BY t.remind_at ASC, t.id ASC LIMIT ?) RETURNING id, user_id, title, remind_at, remind_attempts").bind(nowIso, nowIso, n).all();
+    const res = await db.prepare("UPDATE tasks SET reminded_at = ?, remind_attempts = remind_attempts + 1 WHERE id IN (SELECT t.id FROM tasks t WHERE t.status = 'open' AND t.remind_at IS NOT NULL AND datetime(t.remind_at) IS NOT NULL AND datetime(t.remind_at) <= datetime(?) AND t.reminded_at IS NULL AND t.remind_attempts < 3 AND EXISTS (SELECT 1 FROM users u WHERE u.id = t.user_id AND u.telegram_id IS NOT NULL) ORDER BY datetime(t.remind_at) ASC, t.id ASC LIMIT ?) RETURNING id, user_id, title, remind_at, remind_attempts").bind(nowIso, nowIso, n).all();
     const rows = Array.isArray(res?.results) ? res.results : [];
     if (rows.length === 0) return { ok: true, reminders: [] };
     let owners;
@@ -498,12 +505,15 @@ export async function snoozeTaskReminder(envOrDb, userId, taskId, newRemindAtIso
 // Phase 1-c-1: 30-day purge of closed tasks only. A done/deleted task
 // counts as old by completed_at, falling back to created_at when
 // completed_at is null (legacy rows). Open tasks are never touched.
+// Phase 1-c-3: the cutoff comparison also runs through datetime(), so an
+// offset-stored timestamp is compared as a true instant, not as text
+// (for the Z-form timestamps already in practice this is identity).
 // {ok: false, deleted: 0} ONLY on a real D1 failure.
 export async function purgeOldClosedTasks(envOrDb, cutoffIso) {
   const db = dbOf(envOrDb);
   if (!db || typeof cutoffIso !== "string" || !Number.isFinite(Date.parse(cutoffIso))) return { ok: false, deleted: 0 };
   try {
-    const res = await db.prepare("DELETE FROM tasks WHERE status IN ('done', 'deleted') AND COALESCE(completed_at, created_at) < ?").bind(cutoffIso).run();
+    const res = await db.prepare("DELETE FROM tasks WHERE status IN ('done', 'deleted') AND datetime(COALESCE(completed_at, created_at)) < datetime(?)").bind(cutoffIso).run();
     return { ok: true, deleted: res?.meta?.changes ?? 0 };
   } catch {
     return { ok: false, deleted: 0 };
