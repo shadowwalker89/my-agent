@@ -346,6 +346,27 @@ export function parseNoteQuery(raw, now) {
   if (NOTE_QUERY_RE.test(raw)) return { intent: "note-query", confidence: 1, date: day, projectName: null };
   return null;
 }
+// 1-d-4: summary/table requests. The trailing verb phrase is stripped
+// first — this MUST run before note-query, else "project notes,
+// summarize them" misreads as a project filter with a junk name — then
+// the subject is a note/task head with an optional project name. Only
+// summarize/tabulate verbs count (tell/show verbs are not summary).
+// A bare date word is not a project name: summary has no date
+// dimension, so it degrades to unfiltered rather than a bogus project.
+export function parseSummaryQuery(raw) {
+  const t = String(raw ?? "").trim().replace(/[؟?!.،,]+$/u, "");
+  const m = /^(.*?)(?:\s+(?:رو|را))?\s+(?:خلاصه|جدول)(?:\s+و\s+(?:خلاصه|جدول))?\s*(?:کن|کنید|بکن)\s*$/u.exec(t);
+  if (!m) return null;
+  const subj = m[1].trim();
+  const nm = /^(یادداشت|تسک)\s*های?/u.exec(subj);
+  if (!nm) return null;
+  const kind = nm[1] === "یادداشت" ? "note" : "task";
+  const rest = subj.slice(nm[0].length).trim();
+  if (!rest || /^(?:م|مو|من|امروز|دیروز)$/.test(rest)) return kind === "task" ? null : { intent: "summary", confidence: 1, kind, projectName: null };
+  const pm = /^پروژه\s+(.+)$/u.exec(rest);
+  if (pm && pm[1].trim()) return { intent: "summary", confidence: 1, kind, projectName: pm[1].trim() };
+  return { intent: "summary", confidence: 1, kind, projectName: rest };
+}
 const NOTE_QUERY_RE = /(یادداشت\s*های(م|مو| امروز)?|یادداشت\s*هامو?)/;
 // Task list (1-b-1): anchored CLOSED list of clear list-request forms
 // (spaced/ZWNJ/joined تسک‌هام / تسک‌هایم + a show verb). Bare تسک,
@@ -494,6 +515,7 @@ export function classifyDaily(text, opts = {}) {
   if (amount?.error === "amount") return { intent: "ask", confidence: 0.5, question: "amount" };
   if (amount?.error === "unknown-number") return { intent: "chat", confidence: 1 }; // no verb: a bare-thousand statement is chat, not an amount question
   if (TASK_LIST_RE.test(raw)) return { intent: "task-list", confidence: 1 };
+  const sq = parseSummaryQuery(raw); if (sq) return sq;
   const nq = parseNoteQuery(raw, now); if (nq) return nq;
   if (FILE_RE.test(raw)) {
     // File reference only for a short message with no accompanying text:
