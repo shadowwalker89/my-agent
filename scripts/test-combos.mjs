@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { RULES, pickModels, diversify, WEIGHTS } from "../src/combos.js";
 import { mapNvidia, mapXkiro, mapOpenRouter } from "../src/providers.js";
-import { classifyFailure, sortForStrategy, normalizeOpenAiChat, runCombo } from "../src/router.js";
+import { classifyFailure, sortForStrategy, normalizeOpenAiChat, runCombo, resetRouterHealthForTests } from "../src/router.js";
 import {
   getConfig,
   upsertProvider,
@@ -1351,6 +1351,10 @@ const v1ChatReq = (extra, key = ROUTER_KEY_3G) =>
 
 // 8) fallback روی 429 و 5xx — قبل از اولین بایت مجاز است
 for (const [label, status] of [["429", 429], ["5xx", 500]]) {
+  // Phase 2-b: the in-memory breaker persists per process, so the
+  // 429 recorded for m1 in the first iteration must not reorder the
+  // second iteration's independent env — reset between iterations.
+  resetRouterHealthForTests();
   const env = v1Env();
   await seedV1(env, [v1Target("m1"), v1Target("m2")]);
   const mock = mockUpstreamQueue([

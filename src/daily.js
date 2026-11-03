@@ -429,7 +429,12 @@ function countAnchoredAmounts(text) { const toks = stripThousands(normalizeDigit
 // Rule-only classifier. Confident = 1; ambiguous = { intent: "ask" }.
 // Never a guess, never a model call. Strict translate is checked FIRST:
 // a bare word "translate" anywhere is not a translate, only the verb is.
-export function classifyDaily(text, opts = {}) {
+export function classifyDaily(text, opts = {}, projectsArg = null) {
+  // Phase 2-b: the project list may arrive as a numeric nowMs, as an
+  // opts object carrying `projects`, or as the third argument — all
+  // existing callers (opts objects, or none) keep working unchanged.
+  if (typeof opts === "number") opts = { nowMs: opts };
+  if (opts && Array.isArray(opts.projects) && !projectsArg) projectsArg = opts.projects;
   const now = opts.nowMs ?? Date.now(), raw = normalizeText(text);
   if (!raw.trim()) return { intent: "chat", confidence: 1 };
   if (raw.trimStart().startsWith("/")) return { intent: "command", confidence: 1 };
@@ -477,7 +482,7 @@ export function classifyDaily(text, opts = {}) {
   // Only note/task-create/reminder verdicts return here, so any other
   // stripped reading falls through to the normal checks below.
   const mid = stripMiddleFolderTag(text);
-  if (mid) { const c2 = classifyDaily(mid.body, opts); if (c2.intent === "note" || c2.intent === "task-create" || c2.intent === "reminder") return c2; }
+  if (mid) { const c2 = classifyDaily(mid.body, opts, projectsArg); if (c2.intent === "note" || c2.intent === "task-create" || c2.intent === "reminder") return c2; }
   // Phase 1-e Pillar 2: deterministic natural note forms without a
   // colon (0 model calls). Placed BEFORE NOTE_RE so the "که" particle
   // is stripped from the body (NOTE_RE would keep it) and a stray
@@ -638,7 +643,65 @@ export function stripMiddleFolderTag(text) {
   if (!name || !rest) return null;
   return { keyword, name, body: middleTagBody(keyword, rest), nameSpan: m.indices[2], restSpan: m.indices[3] };
 }
-export function extractFolderTag(text) {
+
+// Phase 2-b Pillar B: known-project boundary matching. The old end
+// form captured everything after "برای پروژه " up to punctuation/EOL
+// ("گلبهار برسه", "یوتیوب ضبط ویدیوی معرفی"), so resolution returned
+// null and the badge was dropped. When the caller supplies the known
+// projects, an introducer followed by a known name/alias (longest
+// first, followed by end-of-string, whitespace, colon, or
+// punctuation) extracts ONLY that name and keeps the remaining words
+// intact. Aliases may be arrays or JSON strings (D1 stores aliases as
+// JSON text). Pure and side-effect free; daily.js stays agnostic of
+// where the project list came from — resolveFolderTag in everyday.js
+// passes the real D1 rows.
+const FOLDER_INTRO_RE = /(?:توی|تو|در|برای|بابت)\s+(?:پروژه(?:\s+ی(?=[\s:：؟?!.،,]|$))?|پوشه(?:\s+ی(?=[\s:：؟?!.،,]|$))?)\s*/gu;
+const PROJECT_BOUNDARY_RE = /[\s؟?!.،,:：]/u;
+function projectCandidates(projects) {
+  const out = [];
+  const push = (n) => {
+    const v = normalizeText(n ?? "").trim();
+    if (v && !out.includes(v)) out.push(v);
+  };
+  for (const p of projects ?? []) {
+    if (typeof p === "string") { push(p); continue; }
+    if (!p) continue;
+    push(p.name);
+    let aliases = p.aliases;
+    if (typeof aliases === "string") { try { aliases = JSON.parse(aliases); } catch { aliases = []; } }
+    if (Array.isArray(aliases)) for (const a of aliases) push(a);
+  }
+  out.sort((a, b) => b.length - a.length);
+  return out;
+}
+// Returns { name, rest } when `afterText` starts with a known project
+// name/alias at that exact position (boundary-delimited), else null.
+// `rest` is the remaining text with one immediately adjacent colon
+// stripped — the trailing words are never swallowed into the name.
+export function matchKnownProjectAt(afterText, projects) {
+  const after = normalizeText(afterText ?? "");
+  for (const c of projectCandidates(projects)) {
+    if (after === c) return { name: c, rest: "" };
+    if (after.startsWith(c)) {
+      const next = after[c.length];
+      if (next === undefined || PROJECT_BOUNDARY_RE.test(next)) {
+        let rest = after.slice(c.length).replace(/^[\s:：]+/u, "");
+        // A remainder of pure punctuation ("گلبهار.") is no remainder.
+        if (/^[\s؟?!.،,:：]+$/u.test(rest)) rest = "";
+        return { name: c, rest };
+      }
+    }
+  }
+  return null;
+}
+// Phase 2-b upgrade of the old "resolveProjectMatch": a raw candidate
+// that still has trailing words ("گلبهار برسه") resolves to the known
+// project it starts with (longest first, boundary-delimited), or null.
+export function resolveProjectName(rawCandidate, projects) {
+  const hit = matchKnownProjectAt(rawCandidate, projects);
+  return hit ? hit.name : null;
+}
+export function extractFolderTag(text, projects = null) {
   const raw = normalizeText(text);
   const orig = String(text ?? "");
   const s = FOLDER_START_RE.exec(raw);
@@ -653,6 +716,27 @@ export function extractFolderTag(text) {
     const name = orig.slice(mid.nameSpan[0], mid.nameSpan[1]).trim();
     const rest = orig.slice(mid.restSpan[0], mid.restSpan[1]).trim();
     if (name && rest) return { at: "middle", body: middleTagBody(mid.keyword, rest), name };
+  }
+  // Phase 2-b: known-name scan for mid-sentence phrases ("... برای
+  // پروژه گلبهار برسه"). Runs before the end form so a trailing-word
+  // name never falls through to an exact-match failure. The start
+  // form above already handled a leading introducer; a known hit here
+  // covers every other position, including a leading introducer that
+  // the start regex missed (leading whitespace).
+  if (Array.isArray(projects) && projects.length) {
+    FOLDER_INTRO_RE.lastIndex = 0;
+    let m;
+    while ((m = FOLDER_INTRO_RE.exec(raw)) !== null) {
+      const afterIdx = m.index + m[0].length;
+      const hit = matchKnownProjectAt(raw.slice(afterIdx), projects);
+      if (!hit) continue;
+      // raw indices map 1:1 onto orig (see the comment above).
+      const restClean = orig.slice(afterIdx + hit.name.length).replace(/^[\s:：]+/u, "").trim();
+      const before = orig.slice(0, m.index).trim();
+      const clean = /^[\s؟?!.،,:：]+$/u.test(restClean) ? "" : restClean;
+      const body = before ? (clean ? `${before} ${clean}` : before) : clean;
+      if (body) return { at: "known", name: hit.name, body };
+    }
   }
   const e = FOLDER_END_RE.exec(raw);
   if (e) { const body = orig.slice(0, e[1].length).trim(); const name = e[2].trim(); if (body && name) return { at: "end", body, name }; }

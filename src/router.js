@@ -15,6 +15,72 @@ const DEADLINE_MS = 25000;
 const PER_TARGET_TIMEOUT_MS = 20000;
 const MAX_HEALTH_CHECKS = 20;
 
+// Phase 2-b Pillar A: in-memory target health circuit-breaker. This is
+// separate from the KV health layer (markFailure): the map lives in
+// the isolate and deprioritizes a target for 10 minutes after a
+// breaker-listed failure, so the next request tries healthy targets
+// first in 0 ms instead of re-hitting the same dead 503/404/timeout
+// at the top of the list. Success clears the entry.
+const TARGET_HEALTH_COOLDOWN_MS = 600_000;
+const BREAKER_FAILURE_STATUSES = new Set([404, 503, 502, 401, 402, 429]);
+const targetHealthMap = new Map();
+export function resetRouterHealthForTests() { targetHealthMap.clear(); }
+function recordTargetFailure(used, statusOrReason) {
+  const prev = targetHealthMap.get(used);
+  targetHealthMap.set(used, {
+    failCount: (prev?.failCount ?? 0) + 1,
+    lastFailAt: Date.now(),
+    lastStatus: statusOrReason,
+  });
+}
+function partitionTargetsByHealth(targets) {
+  const now = Date.now();
+  const healthy = [];
+  const cooled = [];
+  for (const t of targets) {
+    const key = `${t.provider}/${t.model}`;
+    const entry = targetHealthMap.get(key);
+    if (!entry || now - entry.lastFailAt >= TARGET_HEALTH_COOLDOWN_MS) healthy.push(t);
+    else cooled.push({ t, failCount: entry.failCount, lastFailAt: entry.lastFailAt });
+  }
+  // Cooled-down targets sort by fewest failures, then oldest failure,
+  // and are only tried after every healthy target has failed.
+  cooled.sort((a, b) => a.failCount - b.failCount || a.lastFailAt - b.lastFailAt);
+  return [...healthy, ...cooled.map((c) => c.t)];
+}
+
+// Phase 2-b Pillar A: reasoning-model text extraction. Reasoning /
+// thinking models often leave content empty and put the generation in
+// reasoning_content / reasoning, or return an unclosed <think> block
+// when max_tokens cuts them off. Only when content, reasoning_content
+// AND reasoning are all empty is the response an "empty assistant
+// message" — a fast HTTP 200 must not be thrown away.
+export function extractAssistantText(message) {
+  const msg = message ?? {};
+  let raw = typeof msg.content === "string" ? msg.content : "";
+  if (Array.isArray(msg.content)) {
+    raw = msg.content.map((p) => (typeof p?.text === "string" ? p.text : "")).join("");
+  }
+  let text = String(raw).replace(/<think>[\s\S]*?<\/think>/g, "");
+  const openIdx = text.indexOf("<think>");
+  if (openIdx !== -1 && !text.slice(openIdx).includes("</think>")) {
+    // Unclosed <think>: stripping "<think>[\s\S]*$" would empty it, so
+    // the text INSIDE the tag is the fallback, not an empty string.
+    const before = text.slice(0, openIdx).trim();
+    const inner = text.slice(openIdx + "<think>".length).trim();
+    text = before ? `${before} ${inner}` : inner;
+  }
+  text = text.trim();
+  if (text) return text;
+  if (typeof msg.reasoning_content === "string" && msg.reasoning_content.trim()) {
+    return msg.reasoning_content.trim();
+  }
+  if (typeof msg.reasoning === "string" && msg.reasoning.trim()) {
+    return msg.reasoning.trim();
+  }
+  return "";
+}
+
 function truncate(text) {
   const s = String(text ?? "");
   return s.length > 200 ? s.slice(0, 200) : s;
@@ -342,13 +408,15 @@ export async function runCombo(
   }
 
   // Phase 1-e Pillar 1: hard wall-clock budgets, always. Per-attempt
-  // timeout defaults to 11s and is capped at 14s; the total deadline
-  // across all targets/retries defaults to 20s and is capped at 22s,
+  // timeout defaults to 6s (Phase 2-b: 11s + 8.5s used to exhaust the
+  // whole 20s budget after only 2 targets; 2 x 6s still leaves 8s for
+  // 2-3 more models) and is capped at 14s; the total deadline across
+  // all targets/retries defaults to 20s and is capped at 22s,
   // leaving >= 8s before Cloudflare's 30s waitUntil limit. The legacy
   // deadlineMs / perTargetTimeoutMs knobs keep working as aliases,
   // capped by the same bounds. A manual combo's old up-to-55s deadline
   // is capped by the total budget too — that was the silent-death hole.
-  const attemptTimeoutMs = Math.min(attemptOpt ?? perTargetTimeoutMs ?? 11000, 14000);
+  const attemptTimeoutMs = Math.min(attemptOpt ?? perTargetTimeoutMs ?? 6000, 14000);
   const totalTimeoutMs = Math.min(totalOpt ?? deadlineMs ?? 20000, 22000);
   const started = Date.now();
   const errors = [];
@@ -363,12 +431,16 @@ export async function runCombo(
   // یک ساعت در health منع می‌شود (markFailure خودش این را ثبت می‌کند).
   const rejectedProviders = new Set();
   let lastErr = null;
+  // Phase 2-b Pillar A: healthy targets first; cooled-down targets
+  // (breaker-listed failure within the last 10 minutes) only after
+  // every healthy target has failed.
+  targets = partitionTargetsByHealth(targets);
 
   for (const t of targets) {
     if (rejectedProviders.has(t.provider)) continue;
     const usedModel = `${t.provider}/${t.model}`;
     const remaining = deadline - (Date.now() - started);
-    if (remaining < 1500) {
+    if (remaining < 1200) {
       errors.push({ target: usedModel, reason: lastErr || "timeout" });
       break;
     }
@@ -400,7 +472,7 @@ export async function runCombo(
     let failure = null;
     for (let attemptNo = 0; ; attemptNo++) {
       const rem = deadline - (Date.now() - started);
-      if (rem < 1500) {
+      if (rem < 1200) {
         attempt = { error: { target: usedModel, reason: lastErr || "timeout" }, cause: "timeout" };
         failure = { isTimeout: true, cls: classifyFailure(null, "", true), cause: "timeout" };
         break;
@@ -456,6 +528,14 @@ export async function runCombo(
           console.error("markFailure failed:", err && err.message);
         }
       }
+      // Phase 2-b: breaker-listed failures deprioritize this target
+      // for 10 minutes on the next request (timeout / 404 / 503 / 502
+      // / 401 / 402 / 429 only — network errors and bad json do not
+      // cool a target).
+      if (isTimeout) recordTargetFailure(usedModel, "timeout");
+      else if (typeof cause === "number" && BREAKER_FAILURE_STATUSES.has(cause)) {
+        recordTargetFailure(usedModel, cause);
+      }
     } else if (stream) {
       const res = attempt.res;
       if (res.body) {
@@ -464,6 +544,7 @@ export async function runCombo(
         } catch (err) {
           console.error("recordLatency failed:", err && err.message);
         }
+        targetHealthMap.delete(usedModel);
         return {
           ok: true,
           stream: res.body,
@@ -482,7 +563,7 @@ export async function runCombo(
       // The body read itself must respect the total budget too: a
       // stalled body stream must not outlive the <= 22s guarantee.
       const remJson = deadline - (Date.now() - started);
-      if (remJson < 1500) {
+      if (remJson < 1200) {
         errors.push({ target: usedModel, reason: lastErr || "timeout" });
         lastErr = lastErr || "timeout";
         continue;
@@ -499,6 +580,7 @@ export async function runCombo(
           errors.push({ target: usedModel, reason: "timeout" });
           lastErr = "timeout";
           await markFailure(env, usedModel, classifyFailure(null, "", true), "timeout");
+          recordTargetFailure(usedModel, "timeout");
           continue;
         }
         errors.push({ target: usedModel, reason: truncate(`bad json: ${err && err.message}`) });
@@ -512,17 +594,26 @@ export async function runCombo(
       const { message } = data?.choices?.[0] ?? {};
       const hasToolCalls =
         Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
+      // Phase 2-b: reasoning/thinking models may carry the generation
+      // in reasoning_content / reasoning or in an unclosed <think>
+      // block. Only when all three are empty is this an "empty
+      // assistant message". Array content keeps the old length check.
       const content = message?.content;
+      const text = Array.isArray(content) ? null : extractAssistantText(message);
       const empty =
         !hasToolCalls &&
-        (!content ||
-          (typeof content === "string" && !content.trim()) ||
-          (Array.isArray(content) && content.length === 0));
+        (Array.isArray(content) ? content.length === 0 : !text);
       if (empty) {
         errors.push({ target: usedModel, reason: "empty assistant message" });
         lastErr = "empty assistant message";
         await markFailure(env, usedModel, classifyFailure(null, "", false), "empty assistant message");
+        recordTargetFailure(usedModel, "empty assistant message");
         continue;
+      }
+      // Surface the extracted text as the message content so the
+      // caller (answerChatText, callRouter) sees the generation.
+      if (text && typeof content === "string" && text !== content) {
+        data.choices[0].message.content = text;
       }
 
       try {
@@ -530,6 +621,7 @@ export async function runCombo(
       } catch (err) {
         console.error("recordLatency failed:", err && err.message);
       }
+      targetHealthMap.delete(usedModel);
       return {
         ok: true,
         data: normalizeOpenAiChat(data),
@@ -599,13 +691,8 @@ export async function directCall(env, providerName, model, body, { timeoutMs = 2
 export async function callRouter(env, comboNameOrProviderModel, body, opts = {}) {
   const r = await runCombo(env, comboNameOrProviderModel, body, { ...opts, stream: false });
   if (r.ok) {
-    const content = r.data?.choices?.[0]?.message?.content;
-    const text =
-      typeof content === "string"
-        ? content
-        : Array.isArray(content)
-          ? content.map((p) => p?.text ?? "").join("")
-          : "";
+    // Phase 2-b: reasoning/think extraction (see extractAssistantText).
+    const text = extractAssistantText(r.data?.choices?.[0]?.message);
     return { ok: true, text, model: r.used ?? null, error: null };
   }
   const first = Array.isArray(r.errors) && r.errors.length ? r.errors[0] : null;
