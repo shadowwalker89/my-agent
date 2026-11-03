@@ -8,7 +8,7 @@ import {
   removeCombo,
 } from "./config.js";
 import { RULES, capabilityTags } from "./combos.js";
-import { runCombo, getComboTargets, directCall, clearRouterHealthTarget, clearRouterHealthForProvider, resetRouterHealthForTests } from "./router.js";
+import { runCombo, getComboTargets, directCall, clearRouterHealthTarget, clearRouterHealthForProvider, resetRouterHealthForTests, extractFinalText } from "./router.js";
 import { classifyTask, comboCandidates, fallbackCombo, updateHasImage } from "./task-route.js";
 import { getPrefs, setPrefs } from "./tgprefs.js";
 import { syncProvider, getSyncReport, loadCatalog } from "./catalog.js";
@@ -241,6 +241,63 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
     }
   }
 
+  // Stable v1 addendum: FINAL content for Telegram delivery. runCombo's
+  // ok result carries answerMeta.finalText (computed from the raw message
+  // before reasoning surfacing); the fallback reads the data message
+  // through extractFinalText for shapes without answerMeta. Reasoning-only,
+  // unclosed-think-only, and genuinely empty output all yield "" here and
+  // are NEVER delivered as the user's answer (the 2-b reasoning-as-final
+  // rule is superseded for Telegram; the router//v1 layer is untouched).
+  const finalOf = (r) => {
+    if (r?.answerMeta && typeof r.answerMeta.finalText === "string") return r.answerMeta.finalText;
+    return extractFinalText(r?.data?.choices?.[0]?.message);
+  };
+  let answer = result.ok ? finalOf(result) : "";
+  if (result.ok && !answer.trim() && fallback && fallback !== usedCombo) {
+    const remaining = CHAT_TOTAL_BUDGET_MS - (Date.now() - chatBudgetStart);
+    if (remaining >= 1500) {
+      // Bounded recovery within the SAME shared budget: a reasoning-only
+      // first combo may still yield a final answer from the fallback
+      // combo. No budget extension, no attempts beyond the existing chain.
+      console.warn(`[tg] combo ${usedCombo} empty final -> fallback ${fallback}`);
+      routed = "manual";
+      usedCombo = fallback;
+      result = await runCombo(env, fallback, body, { totalTimeoutMs: remaining });
+      answer = result.ok ? finalOf(result) : "";
+    }
+  }
+
+  // Stable v1 addendum: privacy-safe diagnostic metadata for FAILED
+  // text/summary attempts only. Console only — never KV (no high-write
+  // records). Metadata only: correlation id, stage, combo, target,
+  // elapsed/configured/remaining budget, HTTP status, failure category
+  // (reason strings), finish_reason, final/reasoning char counts, usage
+  // tokens when supplied (else null), and abort provenance (timerFired:
+  // true = OUR deadline timer fired, false = network throw, null =
+  // unknown/budget floor). NEVER prompts, message text, raw provider
+  // bodies, reasoning text, credentials, or auth headers.
+  const logAnswerDiag = (fields) => {
+    try {
+      const errs = (result.errors ?? []).map((e) => ({
+        target: e.target,
+        reason: e.reason ?? e.status ?? null,
+        status: e.status ?? null,
+        timerFired: e.timerFired ?? null,
+      }));
+      console.log(JSON.stringify({
+        event: "telegram_answer_diag",
+        corrId: progressMsgId ?? null,
+        stage: opts.failureLabel || "چت",
+        combo: usedCombo,
+        errors: errs,
+        elapsedMs: Date.now() - chatBudgetStart,
+        budgetMs: CHAT_TOTAL_BUDGET_MS,
+        remainingMs: Math.max(0, CHAT_TOTAL_BUDGET_MS - (Date.now() - chatBudgetStart)),
+        ...fields,
+      }));
+    } catch {}
+  };
+
   if (!result.ok) {
     // Phase 2-d: compact failure detail — line 1 stays the stage
     // notice (existing tests assert it), followed by a Persian count
@@ -256,22 +313,37 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
     // heard, because the notice IS the bot's response.
     const notice = chatFailureNotice(opts.failureLabel || "چت", detail, opts);
     await finalizeProgressMessage(env, chatId, progressMsgId, (opts.voiceHeader || "") + notice.text, notice.replyMarkup ? { replyMarkup: notice.replyMarkup } : {});
+    logAnswerDiag({
+      ok: false,
+      target: (result.errors ?? []).at(-1)?.target ?? null,
+      finishReason: null,
+      finalChars: null,
+      reasoningChars: null,
+      usage: null,
+      timerFired: (result.errors ?? []).at(-1)?.timerFired ?? null,
+    });
     console.log(JSON.stringify({ combo: usedCombo, used: null, routed }));
     return; // failed turn stores nothing, neither side
   }
 
-  const content = result.data?.choices?.[0]?.message?.content;
-  let answer =
-    typeof content === "string"
-      ? content
-      : Array.isArray(content)
-        ? content.map((p) => p?.text ?? "").join("")
-        : "";
   if (!answer.trim()) {
     // 1-d-5: an empty answer is a pipeline failure too — it gets the
     // same stage notice (with the same buttons), never a silent drop.
+    // Stable v1 addendum: reasoning-only, unclosed-think-only, and
+    // tool-call-only responses land here by design (no displayable
+    // final text), with diag metadata recording what was actually
+    // present (reasoningChars > 0 vs genuinely empty).
     const notice = chatFailureNotice(opts.failureLabel || "چت", "پاسخ خالی بود.", opts);
     await finalizeProgressMessage(env, chatId, progressMsgId, (opts.voiceHeader || "") + notice.text, notice.replyMarkup ? { replyMarkup: notice.replyMarkup } : {});
+    logAnswerDiag({
+      ok: true,
+      target: result.used ?? null,
+      finishReason: result.answerMeta?.finishReason ?? result.data?.choices?.[0]?.finish_reason ?? null,
+      finalChars: answer.length,
+      reasoningChars: result.answerMeta?.reasoningChars ?? null,
+      usage: result.answerMeta?.usage ?? null,
+      timerFired: false,
+    });
     console.log(JSON.stringify({ combo: usedCombo, used: result.used ?? null, routed }));
     return; // empty turn stores nothing either
   }
@@ -280,6 +352,15 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
   // only the assistant row is saved — never a second or empty user row.
   if (opts.saveText !== "") await saveMessage(env, { userId, role: "user", content: opts.saveText ?? text, kind: "chat" });
   await saveMessage(env, { userId, role: "assistant", content: answer, kind: "chat" });
+  // Stable v1 addendum: finish_reason="length" means the output may be
+  // cut off — a truncated summary/table must NEVER be labeled complete.
+  // The warning rides the delivered text only (the stored row keeps the
+  // model text), mirroring the show-model line below. /v1 is unaffected:
+  // it returns finish_reason verbatim to API clients.
+  const finishReason = result.answerMeta?.finishReason ?? result.data?.choices?.[0]?.finish_reason ?? null;
+  if (finishReason === "length") {
+    answer += "\n⚠️ توجه: پاسخ ممکن است ناقص باشد؛ خروجی پیش از پایان قطع شد.";
+  }
   // show: ترجیح هر کاربر؛ SHOW_MODEL=1 همیشه override جهانی است.
   if (prefs.show === true || env.SHOW_MODEL === "1") {
     answer += `\n- ${usedCombo} / ${result.used}`;
