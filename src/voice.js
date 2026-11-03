@@ -44,8 +44,8 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
   const log = (ok, reason) => console.log(JSON.stringify({ voiceTranscribe: "gemini-3.5-transcribe", ms: Date.now() - started, ok, reason: reason ?? null }));
   if (!key) { log(false, "missing-key"); return { ok: false, reason: "missing-key" }; }
   const headers = { "x-goog-api-key": key };
-  const pollIntervalMs = opts.pollIntervalMs ?? 2000;
-  const maxPolls = opts.maxPolls ?? 30;
+  const pollIntervalMs = opts.pollIntervalMs ?? 1500;
+  const maxPolls = opts.maxPolls ?? 8;
   let name = null;
   try {
     const boundary = `----voice${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;

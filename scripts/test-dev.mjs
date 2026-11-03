@@ -43,7 +43,7 @@ import {
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
 import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, resolveProjectName, matchKnownProjectAt, parseNoteQuery, parseSummaryQuery, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, stripMiddleFolderTag, normalizeDaypartToken } from "../src/daily.js";
-import { callRouter, runCombo, resetRouterHealthForTests, extractAssistantText } from "../src/router.js";
+import { callRouter, runCombo, resetRouterHealthForTests, getRouterHealthSnapshotForTests, extractAssistantText } from "../src/router.js";
 import { PROVIDERS } from "../src/providers.js";
 import { sendProgressMessage, finalizeProgressMessage, splitTelegramText } from "../src/telegram.js";
 import { answerChatText } from "../src/index.js";
@@ -1145,7 +1145,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion } from "../src/everyday.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
   check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
@@ -5239,6 +5239,82 @@ if (DatabaseSync) {
     await c.say("اینو یادداشت کن که فردا سیمان برای پروژه گل برسه", MORNING);
     const note = sc.rows("SELECT text, project_id FROM notes WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
     check(note?.text === "فردا سیمان برسه" && note?.project_id === gol && c.s.sent.at(-1)?.text === "✅ یادداشت ذخیره شد. [📁 گلبهار]" && c.s.chats.length === 0, "2-b: alias mid-sentence tag resolves to گلبهار, exact body + badge, 0 model calls");
+  }
+  // ── Phase 2-c: timeout classification, phantom lines, provider demotion, NLU skip ──
+  // (a) Error("timeout") thrown by fetch is classified as "timeout" and
+  // recorded in targetHealthMap — not "network: timeout".
+  {
+    resetRouterHealthForTests();
+    const prev = global.fetch;
+    const calls = [];
+    global.fetch = async () => { calls.push(1); throw new Error("timeout"); };
+    try {
+      const env = { STATE: fakeKV(), XKIRO_API_KEY: "k" };
+      const r = await runCombo(env, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, { attemptTimeoutMs: 5000, totalTimeoutMs: 20000 });
+      check(r.ok === false && r.errors.length === 1 && r.errors[0]?.reason === "timeout", "2-c: Error(\"timeout\") in fetch is classified as \"timeout\", not \"network: timeout\"");
+      check(getRouterHealthSnapshotForTests().get("xkiro/test-model")?.lastStatus === "timeout", "2-c: timeout failure is recorded in targetHealthMap");
+    } finally { global.fetch = prev; }
+    // Same classification for the bare-string abort shape.
+    resetRouterHealthForTests();
+    global.fetch = async () => { throw "timeout"; };
+    try {
+      const env = { STATE: fakeKV(), XKIRO_API_KEY: "k" };
+      const r = await runCombo(env, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, { attemptTimeoutMs: 5000, totalTimeoutMs: 20000 });
+      check(r.ok === false && r.errors[0]?.reason === "timeout", "2-c: bare-string \"timeout\" throw is classified as \"timeout\"");
+    } finally { global.fetch = prev; }
+  }
+  // (b) No phantom unattempted lines when the budget expires after real
+  // attempts: first target fails 503 after ~800ms inside an 1800ms
+  // total budget, so < 1200ms remain for the second target.
+  {
+    resetRouterHealthForTests();
+    const prev = global.fetch;
+    global.fetch = async (url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.model === "first") {
+        await new Promise((r) => setTimeout(r, 800));
+        return new Response(JSON.stringify({ error: { message: "down" } }), { status: 503 });
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 });
+    };
+    try {
+      const kv = fakeKV();
+      await kv.put("config:v1", JSON.stringify({ providers: [{ id: "demoprov", name: "demoprov", baseUrl: "https://demo.test/v1", secretName: "TG_TOKEN", enabled: true }], combos: [{ name: "phantomtest", kind: "custom", strategy: "priority", timeoutMs: 8000, retries: 0, targets: [{ provider: "demoprov", model: "first" }, { provider: "demoprov", model: "second" }] }] }));
+      const env = { STATE: kv, TG_TOKEN: "x" };
+      const r = await runCombo(env, "phantomtest", { messages: [{ role: "user", content: "hi" }] }, { totalTimeoutMs: 1800 });
+      check(r.ok === false && r.errors.length === 1 && r.errors[0]?.target === "demoprov/first", "2-c: no phantom unattempted target lines when budget expires after real attempts");
+    } finally { global.fetch = prev; }
+  }
+  // (c) Intra-call provider demotion: [xkiro/m1 (503), xkiro/m2,
+  // nvidia/m3] tries nvidia/m3 BEFORE xkiro/m2.
+  {
+    resetRouterHealthForTests();
+    const prev = global.fetch;
+    const seen = [];
+    global.fetch = async (url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      seen.push(body.model);
+      if (body.model === "m1") return new Response(JSON.stringify({ error: { message: "down" } }), { status: 503 });
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok-" + body.model } }] }), { status: 200 });
+    };
+    try {
+      const kv = fakeKV();
+      await kv.put("config:v1", JSON.stringify({ providers: [{ id: "xkiro", name: "xkiro", baseUrl: "https://xkiro.test/v1", secretName: "XKIRO_API_KEY", enabled: true }, { id: "nvidia", name: "nvidia", baseUrl: "https://nvidia.test/v1", secretName: "NVIDIA_API_KEY", enabled: true }], combos: [{ name: "demotest", kind: "custom", strategy: "priority", timeoutMs: 8000, retries: 0, targets: [{ provider: "xkiro", model: "m1" }, { provider: "xkiro", model: "m2" }, { provider: "nvidia", model: "m3" }] }] }));
+      const env = { STATE: kv, XKIRO_API_KEY: "k", NVIDIA_API_KEY: "k" };
+      const r = await runCombo(env, "demotest", { messages: [{ role: "user", content: "hi" }] }, {});
+      check(r.ok === true && r.used === "nvidia/m3" && seen.join(",") === "m1,m3", "2-c: provider demotion tries nvidia/m3 before xkiro/m2 after xkiro/m1 503");
+    } finally { global.fetch = prev; }
+  }
+  // (d) Unambiguous question skips classifyIntentNlu (0 AI.run calls)
+  // and goes straight to chat; the rule itself is checked directly too.
+  {
+    check(isUnambiguousQuestion("تفاوت Cloudflare D1 و KV چیه؟") && isUnambiguousQuestion("چرا آسمان آبیه؟") && !isUnambiguousQuestion("یادداشت‌هام رو چطور ببینم؟") && !isUnambiguousQuestion("فردا سیمان و گچ برای پروژه گلبهار تحویل گرفته میشه"), "2-c: isUnambiguousQuestion rule — question words skip, keyword/statement messages do not");
+    const sc = fresh1d6(); seedProj6(sc.sq, 1, "عمومی", [], 1);
+    let aiCalls = 0;
+    const env = { STATE: fakeKV(), DB: sc.db, AI: { run: async () => { aiCalls++; return { response: JSON.stringify({ intent: "chat", confidence: 0.9 }) }; } } };
+    const s = mkS6();
+    const r = await handleDailyText(env, { chatId: 1, userId: 1, text: "تفاوت Cloudflare D1 و KV چیه؟", send: s.send, chat: s.chat, nowMs: MORNING });
+    check(r === "chat" && aiCalls === 0, "2-c: unambiguous question skips classifyIntentNlu (0 AI.run calls) and goes straight to chat");
   }
 }
 
