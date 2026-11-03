@@ -1,7 +1,7 @@
 // Step 1b-2: everyday wiring (money, notes, reminders, translate,
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
-import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, extractFolderTag, IRAN_OFFSET_MIN } from "./daily.js";
+import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, extractFolderTag, IRAN_OFFSET_MIN } from "./daily.js";
 import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
 import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
@@ -650,6 +650,12 @@ async function resolveFolderTag(env, userId, fullText) {
     const hit = cands.find((c) => c.name && c.name === normalizeText(tag.name).trim());
     return hit ? { project: hit.project, body: tag.body } : null;
   }
+  // 1-d-6 middle form: the name is already colon-bounded, so it resolves
+  // exactly like the end form; the body is the phrase-stripped text.
+  if (tag.at === "middle") {
+    const hit = cands.find((c) => c.name && c.name === normalizeText(tag.name).trim());
+    return hit ? { project: hit.project, body: tag.body } : null;
+  }
   const rest = normalizeText(tag.rest).trim();
   const origRest = tag.rest.trim();
   for (const c of cands) {
@@ -757,9 +763,10 @@ async function renderNoteList(env, userId, { projectName = null, projectId = nul
 // ZERO model calls. Otherwise ONLY the verified rows (Jalali dates,
 // project names) go to the chat combo with no history (history would
 // pollute grounding, as it did for translate), no user-row save (the
-// caller owns the entry, or the tap owns none), and a 700-token cap.
+// caller owns the entry, or the tap owns none), and a 1600-token cap
+// (1-d-6: 700 cut a 13-note summary off mid-sentence before its table).
 // Returns false ONLY on a D1 failure (the branch gates markDaily on it).
-const SUMMARY_SYSTEM = "فقط از روی ردیف‌هایی که در پیام کاربر آمده خلاصه بساز. هیچ ردیفی را اضافه، حذف یا حدس نزن و هیچ دانسته‌ی بیرونی را قاطی نکن؛ تاریخ‌ها و نام پروژه‌ها را دقیقاً همان‌طور که داده شده بنویس. خروجی: اول یک خلاصه‌ی ساخت‌یافته‌ی کوتاه به فارسی، بعد یک جدول مارک‌داون با همان ردیف‌ها.";
+const SUMMARY_SYSTEM = "فقط از روی ردیف‌هایی که در پیام کاربر آمده خلاصه بساز. هیچ ردیفی را اضافه، حذف یا حدس نزن و هیچ دانسته‌ی بیرونی را قاطی نکن؛ تاریخ‌ها و نام پروژه‌ها را دقیقاً همان‌طور که داده شده بنویس. خلاصه حداکثر ۴ تا ۵ خط کوتاه باشد و بلافاصله بعد از آن جدول مارک‌داون با ستون‌های | ردیف | تاریخ | پوشه | خلاصه | بیاید.";
 async function runSummary(env, o, kind, projectId, userId, retryData = null) {
   const rp = await listProjectsResult(env, userId);
   const names = new Map();
@@ -775,7 +782,7 @@ async function runSummary(env, o, kind, projectId, userId, retryData = null) {
     const whenOf = (iso, label) => { const tp = tehranParts(iso); return tp ? ` (${label}: ${formatJalali(tp.date) || tp.date} ${tp.hhmm})` : ""; };
     return `${i + 1}. ${badge ? `${badge} ` : ""}${row.title}${row.remind_at ? whenOf(row.remind_at, "یادآوری") : ""}${row.due_at ? whenOf(row.due_at, "مهلت") : ""}`;
   }).join("\n");
-  await o.chat(`${kind === "note" ? "یادداشت‌ها" : "تسک‌ها"} (${scope}، ${rows.length} ردیف):\n${lines}`, { systemPrompt: SUMMARY_SYSTEM, saveText: "", noHistory: true, maxTokens: 700, failureLabel: "خلاصه‌سازی", ...(retryData ? { retryData } : {}) });
+  await o.chat(`${kind === "note" ? "یادداشت‌ها" : "تسک‌ها"} (${scope}، ${rows.length} ردیف):\n${lines}`, { systemPrompt: SUMMARY_SYSTEM, saveText: "", noHistory: true, maxTokens: 1600, failureLabel: "خلاصه‌سازی", ...(retryData ? { retryData } : {}) });
   return true;
 }
 
@@ -1661,18 +1668,40 @@ export async function handleDailyText(env, o) {
   if (c.intent === "task-list") { await clearPendingAsk(env, userId); return viaBranch(c); }
   if (c.intent !== "chat" && c.intent !== "ask") { await clearPendingAsk(env, userId); return viaBranch(c); }
   // Answers to an open bot question keep the existing slot path.
-  const slot = await getPendingAsk(env, userId);
-  // 1-c-3: deterministic rule-tier fill for a pending hour-ambiguous
-  // reminder slot, BEFORE the model branch. The slot kind stays
-  // "hour-ambiguous" (no new "time" kind is introduced). Only the two
-  // follow-up shapes resolve (bare daypart; time + daypart); anything
-  // else falls through to the existing routing unchanged, so a
-  // brand-new unambiguous command/query is never trapped here
-  // (task-list and other non-chat/non-ask intents already returned
-  // above with the slot cleared).
-  if (slot && slotKind(slot) === "hour-ambiguous" && typeof slot.pendingBody === "string" && slot.pendingBody) {
-    const filled = resolveHourAmbiguousFollowup(text, slot.pendingBody, now);
-    if (filled) { await clearPendingAsk(env, userId); return viaBranch({ intent: "reminder", text: filled.text, due: filled.due }); }
+  let slot = await getPendingAsk(env, userId);
+  // 1-d-6: an hour-ambiguous slot must be fully discharged HERE, before
+  // any model branch — the 1-c-3 fill alone left a trap: when it
+  // returned null, the slot stayed set and runModelBranch re-asked the
+  // same question forever (model-failure re-ask, or a chat+followup
+  // verdict). Discharge rules, in order:
+  //   filled -> clear + store the reminder (unchanged 1-c-3 path);
+  //   merged but still-ambiguous -> re-ask ONCE with the ORIGINAL
+  //     pendingBody preserved (routing the reply itself would lose it);
+  //   merged but otherwise unparseable (past/empty/...) -> clear +
+  //     normal reminder branch with that ask, so the user gets a
+  //     meaningful message, never the same question again;
+  //   unfillable (no daypart shape, or no usable pendingBody) -> clear
+  //     the slot and fall through to the normal pipeline below (slot
+  //     nulled, so the model branch below cannot re-ask it).
+  if (slot && slotKind(slot) === "hour-ambiguous") {
+    if (typeof slot.pendingBody === "string" && slot.pendingBody) {
+      const filled = resolveHourAmbiguousFollowup(text, slot.pendingBody, now);
+      if (filled) { await clearPendingAsk(env, userId); return viaBranch({ intent: "reminder", text: filled.text, due: filled.due }); }
+      const merged = mergeHourAmbiguousFollowup(text, slot.pendingBody);
+      if (merged) {
+        const r = parseReminder(normalizeText(merged), now, merged);
+        if (r.ask === "hour-ambiguous") {
+          await setPendingAsk(env, userId, askText("hour-ambiguous"), undefined, "hour-ambiguous", slot.pendingBody);
+          await o.send(askText("hour-ambiguous"));
+          await finalizeEntry("daily");
+          return "handled";
+        }
+        await clearPendingAsk(env, userId);
+        return viaBranch(r.ask ? { intent: "reminder", ask: r.ask } : { intent: "reminder", text: r.text, due: r.due });
+      }
+    }
+    await clearPendingAsk(env, userId);
+    slot = null;
   }
   if (slot) { const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx); console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome })); await finalizeEntry(ret === "handled" ? "daily" : "chat"); return ret; }
   // 1-d-1: interpreter unconfigured -> NO model classifier for UNMATCHED
