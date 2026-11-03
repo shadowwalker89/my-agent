@@ -229,13 +229,13 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
   const autoPick = prefs.auto !== false && combo === task;
   const fallback = fallbackCombo(def, combo);
 
-  // Phase 1-e Pillar 1: ONE shared 20s budget across primary + fallback
+  // Phase 1-e Pillar 1: ONE shared 22s budget across primary + fallback
   // (the old two sequential 25s calls could run ~50s and die silently
   // at Cloudflare's 30s waitUntil limit). The fallback only runs when
-  // >= 1500ms of budget remains; runCombo caps each attempt at 14s and
+  // >= 1500ms of budget remains; runCombo caps each attempt at 15s and
   // the total at 22s, so this whole block always finishes in <= 22s.
   const chatBudgetStart = Date.now();
-  const CHAT_TOTAL_BUDGET_MS = 20000;
+  const CHAT_TOTAL_BUDGET_MS = 22000;
   let result = await runCombo(env, combo, body, { totalTimeoutMs: CHAT_TOTAL_BUDGET_MS });
   let usedCombo = combo;
   let routed = autoPick ? "auto" : "manual";
