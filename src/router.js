@@ -25,6 +25,16 @@ const TARGET_HEALTH_COOLDOWN_MS = 600_000;
 const BREAKER_FAILURE_STATUSES = new Set([404, 503, 502, 504, 401, 402, 429]);
 const targetHealthMap = new Map();
 export function resetRouterHealthForTests() { targetHealthMap.clear(); }
+// Phase 2-d: admin "Unblock" clears one target's in-memory breaker entry
+// (the KV health:<target> delete alone would leave the 10-minute
+// in-memory cooldown in place for the rest of the isolate's life).
+export function clearRouterHealthTarget(used) { targetHealthMap.delete(used); }
+export function clearRouterHealthForProvider(provider) {
+  const prefix = `${provider}/`;
+  for (const k of [...targetHealthMap.keys()]) {
+    if (k.startsWith(prefix)) targetHealthMap.delete(k);
+  }
+}
 // Test-only snapshot (copy) of the in-memory breaker map, so tests can
 // assert a failure was actually recorded — same precedent as
 // resetRouterHealthForTests above.
@@ -197,10 +207,10 @@ export function sortForStrategy(targets, strategy, { rrStart = 0, medians = {} }
   return list;
 }
 
-export async function getComboTargets(env, name) {
+export async function getComboTargets(env, name, opts = {}) {
   const cfg = env.STATE ? await getConfig(env) : { providers: [], combos: [] };
   const manual = (cfg.combos ?? []).find((c) => c.name === name);
-  if (manual) return getManualComboTargets(env, manual, cfg);
+  if (manual) return getManualComboTargets(env, manual, cfg, opts);
 
   const rule = RULES[name];
   if (!rule) return { error: `unknown combo: ${name}` };
@@ -218,13 +228,24 @@ export async function getComboTargets(env, name) {
 
   const preferPatterns = ov.prefer?.[name] ?? null;
   const compiled = compilePrefer(preferPatterns ?? rule.prefer);
-  const pins = resolvePins(ov.pins?.[name], catalog)
+  // Phase 2-d safe pinning: pins are still resolved first, but a pin
+  // that is currently KV-cooling must NOT sit ahead of healthy
+  // targets — it is demoted after the healthy scored targets instead
+  // of being skipped outright, so it stays visible and is still tried
+  // when budget remains. Provider-level blocks still drop pins fully.
+  const pinModels = resolvePins(ov.pins?.[name], catalog)
     .map((m) => ({
       ...m,
       score: scoreModel(m, compiled, { skipVlPenalty: rule.needsVision === true }),
     }))
     .filter((m) => !unhealthyProviders[m.provider]);
-  const pinKeys = new Set(pins.map((m) => `${m.provider}/${m.id}`.toLowerCase()));
+  const healthyPins = [];
+  const cooledPins = [];
+  for (const m of pinModels) {
+    if (await isModelHealthy(env, `${m.provider}/${m.id}`)) healthyPins.push(m);
+    else cooledPins.push(m);
+  }
+  const pinKeys = new Set(pinModels.map((m) => `${m.provider}/${m.id}`.toLowerCase()));
   const scored = pickModels(catalog, rule, {
     prefer: preferPatterns,
     bans: ov.bans ?? [],
@@ -232,7 +253,7 @@ export async function getComboTargets(env, name) {
     .filter((m) => !pinKeys.has(`${m.provider}/${m.id}`.toLowerCase()))
     .filter((m) => !unhealthyProviders[m.provider]);
 
-  const need = Math.max(0, rule.maxTargets - pins.length);
+  const need = Math.max(0, rule.maxTargets - healthyPins.length);
   const healthy = [];
   let checks = 0;
   for (const m of scored) {
@@ -242,10 +263,16 @@ export async function getComboTargets(env, name) {
   }
 
   const ordered = diversify(
-    pins.map((m) => ({ ...m, pinned: true })),
+    healthyPins.map((m) => ({ ...m, pinned: true })),
     healthy,
     rule.maxTargets,
   );
+  // Demoted cooled pins ride at the tail (still marked pinned), capped
+  // by maxTargets like everything else.
+  for (const m of cooledPins) {
+    if (ordered.length >= rule.maxTargets) break;
+    ordered.push({ ...m, pinned: true });
+  }
   return {
     name,
     targets: ordered.map((m) => ({
@@ -259,7 +286,7 @@ export async function getComboTargets(env, name) {
 }
 
 // comboهای دستی از config:v1 — استراتژی، skip سردشده‌ها، بدون diversify
-async function getManualComboTargets(env, combo, cfg) {
+async function getManualComboTargets(env, combo, cfg, opts = {}) {
   const providerMap = new Map(cfg.providers.map((p) => [p.id, p]));
   const ov = await getOverrides(env);
   const banSet = new Set((ov.bans ?? []).map((b) => String(b).toLowerCase()));
@@ -283,7 +310,12 @@ async function getManualComboTargets(env, combo, cfg) {
   }
 
   let rrStart = 0;
-  if (combo.strategy === "round-robin" && env.STATE) {
+  // Phase 2-d: read-only previews (Telegram /models display, the admin
+  // /admin/catalog endpoint, GET /admin/api/auto/<name>) must NOT
+  // advance the rr:<combo> pointer — only actual routing calls do.
+  // Default preview = false, so direct getComboTargets(env, name)
+  // calls (tests, routing) keep advancing exactly as before.
+  if (combo.strategy === "round-robin" && env.STATE && !opts.preview) {
     const cur = Number((await env.STATE.get(`rr:${combo.name}`)) ?? 0);
     rrStart = Number.isFinite(cur) ? cur : 0;
     const n = candidate.length || 1;
