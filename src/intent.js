@@ -260,7 +260,13 @@ async function callFastCombo(env, text) {
 
 // classifyIntent: main export — rule-based + optional LLM fallback
 // ctx: { callLLM: boolean, env: object } — env فقط برای LLM؛ هرگز لاگ نمیشود
-export async function classifyIntent(message, ctx = {}) {
+// Phase 1-e Pillar 2 overload: classifyIntent(env, text, context) —
+// first arg an object, second a string — routes to the NLU interpreter
+// (classifyIntentNlu). The legacy (message, ctx) form is untouched.
+export async function classifyIntent(message, ctx = {}, nluContext = {}) {
+  if (message && typeof message === "object" && typeof ctx === "string") {
+    return classifyIntentNlu(message, ctx, nluContext);
+  }
   const sync = classifyIntentSync(message);
 
   const needsLLM =
@@ -286,4 +292,139 @@ export function needsConfirmation(result) {
 // Only an explicit /dev dispatches a run.
 export function freeTextDevSuggestion() {
   return "این یک درخواست تغییر کد به نظر می‌رسد. برای اجرا، آن را با /dev بفرست.\nThis looks like a code-change request. Send it with /dev to run it.";
+}
+
+// ── Phase 1-e Pillar 2: context-aware AI NLU interpreter ─────────────
+// Separate from the Phase-0 interpreter (src/interpreter.js), which
+// stays gated on INTERPRETER_MODEL / o.interpreterCallFn. This layer
+// activates on the Workers AI binding alone — no wrangler.jsonc edit —
+// because resolveInterpreterModel falls back to the default model when
+// the binding exists and INTERPRETER_MODEL is unset ("off"/"none"
+// disables it). The caller (everyday.js) runs deterministic rules FIRST
+// and only calls this when they return chat, so the model never decides
+// numbers, dates, projects, or D1 writes — it only proposes an intent,
+// and the caller re-validates everything deterministically.
+export const DEFAULT_INTERPRETER_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+export const NLU_TIMEOUT_MS = 4500;
+export const NLU_MAX_TOKENS = 240;
+export const NLU_VALID_INTENTS = Object.freeze([
+  "note", "task", "reminder", "expense", "note_list", "task_list",
+  "project_list", "project_create", "summary", "daypart_reply", "chat",
+]);
+
+export function resolveInterpreterModel(env) {
+  const v = env?.INTERPRETER_MODEL;
+  if (v === "off" || v === "none") return null;
+  if (typeof v === "string" && v.trim()) return v.trim();
+  if (env?.AI && typeof env.AI.run === "function") return DEFAULT_INTERPRETER_MODEL;
+  return null;
+}
+
+// extractJsonObject(raw): strip <think> blocks (closed and unclosed)
+// and markdown fences, then parse the FIRST balanced {...} object with
+// string awareness (braces inside quoted strings do not count). Any
+// failure returns null — never a partial object.
+export function extractJsonObject(raw) {
+  let s = typeof raw === "string" ? raw : "";
+  s = s.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<think>[\s\S]*$/g, "");
+  s = s.replace(/```(?:json|JSON)?\s*\n?([\s\S]*?)```/g, "$1");
+  const start = s.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(s.slice(start, i + 1)); } catch { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+function buildNluPrompt(text, context = {}) {
+  const projects = Array.isArray(context.projects) && context.projects.length
+    ? context.projects.join("، ")
+    : "none";
+  const pending = context.pendingAsk
+    ? JSON.stringify(context.pendingAsk)
+    : "none";
+  const system = [
+    "You are a Persian intent classifier for a single-user personal assistant bot.",
+    "Output ONLY one JSON object, no other text, no markdown fences:",
+    '{"intent": "...", "confidence": 0.0-1.0, "project": "name or null", "body": "text or null", "date_ref": "امروز|فردا|پس‌فردا|null", "time_ref": "HH:MM or hour text or null", "daypart": "صبح|عصر|شب|cancel|null", "summary_target": "notes|tasks|null"}',
+    "Intents: note, task, reminder, expense, note_list, task_list, project_list, project_create, summary, daypart_reply, chat.",
+    "Rules:",
+    "- Information/explanation questions (e.g. تفاوت Cloudflare D1 و KV چیه؟, چطور توی پایتون...) are ALWAYS chat.",
+    "- A natural statement asking to remember something (e.g. فردا سیمان و گچ برای پروژه گلبهار تحویل گرفته میشه اینو یادت بمونه, برای پروژه یوتیوب یادداشت کن که...) is note: body = the clean text, project = the matched project name.",
+    "- A natural to-do (e.g. یه تسک برای پروژه گلبهار بذار بررسی قرارداد پیمانکار, باید فردا قرارداد گلبهار رو بررسی کنم ثبتش کن جزو تسک‌ها) is task: body = the task title, project = matched name.",
+    "- A time-based request (e.g. یادم بنداز فردا ساعت ۵ عصر به علی زنگ بزنم توی پروژه گلبهار) is reminder: body = title, date_ref, time_ref, daypart, project.",
+    "- Summarize requests (e.g. یه خلاصه از یادداشت‌هام بده, یادداشت‌های گلبهار رو جدول کن) are summary with summary_target notes/tasks and project.",
+    "- When a pending hour-ambiguous question is active and the message is a time/daypart clarification or cancellation, even with typos or conversational phrasing (صبخ, واسه صبح, عصری, کنسل), it is daypart_reply with daypart صبح/عصر/شب/cancel.",
+    "- Never invent a project: project must be one of the listed names or null. Never invent numbers: the caller validates any amount deterministically.",
+    "- If unsure, return chat with low confidence.",
+    `Projects: ${projects}`,
+    `Pending question: ${pending}`,
+  ].join("\n");
+  return { system, user: String(text ?? "") };
+}
+
+// classifyIntentNlu(env, text, context, opts) -> { ok, intent,
+// confidence, project, body, date_ref, time_ref, daypart,
+// summary_target } | { ok: false, reason }. Timeout is a Promise.race
+// (env.AI.run takes no abort signal); a timeout, a bad parse, or an
+// unknown intent all return { ok: false } so the caller falls through
+// to chat — never a drop, never a guessed write.
+export async function classifyIntentNlu(env, text, context = {}, opts = {}) {
+  const model = resolveInterpreterModel(env);
+  if (!model) return { ok: false, reason: "no-model" };
+  const timeoutMs = opts.timeoutMs || NLU_TIMEOUT_MS;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("nlu timeout")), timeoutMs);
+  });
+  try {
+    const prompt = buildNluPrompt(text, context);
+    const res = await Promise.race([
+      env.AI.run(model, {
+        messages: [
+          { role: "system", content: prompt.system },
+          { role: "user", content: prompt.user },
+        ],
+        temperature: 0,
+        max_tokens: NLU_MAX_TOKENS,
+      }),
+      timeout,
+    ]);
+    const raw = typeof res === "string" ? res : (res?.response ?? res?.text ?? "");
+    const obj = extractJsonObject(raw);
+    if (!obj) return { ok: false, reason: "bad-json" };
+    if (!NLU_VALID_INTENTS.includes(obj.intent)) return { ok: false, reason: "bad-intent" };
+    const conf = typeof obj.confidence === "number" ? obj.confidence : Number(obj.confidence);
+    const str = (v) => (typeof v === "string" ? v : null);
+    return {
+      ok: true,
+      intent: obj.intent,
+      confidence: Number.isFinite(conf) ? Math.min(1, Math.max(0, conf)) : 0,
+      project: str(obj.project),
+      body: str(obj.body),
+      date_ref: str(obj.date_ref),
+      time_ref: str(obj.time_ref),
+      daypart: str(obj.daypart),
+      summary_target: str(obj.summary_target),
+    };
+  } catch (err) {
+    return { ok: false, reason: err?.message === "nlu timeout" ? "timeout" : "error" };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
