@@ -127,6 +127,35 @@ export function chatFailureNotice(label, detail, opts = {}) {
   if (opts.quickConvertId) keyboard.push(...quickConvertKeyboard(opts.quickConvertId));
   return { text, replyMarkup: keyboard.length ? { inline_keyboard: keyboard } : undefined };
 }
+// Phase 2-d: compact failure detail for the chat path (answerChatText).
+// Line 1 of the notice itself stays the stage line (chatFailureNotice
+// adds it); this detail is: a Persian count line, at most the first 3
+// target: status lines, and a (+N مورد دیگر) overflow line. A 7-target
+// failure therefore never dumps a wall of raw model:status lines.
+export function formatFailureDetail(lines) {
+  const arr = (lines ?? []).filter((l) => String(l ?? "").trim() !== "");
+  if (!arr.length) return "";
+  const parts = [`تعداد مدل‌های بررسی‌شده: ${arr.length}`, ...arr.slice(0, 3)];
+  if (arr.length > 3) parts.push(`(+${arr.length - 3} مورد دیگر)`);
+  return parts.join("\n");
+}
+// Phase 2-d: a leading "." (or ":" / "-") left by a folder-strip or a
+// "یادداشت: . ..." form must never reach storage or the list render.
+// E.g. "یادداشت توی پروژه عمومی: . یه قابلیت" re-classifies to a body
+// starting with ". ", which used to render as "[📁 عمومی] . یه قابلیت...".
+export function stripLeadingNotePunct(text) {
+  // Leading run only: the directive is a stray leading ". "/" : "/" -".
+  // No trailing trim — a note body must be stored byte-identical apart
+  // from that leading run (a trailing space is user content).
+  return String(text ?? "").replace(/^[\s.·:؛،\-–—()[\]]+/u, "");
+}
+// Phase 2-d: chunk a flat button list into rows of at most n (Telegram
+// keyboards with one unbounded row overflow; one row per item towers).
+function chunkButtons(buttons, n) {
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += n) rows.push(buttons.slice(i, i + n));
+  return rows;
+}
 function newId() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
 async function putKv(env, key, value) { if (!env.STATE) return; try { await env.STATE.put(key, JSON.stringify(value), { expirationTtl: DRAFT_TTL_SEC }); } catch {} }
 async function getKv(env, key) { if (!env.STATE) return null; try { const raw = await env.STATE.get(key, "json"); return raw && typeof raw === "object" ? raw : null; } catch { return null; } }
@@ -298,6 +327,10 @@ async function runDailyBranch(env, o, c, ctx) {
       const c2 = classifyDaily(tag.body, { nowMs: ctx.now, rememberedCurrency: ctx.remembered });
       if (c2.intent === "note" && c2.text) { body = c2.text; pid = tag.project.id; pname = tag.project.name; }
     }
+    // Phase 2-d: trim a stray leading "." / ":" / "-" from the saved
+    // note body (folder-strip and "یادداشت: . ..." forms leave one).
+    const cleanBody = stripLeadingNotePunct(body);
+    if (cleanBody) body = cleanBody;
     const r = pid === null ? await runDb(env, "INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)", [userId, body, o.source === "voice" ? "voice" : "text", new Date().toISOString()]) : await runDb(env, "INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (?, ?, ?, ?, ?)", [userId, body, o.source === "voice" ? "voice" : "text", new Date().toISOString(), pid]);
     await o.send(r.ok ? `✅ یادداشت ذخیره شد.${pname ? ` [📁 ${pname}]` : ""}` : NOT_SAVED_TEXT);
     if (r.ok) await markDaily(env, o);
@@ -719,22 +752,32 @@ const TASK_LIST_FAILED_TEXT = "تسک‌ها خوانده نشد؛ دوباره 
 // ONLY on a task-read failure (Fix A); name resolution degrades to
 // titles only when IT fails, since names are decoration. The more
 // button renders ONLY on a full page; beyond-end renders no-more.
-async function renderTaskList(env, userId, projectId = null, offset = 0) {
+export async function renderTaskList(env, userId, projectId = null, offset = 0) {
   const r = await listOpenTasksResult(env, userId, projectId, 8, offset);
   if (!r.ok) return { ok: false, text: TASK_LIST_FAILED_TEXT, keyboard: null };
   if (r.tasks.length === 0) return { ok: true, text: offset > 0 ? "صفحه‌ی دیگری نیست." : "تسک بازی پیدا نشد.", keyboard: offset > 0 ? [[{ text: "↩ فهرست", callback_data: projectId == null ? "task:more:0" : `task:more:0:${projectId}` }]] : null };
   const rp = await resolveProjects(env, userId);
   const names = new Map();
   if (rp.ok && !rp.fallback) for (const p of rp.projects) if (p.id != null) names.set(p.id, p.name);
-  const text = r.tasks.map((t) => `• ${t.title}${t.project_id != null && names.get(t.project_id) ? ` — ${names.get(t.project_id)}` : ""}`).join("\n");
-  const keyboard = r.tasks.map((t) => [{ text: "✅", callback_data: `task:done:${t.id}` }, { text: "🗑", callback_data: `task:del:${t.id}` }]);
+  // Phase 2-d: numbered lines (so numbered buttons map to rows) and
+  // compact buttons — 2 tasks per row instead of one row per task.
+  const text = r.tasks.map((t, i) => `${offset + i + 1}. ${t.title}${t.project_id != null && names.get(t.project_id) ? ` — ${names.get(t.project_id)}` : ""}`).join("\n");
+  const perTask = r.tasks.map((t, i) => [
+    { text: `✅${offset + i + 1}`, callback_data: `task:done:${t.id}` },
+    { text: `🗑${offset + i + 1}`, callback_data: `task:del:${t.id}` },
+  ]);
+  const keyboard = [];
+  for (let i = 0; i < perTask.length; i += 2) {
+    keyboard.push([...perTask[i], ...(perTask[i + 1] ?? [])]);
+  }
   if (r.tasks.length === 8) keyboard.push([{ text: "بیشتر", callback_data: projectId == null ? `task:more:${offset + 8}` : `task:more:${offset + 8}:${projectId}` }]);
-  keyboard.push([{ text: "📦 آرشیو", callback_data: "task:arch:0" }]);
-  keyboard.push([{ text: "📊 خلاصه و جدول", callback_data: `task:sum:${projectId == null ? "all" : projectId}` }]);
+  keyboard.push([{ text: "📦 آرشیو", callback_data: "task:arch:0" }, { text: "📊 خلاصه و جدول", callback_data: `task:sum:${projectId == null ? "all" : projectId}` }]);
   if (rp.ok && !rp.fallback) {
-    const row = rp.projects.filter((p) => p.id != null).map((p) => ({ text: p.name, callback_data: `task:proj:${p.id}:0` }));
-    if (row.length) keyboard.push(row);
-    if (projectId != null) keyboard.push([{ text: "همه", callback_data: "task:more:0" }]);
+    const filters = rp.projects.filter((p) => p.id != null).map((p) => ({ text: p.name, callback_data: `task:proj:${p.id}:0` }));
+    if (projectId != null) filters.push({ text: "همه", callback_data: "task:more:0" });
+    // Phase 2-d: project filters chunked to at most 3 per row, never
+    // one unbounded horizontal row.
+    keyboard.push(...chunkButtons(filters, 3));
   }
   return { ok: true, text, keyboard };
 }
@@ -764,7 +807,7 @@ const NOTE_LIST_FAILED_TEXT = "یادداشت‌ها خوانده نشد؛ دو�
 // per-note delete, project filter, pagination. {ok:false} ONLY on a note-read failure (Fix A); names degrade to
 // no badge when THEIR read fails. The more callback carries the date filter as an optional 4th segment (the spec
 // shape note:more:<pid|all>:<offset> still parses): without it, paging a date-filtered list would drop the filter.
-async function renderNoteList(env, userId, { projectName = null, projectId = null, date = null, offset = 0 } = {}) {
+export async function renderNoteList(env, userId, { projectName = null, projectId = null, date = null, offset = 0 } = {}) {
   const rp = await listProjectsResult(env, userId);
   if (projectName) {
     if (!rp.ok) return { ok: false, text: NOTE_LIST_FAILED_TEXT, keyboard: null };
@@ -785,15 +828,19 @@ async function renderNoteList(env, userId, { projectName = null, projectId = nul
     const tp = tehranParts(n.created_at);
     const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : "";
     const badge = n.project_id != null && names.get(n.project_id) ? ` [📁 ${names.get(n.project_id)}]` : "";
-    return `${offset + i + 1}. ${when ? `${when} ` : ""}${badge ? `${badge} ` : ""}${n.text}`;
+    // Phase 2-d: legacy rows stored with a stray leading ". " render
+    // clean too (new saves are trimmed at save time).
+    return `${offset + i + 1}. ${when ? `${when} ` : ""}${badge ? `${badge} ` : ""}${stripLeadingNotePunct(n.text)}`;
   }).join("\n");
-  const keyboard = r.notes.map((n) => [{ text: "🗑", callback_data: `note:del:${n.id}` }]);
+  // Phase 2-d: delete buttons numbered by row and packed 4 per row
+  // (8 vertical rows become 2); project filters chunked to at most 3.
+  const keyboard = chunkButtons(r.notes.map((n, i) => ({ text: `🗑 #${offset + i + 1}`, callback_data: `note:del:${n.id}` })), 4);
   if (r.notes.length === 8) keyboard.push([{ text: "بیشتر", callback_data: moreTag(offset + 8) }]);
   keyboard.push([{ text: "📊 خلاصه و جدول", callback_data: `note:sum:${pidTag}` }]);
   if (rp.ok) {
-    const row = rp.projects.filter((p) => p.id != null).map((p) => ({ text: p.name, callback_data: `note:proj:${p.id}` }));
-    if (row.length) keyboard.push(row);
-    if (projectId != null) keyboard.push([{ text: "همه", callback_data: "note:proj:all" }]);
+    const filters = rp.projects.filter((p) => p.id != null).map((p) => ({ text: p.name, callback_data: `note:proj:${p.id}` }));
+    if (projectId != null) filters.push({ text: "همه", callback_data: "note:proj:all" });
+    keyboard.push(...chunkButtons(filters, 3));
   }
   return { ok: true, text, keyboard };
 }
@@ -822,7 +869,7 @@ async function runSummary(env, o, kind, projectId, userId, retryData = null) {
   const scope = projectId != null && names.get(projectId) ? `پروژه «${names.get(projectId)}»` : "همه";
   const lines = rows.map((row, i) => {
     const badge = row.project_id != null && names.get(row.project_id) ? ` [📁 ${names.get(row.project_id)}]` : "";
-    if (kind === "note") { const tp = tehranParts(row.created_at); const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : ""; return `${i + 1}. ${when ? `${when} ` : ""}${badge ? `${badge} ` : ""}${row.text}`; }
+    if (kind === "note") { const tp = tehranParts(row.created_at); const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : ""; return `${i + 1}. ${when ? `${when} ` : ""}${badge ? `${badge} ` : ""}${stripLeadingNotePunct(row.text)}`; }
     const whenOf = (iso, label) => { const tp = tehranParts(iso); return tp ? ` (${label}: ${formatJalali(tp.date) || tp.date} ${tp.hhmm})` : ""; };
     return `${i + 1}. ${badge ? `${badge} ` : ""}${row.title}${row.remind_at ? whenOf(row.remind_at, "یادآوری") : ""}${row.due_at ? whenOf(row.due_at, "مهلت") : ""}`;
   }).join("\n");
@@ -2009,9 +2056,23 @@ export async function resolveAskCallback(env, o) {
   }
   const now = o.nowMs ?? Date.now();
   await clearPendingAsk(env, o.fromId);
-  if (o.editMarkup) await o.editMarkup();
+  // Phase 2-d: a final confirmation edits the original ask message in
+  // place (text replaced, buttons removed) instead of sending a second
+  // message — this is what eliminates the 9:16 PM double-message
+  // clutter. Falls back to the old markup-clear + send when no
+  // editText is available (offline mocks) or the edit fails.
+  const editFinalOrSend = async (text) => {
+    if (typeof o.editText === "function") {
+      try {
+        const res = await o.editText(text);
+        if (res && res.ok !== false) return;
+      } catch {}
+    }
+    if (o.editMarkup) await o.editMarkup();
+    await o.send(text);
+  };
   if (cancel) {
-    await o.send("❌ یادآوری لغو شد.");
+    await editFinalOrSend("❌ یادآوری لغو شد.");
     return true;
   }
   const daypart = dp[1];
@@ -2020,10 +2081,14 @@ export async function resolveAskCallback(env, o) {
     const merged = mergeHourAmbiguousFollowup(daypart, slot.pendingBody);
     if (merged) {
       const r = parseReminder(normalizeText(merged), now, merged);
-      if (r.ask === "past") { await o.send(askText("past")); return true; }
-      if (r.ask === "hour-ambiguous") { await sendHourAmbiguousAsk(o); await setPendingAsk(env, o.fromId, askText("hour-ambiguous"), undefined, "hour-ambiguous", slot.pendingBody); return true; }
-      if (r.ask) { await o.send(askText(r.ask)); return true; }
+      if (r.ask) {
+        if (o.editMarkup) await o.editMarkup();
+        if (r.ask === "past") { await o.send(askText("past")); return true; }
+        if (r.ask === "hour-ambiguous") { await sendHourAmbiguousAsk(o); await setPendingAsk(env, o.fromId, askText("hour-ambiguous"), undefined, "hour-ambiguous", slot.pendingBody); return true; }
+        await o.send(askText(r.ask)); return true;
+      }
     }
+    if (o.editMarkup) await o.editMarkup();
     await o.send(NOT_SAVED_TEXT);
     return true;
   }
@@ -2034,7 +2099,12 @@ export async function resolveAskCallback(env, o) {
     if (filledClean) { body = filledClean.text; pid = tag.project.id; pname = tag.project.name; }
   }
   const r = await insertTask(env, { userId: o.fromId, title: body, remindAt: filled.due, dueAt: null, projectId: pid, source: "text" });
-  await o.send(r.ok ? `⏰ یادآوری به‌عنوان تسک ذخیره شد.${pname ? ` [📁 ${pname}]` : ""}` : NOT_SAVED_TEXT);
+  if (r.ok) {
+    await editFinalOrSend(`⏰ یادآوری به‌عنوان تسک ذخیره شد.${pname ? ` [📁 ${pname}]` : ""}`);
+  } else {
+    if (o.editMarkup) await o.editMarkup();
+    await o.send(NOT_SAVED_TEXT);
+  }
   return true;
 }
 
@@ -2043,6 +2113,12 @@ export function dailySenders(env, chatId, messageId) {
   return {
     send: (msgText, opts) => tgApi(env, "sendMessage", { chat_id: chatId, text: msgText, ...(opts?.replyMarkup ? { reply_markup: opts.replyMarkup } : {}) }),
     editMarkup: () => tgApi(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
+    // Phase 2-d: edit the original message's text in place and drop
+    // its buttons (reply_markup: []); null when there is no message
+    // id to edit, so callers fall back to markup-clear + send.
+    editText: (text) => Number.isInteger(messageId) && messageId > 0
+      ? tgApi(env, "editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: [] } })
+      : Promise.resolve(null),
   };
 }
 
