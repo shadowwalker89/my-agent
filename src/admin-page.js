@@ -307,7 +307,7 @@ input::placeholder{color:var(--muted)}
         <div id="mResult"></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th data-i18n="modelCol"></th><th data-i18n="statusCol"></th><th data-i18n="actions"></th></tr></thead>
+            <thead><tr><th data-i18n="modelCol"></th><th data-i18n="statusCol"></th><th data-i18n="reasonCol"></th><th data-i18n="latencyCol"></th><th data-i18n="actions"></th></tr></thead>
             <tbody id="mTbody"></tbody>
           </table>
         </div>
@@ -350,9 +350,10 @@ input::placeholder{color:var(--muted)}
             </select>
             <span class="lbl" data-i18n="strategy"></span>
             <select id="cStrategy"><option>priority</option><option>round-robin</option><option>fastest</option></select>
-            <span class="lbl" data-i18n="timeoutMs"></span><input id="cTimeout" type="number" min="1000" max="60000" value="20000" style="width:90px">
+            <span class="lbl" data-i18n="timeoutMs"></span><input id="cTimeout" type="number" min="1000" max="15000" value="13000" style="width:90px">
             <span class="lbl" data-i18n="retries"></span><input id="cRetries" type="number" min="0" max="3" value="0" style="width:60px">
           </div>
+          <p class="help" data-i18n="timeoutHelp"></p>
           <h3 data-i18n="targets"></h3>
           <div id="tgtBox"></div>
           <div class="line">
@@ -448,6 +449,23 @@ var I18N = {
     lblServer: 'Provider server error (5xx).',
     lblUnknown: 'Unknown error.',
     timeoutMs: 'Timeout (ms)',
+    timeoutHelp: 'Per-target max is 15,000 ms; total turn budget is 22,000 ms.',
+    reasonCol: 'Reason',
+    latencyCol: 'Median latency',
+    ban: 'Ban',
+    unban: 'Unban',
+    pinToCombo: 'Pin to combo',
+    pinTitle: 'Pin model to combo',
+    pinHelp: 'Choose the auto combo this model is pinned to. A pinned model is tried first, unless it is cooling down.',
+    unblock: 'Unblock',
+    pinsLabel: 'Pins',
+    shadowedBadge: '⚠️ Shadowed by manual combo',
+    copyConfirm: 'This creates a manual combo with the same name and overrides automatic routing for this combo until deleted.',
+    banDone: 'Banned',
+    unbanDone: 'Unbanned',
+    pinDone: 'Pinned',
+    unpinDone: 'Unpinned',
+    unblockDone: 'Cooldown cleared',
     retries: 'Retries',
     comboName: 'Name',
     strategy: 'Strategy',
@@ -614,6 +632,23 @@ var I18N = {
     lblServer: 'خطای سرور provider (5xx).',
     lblUnknown: 'خطای نامشخص.',
     timeoutMs: 'مهلت (ms)',
+    timeoutHelp: 'سقف هر هدف ۱۵٬۰۰۰ میلی‌ثانیه است؛ بودجه‌ی کل نوبت ۲۲٬۰۰۰ میلی‌ثانیه است.',
+    reasonCol: 'دلیل',
+    latencyCol: 'تأخیر میانه',
+    ban: 'مسدود',
+    unban: 'رفع مسدودیت',
+    pinToCombo: 'پین به combo',
+    pinTitle: 'پین مدل به combo',
+    pinHelp: 'combo خودکاری را که این مدل به آن پین می‌شود انتخاب کن. مدل پین‌شده اول امتحان می‌شود، مگر اینکه در کول‌داون باشد.',
+    unblock: 'رفع کول‌داون',
+    pinsLabel: 'پین‌ها',
+    shadowedBadge: '⚠️ زیر سایه‌ی combo دستی',
+    copyConfirm: 'این کار یک combo دستی با همین نام می‌سازد و تا وقتی حذفش نکنی، مسیریابی خودکار این combo را کنار می‌گذارد.',
+    banDone: 'مسدود شد',
+    unbanDone: 'رفع مسدودیت شد',
+    pinDone: 'پین شد',
+    unpinDone: 'پین حذف شد',
+    unblockDone: 'کول‌داون پاک شد',
     retries: 'تلاش مجدد',
     comboName: 'نام',
     strategy: 'استراتژی',
@@ -738,6 +773,7 @@ var lang;
 try { lang = (localStorage.getItem('admin_lang') === 'fa') ? 'fa' : 'en'; } catch (e) { lang = 'en'; }
 var TABS = ['provTab', 'modelsTab', 'combosTab'];
 var CFG = null;
+var OVERRIDES = { pins: {}, bans: [], prefer: {} };
 var CUR_MODELS = [];
 var CUR_PROVIDER = '';
 var ROW_ELS = {};
@@ -1186,7 +1222,7 @@ async function createTemplateCombo(kind) {
     n++;
   }
   var r = await api('POST', '/admin/api/combos', {
-    name: name, kind: kind, strategy: 'priority', timeoutMs: 20000, retries: 0, targets: []
+    name: name, kind: kind, strategy: 'priority', timeoutMs: 13000, retries: 0, targets: []
   }, { quiet: true });
   if (r.data && r.data.ok) {
     toast('[' + name + '] ' + T('templateCreated'), 'okly');
@@ -1200,6 +1236,7 @@ async function boot() {
   var r = await api('GET', '/admin/api/config', undefined, { quiet: true });
   if (r.data && r.data.ok) {
     CFG = r.data;
+    await loadOverrides();
     showApp();
     renderProviders();
     renderCombos();
@@ -1219,11 +1256,19 @@ async function refreshCfg() {
   var r = await api('GET', '/admin/api/config', undefined, { quiet: true });
   if (r.data && r.data.ok) {
     CFG = r.data;
+    await loadOverrides();
     renderProviders();
     renderCombos();
     renderAutoCombos();
     fillProviderSelects();
   }
+}
+
+// Phase 2-d: overrides (pins/bans/prefer) power the auto-combo cards'
+// pin lists; loaded quietly alongside the config.
+async function loadOverrides() {
+  var r = await api('GET', '/admin/api/overrides', undefined, { quiet: true });
+  if (r.data && r.data.ok) OVERRIDES = r.data;
 }
 
 // ── نتیجه‌کارت ──────────────────────────────────────────────────────────────
@@ -1619,6 +1664,18 @@ function renderRows() {
     tdStatus.appendChild(badgeFor(m));
     tr.appendChild(tdStatus);
 
+    // Phase 2-d: cooldown reason (adjacent to the status badge) and
+    // median latency columns from GET /admin/api/models.
+    var tdReason = el('td');
+    tdReason.setAttribute('data-label', T('reasonCol'));
+    tdReason.appendChild(el('span', 'mono', m.status === 'cooldown' && m.cooldownReason ? String(m.cooldownReason) : '—'));
+    tr.appendChild(tdReason);
+
+    var tdLatency = el('td');
+    tdLatency.setAttribute('data-label', T('latencyCol'));
+    tdLatency.appendChild(el('span', 'mono', (m.medianLatencyMs === null || m.medianLatencyMs === undefined) ? '—' : secs(m.medianLatencyMs)));
+    tr.appendChild(tdLatency);
+
     var tdAct = el('td', 'actions-cell');
     tdAct.setAttribute('data-label', T('actions'));
     var act = el('div', 'actions');
@@ -1626,6 +1683,19 @@ function renderRows() {
     var ab = btn(T('addCombo'), function () { openAddToCombo(CUR_PROVIDER, m.id); }, 'sm');
     act.appendChild(bt);
     act.appendChild(ab);
+    // Phase 2-d: per-model Ban/Unban, Pin to combo, and (on cooldown)
+    // Unblock / Clear Cooldown quick actions.
+    var banned = m.status === 'banned';
+    var banB = btn(banned ? T('unban') : T('ban'), function () {
+      if (banned) unbanModel(CUR_PROVIDER, m.id, banB); else banModel(CUR_PROVIDER, m.id, banB);
+    }, 'sm' + (banned ? '' : ' danger'));
+    act.appendChild(banB);
+    var pinB = btn(T('pinToCombo'), function () { openPinDialog(CUR_PROVIDER, m.id); }, 'sm');
+    act.appendChild(pinB);
+    if (m.status === 'cooldown') {
+      var ub = btn(T('unblock'), function () { unblockModel(CUR_PROVIDER, m.id, ub); }, 'sm');
+      act.appendChild(ub);
+    }
     tdAct.appendChild(act);
     tr.appendChild(tdAct);
 
@@ -1636,6 +1706,61 @@ function renderRows() {
   showErr('mErr', n ? '' : T('noModels'));
   updateTestAllLabel();
   refreshBusy();
+}
+
+// Phase 2-d: per-model Ban / Unban / Pin / Unblock quick actions.
+// Ban/Unban/Unblock refresh the model list (status changes); Pin
+// refreshes the config (auto-combo cards show the new pin).
+async function banModel(prov, mid, btnEl) {
+  busy(btnEl, 'saving');
+  var r = await api('POST', '/admin/api/overrides/ban', { target: prov + '/' + mid }, { quiet: true });
+  idle(btnEl);
+  if (r.data && r.data.ok) { toast(T('banDone'), 'okly'); searchModels(); } else toast(r.error || T('loginFail'), 'err');
+}
+async function unbanModel(prov, mid, btnEl) {
+  busy(btnEl, 'saving');
+  var r = await api('DELETE', '/admin/api/overrides/ban', { target: prov + '/' + mid }, { quiet: true });
+  idle(btnEl);
+  if (r.data && r.data.ok) { toast(T('unbanDone'), 'okly'); searchModels(); } else toast(r.error || T('loginFail'), 'err');
+}
+async function unblockModel(prov, mid, btnEl) {
+  busy(btnEl, 'saving');
+  var r = await api('POST', '/admin/api/health/clear', { target: prov + '/' + mid }, { quiet: true });
+  idle(btnEl);
+  if (r.data && r.data.ok) { toast(T('unblockDone'), 'okly'); searchModels(); } else toast(r.error || T('loginFail'), 'err');
+}
+async function unpinModel(combo, target, btnEl) {
+  if (btnEl) busy(btnEl, 'saving');
+  var r = await api('DELETE', '/admin/api/overrides/pin', { combo: combo, target: target }, { quiet: true });
+  if (btnEl) idle(btnEl);
+  if (r.data && r.data.ok) { toast(T('unpinDone'), 'okly'); await refreshCfg(); } else toast(r.error || T('loginFail'), 'err');
+}
+function openPinDialog(prov, model) {
+  var ov = $('ovl');
+  ov.className = 'overlay';
+  ov.textContent = '';
+  var card = el('div', 'card pop');
+  card.appendChild(el('h3', null, T('pinTitle')));
+  card.appendChild(el('div', 'mono lbl', prov + '/' + model));
+  card.appendChild(el('p', 'help', T('pinHelp')));
+  var list = el('div', 'stack');
+  AUTO_COMBOS.forEach(function (name) {
+    var row = el('div', 'line');
+    var b = btn(name, async function () {
+      busy(b, 'saving');
+      var r = await api('POST', '/admin/api/overrides/pin', { combo: name, target: prov + '/' + model }, { quiet: true });
+      idle(b);
+      if (r.data && r.data.ok) { toast(T('pinDone'), 'okly'); closeOverlay(); await refreshCfg(); }
+      else toast(r.error || T('loginFail'), 'err');
+    }, 'sm');
+    row.appendChild(b);
+    list.appendChild(row);
+  });
+  card.appendChild(list);
+  var foot = el('div', 'line');
+  foot.appendChild(btn(T('cancel'), closeOverlay, 'ghost'));
+  card.appendChild(foot);
+  ov.appendChild(card);
 }
 
 function shownModels() {
@@ -1962,7 +2087,7 @@ async function createComboWithTarget(name, kind, prov, model, btnEl) {
     name: name,
     kind: kind || 'custom',
     strategy: 'priority',
-    timeoutMs: 20000,
+    timeoutMs: 13000,
     retries: 0,
     targets: [{ provider: prov, model: model, enabled: true }]
   });
@@ -1991,10 +2116,25 @@ function renderAutoCombos() {
     title.appendChild(el('strong', 'mono', name));
     title.appendChild(el('span', 'badge b-ok', T('autoBadge')));
     title.appendChild(el('span', 'badge b-muted', T(kindKey(AUTO_KINDS[name] || 'custom'))));
-    if (manualExists) title.appendChild(el('span', 'badge b-cool', T('manualCombos')));
+    // Phase 2-d: a manual combo with the same name silently shadows
+    // this auto combo — warn loudly, not with a neutral badge.
+    if (manualExists) title.appendChild(el('span', 'badge b-cool', T('shadowedBadge')));
     head.appendChild(title);
     card.appendChild(head);
     card.appendChild(el('p', 'help', T('autoReadonly')));
+    // Phase 2-d: active pins for this auto combo, each with an unpin ×.
+    var pins = ((OVERRIDES.pins || {})[name] || []);
+    if (pins.length) {
+      var pinLine = el('div', 'line');
+      pinLine.appendChild(el('span', 'lbl', T('pinsLabel') + ':'));
+      pins.forEach(function (t) {
+        var chip = el('span', 'chip', t + ' ');
+        var x = btn('×', function () { unpinModel(name, t, x); }, 'sm');
+        chip.appendChild(x);
+        pinLine.appendChild(chip);
+      });
+      card.appendChild(pinLine);
+    }
     var act = el('div', 'line');
     var b = btn(T('createManualCopy'), function () { createManualCopy(name, b); }, 'sm');
     act.appendChild(b);
@@ -2009,6 +2149,9 @@ async function createManualCopy(name, btnEl) {
     toast(T('copyExists'), 'err');
     return;
   }
+  // Phase 2-d: confirm — a manual copy silently overrides automatic
+  // routing for this combo until deleted.
+  if (!window.confirm(T('copyConfirm'))) return;
   busy(btnEl, 'loading');
   var r = await api('GET', '/admin/api/auto/' + encodeURIComponent(name), undefined, { quiet: true });
   if (!(r.data && r.data.ok)) {
@@ -2026,7 +2169,7 @@ async function createManualCopy(name, btnEl) {
     name: name,
     kind: r.data.kind || AUTO_KINDS[name] || 'custom',
     strategy: 'priority',
-    timeoutMs: 20000,
+    timeoutMs: 13000,
     retries: 0,
     targets: targets
   }, { quiet: true });
@@ -2126,7 +2269,7 @@ function renderCombos() {
     });
     st.value = c.strategy;
     var to = el('input');
-    to.type = 'number'; to.min = '1000'; to.max = '60000'; to.value = c.timeoutMs;
+    to.type = 'number'; to.min = '1000'; to.max = '15000'; to.value = c.timeoutMs;
     var re = el('input');
     re.type = 'number'; re.min = '0'; re.max = '3'; re.value = c.retries || 0;
     opts.appendChild(el('span', 'lbl', T('kindLabel'))); opts.appendChild(kd);
