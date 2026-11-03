@@ -6,7 +6,11 @@ import { getConfig } from "./config.js";
 // طبقه‌بندی شکست در classifyFailure داخل src/router.js تمرکز دارد — اینجا فقط نمایش.
 
 // ثبت شکست بر پایه‌ی همان طبقه‌بندی classifyFailure؛ put هر بار TTL را تازه می‌کند
-// تا شکست‌های تکراری، سردی را طولانی نکنند و همیشه old را هم بخوانیم (صرفه‌جویی نوشتن).
+// تا شکست‌های تکراری هم سردی را تمدید کنند. Phase 2-c: the old
+// `old !== value` guard skipped the put on identical repeat failures,
+// so a repeatedly failing target never refreshed its KV expirationTtl
+// (the audit's glm-5.3-repeat hypothesis) — always put now. No unit
+// test pins skipping duplicate puts, so no test contract is broken.
 export async function markFailure(env, target, classification, reasonText) {
   if (!env.STATE || !classification) return;
   const key =
@@ -18,10 +22,7 @@ export async function markFailure(env, target, classification, reasonText) {
     label: classification.label ?? null,
     reason: String(reasonText ?? "").slice(0, 200),
   });
-  const old = await env.STATE.get(key);
-  if (old !== value) {
-    await env.STATE.put(key, value, { expirationTtl: Math.max(60, classification.cooldownSec) });
-  }
+  await env.STATE.put(key, value, { expirationTtl: Math.max(60, classification.cooldownSec) });
 }
 
 // منع‌های سطح provider — لیست providerها از config می‌آید (داخلی + دستی)
