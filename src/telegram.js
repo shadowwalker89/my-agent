@@ -31,12 +31,35 @@ export async function tgBroadcast(env, text) {
 }
 
 // Phase 1-e Pillar 1: zero-drop progress feedback. Telegram caps a
-// message at 4096 chars; chunks are hard slices (no word-boundary
-// guarantee needed — the caller passes already-safe text).
-export function splitTelegramText(text) {
+// message at 4096 chars. Phase 2-d: chunks split on newline or space
+// boundaries whenever possible within maxLen, so a multi-chunk answer
+// never cuts a Persian word in half; only a single contiguous token
+// longer than maxLen is hard-sliced at maxLen.
+export function splitTelegramText(text, maxLen = 4096) {
   const s = String(text ?? "");
+  const limit = Math.max(1, Math.floor(maxLen) || 4096);
   const chunks = [];
-  for (let i = 0; i < s.length; i += 4096) chunks.push(s.slice(i, i + 4096));
+  let rest = s;
+  while (rest.length > limit) {
+    const window = rest.slice(0, limit);
+    // Prefer a newline break (drop the newline itself); else the last
+    // space in the window (drop one space); else a hard slice.
+    const nl = window.lastIndexOf("\n");
+    if (nl > 0) {
+      chunks.push(rest.slice(0, nl));
+      rest = rest.slice(nl + 1);
+      continue;
+    }
+    const sp = window.lastIndexOf(" ");
+    if (sp > 0) {
+      chunks.push(rest.slice(0, sp));
+      rest = rest.slice(sp + 1);
+      continue;
+    }
+    chunks.push(window);
+    rest = rest.slice(limit);
+  }
+  chunks.push(rest);
   return chunks.length ? chunks : [""];
 }
 
@@ -82,8 +105,14 @@ export async function finalizeProgressMessage(env, chatId, progressMsgId, fullTe
         return;
       }
     } catch {
-      // edit failed: fall through to plain sends below
+      // edit failed: delete the orphan placeholder, then plain sends
     }
+    // Phase 2-d: an edit failure used to leave "⏳ در حال پردازش..."
+    // stranded above the fresh answer. Best-effort delete first; a
+    // failed delete is ignored (the sends below still deliver).
+    try {
+      await tgApi(env, "deleteMessage", { chat_id: chatId, message_id: progressMsgId });
+    } catch {}
   }
   await sendRest(0);
 }

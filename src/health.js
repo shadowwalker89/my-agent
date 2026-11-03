@@ -11,6 +11,11 @@ import { getConfig } from "./config.js";
 // so a repeatedly failing target never refreshed its KV expirationTtl
 // (the audit's glm-5.3-repeat hypothesis) — always put now. No unit
 // test pins skipping duplicate puts, so no test contract is broken.
+// Phase 2-d: the stored value also carries failedAt + ttlSec so the
+// admin models table can show the cooldown reason and the remaining
+// TTL estimate (expiry = failedAt + ttlSec). Old readers only check
+// key existence (isModelHealthy) or parse label/reason, so the extra
+// fields are backward-compatible.
 export async function markFailure(env, target, classification, reasonText) {
   if (!env.STATE || !classification) return;
   const key =
@@ -21,8 +26,42 @@ export async function markFailure(env, target, classification, reasonText) {
     cls: classification.scope,
     label: classification.label ?? null,
     reason: String(reasonText ?? "").slice(0, 200),
+    failedAt: Date.now(),
+    ttlSec: Math.max(60, classification.cooldownSec),
   });
   await env.STATE.put(key, value, { expirationTtl: Math.max(60, classification.cooldownSec) });
+}
+
+// Phase 2-d: parsed cooldown entry for one model, or null when healthy
+// or unparseable. Remaining seconds are estimated from the stored put
+// time + TTL (KV itself exposes no TTL introspection).
+export async function getHealthEntry(env, target) {
+  if (!env.STATE) return null;
+  let raw;
+  try {
+    raw = await env.STATE.get(`health:${target}`);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  let v = null;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    v = null;
+  }
+  if (!v || typeof v !== "object") return { label: null, reason: String(raw).slice(0, 200), failedAt: null, ttlSec: null, remainingSec: null };
+  const failedAt = Number.isFinite(Number(v.failedAt)) ? Number(v.failedAt) : null;
+  const ttlSec = Number.isFinite(Number(v.ttlSec)) ? Number(v.ttlSec) : null;
+  const remainingSec =
+    failedAt !== null && ttlSec !== null ? Math.max(0, Math.round((failedAt + ttlSec * 1000 - Date.now()) / 1000)) : null;
+  return {
+    label: v.label ?? null,
+    reason: v.reason ?? null,
+    failedAt,
+    ttlSec,
+    remainingSec,
+  };
 }
 
 // منع‌های سطح provider — لیست providerها از config می‌آید (داخلی + دستی)
