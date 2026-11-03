@@ -1689,8 +1689,32 @@ export async function resolveInterpCallback(env, o) {
 // reminders re-parsed by parseReminder, expenses ONLY via parseExpense's
 // integer amount into the 10-minute confirm draft. An executed verdict
 // also saves an intent-feedback trace row.
+// Phase 2-c: unambiguous-question rule for the NLU skip above.
+// A message is unambiguous when it starts with a question word
+// (تفاوت / چرا / چطور / چگونه / چیست / چیه) or ends with ? / ؟,
+// AND contains no note/task/reminder/expense/project/summary keyword.
+// The keyword guard keeps questions like "یادداشت‌هام رو چطور ببینم؟"
+// on the NLU path, where they may route to a list instead of chat.
+const NLU_SKIP_QUESTION_PREFIXES = ["تفاوت ", "چرا ", "چطور ", "چگونه ", "چیست", "چیه"];
+const NLU_SKIP_KEYWORDS = ["یادداشت", "تسک", "یادآوری", "یادم بنداز", "زنگ", "هزینه", "خرج", "پروژه", "پوشه", "خلاصه", "جدول"];
+export function isUnambiguousQuestion(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  const startsQ = NLU_SKIP_QUESTION_PREFIXES.some((p) => t.startsWith(p));
+  const endsQ = t.endsWith("?") || t.endsWith("؟");
+  if (!startsQ && !endsQ) return false;
+  return !NLU_SKIP_KEYWORDS.some((k) => t.includes(k));
+}
+
 async function runNluBranch(env, o, ctx) {
   const { userId, text } = o;
+  // Phase 2-c: unambiguous questions skip the NLU entirely — 0 AI.run
+  // calls and no D1 projects query — and fall through to chat, which
+  // is where they always end up anyway. Skipped only when clearly
+  // unambiguous (see isUnambiguousQuestion); anything carrying a
+  // note/task/reminder/expense/project/summary keyword still runs
+  // the NLU, since it might legitimately route to a list or a write.
+  if (isUnambiguousQuestion(text)) return null;
   const now = ctx.now ?? o.nowMs ?? Date.now();
   const pres = await resolveProjects(env, userId);
   const nlu = await classifyIntent(env, text, { projects: (pres.projects || []).map((p) => p.name), pendingAsk: null });
