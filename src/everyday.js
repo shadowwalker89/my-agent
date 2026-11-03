@@ -1,12 +1,12 @@
 // Step 1b-2: everyday wiring (money, notes, reminders, translate,
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
-import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, extractFolderTag, IRAN_OFFSET_MIN } from "./daily.js";
-import { classifyDailyWithModel, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
+import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, extractFolderTag, IRAN_OFFSET_MIN } from "./daily.js";
+import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
 import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
-import { tgApi } from "./telegram.js";
+import { tgApi, sendProgressMessage } from "./telegram.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
 const DRAFT_TTL_SEC = 600;
@@ -19,10 +19,18 @@ export function askText(q) {
 }
 
 // Chat context: last 50 rows plus the 8,000-char cap, oldest dropped first.
+// Phase 1-e Pillar 3: anti-hallucination filter — historical assistant
+// turns that START with a fake confirmation header are skipped, so a
+// hallucinated "stored" message can never be quoted back as fact by a
+// later chat turn (the live 2026-11-03 case: an old fake ✅ note header
+// was repeated to the user as if it had been stored).
 export function buildChatContext(rows) {
   const msgs = (rows || []).filter((r) => r && typeof r.content === "string" && r.content).slice(-50);
   const kept = []; let total = 0;
-  for (let i = msgs.length - 1; i >= 0; i--) { if (total + msgs[i].content.length > CHAT_CONTEXT_CHAR_LIMIT) break; kept.push({ role: msgs[i].role === "assistant" ? "assistant" : "user", content: msgs[i].content }); total += msgs[i].content.length; }
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === "assistant" && (/^✅\s*\*\*یادداشت جدید/.test(msgs[i].content) || /^✅\s*(?:یادداشت|تسک|هزینه)/.test(msgs[i].content) || /^⏰\s*یادآوری/.test(msgs[i].content))) continue;
+    if (total + msgs[i].content.length > CHAT_CONTEXT_CHAR_LIMIT) break; kept.push({ role: msgs[i].role === "assistant" ? "assistant" : "user", content: msgs[i].content }); total += msgs[i].content.length;
+  }
   return kept.reverse();
 }
 
@@ -88,6 +96,16 @@ function askKeyboard(question, id) {
   return question === "expense-or-chat"
     ? [[{ text: "💰 خرج", callback_data: `daily:ask:${id}:expense` }, { text: "💬 چت", callback_data: `daily:ask:${id}:chat` }]]
     : [[{ text: "💰 خرج", callback_data: `daily:ask:${id}:expense` }, { text: "📥 درآمد", callback_data: `daily:ask:${id}:income` }]];
+}
+// Phase 1-e Pillar 3: 1-tap disambiguation for hour-ambiguous asks.
+// Attached EVERY time the bot sends "ساعت را با صبح یا عصر مشخص کن."
+// (rule ask, discharge re-ask, NLU reminder ask, short-token hold), so
+// the user never has to type a daypart. Handled by resolveAskCallback.
+export function hourAmbiguousKeyboard() {
+  return [[{ text: "☀️ صبح", callback_data: "ask:dp:صبح" }, { text: "🌇 عصر", callback_data: "ask:dp:عصر" }], [{ text: "❌ انصراف", callback_data: "ask:cancel" }]];
+}
+async function sendHourAmbiguousAsk(o) {
+  await o.send(askText("hour-ambiguous"), { replyMarkup: { inline_keyboard: hourAmbiguousKeyboard() } });
 }
 // 1-d-1: 1-tap quick-convert buttons for chat replies. The callback
 // handlers (qconv:note:<msgId> / qconv:task:<msgId>) land in 1-d-5;
@@ -319,7 +337,7 @@ async function runDailyBranch(env, o, c, ctx) {
     // pendingBody, so a bare daypart (or time + daypart) follow-up can
     // be resolved deterministically in the rule tier. Other reminder
     // asks keep the old slot shape (question + kind only).
-    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask, c.ask === "hour-ambiguous" ? text : undefined); await o.send(askText(c.ask)); return "handled"; }
+    if (c.ask) { await setPendingAsk(env, userId, askText(c.ask), undefined, c.ask, c.ask === "hour-ambiguous" ? text : undefined); if (c.ask === "hour-ambiguous") await sendHourAmbiguousAsk(o); else await o.send(askText(c.ask)); return "handled"; }
     // 1-d-2: an explicit folder phrase attaches the resolved project
     // (re-classified body must stay a clean reminder, else ignored).
     const tag = await resolveFolderTag(env, userId, text);
@@ -763,8 +781,11 @@ async function renderNoteList(env, userId, { projectName = null, projectId = nul
 // ZERO model calls. Otherwise ONLY the verified rows (Jalali dates,
 // project names) go to the chat combo with no history (history would
 // pollute grounding, as it did for translate), no user-row save (the
-// caller owns the entry, or the tap owns none), and a 1600-token cap
-// (1-d-6: 700 cut a 13-note summary off mid-sentence before its table).
+// caller owns the entry, or the tap owns none), and a 900-token cap
+// (Phase 1-e: 1600 from 1-d-6 lowered back — the 700-token cut that
+// motivated 1600 was a prompt-shape problem, fixed by the 4–5-line +
+// immediate-table instruction; 900 keeps the table intact while leaving
+// headroom inside the 22s router budget).
 // Returns false ONLY on a D1 failure (the branch gates markDaily on it).
 const SUMMARY_SYSTEM = "فقط از روی ردیف‌هایی که در پیام کاربر آمده خلاصه بساز. هیچ ردیفی را اضافه، حذف یا حدس نزن و هیچ دانسته‌ی بیرونی را قاطی نکن؛ تاریخ‌ها و نام پروژه‌ها را دقیقاً همان‌طور که داده شده بنویس. خلاصه حداکثر ۴ تا ۵ خط کوتاه باشد و بلافاصله بعد از آن جدول مارک‌داون با ستون‌های | ردیف | تاریخ | پوشه | خلاصه | بیاید.";
 async function runSummary(env, o, kind, projectId, userId, retryData = null) {
@@ -782,7 +803,14 @@ async function runSummary(env, o, kind, projectId, userId, retryData = null) {
     const whenOf = (iso, label) => { const tp = tehranParts(iso); return tp ? ` (${label}: ${formatJalali(tp.date) || tp.date} ${tp.hhmm})` : ""; };
     return `${i + 1}. ${badge ? `${badge} ` : ""}${row.title}${row.remind_at ? whenOf(row.remind_at, "یادآوری") : ""}${row.due_at ? whenOf(row.due_at, "مهلت") : ""}`;
   }).join("\n");
-  await o.chat(`${kind === "note" ? "یادداشت‌ها" : "تسک‌ها"} (${scope}، ${rows.length} ردیف):\n${lines}`, { systemPrompt: SUMMARY_SYSTEM, saveText: "", noHistory: true, maxTokens: 1600, failureLabel: "خلاصه‌سازی", ...(retryData ? { retryData } : {}) });
+  // Phase 1-e Pillar 1: the ⏳ placeholder goes out BEFORE the model
+  // call (only when the caller carries a chatId — callback and message
+  // paths do; bare mocks do not), and its id rides into o.chat so
+  // answerChatText finalizes that exact message instead of sending a
+  // second one. Without TG_TOKEN this is a silent null (no network).
+  let progressMsgId = null;
+  if (o.chatId != null) progressMsgId = await sendProgressMessage(env, o.chatId, "⏳ در حال آماده‌سازی خلاصه و جدول...");
+  await o.chat(`${kind === "note" ? "یادداشت‌ها" : "تسک‌ها"} (${scope}، ${rows.length} ردیف):\n${lines}`, { systemPrompt: SUMMARY_SYSTEM, saveText: "", noHistory: true, maxTokens: 900, failureLabel: "خلاصه‌سازی", ...(retryData ? { retryData } : {}), ...(progressMsgId != null ? { progressMsgId } : {}) });
   return true;
 }
 
@@ -1627,6 +1655,108 @@ export async function resolveInterpCallback(env, o) {
 // results never reach a model. Returns "handled", "chat" (normal
 // chat/task/dev path), or "chat-direct" (model already said chat for a
 // text message, so the caller answers directly and skips classifyIntent).
+// Phase 1-e Pillar 2: NLU branch. Runs ONLY after deterministic rules
+// returned chat/ask, only when the legacy interpreter is unconfigured
+// but the AI binding exists. Returns "handled" when an intent executed,
+// null when the caller must fall through (chat intent, low confidence,
+// NLU failure, or an unexecutable verdict) — never a drop. Every write
+// is re-validated deterministically: note/task bodies non-empty,
+// projects resolved against real D1 rows (explicit folder phrase wins
+// over the NLU name; a seed fallback has no id and is never attached),
+// reminders re-parsed by parseReminder, expenses ONLY via parseExpense's
+// integer amount into the 10-minute confirm draft. An executed verdict
+// also saves an intent-feedback trace row.
+async function runNluBranch(env, o, ctx) {
+  const { userId, text } = o;
+  const now = ctx.now ?? o.nowMs ?? Date.now();
+  const pres = await resolveProjects(env, userId);
+  const nlu = await classifyIntent(env, text, { projects: (pres.projects || []).map((p) => p.name), pendingAsk: null });
+  if (!nlu.ok || nlu.confidence < 0.75 || nlu.intent === "chat") return null;
+  const trace = async (projectName) => { try { await insertIntentFeedback(env, { userId, text, predictedType: nlu.intent, correctType: nlu.intent, project: projectName ?? null }); } catch {} };
+  const tag = await resolveFolderTag(env, userId, text);
+  const resolveProject = () => {
+    if (tag) return { id: tag.project.id, name: tag.project.name };
+    if (nlu.project && !pres.fallback) {
+      const hit = findProjectByName(pres.projects, nlu.project);
+      if (hit) return { id: hit.id, name: hit.name };
+    }
+    return null;
+  };
+  const viaBranch = async (cc) => { const r = await runDailyBranch(env, o, cc, ctx); return r === "handled" ? "handled" : null; };
+  switch (nlu.intent) {
+    case "note":
+    case "task": {
+      if (!nlu.body || !nlu.body.trim()) return null;
+      const proj = resolveProject();
+      const body = nlu.body.trim();
+      let r;
+      if (nlu.intent === "note") {
+        const pid = proj ? proj.id : await defaultProjectId(env, userId);
+        const pname = proj ? proj.name : null;
+        r = pid === null
+          ? await runDb(env, "INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)", [userId, body, o.source === "voice" ? "voice" : "text", new Date().toISOString()])
+          : await runDb(env, "INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (?, ?, ?, ?, ?)", [userId, body, o.source === "voice" ? "voice" : "text", new Date().toISOString(), pid]);
+        await o.send(r.ok ? `✅ یادداشت ذخیره شد.${pname ? ` [📁 ${pname}]` : ""}` : NOT_SAVED_TEXT);
+        if (r.ok) { await trace(pname); await markDaily(env, o); }
+      } else {
+        r = await insertTask(env, { userId, title: body, projectId: proj ? proj.id : null, source: o.source === "voice" ? "voice" : "text" });
+        await o.send(r.ok ? `✅ تسک ثبت شد.${proj ? ` [📁 ${proj.name}]` : ""}` : NOT_SAVED_TEXT);
+        if (r.ok) { await trace(proj ? proj.name : null); await markDaily(env, o); }
+      }
+      return "handled";
+    }
+    case "reminder": {
+      if (!nlu.body || !nlu.body.trim()) return null;
+      // With an explicit folder phrase, the folder-stripped ORIGINAL
+      // message is the canonical string (it still carries trigger, date,
+      // and hour words for parseReminder); otherwise the canonical
+      // string is built from the NLU fields. Either way parseReminder
+      // — never the model — decides the due time.
+      let canonical;
+      if (tag) canonical = tag.body;
+      else {
+        const datePart = ["امروز", "فردا", "پس‌فردا"].includes(nlu.date_ref) ? nlu.date_ref : "";
+        const timePart = nlu.time_ref ? `ساعت ${nlu.time_ref}${nlu.daypart && ["صبح", "عصر", "شب"].includes(nlu.daypart) ? ` ${nlu.daypart}` : ""}` : "";
+        canonical = `یادم بنداز ${datePart} ${timePart} ${nlu.body.trim()}`.replace(/\s+/g, " ").trim();
+      }
+      const r = parseReminder(canonical, now, canonical);
+      if (r.ask === "hour-ambiguous" || r.ask === "no-time") {
+        await setPendingAsk(env, userId, askText(r.ask), undefined, r.ask, r.ask === "hour-ambiguous" ? canonical : undefined);
+        if (r.ask === "hour-ambiguous") await sendHourAmbiguousAsk(o); else await o.send(askText(r.ask));
+        return "handled";
+      }
+      if (r.ask) return viaBranch({ intent: "reminder", ask: r.ask });
+      const proj = resolveProject();
+      const rr = await insertTask(env, { userId, title: r.text, remindAt: r.due, dueAt: null, projectId: proj ? proj.id : null, source: o.source === "voice" ? "voice" : "text" });
+      await o.send(rr.ok ? `⏰ یادآوری به‌عنوان تسک ذخیره شد.${proj ? ` [📁 ${proj.name}]` : ""}` : NOT_SAVED_TEXT);
+      if (rr.ok) { await trace(proj ? proj.name : null); await markDaily(env, o); }
+      return "handled";
+    }
+    case "expense": {
+      const ex = parseExpense(text, { nowMs: now }, text);
+      if (!ex || ex.error || !Number.isInteger(ex.amount)) return null;
+      await startConfirm(env, o, "expense", ex);
+      return "handled";
+    }
+    case "note_list":
+      return viaBranch({ intent: "note-query", date: null, projectName: nlu.project });
+    case "task_list":
+      return viaBranch({ intent: "task-list" });
+    case "project_list":
+      return viaBranch({ intent: "project-list" });
+    case "project_create": {
+      if (!nlu.body || !nlu.body.trim()) return null;
+      return viaBranch({ intent: "project-create", name: nlu.body.trim() });
+    }
+    case "summary": {
+      const kind = nlu.summary_target === "tasks" ? "task" : "note";
+      return viaBranch({ intent: "summary", kind, projectName: nlu.project });
+    }
+    default:
+      return null;
+  }
+}
+
 export async function handleDailyText(env, o) {
   const { userId, text } = o;
   const now = o.nowMs ?? Date.now();
@@ -1684,15 +1814,55 @@ export async function handleDailyText(env, o) {
   //     the slot and fall through to the normal pipeline below (slot
   //     nulled, so the model branch below cannot re-ask it).
   if (slot && slotKind(slot) === "hour-ambiguous") {
-    if (typeof slot.pendingBody === "string" && slot.pendingBody) {
-      const filled = resolveHourAmbiguousFollowup(text, slot.pendingBody, now);
+    // Phase 1-e Pillar 3: cancel text never reaches free chat — it
+    // clears the slot and confirms, with 0 model calls.
+    if (normalizeDaypartToken(text) === "cancel") {
+      await clearPendingAsk(env, userId);
+      await o.send("❌ یادآوری لغو شد.");
+      await finalizeEntry("daily");
+      return "handled";
+    }
+    // Phase 1-e Pillar 3: a short 1-word token (<= 10 chars, no spaces,
+    // not a question, not a daypart shape, no rule match) is held, not
+    // dumped into chat — but only after the AI interpreter gets its
+    // chance when available: a confident daypart_reply resolves through
+    // the fill below with the canonical daypart word, and any other
+    // confident non-chat verdict discharges the slot into the normal
+    // pipeline (which re-runs the NLU). Longer messages and real
+    // questions skip this block entirely and discharge below.
+    const trimmed = text.trim();
+    const shortUnknown = trimmed.length > 0 && trimmed.length <= 10 && !/\s/.test(trimmed) && !/[؟?]/.test(trimmed) && !hasDaypartReply(text) && c.intent === "chat";
+    let answerText = text;
+    if (shortUnknown && !o.interpreterCallFn && !o.interpreterModel && !env.INTERPRETER_MODEL && env?.AI && typeof env.AI.run === "function") {
+      const pres = await resolveProjects(env, userId);
+      const nlu = await classifyIntent(env, text, { projects: (pres.projects || []).map((p) => p.name), pendingAsk: { kind: "reminder", reason: "hour-ambiguous", pendingBody: slot.pendingBody ?? null } });
+      if (nlu.ok && nlu.confidence >= 0.75 && nlu.intent === "daypart_reply") {
+        if (nlu.daypart === "cancel") {
+          await clearPendingAsk(env, userId);
+          await o.send("❌ یادآوری لغو شد.");
+          await finalizeEntry("daily");
+          return "handled";
+        }
+        if (["صبح", "عصر", "شب"].includes(nlu.daypart)) answerText = nlu.daypart;
+      } else if (nlu.ok && nlu.confidence >= 0.75 && nlu.intent !== "chat") {
+        await clearPendingAsk(env, userId);
+        slot = null;
+      }
+    }
+    if (slot && shortUnknown && answerText === text) {
+      await o.send("متوجه نشدم؛ لطفاً روی یکی از دکمه‌های «☀️ صبح» یا «🌇 عصر» بزنید یا ساعت دقیق را بنویسید.", { replyMarkup: { inline_keyboard: hourAmbiguousKeyboard() } });
+      await finalizeEntry("daily");
+      return "handled";
+    }
+    if (slot && typeof slot.pendingBody === "string" && slot.pendingBody) {
+      const filled = resolveHourAmbiguousFollowup(answerText, slot.pendingBody, now);
       if (filled) { await clearPendingAsk(env, userId); return viaBranch({ intent: "reminder", text: filled.text, due: filled.due }); }
-      const merged = mergeHourAmbiguousFollowup(text, slot.pendingBody);
+      const merged = mergeHourAmbiguousFollowup(answerText, slot.pendingBody);
       if (merged) {
         const r = parseReminder(normalizeText(merged), now, merged);
         if (r.ask === "hour-ambiguous") {
           await setPendingAsk(env, userId, askText("hour-ambiguous"), undefined, "hour-ambiguous", slot.pendingBody);
-          await o.send(askText("hour-ambiguous"));
+          await sendHourAmbiguousAsk(o);
           await finalizeEntry("daily");
           return "handled";
         }
@@ -1700,8 +1870,7 @@ export async function handleDailyText(env, o) {
         return viaBranch(r.ask ? { intent: "reminder", ask: r.ask } : { intent: "reminder", text: r.text, due: r.due });
       }
     }
-    await clearPendingAsk(env, userId);
-    slot = null;
+    if (slot) { await clearPendingAsk(env, userId); slot = null; }
   }
   if (slot) { const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx); console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome })); await finalizeEntry(ret === "handled" ? "daily" : "chat"); return ret; }
   // 1-d-1: interpreter unconfigured -> NO model classifier for UNMATCHED
@@ -1712,7 +1881,16 @@ export async function handleDailyText(env, o) {
   // above (runModelBranch), where a model verdict is only a branch
   // picker re-validated by rule code. Ask-tier messages DID match a
   // deterministic rule (the ask), so they keep the model path below.
+  // Phase 1-e Pillar 2: when the Workers AI binding exists, the NLU
+  // interpreter activates in code (no wrangler.jsonc edit) BEFORE the
+  // plain-chat fallthrough: deterministic rules already ran and said
+  // chat/ask, so the NLU only proposes, and runNluBranch re-validates
+  // every write deterministically. No binding -> the 1-d-1 path below.
   if (!o.interpreterCallFn && !o.interpreterModel && !env.INTERPRETER_MODEL) {
+    if (env?.AI && typeof env.AI.run === "function") {
+      const nluHandled = await runNluBranch(env, o, ctx);
+      if (nluHandled !== null) { await finalizeEntry(nluHandled === "chat" ? "chat" : "daily"); return nluHandled; }
+    }
     if (c.intent === "chat") { await finalizeEntry("chat"); return "chat"; }
     const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx);
     console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome }));
@@ -1761,6 +1939,55 @@ export async function resolveDailyCallback(env, o) {
   const ex = parseExpense(ask.text, { nowMs: o.nowMs ?? Date.now() }, ask.text);
   if (ex?.error) { const q = askText(mapQuestion(ex.error)); await setPendingAsk(env, o.fromId, q, undefined, mapQuestion(ex.error)); await o.send(q); return true; }
   await startConfirm(env, o, choice, ex);
+  return true;
+}
+
+// Phase 1-e Pillar 3: ask: callbacks — the hour-ambiguous buttons.
+// ask:dp:صبح / ask:dp:عصر resolve the pending reminder via
+// resolveHourAmbiguousFollowup on the stored pendingBody (never a new
+// parse of the tap text); ask:cancel clears + confirms. A missing,
+// foreign, or non-hour-ambiguous slot sends EXPIRED_TEXT and clears the
+// buttons, never a silent tap. Project preservation: when pendingBody
+// carries a folder phrase, the fill re-runs on the tag-stripped
+// original so the stored title is clean AND the project attaches.
+export async function resolveAskCallback(env, o) {
+  const dp = /^ask:dp:(.+)$/.exec(o.data);
+  const cancel = o.data === "ask:cancel";
+  if (!dp && !cancel) return false;
+  const slot = await getPendingAsk(env, o.fromId);
+  if (!slot || slotKind(slot) !== "hour-ambiguous" || typeof slot.pendingBody !== "string" || !slot.pendingBody) {
+    if (o.editMarkup) await o.editMarkup();
+    await o.send(EXPIRED_TEXT);
+    return true;
+  }
+  const now = o.nowMs ?? Date.now();
+  await clearPendingAsk(env, o.fromId);
+  if (o.editMarkup) await o.editMarkup();
+  if (cancel) {
+    await o.send("❌ یادآوری لغو شد.");
+    return true;
+  }
+  const daypart = dp[1];
+  const filled = resolveHourAmbiguousFollowup(daypart, slot.pendingBody, now);
+  if (!filled) {
+    const merged = mergeHourAmbiguousFollowup(daypart, slot.pendingBody);
+    if (merged) {
+      const r = parseReminder(normalizeText(merged), now, merged);
+      if (r.ask === "past") { await o.send(askText("past")); return true; }
+      if (r.ask === "hour-ambiguous") { await sendHourAmbiguousAsk(o); await setPendingAsk(env, o.fromId, askText("hour-ambiguous"), undefined, "hour-ambiguous", slot.pendingBody); return true; }
+      if (r.ask) { await o.send(askText(r.ask)); return true; }
+    }
+    await o.send(NOT_SAVED_TEXT);
+    return true;
+  }
+  let body = filled.text, pid = null, pname = null;
+  const tag = await resolveFolderTag(env, o.fromId, slot.pendingBody);
+  if (tag) {
+    const filledClean = resolveHourAmbiguousFollowup(daypart, tag.body, now);
+    if (filledClean) { body = filledClean.text; pid = tag.project.id; pname = tag.project.name; }
+  }
+  const r = await insertTask(env, { userId: o.fromId, title: body, remindAt: filled.due, dueAt: null, projectId: pid, source: "text" });
+  await o.send(r.ok ? `⏰ یادآوری به‌عنوان تسک ذخیره شد.${pname ? ` [📁 ${pname}]` : ""}` : NOT_SAVED_TEXT);
   return true;
 }
 

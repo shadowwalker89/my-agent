@@ -261,7 +261,11 @@ async function tryTarget(env, ctx, model, body, timeoutMs) {
       body: JSON.stringify({ ...body, model }),
     });
   } catch (err) {
-    const isTimeout = err?.reason === "timeout";
+    // Timer aborts surface as AbortError (Workers: abort("timeout")
+    // rejects with a DOMException, not the string reason), so all three
+    // shapes count as a timeout — never an uncaught exception.
+    const isTimeout =
+      err?.reason === "timeout" || err?.name === "AbortError" || err?.name === "TimeoutError";
     return {
       error: {
         target: used,
@@ -315,7 +319,7 @@ export async function runCombo(
   env,
   comboNameOrProviderModel,
   body,
-  { deadlineMs = DEADLINE_MS, perTargetTimeoutMs = PER_TARGET_TIMEOUT_MS, stream = false } = {},
+  { deadlineMs, perTargetTimeoutMs, attemptTimeoutMs: attemptOpt, totalTimeoutMs: totalOpt, stream = false } = {},
 ) {
   const wanted = String(comboNameOrProviderModel);
   const resolved = await resolveRouterTarget(env, wanted);
@@ -337,35 +341,47 @@ export async function runCombo(
     comboName = resolved.name;
   }
 
+  // Phase 1-e Pillar 1: hard wall-clock budgets, always. Per-attempt
+  // timeout defaults to 11s and is capped at 14s; the total deadline
+  // across all targets/retries defaults to 20s and is capped at 22s,
+  // leaving >= 8s before Cloudflare's 30s waitUntil limit. The legacy
+  // deadlineMs / perTargetTimeoutMs knobs keep working as aliases,
+  // capped by the same bounds. A manual combo's old up-to-55s deadline
+  // is capped by the total budget too — that was the silent-death hole.
+  const attemptTimeoutMs = Math.min(attemptOpt ?? perTargetTimeoutMs ?? 11000, 14000);
+  const totalTimeoutMs = Math.min(totalOpt ?? deadlineMs ?? 20000, 22000);
   const started = Date.now();
   const errors = [];
   const maxRetries = manualCfg?.retries ?? 0;
-  const perTargetTimeout = manualCfg?.timeoutMs ?? perTargetTimeoutMs;
+  const perTargetTimeout = manualCfg?.timeoutMs
+    ? Math.min(manualCfg.timeoutMs, attemptTimeoutMs)
+    : attemptTimeoutMs;
   const needsTools = Array.isArray(body?.tools) && body.tools.length > 0;
-  const deadline = manualCfg
-    ? Math.min(55000, Math.max(deadlineMs, perTargetTimeout * (maxRetries + 2)))
-    : deadlineMs;
+  const deadline = totalTimeoutMs;
   // اگر کلید یک provider رد شد (401/403)، بقیه‌ی هدف‌های همان provider در این
   // فراخوانی بی‌خیال می‌شوند — فقط یک پیام «key rejected» برمی‌گردد و provider
   // یک ساعت در health منع می‌شود (markFailure خودش این را ثبت می‌کند).
   const rejectedProviders = new Set();
+  let lastErr = null;
 
   for (const t of targets) {
     if (rejectedProviders.has(t.provider)) continue;
     const usedModel = `${t.provider}/${t.model}`;
     const remaining = deadline - (Date.now() - started);
-    if (remaining <= 0) {
-      errors.push({ target: usedModel, reason: "deadline exceeded" });
+    if (remaining < 1500) {
+      errors.push({ target: usedModel, reason: lastErr || "timeout" });
       break;
     }
 
     if (t.model.startsWith("PLACEHOLDER")) {
       errors.push({ target: usedModel, reason: "placeholder model id" });
+      lastErr = "placeholder model id";
       continue;
     }
     // هدف بدون پشتیبانی ابزار وقتی tools خواسته شده — رد (فقط اگر metadata گویا باشد)
     if (needsTools && t.caps && t.caps.tools === false) {
       errors.push({ target: usedModel, reason: "no tool support" });
+      lastErr = "no tool support";
       continue;
     }
 
@@ -373,6 +389,7 @@ export async function runCombo(
     if (!ctx) ctx = await getProviderCtx(env, t.provider);
     if (!ctx) {
       errors.push({ target: usedModel, reason: "unknown provider" });
+      lastErr = "unknown provider";
       continue;
     }
     if (ctx.enabled === false) continue;
@@ -382,7 +399,13 @@ export async function runCombo(
     let attempt = null;
     let failure = null;
     for (let attemptNo = 0; ; attemptNo++) {
-      attempt = await tryTarget(env, ctx, t.model, body, Math.min(perTargetTimeout, remaining));
+      const rem = deadline - (Date.now() - started);
+      if (rem < 1500) {
+        attempt = { error: { target: usedModel, reason: lastErr || "timeout" }, cause: "timeout" };
+        failure = { isTimeout: true, cls: classifyFailure(null, "", true), cause: "timeout" };
+        break;
+      }
+      attempt = await tryTarget(env, ctx, t.model, body, Math.min(perTargetTimeout, rem));
       if (attempt.skipReason || !attempt.error) break;
       const isTimeout = attempt.cause === "timeout";
       const cls = classifyFailure(
@@ -402,14 +425,17 @@ export async function runCombo(
 
     if (attempt.skipReason) {
       errors.push({ target: usedModel, reason: attempt.skipReason });
+      lastErr = attempt.skipReason;
     } else if (failure) {
       const { isTimeout, cls, cause } = failure;
+      if (isTimeout) console.log(JSON.stringify({ event: "router_timeout", target: usedModel, ms: latencyMs }));
       if (cls.scope === "provider") {
         rejectedProviders.add(t.provider);
         errors.push({
           target: usedModel,
           reason: `provider ${t.provider}: key rejected (${cause})`,
         });
+        lastErr = `provider ${t.provider}: key rejected (${cause})`;
       } else {
         const entry = { target: usedModel };
         if (typeof cause === "number") {
@@ -421,6 +447,7 @@ export async function runCombo(
           entry.reason = truncate(cause);
         }
         errors.push(entry);
+        lastErr = entry.reason;
       }
       if (env.STATE) {
         try {
@@ -447,16 +474,39 @@ export async function runCombo(
         };
       }
       errors.push({ target: usedModel, reason: "no stream body" });
+      lastErr = "no stream body";
       await markFailure(env, usedModel, classifyFailure(null, "", false), "no stream body");
     } else {
       const res = attempt.res;
       let data;
+      // The body read itself must respect the total budget too: a
+      // stalled body stream must not outlive the <= 22s guarantee.
+      const remJson = deadline - (Date.now() - started);
+      if (remJson < 1500) {
+        errors.push({ target: usedModel, reason: lastErr || "timeout" });
+        lastErr = lastErr || "timeout";
+        continue;
+      }
+      let jsonTimer;
       try {
-        data = await res.json();
+        data = await Promise.race([
+          res.json(),
+          new Promise((_, rej) => { jsonTimer = setTimeout(() => rej(new Error("timeout")), remJson); }),
+        ]);
       } catch (err) {
+        if (err && err.message === "timeout") {
+          console.log(JSON.stringify({ event: "router_timeout", target: usedModel, ms: Date.now() - t0 }));
+          errors.push({ target: usedModel, reason: "timeout" });
+          lastErr = "timeout";
+          await markFailure(env, usedModel, classifyFailure(null, "", true), "timeout");
+          continue;
+        }
         errors.push({ target: usedModel, reason: truncate(`bad json: ${err && err.message}`) });
+        lastErr = `bad json: ${err && err.message}`;
         await markFailure(env, usedModel, classifyFailure(null, "", false), "bad json response");
         continue;
+      } finally {
+        if (jsonTimer) clearTimeout(jsonTimer);
       }
 
       const { message } = data?.choices?.[0] ?? {};
@@ -470,6 +520,7 @@ export async function runCombo(
           (Array.isArray(content) && content.length === 0));
       if (empty) {
         errors.push({ target: usedModel, reason: "empty assistant message" });
+        lastErr = "empty assistant message";
         await markFailure(env, usedModel, classifyFailure(null, "", false), "empty assistant message");
         continue;
       }
@@ -538,4 +589,25 @@ export async function directCall(env, providerName, model, body, { timeoutMs = 2
         ? content.map((p) => p?.text ?? "").join("")
         : JSON.stringify(data ?? {});
   return { ok: true, status: attempt.res.status, latencyMs, snippet: redact(text, [key], 200) };
+}
+
+// Phase 1-e Pillar 1: thin directive-shaped wrapper over runCombo.
+// The production paths keep runCombo's established { ok, errors } shape;
+// this wrapper normalizes to { ok, text, model, error } for callers and
+// tests that need the timeout contract directly. Streaming is forced off
+// (a stream has no single text). Timeouts are runCombo's capped budgets.
+export async function callRouter(env, comboNameOrProviderModel, body, opts = {}) {
+  const r = await runCombo(env, comboNameOrProviderModel, body, { ...opts, stream: false });
+  if (r.ok) {
+    const content = r.data?.choices?.[0]?.message?.content;
+    const text =
+      typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content.map((p) => p?.text ?? "").join("")
+          : "";
+    return { ok: true, text, model: r.used ?? null, error: null };
+  }
+  const first = Array.isArray(r.errors) && r.errors.length ? r.errors[0] : null;
+  return { ok: false, text: "", model: null, error: (first?.reason ?? null) || "timeout" };
 }

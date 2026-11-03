@@ -102,12 +102,19 @@ const HOUR_ALTS = "دوازده|یازده|ده|نه|هشت|هفت|شش|پنج|�
 function qualifierNearHour(text, hourEnd) {
   // Qualifiers count only near the hour itself (next few tokens), with
   // Unicode word boundaries, so "شبکه", "عصرانه", "صبحانه" do not qualify.
-  const window = text.slice(hourEnd, hourEnd + 24);
+  // Phase 1-e Pillar 3: typo-tolerant — keyboard-adjacent daypart typos
+  // in the window are canonicalized first, so "ساعت ۳ صبخ" qualifies
+  // as morning with 0 model calls.
+  const window = text.slice(hourEnd, hourEnd + 24)
+    .replace(/(?<!\p{L})(?:بعدازظهر|بعداز ظهر)(?!\p{L})/gu, "بعد از ظهر")
+    .replace(/(?<!\p{L})(?:صبخ|صیح|صبج|صبحی|صب)(?!\p{L})/gu, "صبح")
+    .replace(/(?<!\p{L})(?:عصز|عصذ|عصری)(?!\p{L})/gu, "عصر")
+    .replace(/(?<!\p{L})(?:شبی|شی)(?!\p{L})/gu, "شب");
   if (/(?<!\p{L})بعد از ظهر(?!\p{L})/u.test(window)) return "afternoon";
   if (/(?<!\p{L})عصر(?!\p{L})/u.test(window)) return "evening";
   if (/(?<!\p{L})شب(?!\p{L})/u.test(window)) return "night";
   if (/(?<!\p{L})ظهر(?!\p{L})/u.test(window)) return "noon";
-  if (/(?<!\p{L})(صبح|بامداد)(?!\p{L})/u.test(window)) return "morning";
+  if (/(?<!\p{L})(صبح|بامداد|سحر)(?!\p{L})/u.test(window)) return "morning";
   return null;
 }
 // Hour phrase only: "hour" + number (digits or 1-12 words, where nine
@@ -142,7 +149,7 @@ export function parseReminder(text, nowMs, origText) {
   const collect = (re) => { let mm; while ((mm = re.exec(text)) !== null) ranges.push([mm.index, mm.index + mm[0].length]); };
   collect(new RegExp(REMINDER_TRIGGERS.source, "gu"));
   collect(/پس[\s\u200c]+فردا|فردا|امروز|دیروز/g);
-  collect(new RegExp(`ساعت\\s*(?:[\\d۰-۹٠-٩]{1,2}|${HOUR_ALTS})(?::[\\d۰-۹٠-٩]{1,2})?(?:\\s+و\\s+(?:ربع|نیم))?(?:\\s+(?:بعد از ظهر|صبح|بامداد|ظهر|عصر|شب))?`, "g"));
+  collect(new RegExp(`ساعت\\s*(?:[\\d۰-۹٠-٩]{1,2}|${HOUR_ALTS})(?::[\\d۰-۹٠-٩]{1,2})?(?:\\s+و\\s+(?:ربع|نیم))?(?:\\s+(?:بعد از ظهر|بعدازظهر|بعداز ظهر|صبح|صبخ|صیح|صبج|صب|سحر|صبحی|بامداد|ظهر|عصر|عصز|عصذ|عصری|شب|شی|شبی))?`, "g")); // Phase 1-e: typo daypart forms stripped too, so they never leak into the title
   collect(/و\s+(?:ربع|نیم)/g);
   ranges.sort((a, b) => a[0] - b[0]);
   let body = "", pos = 0;
@@ -176,8 +183,36 @@ export function parseReminder(text, nowMs, origText) {
 // Daypart detection is EXACT-SHAPE (full answer after trim/punct-strip),
 // never substring: a question that merely mentions a daypart word (e.g.
 // "تفاوت صبح و عصر چیه؟") must stay chat, not become a reminder answer.
-const DAYPART_ALT = "بعد از ظهر|بعدازظهر|بعداز ظهر|بامداد|صبح|ظهر|عصر|شب";
-function normalizeDaypartToken(s) { return s === "بعدازظهر" || s === "بعداز ظهر" ? "بعد از ظهر" : s; }
+// Longest-first alternation for the daypart forms (full word before its
+// prefix: صبح before صب, عصری after عصر is rescued by the $ anchors
+// in the consuming regexes). Cancel words are NOT dayparts — they never
+// belong in a time expression — and live only in the token map below.
+const DAYPART_ALT = "بعد از ظهر|بعدازظهر|بعداز ظهر|بامداد|صبح|صبخ|صیح|صبج|صب|سحر|صبحی|ظهر|عصر|عصز|عصذ|عصری|شب|شی|شبی";
+// Phase 1-e Pillar 3: typo/phrase map for daypart tokens. A raw token is
+// trimmed of trailing punctuation, "واسه/برای X" phrases collapse to X,
+// then the map yields the canonical token (صبح/عصر/شب/cancel) or null.
+// Used by parseDaypartReply, parseHour's qualifier window (indirectly,
+// via DAYPART_ALT + qualifierNearHour), and resolveHourAmbiguousFollowup.
+const DAYPART_TOKEN_MAP = {
+  صبح: ["صبح", "صبخ", "صیح", "صبج", "صب", "بامداد", "سحر", "صبحی"],
+  عصر: ["عصر", "عصز", "عصذ", "عصری", "ظهر", "بعدازظهر", "بعد از ظهر", "بعداز ظهر"],
+  شب: ["شب", "شی", "شبی"],
+  cancel: ["لغو", "انصراف", "کنسل", "بیخیال", "هیچی"],
+};
+const DAYPART_LOOKUP = {};
+for (const [canon, forms] of Object.entries(DAYPART_TOKEN_MAP)) {
+  for (const f of forms) DAYPART_LOOKUP[f] = canon;
+}
+export function normalizeDaypartToken(raw) {
+  const t = normalizeDigits(normalizeText(raw ?? ""))
+    .trim()
+    .replace(/[؟?!.،,:：\s]+$/u, "");
+  if (!t) return null;
+  if (Object.hasOwn(DAYPART_LOOKUP, t)) return DAYPART_LOOKUP[t];
+  const core = t.replace(/^(?:واسه|برای)\s+/u, "");
+  if (core !== t && Object.hasOwn(DAYPART_LOOKUP, core)) return DAYPART_LOOKUP[core];
+  return null;
+}
 export function parseDaypartReply(answer) {
   const ans = normalizeDigits(normalizeText(answer ?? "")).trim().replace(/[؟?!.،,:：\s]+$/u, "");
   if (!ans) return null;
@@ -443,6 +478,16 @@ export function classifyDaily(text, opts = {}) {
   // stripped reading falls through to the normal checks below.
   const mid = stripMiddleFolderTag(text);
   if (mid) { const c2 = classifyDaily(mid.body, opts); if (c2.intent === "note" || c2.intent === "task-create" || c2.intent === "reminder") return c2; }
+  // Phase 1-e Pillar 2: deterministic natural note forms without a
+  // colon (0 model calls). Placed BEFORE NOTE_RE so the "که" particle
+  // is stripped from the body (NOTE_RE would keep it) and a stray
+  // colon after کن is dropped; the (?!\p{L}) guard keeps words like
+  // کهکشان intact. A trigger with no body still falls through to the
+  // bare-note ask below.
+  for (const re of [/^(?:اینو\s+)?یادداشت\s+کن(?:\s+که(?!\p{L}))?\s*:?\s*([\s\S]+)$/ud, /^بنویس(?:\s+توی\s+یادداشت\s*های?م)?\s+([\s\S]+)$/ud]) {
+    const m = re.exec(raw);
+    if (m && m[1].trim().replace(/[؟?!.،,:：\s]+/gu, "")) return { intent: "note", confidence: 1, text: text.slice(m.indices[1][0], m.indices[1][1]).trim() };
+  }
   const note = NOTE_RE.exec(raw); if (note && note[1].trim().replace(/[؟?!.،,:：\s]+/gu, "")) return { intent: "note", confidence: 1, text: text.slice(note.index + note[0].length - note[1].length).trim() };
   // Bare note: only a note trigger, no body. Ask for the text at rule
   // level instead of falling through to chat, where the live model
@@ -465,6 +510,13 @@ export function classifyDaily(text, opts = {}) {
     if (m) { const name = stripPunct(text.slice(m.indices[1][0], m.indices[1][1])); if (name) return { intent: "project-create", confidence: 1, name }; }
   }
   if (/^(?:پروژه\s+ها\s*(?:م|یم|ی\s+من|من)?|پروژه\s+هام|لیست\s+پروژه\s+ها|فهرست\s+پروژه\s+ها)\s*[؟?!.،,]*$/u.test(raw)) return { intent: "project-list", confidence: 1 };
+  // Phase 1-e Pillar 2: deterministic natural task forms without a
+  // colon ("یه تسک بذار ...", "تسک ثبت کن که ..."). Placed before the
+  // colon-prefix loop; colon forms still match through the :? tail.
+  {
+    const m = /^(?:یه\s+)?تسک\s+(?:جدید\s+)?(?:ثبت\s+کن|بذار|اضافه\s+کن)(?:\s+که(?!\p{L})|\s+برای(?!\p{L}))?\s*:?\s*([\s\S]+)$/ud.exec(raw);
+    if (m && m[1].trim().replace(/[؟?!.،,:：\s]+/gu, "")) return { intent: "task-create", confidence: 1, text: text.slice(m.indices[1][0], m.indices[1][1]).trim() };
+  }
   for (const re of [/^تسک\s*[:：]\s*(.+)$/ud, /^تسک جدید\s*[:：]\s*(.+)$/ud, /^تسک ثبت کن\s*[:：]\s*(.+)$/ud, /^به تسک\s*هامو?\s+اضافه کن\s*[:：]\s*(.+)$/ud]) {
     const m = re.exec(raw);
     if (m) { const body = text.slice(m.indices[1][0], m.indices[1][1]).trim(); if (body) return { intent: "task-create", confidence: 1, text: body }; }
@@ -536,6 +588,18 @@ export function classifyDaily(text, opts = {}) {
   if (amount?.error === "unknown-number") return { intent: "chat", confidence: 1 }; // no verb: a bare-thousand statement is chat, not an amount question
   if (TASK_LIST_RE.test(raw)) return { intent: "task-list", confidence: 1 };
   const sq = parseSummaryQuery(raw); if (sq) return sq;
+  // Phase 1-e Pillar 2: flexible summary phrasings without a trailing
+  // "خلاصه/جدول کن" verb ("یه خلاصه از یادداشت‌هام بده"). NOTE-ONLY
+  // by design: 1-d-4 deliberately excludes bare task forms from
+  // summaries ("تسک‌هام رو جدول کن" stays a task list — task summaries
+  // require the strict project forms), and the directive's flexible
+  // examples are note forms, so nothing here overrides that pin.
+  // The strict parseSummaryQuery above keeps precedence for exact
+  // forms, and the file-reference check below still wins for short
+  // messages without a یادداشت word.
+  if (/(?:خلاصه|جدول)/.test(raw) && raw.search(/یادداشت/) >= 0) {
+    return { intent: "summary", confidence: 1, kind: "note", projectName: null };
+  }
   const nq = parseNoteQuery(raw, now); if (nq) return nq;
   if (FILE_RE.test(raw)) {
     // File reference only for a short message with no accompanying text:

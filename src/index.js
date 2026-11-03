@@ -21,12 +21,12 @@ import {
   setPrefer,
   validatePattern,
 } from "./overrides.js";
-import { tgApi, tgSend, tgBroadcast } from "./telegram.js";
+import { tgApi, tgSend, tgBroadcast, sendProgressMessage, finalizeProgressMessage } from "./telegram.js";
 import { healthCounts } from "./health.js";
 import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation } from "./intent.js";
 import { getChatContext } from "./memory.js";
-import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, chatFailureNotice, runReminderTick, quickConvertKeyboard } from "./everyday.js";
+import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, chatFailureNotice, runReminderTick, quickConvertKeyboard } from "./everyday.js";
 import { handleVoice, handleVoiceRetry } from "./voice.js";
 import { saveMessage } from "./db.js";
 import {
@@ -185,8 +185,16 @@ async function comboUsable(env, name) {
   }
 }
 
-async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
+// Phase 1-e: exported for the offline simulation suite (no behavior
+// change — production still calls it through handlePlainText).
+export async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
   await tgApi(env, "sendChatAction", { chat_id: chatId, action: "typing" });
+  // Phase 1-e Pillar 1: the ⏳ placeholder goes out FIRST (or is reused
+  // when the caller already sent one, e.g. runSummary), and every
+  // delivery below finalizes that exact message instead of sending a
+  // second one. Without TG_TOKEN this is a silent no-op (null id).
+  let progressMsgId = opts.progressMsgId ?? null;
+  if (progressMsgId == null) progressMsgId = await sendProgressMessage(env, chatId);
 
   const prefs = await getPrefs(env, userId);
   const task = classifyTask(text, { hasImage: hasImage === true });
@@ -221,15 +229,24 @@ async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
   const autoPick = prefs.auto !== false && combo === task;
   const fallback = fallbackCombo(def, combo);
 
-  let result = await runCombo(env, combo, body, { deadlineMs: 25000 });
+  // Phase 1-e Pillar 1: ONE shared 20s budget across primary + fallback
+  // (the old two sequential 25s calls could run ~50s and die silently
+  // at Cloudflare's 30s waitUntil limit). The fallback only runs when
+  // >= 1500ms of budget remains; runCombo caps each attempt at 14s and
+  // the total at 22s, so this whole block always finishes in <= 22s.
+  const chatBudgetStart = Date.now();
+  const CHAT_TOTAL_BUDGET_MS = 20000;
+  let result = await runCombo(env, combo, body, { totalTimeoutMs: CHAT_TOTAL_BUDGET_MS });
   let usedCombo = combo;
   let routed = autoPick ? "auto" : "manual";
   if (!result.ok && fallback && fallback !== usedCombo) {
-    // جایگزینِ تنها — بدون حلقه
-    console.warn(`[tg] combo ${usedCombo} failed -> fallback ${fallback}`);
-    routed = "manual";
-    usedCombo = fallback;
-    result = await runCombo(env, fallback, body, { deadlineMs: 25000 });
+    const remaining = CHAT_TOTAL_BUDGET_MS - (Date.now() - chatBudgetStart);
+    if (remaining >= 1500) {
+      console.warn(`[tg] combo ${usedCombo} failed -> fallback ${fallback}`);
+      routed = "manual";
+      usedCombo = fallback;
+      result = await runCombo(env, fallback, body, { totalTimeoutMs: remaining });
+    }
   }
 
   if (!result.ok) {
@@ -243,7 +260,7 @@ async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
     // the handleDailyText chat wrap). A voice turn still shows what was
     // heard, because the notice IS the bot's response.
     const notice = chatFailureNotice(opts.failureLabel || "چت", lines, opts);
-    await tgSend(env, chatId, (opts.voiceHeader || "") + notice.text, notice.replyMarkup ? { replyMarkup: notice.replyMarkup } : undefined);
+    await finalizeProgressMessage(env, chatId, progressMsgId, (opts.voiceHeader || "") + notice.text, notice.replyMarkup ? { replyMarkup: notice.replyMarkup } : {});
     console.log(JSON.stringify({ combo: usedCombo, used: null, routed }));
     return; // failed turn stores nothing, neither side
   }
@@ -259,7 +276,7 @@ async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
     // 1-d-5: an empty answer is a pipeline failure too — it gets the
     // same stage notice (with the same buttons), never a silent drop.
     const notice = chatFailureNotice(opts.failureLabel || "چت", "پاسخ خالی بود.", opts);
-    await tgSend(env, chatId, (opts.voiceHeader || "") + notice.text, notice.replyMarkup ? { replyMarkup: notice.replyMarkup } : undefined);
+    await finalizeProgressMessage(env, chatId, progressMsgId, (opts.voiceHeader || "") + notice.text, notice.replyMarkup ? { replyMarkup: notice.replyMarkup } : {});
     console.log(JSON.stringify({ combo: usedCombo, used: result.used ?? null, routed }));
     return; // empty turn stores nothing either
   }
@@ -277,10 +294,9 @@ async function answerChatText(env, chatId, userId, text, hasImage, opts = {}) {
   // (mirroring sendListMessage), so multi-chunk answers keep one button row.
   // 1-d-5: a voice header prepends to the answer BEFORE chunking, so it
   // rides the first chunk only (later chunks stay clean).
-  const chunks = splitMessage((opts.voiceHeader || "") + answer);
-  for (let i = 0; i < chunks.length; i++) {
-    await tgSend(env, chatId, chunks[i], i === chunks.length - 1 && opts.replyMarkup ? { replyMarkup: opts.replyMarkup } : undefined);
-  }
+  // Phase 1-e Pillar 1: the answer finalizes the ⏳ placeholder (edit
+  // the first chunk in place, send the rest) instead of sending anew.
+  await finalizeProgressMessage(env, chatId, progressMsgId, (opts.voiceHeader || "") + answer, opts.replyMarkup ? { replyMarkup: opts.replyMarkup } : {});
 }
 
 const HELP_TEXT =
@@ -753,6 +769,15 @@ async function handleCallbackQuery(env, cb) {
 
   if (data.startsWith("daily:")) {
     await resolveDailyCallback(env, { fromId, chatId, data, ...dailySenders(env, chatId, cb?.message?.message_id),
+      chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
+    return;
+  }
+  // Phase 1-e Pillar 3: hour-ambiguous disambiguation buttons
+  // (ask:dp:صبح / ask:dp:عصر / ask:cancel) on the "ساعت را با صبح یا
+  // عصر مشخص کن." ask. Ownership is re-checked inside via the
+  // user-scoped pending-ask read; the allow-list gate already ran.
+  if (data.startsWith("ask:")) {
+    await resolveAskCallback(env, { fromId, chatId, data, nowMs: Date.now(), ...dailySenders(env, chatId, cb?.message?.message_id),
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
     return;
   }
@@ -1688,6 +1713,14 @@ async function route(request, env, ctx) {
           await handleUpdate(env, update);
         } catch (err) {
           console.error("handleUpdate failed:", err && err.message);
+          // Phase 1-e Pillar 1: top-level safety net — an unhandled
+          // exception must never mean a silent drop. The fallback is
+          // best-effort (its own try/catch) and never throws into the
+          // webhook response, which already returned 200.
+          try {
+            const chatId = update?.message?.chat?.id ?? update?.callback_query?.message?.chat?.id ?? update?.callback_query?.from?.id ?? null;
+            if (chatId) await tgSend(env, chatId, "❌ خطای غیرمنتظره در پردازش پیام رخ داد. لطفاً دوباره تلاش کنید.");
+          } catch {}
         }
       })(),
     );
