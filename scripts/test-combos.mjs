@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { RULES, pickModels, diversify, WEIGHTS } from "../src/combos.js";
 import { mapNvidia, mapXkiro, mapOpenRouter } from "../src/providers.js";
-import { classifyFailure, sortForStrategy, normalizeOpenAiChat, runCombo, resetRouterHealthForTests } from "../src/router.js";
+import { classifyFailure, sortForStrategy, normalizeOpenAiChat, runCombo, resetRouterHealthForTests, getEmptyFinalCounts, resetEmptyFinalCountsForTests } from "../src/router.js";
 import {
   getConfig,
   upsertProvider,
@@ -1458,6 +1458,75 @@ for (const [label, status] of [["429", 429], ["5xx", 500]]) {
   const vc = j.data.find((m) => m.id === "combo/vc");
   check(vc.owned_by === "router" && vc.object === "model", `owned_by router: ${JSON.stringify(vc)}`);
   check(!JSON.stringify(j).includes(ROUTER_KEY_3G) && !JSON.stringify(j).includes(env.TG_TOKEN), "هیچ رازی در models نباید بیاید");
+}
+
+// 12a) Phase 2-f: in-combo empty-final failover (opt-in, Telegram-only)
+{
+  const msg = (m) => ({ choices: [{ message: m, finish_reason: "stop" }] });
+  const resp = (m) => new Response(JSON.stringify(msg(m)), { status: 200, headers: { "content-type": "application/json" } });
+  // (1a) requireFinalText: true — #1 content:null + reasoning, #2
+  // unclosed <think> only, #3 final: answer from #3, tried lists both.
+  {
+    resetRouterHealthForTests(); resetEmptyFinalCountsForTests();
+    const env = v1Env();
+    await seedV1(env, [v1Target("m1"), v1Target("m2"), v1Target("m3")]);
+    const mock = mockUpstreamQueue([
+      resp({ content: null, reasoning_content: "reasoning one" }),
+      resp({ content: "<think>truncated" }),
+      resp({ content: "• خلاصه آماده است" }),
+    ]);
+    let r;
+    try { r = await runCombo(env, "vc", { messages: [{ role: "user", content: "hi" }] }, { requireFinalText: true }); }
+    finally { mock.restore(); }
+    check(r.ok === true && r.used === "gwprov/m3" && r.answerMeta?.finalText === "• خلاصه آماده است" && Array.isArray(r.tried) && r.tried.includes("gwprov/m1: empty_response") && r.tried.includes("gwprov/m2: empty_response") && mock.calls.length === 3, `2-f: requireFinalText fails over inside the combo to #3 (tried=${JSON.stringify(r.tried)})`);
+    const h1 = await env.STATE.get("health:gwprov/m1", "json");
+    check(h1?.label === "empty_response" && h1?.ttlSec === 900, "2-f: empty_response cools via markFailure in the transient-5xx family (model scope, 900s — never a ban)");
+    check(getEmptyFinalCounts().get("gwprov/m1") === 1 && getEmptyFinalCounts().get("gwprov/m2") === 1, "2-f: Empty-final counter increments per empty_response target");
+  }
+  // (1b) default (false) — the identical queue returns at #1, proving
+  // /v1 behaviour is untouched by the opt-in flag.
+  {
+    resetRouterHealthForTests(); resetEmptyFinalCountsForTests();
+    const env = v1Env();
+    await seedV1(env, [v1Target("m1"), v1Target("m2"), v1Target("m3")]);
+    const mock = mockUpstreamQueue([
+      resp({ content: null, reasoning_content: "reasoning one" }),
+      resp({ content: "<think>truncated" }),
+      resp({ content: "• خلاصه آماده است" }),
+    ]);
+    let r;
+    try { r = await runCombo(env, "vc", { messages: [{ role: "user", content: "hi" }] }, {}); }
+    finally { mock.restore(); }
+    check(r.ok === true && r.used === "gwprov/m1" && mock.calls.length === 1, "2-f: default (requireFinalText false) returns at #1, proving /v1 behaviour unchanged");
+  }
+  // (3) tool-call-only with requireFinalText: true — NOT treated as empty.
+  {
+    resetRouterHealthForTests();
+    const env = v1Env();
+    await seedV1(env, [v1Target("m1")]);
+    const mock = mockUpstreamQueue([
+      resp({ content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "f", arguments: "{}" } }] }),
+    ]);
+    let r;
+    try { r = await runCombo(env, "vc", { messages: [{ role: "user", content: "hi" }] }, { requireFinalText: true }); }
+    finally { mock.restore(); }
+    check(r.ok === true && r.used === "gwprov/m1" && r.answerMeta?.toolCalls === true && (r.tried ?? []).length === 0, "2-f: tool-call-only with requireFinalText returns successfully, never treated as empty");
+  }
+  // (4) budget floor: total 1400ms — after the first empty_response,
+  // remaining (< 1500ms) stops the loop with a budget-floor entry and
+  // no second fetch (the queue throws on any unexpected call).
+  {
+    resetRouterHealthForTests();
+    const env = v1Env();
+    await seedV1(env, [v1Target("m1"), v1Target("m2"), v1Target("m3")]);
+    const mock = mockUpstreamQueue([
+      resp({ content: null, reasoning_content: "reasoning one" }),
+    ]);
+    let r;
+    try { r = await runCombo(env, "vc", { messages: [{ role: "user", content: "hi" }] }, { requireFinalText: true, totalTimeoutMs: 1400 }); }
+    finally { mock.restore(); }
+    check(r.ok === false && mock.calls.length === 1 && r.errors.some((e) => e.reason === "empty_response") && r.errors.some((e) => e.reason === "budget floor"), `2-f: budget floor stops mid-failover below 1500ms with a budget-floor entry, no further fetch (errors=${JSON.stringify(r.errors)})`);
+  }
 }
 
 // 12) runCombo مستقیم با نام ساده‌ی combo دستی (رفتار سازگار تلگرام)
