@@ -43,10 +43,10 @@ import {
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
 import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, resolveProjectName, matchKnownProjectAt, parseNoteQuery, parseSummaryQuery, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, stripMiddleFolderTag, normalizeDaypartToken } from "../src/daily.js";
-import { callRouter, runCombo, resetRouterHealthForTests, getRouterHealthSnapshotForTests, extractAssistantText } from "../src/router.js";
+import { callRouter, runCombo, resetRouterHealthForTests, getRouterHealthSnapshotForTests, extractAssistantText, getComboTargets, classifyFailure } from "../src/router.js";
 import { PROVIDERS } from "../src/providers.js";
 import { sendProgressMessage, finalizeProgressMessage, splitTelegramText } from "../src/telegram.js";
-import { answerChatText } from "../src/index.js";
+import { answerChatText, adminApi, handleUpdate, resetSeenUpdateIdsForTests } from "../src/index.js";
 import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
 import { buildInterpreterPrompt, parseInterpreterOutput, interpretText, callInterpreterModel, validateAmountText, validateDateTexts, matchProject, validateInterpreterAction, INTERPRETER_MAX_ACTIONS } from "../src/interpreter.js";
 import { scoreEvalResults, mapOutcome, scoreSlots, runCaseEvaluation, iranNowIso, median } from "../scripts/eval-intent.mjs";
@@ -290,9 +290,15 @@ async function sendTg(env, update) {
   await Promise.all(pending);
 }
 
+// Phase 2-d: webhook updates carry globally unique, increasing ids in
+// production, so the factories allocate a fresh id per update (the old
+// fixed 1/2 collided with handleUpdate's update_id dedup: after the
+// first scenario, every later scenario was ignored as a redelivery).
+// No test posts the same update twice, so no assertion changes.
+let nextTestUpdateId = 100000;
 function msgUpdate(text, userId = 4242) {
   return {
-    update_id: 1,
+    update_id: nextTestUpdateId++,
     message: {
       message_id: 10,
       date: Math.floor(Date.now() / 1000),
@@ -305,7 +311,7 @@ function msgUpdate(text, userId = 4242) {
 
 function cbUpdate(data, userId = 4242) {
   return {
-    update_id: 2,
+    update_id: nextTestUpdateId++,
     callback_query: {
       id: "cb-1",
       from: { id: userId, is_bot: false, first_name: "T" },
@@ -1145,7 +1151,8 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion } from "../src/everyday.js";
+import { markFailure, isModelHealthy } from "../src/health.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
   check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
@@ -5143,7 +5150,7 @@ if (DatabaseSync) {
       }
     } finally { global.fetch = prev; }
   }
-  // Circuit breaker + fast 6s default timeout (Pillar C.2, A.2/A.3).
+    // Circuit breaker + 13s default timeout (Pillar C.2, A.2/A.3; 2-c raised 6s to 13s).
   {
     resetRouterHealthForTests();
     const attempts = [];
@@ -5185,7 +5192,7 @@ if (DatabaseSync) {
       const r4 = await runCombo(await mkEnv(), "cbtest", body, {});
       check(r4.ok === true && attempts.join(",") === "xkiro/dead-503,xkiro/good", "2-b: resetRouterHealthForTests restores original order");
     } finally { global.fetch = prev; }
-    // Default per-attempt timeout is 6s (no explicit timeout option).
+    // Default per-attempt timeout is 13s (no explicit timeout option).
     const hungFetch = async (url, init = {}) => new Promise((_, rej) => { init.signal?.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))); });
     const prev2 = global.fetch;
     try {
@@ -5194,7 +5201,7 @@ if (DatabaseSync) {
       const t0 = Date.now();
       const r = await callRouter(env, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, {});
       const elapsed = Date.now() - t0;
-      check(r.ok === false && r.error === "timeout" && elapsed >= 5000 && elapsed < 20000, `2-b: default per-attempt timeout is ~6s (elapsed ${elapsed}ms)`);
+      check(r.ok === false && r.error === "timeout" && elapsed >= 5000 && elapsed < 20000, `2-d: default per-attempt timeout is ~13s (within [5s, 20s) window) (elapsed ${elapsed}ms)`);
     } finally { global.fetch = prev2; }
   }
   // Reasoning-model fix through callRouter + runCombo (Pillar C.3).
@@ -5315,6 +5322,139 @@ if (DatabaseSync) {
     const s = mkS6();
     const r = await handleDailyText(env, { chatId: 1, userId: 1, text: "تفاوت Cloudflare D1 و KV چیه؟", send: s.send, chat: s.chat, nowMs: MORNING });
     check(r === "chat" && aiCalls === 0, "2-c: unambiguous question skips classifyIntentNlu (0 AI.run calls) and goes straight to chat");
+  }
+
+  // ── Phase 2-d: admin overrides API, safe pinning, compact keyboards,
+  // stray-dot strip, line-aware split, update_id dedup ──
+  // (a) /admin/api/overrides pin/ban validation + /admin/api/health/clear.
+  {
+    const kv = fakeKV();
+    await kv.put("catalog:xkiro", JSON.stringify({ models: [{ id: "qwen3-32b", provider: "xkiro", context: 131072 }] }));
+    const env = { STATE: kv };
+    const call = async (method, pathname, body, url = null) => {
+      const req = { method, url: url ?? `http://x${pathname}`, json: async () => body };
+      const res = await adminApi(req, env, method, pathname);
+      return { status: res.status, data: await res.json() };
+    };
+    const badPin = await call("POST", "/admin/api/overrides/pin", { combo: "chat", target: "xkiro/no-such-model" });
+    check(badPin.status === 400 && /unknown model/.test(badPin.data.error ?? ""), "2-d: pin of an unknown catalog model is rejected with 400, never silently dropped");
+    const goodPin = await call("POST", "/admin/api/overrides/pin", { combo: "chat", target: "xkiro/qwen3-32b" });
+    check(goodPin.status === 200 && (goodPin.data.pins?.chat ?? []).includes("xkiro/qwen3-32b"), "2-d: pin of a catalog model stores in overrides:v1");
+    const ov = await call("GET", "/admin/api/overrides", null);
+    check(ov.status === 200 && (ov.data.pins?.chat ?? []).includes("xkiro/qwen3-32b") && Array.isArray(ov.data.bans) && Array.isArray(ov.data.providerBlocks), "2-d: GET /admin/api/overrides returns pins + bans + prefer + provider blocks");
+    const ban = await call("POST", "/admin/api/overrides/ban", { target: "xkiro/qwen3-32b" });
+    check(ban.status === 200 && ban.data.bans.includes("xkiro/qwen3-32b"), "2-d: ban stores in overrides:v1");
+    const unban = await call("DELETE", "/admin/api/overrides/ban", { target: "xkiro/qwen3-32b" });
+    check(unban.status === 200 && !unban.data.bans.includes("xkiro/qwen3-32b"), "2-d: unban removes from overrides:v1");
+    await markFailure(env, "xkiro/qwen3-32b", classifyFailure(null, "", true), "timeout");
+    check((await isModelHealthy(env, "xkiro/qwen3-32b")) === false, "2-d: seeded timeout cooldown marks the model unhealthy");
+    const cleared = await call("POST", "/admin/api/health/clear", { target: "xkiro/qwen3-32b" });
+    check(cleared.status === 200 && cleared.data.cleared.includes("health:xkiro/qwen3-32b") && (await isModelHealthy(env, "xkiro/qwen3-32b")) === true, "2-d: POST /admin/api/health/clear deletes the KV cooldown");
+    const entry = await call("GET", "/admin/api/models", null, "http://x/admin/api/models?provider=xkiro");
+    const row = (entry.data.models ?? []).find((m) => m.id === "qwen3-32b");
+    check(entry.status === 200 && row?.status === "ok" && row?.medianLatencyMs === null, "2-d: GET /admin/api/models carries status + cooldownReason + medianLatencyMs fields");
+  }
+  // (b) KV-cooling pinned models do not block healthy targets; previews
+  // do not advance the round-robin pointer.
+  {
+    const kv = fakeKV();
+    await kv.put("catalog:xkiro", JSON.stringify({ models: [
+      { id: "cool-model", provider: "xkiro", context: 131072 },
+      { id: "fresh-model", provider: "xkiro", context: 131072 },
+    ] }));
+    await kv.put("overrides:v1", JSON.stringify({ pins: { chat: ["xkiro/cool-model"] }, bans: [], prefer: {} }));
+    const env = { STATE: kv };
+    await markFailure(env, "xkiro/cool-model", classifyFailure(null, "", true), "timeout");
+    const sel = await getComboTargets(env, "chat");
+    const order = (sel.targets ?? []).map((t) => `${t.provider}/${t.model}`);
+    const coolIdx = order.indexOf("xkiro/cool-model");
+    const freshIdx = order.indexOf("xkiro/fresh-model");
+    check(!sel.error && freshIdx !== -1 && coolIdx !== -1 && freshIdx < coolIdx && sel.targets[coolIdx].pinned === true, "2-d: KV-cooling pin is demoted after healthy targets, still marked pinned");
+    await kv.put("config:v1", JSON.stringify({ providers: [], combos: [{ name: "rrtest", strategy: "round-robin", timeoutMs: 13000, retries: 0, targets: [{ provider: "xkiro", model: "a", enabled: true }, { provider: "xkiro", model: "b", enabled: true }] }] }));
+    const p1 = await getComboTargets(env, "rrtest", { preview: true });
+    const p2 = await getComboTargets(env, "rrtest", { preview: true });
+    check((await kv.get("rr:rrtest")) === null && p1.targets.map((t) => t.model).join(",") === "a,b" && p2.targets.map((t) => t.model).join(",") === "a,b", "2-d: preview getComboTargets does not advance rr:<combo>");
+    const r1 = await getComboTargets(env, "rrtest");
+    const r2 = await getComboTargets(env, "rrtest");
+    check((await kv.get("rr:rrtest")) === "0" && r1.targets.map((t) => t.model).join(",") === "a,b" && r2.targets.map((t) => t.model).join(",") === "b,a", "2-d: real getComboTargets advances rr:<combo> and rotates");
+  }
+  // (c) Compact keyboards + stray-dot strip (save-time and render-time).
+  {
+    const sc = fresh1d6();
+    seedProj6(sc.sq, 1, "عمومی", [], 1);
+    seedProj6(sc.sq, 1, "گلبهار", []);
+    seedProj6(sc.sq, 1, "ایجنت", []);
+    seedProj6(sc.sq, 1, "قرارها", []);
+    seedProj6(sc.sq, 1, "یوتیوب", []);
+    for (let i = 0; i < 8; i++) sc.sq.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, ?, 'text', '2026-10-20T09:00:00.000Z')").run(`یادداشت ${i + 1}`);
+    for (let i = 0; i < 4; i++) sc.sq.prepare("INSERT INTO tasks (user_id, title, status, created_at) VALUES (1, ?, 'open', '2026-10-20T09:00:00.000Z')").run(`تسک ${i + 1}`);
+    const env = { STATE: fakeKV(), DB: sc.db };
+    const list = await renderNoteList(env, 1, {});
+    const delRows = list.keyboard.filter((row) => row.every((b) => b.callback_data.startsWith("note:del:")));
+    const filterRows = list.keyboard.filter((row) => row.every((b) => b.callback_data.startsWith("note:proj:")));
+    check(list.ok === true && delRows.length === 2 && delRows.every((r) => r.length <= 4) && delRows[0][0].text === "🗑 #1" && filterRows.every((r) => r.length <= 3), "2-d: note delete buttons packed 4/row, project filters chunked ≤3/row");
+    const tl = await renderTaskList(env, 1, null, 0);
+    const taskRows = tl.keyboard.filter((row) => row.some((b) => b.callback_data.startsWith("task:done:")));
+    check(tl.ok === true && taskRows.length === 2 && taskRows[0].length === 4 && taskRows[0][0].text === "✅1" && tl.text.startsWith("1. تسک 1"), "2-d: task action buttons packed 2 tasks/row, numbered to match the list");
+    check(stripLeadingNotePunct(". یه قابلیت") === "یه قابلیت" && stripLeadingNotePunct(": تست") === "تست" && stripLeadingNotePunct("- مورد") === "مورد" && stripLeadingNotePunct("سالم") === "سالم", "2-d: stripLeadingNotePunct trims leading . : - only");
+    const c = convo6(sc);
+    await c.say("یادداشت: . یه قابلیت تازه", MORNING);
+    const saved = sc.rows("SELECT text FROM notes WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(saved?.text === "یه قابلیت تازه", "2-d: note saved from 'یادداشت: . ...' has no leading dot");
+    sc.sq.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, '. قدیمی', 'text', '2026-10-21T09:00:00.000Z')").run();
+    const list2 = await renderNoteList(env, 1, {});
+    check(list2.text.includes("قدیمی") && !list2.text.includes(". قدیمی"), "2-d: legacy note row with a leading dot renders clean");
+  }
+  // (d) Compact failure detail: count line + first 3 lines + overflow.
+  {
+    check(formatFailureDetail(["a: 503", "b: 429"]) === "تعداد مدل‌های بررسی‌شده: 2\na: 503\nb: 429", "2-d: formatFailureDetail keeps short failure lists with a count line");
+    const many = ["m1: 503", "m2: 429", "m3: timeout", "m4: 503", "m5: 429", "m6: 503", "m7: timeout"];
+    check(formatFailureDetail(many) === "تعداد مدل‌های بررسی‌شده: 7\nm1: 503\nm2: 429\nm3: timeout\n(+4 مورد دیگر)", "2-d: formatFailureDetail caps at 3 lines with a (+N) overflow line");
+    check(formatFailureDetail([]) === "", "2-d: formatFailureDetail of no failures is empty");
+  }
+  // (e) Line-aware splitTelegramText: newline/word boundaries first,
+  // hard slice only for a token longer than maxLen.
+  {
+    check(JSON.stringify(splitTelegramText("word1 word2 word3", 6)) === JSON.stringify(["word1", "word2", "word3"]), "2-d: splitTelegramText prefers word boundaries over mid-word cuts");
+    check(JSON.stringify(splitTelegramText("line1\nline2\nline3", 6)) === JSON.stringify(["line1", "line2", "line3"]), "2-d: splitTelegramText prefers newline boundaries");
+    check(JSON.stringify(splitTelegramText("سلام دنیا خوبی", 8)) === JSON.stringify(["سلام", "دنیا", "خوبی"]), "2-d: splitTelegramText never cuts a Persian word in half");
+    check(JSON.stringify(splitTelegramText("a".repeat(25), 10)) === JSON.stringify(["a".repeat(10), "a".repeat(10), "a".repeat(5)]), "2-d: splitTelegramText hard-slices a token longer than maxLen");
+  }
+  // (f) Webhook update_id deduplication.
+  {
+    resetSeenUpdateIdsForTests();
+    const sends = [];
+    const prev = global.fetch;
+    global.fetch = async (url, init = {}) => {
+      const m = /\/bot[^/]+\/(\w+)$/.exec(String(url));
+      let payload = {};
+      try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+      sends.push({ method: m ? m[1] : "", payload });
+      return Response.json({ ok: true, result: { message_id: 1 } });
+    };
+    try {
+      const env = { TG_TOKEN: "x", ALLOWED_TG_IDS: "1" };
+      const upd = (id) => ({ update_id: id, message: { from: { id: 1 }, chat: { id: 1 }, text: "/ping" } });
+      await handleUpdate(env, upd(987654321));
+      await handleUpdate(env, upd(987654321));
+      await handleUpdate(env, upd(987654322));
+      const pongs = sends.filter((s) => s.method === "sendMessage" && s.payload.text === "pong");
+      check(pongs.length === 2, "2-d: redelivered update_id is ignored, a new update_id still answers");
+    } finally { global.fetch = prev; }
+  }
+  // (g) ask:dp tap edits the original ask message in place when
+  // editText is available; without it, the old send path is kept.
+  {
+    const sc = fresh1d6(); const c = convo6(sc);
+    await c.say("یادآوری کن فردا ساعت ۰۳:۳۰ تست یادآور", MORNING);
+    const edited = [];
+    const sentBefore = c.s.sent.length;
+    await resolveAskCallback(c.env, { fromId: 1, chatId: 1, data: "ask:dp:عصر", nowMs: MORNING, send: c.s.send, editMarkup: async () => {}, editText: async (t) => { edited.push(t); return { ok: true }; } });
+    check(edited.length === 1 && edited[0] === "⏰ یادآوری به‌عنوان تسک ذخیره شد." && c.s.sent.length === sentBefore, "2-d: ask:dp tap edits the ask message in place instead of sending a second message");
+    const sc2 = fresh1d6(); const c2 = convo6(sc2);
+    await c2.say("یادآوری کن فردا ساعت ۰۳:۳۰ تست یادآور", MORNING);
+    await resolveAskCallback(c2.env, { fromId: 1, chatId: 1, data: "ask:cancel", nowMs: MORNING, send: c2.s.send, editMarkup: async () => {} });
+    check(c2.s.sent.at(-1)?.text === "❌ یادآوری لغو شد.", "2-d: ask:cancel without editText still falls back to send");
   }
 }
 
