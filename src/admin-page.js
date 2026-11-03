@@ -307,7 +307,7 @@ input::placeholder{color:var(--muted)}
         <div id="mResult"></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th data-i18n="modelCol"></th><th data-i18n="statusCol"></th><th data-i18n="reasonCol"></th><th data-i18n="latencyCol"></th><th data-i18n="actions"></th></tr></thead>
+            <thead><tr><th data-i18n="modelCol"></th><th data-i18n="statusCol"></th><th data-i18n="reasonCol"></th><th data-i18n="latencyCol"></th><th data-i18n="emptyFinalCol"></th><th data-i18n="actions"></th></tr></thead>
             <tbody id="mTbody"></tbody>
           </table>
         </div>
@@ -452,6 +452,7 @@ var I18N = {
     timeoutHelp: 'Per-target max is 15,000 ms; total turn budget is 22,000 ms.',
     reasonCol: 'Reason',
     latencyCol: 'Median latency',
+    emptyFinalCol: 'Empty-final (24h)',
     ban: 'Ban',
     unban: 'Unban',
     pinToCombo: 'Pin to combo',
@@ -635,6 +636,7 @@ var I18N = {
     timeoutHelp: 'سقف هر هدف ۱۵٬۰۰۰ میلی‌ثانیه است؛ بودجه‌ی کل نوبت ۲۲٬۰۰۰ میلی‌ثانیه است.',
     reasonCol: 'دلیل',
     latencyCol: 'تأخیر میانه',
+    emptyFinalCol: 'پاسخ خالی (۲۴ ساعت)',
     ban: 'مسدود',
     unban: 'رفع مسدودیت',
     pinToCombo: 'پین به combo',
@@ -1675,6 +1677,14 @@ function renderRows() {
     tdLatency.setAttribute('data-label', T('latencyCol'));
     tdLatency.appendChild(el('span', 'mono', (m.medianLatencyMs === null || m.medianLatencyMs === undefined) ? '—' : secs(m.medianLatencyMs)));
     tr.appendChild(tdLatency);
+
+    // Phase 2-f Task 3: read-only Empty-final counter from
+    // GET /admin/api/models (in-memory per isolate, no KV writes).
+    // Display 0 when unknown.
+    var tdEmptyFinal = el('td');
+    tdEmptyFinal.setAttribute('data-label', T('emptyFinalCol'));
+    tdEmptyFinal.appendChild(el('span', 'mono', (m.emptyFinal24h === null || m.emptyFinal24h === undefined) ? '0' : String(m.emptyFinal24h)));
+    tr.appendChild(tdEmptyFinal);
 
     var tdAct = el('td', 'actions-cell');
     tdAct.setAttribute('data-label', T('actions'));

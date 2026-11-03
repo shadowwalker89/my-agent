@@ -851,11 +851,13 @@ export async function renderNoteList(env, userId, { projectName = null, projectI
 // ZERO model calls. Otherwise ONLY the verified rows (Jalali dates,
 // project names) go to the chat combo with no history (history would
 // pollute grounding, as it did for translate), no user-row save (the
-// caller owns the entry, or the tap owns none), and a 900-token cap
-// (Phase 1-e: 1600 from 1-d-6 lowered back — the 700-token cut that
-// motivated 1600 was a prompt-shape problem, fixed by the 4–5-line +
-// immediate-table instruction; 900 keeps the table intact while leaving
-// headroom inside the 22s router budget).
+// caller owns the entry, or the tap owns none), and a 2200-token cap
+// (Phase 2-f: raised from 900 — free reasoning models commonly spend
+// 800–1500 tokens inside reasoning_content / <think> before the first
+// visible token, so 900 risked finish_reason "length" with zero visible
+// output; the D1 row cap (30) and the numbered-list prompt already bound
+// the visible output, so this adds headroom without inviting long
+// answers. Normal chat still sends NO max_tokens at all).
 // Returns false ONLY on a D1 failure (the branch gates markDaily on it).
 // Stable v1 addendum: Telegram does NOT render Markdown tables — a
 // | ... | table arrives as literal pipe text. The summary therefore
@@ -863,9 +865,8 @@ export async function renderNoteList(env, userId, { projectName = null, projectI
 // number, date, folder, one-line summary), which Telegram displays
 // cleanly. The list covers exactly the rows given (at most 30 — the
 // runSummary input cap); project/date filters in the D1 queries below
-// are unchanged, and the 900-token cap is unchanged (no evidence the
-// contract itself caused the 00:38/00:39 failures, which were empty
-// output and a timeout, not truncation).
+// are unchanged, and the summary token cap is 2200 (Phase 2-f,
+// reasoning-model headroom — see above).
 const SUMMARY_SYSTEM = "فقط از روی ردیف‌هایی که در پیام کاربر آمده خلاصه بساز. هیچ ردیفی را اضافه، حذف یا حدس نزن و هیچ دانسته‌ی بیرونی را قاطی نکن؛ تاریخ‌ها و نام پروژه‌ها را دقیقاً همان‌طور که داده شده بنویس. خلاصه حداکثر ۴ تا ۵ خط کوتاه باشد و بلافاصله بعد از آن فهرست شماره‌دار همان ردیف‌ها بیاید؛ هر ردیف در یک خط: شماره. تاریخ ـ پوشه ـ خلاصه یک‌خطی. فهرست دقیقاً ردیف‌های داده‌شده (حداکثر ۳۰ ردیف) را پوشش دهد.";
 async function runSummary(env, o, kind, projectId, userId, retryData = null) {
   const rp = await listProjectsResult(env, userId);
@@ -889,7 +890,7 @@ async function runSummary(env, o, kind, projectId, userId, retryData = null) {
   // second one. Without TG_TOKEN this is a silent null (no network).
   let progressMsgId = null;
   if (o.chatId != null) progressMsgId = await sendProgressMessage(env, o.chatId, "⏳ در حال آماده‌سازی خلاصه و جدول...");
-  await o.chat(`${kind === "note" ? "یادداشت‌ها" : "تسک‌ها"} (${scope}، ${rows.length} ردیف):\n${lines}`, { systemPrompt: SUMMARY_SYSTEM, saveText: "", noHistory: true, maxTokens: 900, failureLabel: "خلاصه‌سازی", ...(retryData ? { retryData } : {}), ...(progressMsgId != null ? { progressMsgId } : {}) });
+  await o.chat(`${kind === "note" ? "یادداشت‌ها" : "تسک‌ها"} (${scope}، ${rows.length} ردیف):\n${lines}`, { systemPrompt: SUMMARY_SYSTEM, saveText: "", noHistory: true, maxTokens: 2200, failureLabel: "خلاصه‌سازی", ...(retryData ? { retryData } : {}), ...(progressMsgId != null ? { progressMsgId } : {}) });
   return true;
 }
 
