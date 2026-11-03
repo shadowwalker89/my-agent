@@ -42,8 +42,9 @@ import {
   CHAT_CONTEXT_LIMIT,
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
-import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, parseNoteQuery, parseSummaryQuery, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, stripMiddleFolderTag, normalizeDaypartToken } from "../src/daily.js";
-import { callRouter, runCombo } from "../src/router.js";
+import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, resolveProjectName, matchKnownProjectAt, parseNoteQuery, parseSummaryQuery, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, stripMiddleFolderTag, normalizeDaypartToken } from "../src/daily.js";
+import { callRouter, runCombo, resetRouterHealthForTests, extractAssistantText } from "../src/router.js";
+import { PROVIDERS } from "../src/providers.js";
 import { sendProgressMessage, finalizeProgressMessage, splitTelegramText } from "../src/telegram.js";
 import { answerChatText } from "../src/index.js";
 import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
@@ -4639,11 +4640,16 @@ if (DatabaseSync) {
     const t = rows("SELECT title, remind_at, project_id FROM tasks WHERE user_id = 1")[0];
     check(s.sent.at(-1) === "⏰ یادآوری به‌عنوان تسک ذخیره شد. [📁 گلبهار]" && t.title === "تمرین" && t.remind_at === "2026-11-03T09:00:00+03:30" && t.project_id === gol, "1-d-2: reminder start-form tag attaches گلبهار + keeps the due time");
   }
-  // No-tag guards: middle phrase (unresolvable tail) and unknown project store plain, no badge; untagged note keeps the default + exact old reply.
+  // No-tag guards: an UNKNOWN project stores plain, no badge;
+  // untagged note keeps the default + exact old reply. (Phase 2-b
+  // supersedes the known-project half of the old middle-phrase guard:
+  // a colon-less middle phrase with a KNOWN project now resolves by
+  // boundary matching — body keeps the trailing word, badge attaches.
+  // The unknown-project guard below is unchanged.)
   {
-    const { s, rows, om } = await flow1d2("یادداشت کن خرید نان توی پروژه گلبهار فردا");
+    const { s, rows, gol } = await flow1d2("یادداشت کن خرید نان توی پروژه گلبهار فردا");
     const n = rows("SELECT text, project_id FROM notes WHERE user_id = 1")[0];
-    check(!s.sent.at(-1).includes("[📁") && n.text === "خرید نان توی پروژه گلبهار فردا" && n.project_id === om, "1-d-2: middle phrase does not tag; note keeps full text + default project");
+    check(s.sent.at(-1) === "✅ یادداشت ذخیره شد. [📁 گلبهار]" && n.text === "خرید نان فردا" && n.project_id === gol, "1-d-2 (2-b update): known-project middle phrase now tags; note keeps trailing word + گلبهار badge");
     const f2 = await flow1d2("یادداشت کن خرید نان توی پروژه ناشناخته");
     check(!f2.s.sent.at(-1).includes("[📁"), "1-d-2: unknown project does not tag");
     const f3 = await flow1d2("یادداشت کن خرید نان");
@@ -5061,6 +5067,178 @@ if (DatabaseSync) {
     const c = convo6(sc);
     await c.say("یادداشت‌های گلبهار رو خلاصه کن", MORNING);
     check(c.s.chats.length === 1 && c.s.chats[0].opts.maxTokens === 900 && String(c.s.chats[0].opts.systemPrompt ?? "").includes("۴ تا ۵ خط") && String(c.s.chats[0].opts.systemPrompt ?? "").includes("| ردیف | تاریخ | پوشه | خلاصه |"), "1-d-6: summary passes 900 tokens (Phase 1-e spec change from 1600) + concise-then-table instruction");
+  }
+  // ── Phase 2-b Pillar C ──
+  // Static resource boundary (Pillar A.1): there is no DEFAULT_COMBOS
+  // constant — combos resolve from RULES + KV catalog + manual combos,
+  // and the only builtin providers are the three external router
+  // providers, so workers-ai/Gemini cannot appear in chat/code/
+  // translate combos by construction. Guard that here.
+  check(Object.keys(PROVIDERS).every((k) => ["nvidia", "openrouter", "xkiro"].includes(k)) && !Object.values(PROVIDERS).some((p) => /workers-ai|gemini/i.test(p.baseUrl ?? "")), "2-b: builtin providers contain no workers-ai/Gemini targets (Pillar A.1 by construction)");
+  // Pure reasoning extraction (Pillar A.4).
+  check(extractAssistantText({ content: "", reasoning_content: "خلاصه یادداشت‌ها..." }) === "خلاصه یادداشت‌ها...", "2-b: reasoning_content fallback extracts text");
+  check(extractAssistantText({ content: "<think>خلاصه یادداشت‌ها..." }) === "خلاصه یادداشت‌ها...", "2-b: unclosed <think> extracts inner text instead of empty");
+  check(extractAssistantText({ content: "<think>فکر</think>پاسخ نهایی" }) === "پاسخ نهایی", "2-b: closed <think> block stripped, answer kept");
+  check(extractAssistantText({ content: "سلام <think>ناتمام" }) === "سلام ناتمام", "2-b: text before an unclosed <think> is preserved");
+  check(extractAssistantText({ content: "" }) === "" && extractAssistantText({ content: "", reasoning_content: "", reasoning: "" }) === "", "2-b: all three empty still yields empty");
+  // Pure known-project boundary matching (Pillar B).
+  {
+    const projs = [{ name: "گلبهار", aliases: ["گل"] }, { name: "یوتیوب", aliases: [] }];
+    const a = extractFolderTag("اینو یادداشت کن که فردا قراره بار جدید سیمان برای پروژه گلبهار برسه", projs);
+    check(a?.at === "known" && a?.name === "گلبهار" && a?.body === "اینو یادداشت کن که فردا قراره بار جدید سیمان برسه", "2-b: Example A pure extraction keeps trailing words out of the name");
+    const b = extractFolderTag("یه تسک جدید ثبت کن برای پروژه یوتیوب ضبط ویدیوی معرفی", projs);
+    check(b?.at === "known" && b?.name === "یوتیوب" && b?.body === "یه تسک جدید ثبت کن ضبط ویدیوی معرفی", "2-b: Example B pure extraction keeps trailing words out of the name");
+    check(resolveProjectName("گلبهار برسه", projs) === "گلبهار" && resolveProjectName("یوتیوب ضبط ویدیوی معرفی", projs) === "یوتیوب" && resolveProjectName("ناشناخته", projs) === null, "2-b: resolveProjectName prefix fallback (trailing words) + null for unknown");
+    check(matchKnownProjectAt("گل برسه", projs)?.name === "گل" && matchKnownProjectAt("گلبهارها", projs) === null, "2-b: alias match at exact position, no match inside a longer word");
+    const mid = classifyDaily("یادداشت توی پروژه گلبهار: سیمان", MORNING, projs);
+    check(mid.intent === "note" && mid.text === "سیمان", "2-b: classifyDaily accepts positional (text, nowMs, projects) + threads projects through the mid-tag recursion");
+  }
+  // Strict resource boundary (Pillar C.1): total OUR_ROUTER failure
+  // during chat and during summary delivers the clean stage notice
+  // with 0 calls to env.AI.run.
+  {
+    resetRouterHealthForTests();
+    const tgCalls = [];
+    const stubFetch = async (url, init = {}) => {
+      const u = String(url);
+      if (u.includes("api.telegram.org")) {
+        let body = {};
+        try { body = JSON.parse(init.body ?? "{}"); } catch {}
+        tgCalls.push({ method: u.split("/").pop(), text: body.text ?? "" });
+        return Response.json({ ok: true, result: { message_id: 555 } });
+      }
+      return new Response("down", { status: 503 });
+    };
+    const prev = global.fetch;
+    try {
+      global.fetch = stubFetch;
+      const seedCombo = async (st) => {
+        await st.put("tgprefs:1", JSON.stringify({ combo: "cbchat", auto: false }));
+        await st.put("config:v1", JSON.stringify({ providers: [], combos: [{ name: "cbchat", strategy: "priority", targets: [{ provider: "xkiro", model: "dead-503" }] }] }));
+      };
+      // Chat-level failure.
+      {
+        const sc = fresh1d6();
+        let aiCalls = 0;
+        const env = { STATE: fakeKV(), DB: sc.db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k", AI: { run: async () => { aiCalls++; return {}; } } };
+        await seedCombo(env.STATE);
+        tgCalls.length = 0;
+        await answerChatText(env, 1, 1, "سلام", "", {});
+        const notice = tgCalls.find((c) => c.method === "editMessageText" && c.text.includes("مرحله‌ی چت شکست خورد"));
+        check(!!notice && aiCalls === 0, "2-b: total router failure in chat delivers the clean stage notice with 0 env.AI.run calls");
+      }
+      // Summary-level failure through the real handleDailyText path.
+      {
+        const sc = fresh1d6();
+        const gol = seedProj6(sc.sq, 1, "گلبهار", ["گل"]);
+        sc.sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'صبحانه گلبهار', 'text', '2026-10-28T01:24:00+03:30', ?)").run(gol);
+        let aiCalls = 0;
+        const env = { STATE: fakeKV(), DB: sc.db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k", AI: { run: async () => { aiCalls++; return {}; } } };
+        await seedCombo(env.STATE);
+        tgCalls.length = 0;
+        const chat = (t, copts) => answerChatText(env, 1, 1, t, "", copts);
+        await handleDailyText(env, { chatId: 1, userId: 1, text: "یادداشت‌های گلبهار رو خلاصه کن", send: async () => {}, chat, editMarkup: async () => {}, nowMs: MORNING });
+        const notice = tgCalls.find((c) => c.method === "editMessageText" && c.text.includes("خلاصه‌سازی") && c.text.includes("شکست خورد"));
+        check(!!notice && aiCalls === 0, "2-b: total router failure in summary delivers the clean stage notice with 0 env.AI.run calls");
+      }
+    } finally { global.fetch = prev; }
+  }
+  // Circuit breaker + fast 6s default timeout (Pillar C.2, A.2/A.3).
+  {
+    resetRouterHealthForTests();
+    const attempts = [];
+    let goodDown = false;
+    const stubFetch = async (url, init = {}) => {
+      const u = String(url);
+      if (u.includes("api.xkiro.com")) {
+        // The model travels in the JSON body, not the URL.
+        let model = "";
+        try { model = JSON.parse(init.body ?? "{}").model ?? ""; } catch {}
+        if (model === "dead-503") { attempts.push("xkiro/dead-503"); return new Response("down", { status: 503 }); }
+        attempts.push("xkiro/good");
+        return goodDown ? new Response("down", { status: 503 }) : Response.json({ choices: [{ message: { content: "ok" } }] });
+      }
+      return new Response("unexpected", { status: 500 });
+    };
+    const prev = global.fetch;
+    try {
+      global.fetch = stubFetch;
+      const mkEnv = async () => {
+        const env = { STATE: fakeKV(), XKIRO_API_KEY: "k" };
+        await env.STATE.put("config:v1", JSON.stringify({ providers: [], combos: [{ name: "cbtest", strategy: "priority", targets: [{ provider: "xkiro", model: "dead-503" }, { provider: "xkiro", model: "good" }] }] }));
+        return env;
+      };
+      const body = { messages: [{ role: "user", content: "hi" }] };
+      attempts.length = 0;
+      const r1 = await runCombo(await mkEnv(), "cbtest", body, {});
+      check(r1.ok === true && r1.used === "xkiro/good" && attempts.join(",") === "xkiro/dead-503,xkiro/good", "2-b: breaker call #1 tries both, succeeds via healthy target");
+      attempts.length = 0;
+      const r2 = await runCombo(await mkEnv(), "cbtest", body, {});
+      check(r2.ok === true && r2.used === "xkiro/good" && attempts.join(",") === "xkiro/good", "2-b: breaker call #2 within cooldown tries healthy first, skips cooled-down target");
+      goodDown = true;
+      attempts.length = 0;
+      const r3 = await runCombo(await mkEnv(), "cbtest", body, {});
+      check(r3.ok === false && attempts.join(",") === "xkiro/good,xkiro/dead-503", "2-b: breaker call #3 tries cooled-down target only after all healthy fail");
+      resetRouterHealthForTests();
+      goodDown = false;
+      attempts.length = 0;
+      const r4 = await runCombo(await mkEnv(), "cbtest", body, {});
+      check(r4.ok === true && attempts.join(",") === "xkiro/dead-503,xkiro/good", "2-b: resetRouterHealthForTests restores original order");
+    } finally { global.fetch = prev; }
+    // Default per-attempt timeout is 6s (no explicit timeout option).
+    const hungFetch = async (url, init = {}) => new Promise((_, rej) => { init.signal?.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))); });
+    const prev2 = global.fetch;
+    try {
+      global.fetch = hungFetch;
+      const env = { STATE: fakeKV(), XKIRO_API_KEY: "k" };
+      const t0 = Date.now();
+      const r = await callRouter(env, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, {});
+      const elapsed = Date.now() - t0;
+      check(r.ok === false && r.error === "timeout" && elapsed >= 5000 && elapsed < 20000, `2-b: default per-attempt timeout is ~6s (elapsed ${elapsed}ms)`);
+    } finally { global.fetch = prev2; }
+  }
+  // Reasoning-model fix through callRouter + runCombo (Pillar C.3).
+  {
+    resetRouterHealthForTests();
+    const mkReasonFetch = (message) => async (url) => String(url).includes("api.xkiro.com") ? Response.json({ choices: [{ message }] }) : new Response("unexpected", { status: 500 });
+    const prev = global.fetch;
+    try {
+      global.fetch = mkReasonFetch({ content: "", reasoning_content: "خلاصه یادداشت‌ها..." });
+      const env = { STATE: fakeKV(), XKIRO_API_KEY: "k" };
+      const r = await callRouter(env, "xkiro/reason-model", { messages: [{ role: "user", content: "hi" }] }, {});
+      check(r.ok === true && r.text === "خلاصه یادداشت‌ها..." && r.error === null, "2-b: reasoning_content HTTP 200 returns ok instead of empty assistant message");
+      const r2 = await runCombo(env, "xkiro/reason-model", { messages: [{ role: "user", content: "hi" }] }, {});
+      check(r2.ok === true && r2.data?.choices?.[0]?.message?.content === "خلاصه یادداشت‌ها...", "2-b: runCombo surfaces reasoning text as the message content");
+      global.fetch = mkReasonFetch({ content: "<think>خلاصه یادداشت‌ها..." });
+      const r3 = await callRouter(env, "xkiro/reason-model", { messages: [{ role: "user", content: "hi" }] }, {});
+      check(r3.ok === true && r3.text === "خلاصه یادداشت‌ها...", "2-b: unclosed <think> HTTP 200 returns ok instead of empty assistant message");
+      global.fetch = mkReasonFetch({ content: "" });
+      const r4 = await callRouter(env, "xkiro/reason-model", { messages: [{ role: "user", content: "hi" }] }, {});
+      check(r4.ok === false && r4.error === "empty assistant message", "2-b: all-three-empty still fails as empty assistant message");
+    } finally { global.fetch = prev; }
+    resetRouterHealthForTests();
+  }
+  // Mid-sentence known-project extraction end to end (Pillar C.4).
+  {
+    const sc = fresh1d6(); const gol = seedProj6(sc.sq, 1, "گلبهار", ["گل"]); seedProj6(sc.sq, 1, "عمومی", [], 1);
+    const c = convo6(sc);
+    await c.say("اینو یادداشت کن که فردا قراره بار جدید سیمان برای پروژه گلبهار برسه", MORNING);
+    const note = sc.rows("SELECT text, project_id FROM notes WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(note?.text === "فردا قراره بار جدید سیمان برسه" && note?.project_id === gol && c.s.sent.at(-1)?.text === "✅ یادداشت ذخیره شد. [📁 گلبهار]" && c.s.chats.length === 0, "2-b: Example A end to end — exact note body, گلبهار project_id, badge, 0 model calls");
+  }
+  {
+    const sc = fresh1d6(); const yt = seedProj6(sc.sq, 1, "یوتیوب", []); seedProj6(sc.sq, 1, "عمومی", [], 1);
+    const c = convo6(sc);
+    await c.say("یه تسک جدید ثبت کن برای پروژه یوتیوب ضبط ویدیوی معرفی", MORNING);
+    const task = sc.rows("SELECT title, project_id FROM tasks WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(task?.title === "ضبط ویدیوی معرفی" && task?.project_id === yt && c.s.sent.at(-1)?.text === "✅ تسک ثبت شد. [📁 یوتیوب]" && c.s.chats.length === 0, "2-b: Example B end to end — exact task title, یوتیوب project_id, badge, 0 model calls");
+  }
+  {
+    const sc = fresh1d6(); const gol = seedProj6(sc.sq, 1, "گلبهار", ["گل"]); seedProj6(sc.sq, 1, "عمومی", [], 1);
+    const c = convo6(sc);
+    await c.say("اینو یادداشت کن که فردا سیمان برای پروژه گل برسه", MORNING);
+    const note = sc.rows("SELECT text, project_id FROM notes WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(note?.text === "فردا سیمان برسه" && note?.project_id === gol && c.s.sent.at(-1)?.text === "✅ یادداشت ذخیره شد. [📁 گلبهار]" && c.s.chats.length === 0, "2-b: alias mid-sentence tag resolves to گلبهار, exact body + badge, 0 model calls");
   }
 }
 
