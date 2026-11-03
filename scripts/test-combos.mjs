@@ -1327,6 +1327,31 @@ const v1ChatReq = (extra, key = ROUTER_KEY_3G) =>
   check(JSON.stringify(j.choices?.[0]?.message?.tool_calls) === JSON.stringify(toolCalls), "tool_calls باید بدون تغییر پاس شوند");
 }
 
+// 6b) reasoning-only non-stream — /v1 keeps the router contract exactly:
+// reasoning_content is preserved and the surfaced content is unchanged.
+// The Stable v1 addendum's final-content rule is Telegram-only and must
+// not change API output.
+{
+  const env = v1Env();
+  await seedV1(env, [v1Target("m1")]);
+  const mock = mockUpstreamQueue([
+    new Response(JSON.stringify({
+      id: "cmpl-r",
+      choices: [{ index: 0, message: { role: "assistant", content: "", reasoning_content: "step by step" }, finish_reason: "stop" }],
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  ]);
+  let res;
+  try {
+    res = await workerDefault.fetch(v1ChatReq({}), env, ctxNull);
+  } finally {
+    mock.restore();
+  }
+  check(res.status === 200, `reasoning-only /v1 باید 200 (${res.status})`);
+  const j = await res.json();
+  check(j.choices?.[0]?.message?.reasoning_content === "step by step", "reasoning_content در /v1 حفظ می‌شود");
+  check(j.choices?.[0]?.message?.content === "step by step", "محتوای surfaced در /v1 بدون تغییر می‌ماند");
+}
+
 // 7) tool_calls در استریم — delta.tool_calls پاس می‌شود
 {
   const env = v1Env();
