@@ -1,7 +1,7 @@
 // Step 1b-2: everyday wiring (money, notes, reminders, translate,
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
-import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, extractFolderTag, IRAN_OFFSET_MIN } from "./daily.js";
+import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, extractFolderTag, matchKnownProjectAt, IRAN_OFFSET_MIN } from "./daily.js";
 import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
 import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
@@ -653,10 +653,15 @@ async function defaultProjectId(env, userId) {
 // uses the tag when the intent family is preserved, so a false prefix
 // (e.g. a name that is a prefix of another word) can never mis-store.
 async function resolveFolderTag(env, userId, fullText) {
-  const tag = extractFolderTag(fullText);
-  if (!tag) return null;
+  // Phase 2-b: load the real D1 projects FIRST and pass them into
+  // extractFolderTag, so mid-sentence known names ("... برای پروژه
+  // گلبهار برسه") resolve with 0 model calls. A seed fallback has no
+  // id and is never attached (pre-existing invariant), so D1 failure
+  // or an empty project list still returns null.
   const rp = await listProjectsResult(env, userId);
   if (!rp.ok || rp.projects.length === 0) return null;
+  const tag = extractFolderTag(fullText, rp.projects.map((p) => ({ name: p.name, aliases: parseAliasesText(p.aliases) })));
+  if (!tag) return null;
   const cands = [];
   for (const p of rp.projects) {
     if (p.id == null) continue;
@@ -664,9 +669,27 @@ async function resolveFolderTag(env, userId, fullText) {
     for (const a of parseAliasesText(p.aliases)) cands.push({ name: normalizeText(a).trim(), project: p });
   }
   cands.sort((a, b) => b.name.length - a.name.length);
-  if (tag.at === "end") {
+  // Phase 2-b known form: the name is already a known name/alias, so
+  // it resolves exactly; the body keeps every remaining word intact.
+  if (tag.at === "known") {
     const hit = cands.find((c) => c.name && c.name === normalizeText(tag.name).trim());
     return hit ? { project: hit.project, body: tag.body } : null;
+  }
+  if (tag.at === "end") {
+    const hit = cands.find((c) => c.name && c.name === normalizeText(tag.name).trim());
+    if (hit) return { project: hit.project, body: tag.body };
+    // Phase 2-b fallback (resolveProjectMatch upgrade): a raw
+    // candidate that still has trailing words ("گلبهار برسه")
+    // resolves to the known project it starts with, and the trailing
+    // words rejoin the body — this path only fires when the known
+    // scan above missed (e.g. an introducer spelling it does not
+    // cover).
+    const prefix = matchKnownProjectAt(tag.name, cands.map((c) => c.name));
+    if (prefix) {
+      const pHit = cands.find((c) => c.name === prefix.name);
+      if (pHit) return { project: pHit.project, body: prefix.rest ? `${tag.body} ${prefix.rest}` : tag.body };
+    }
+    return null;
   }
   // 1-d-6 middle form: the name is already colon-bounded, so it resolves
   // exactly like the end form; the body is the phrase-stripped text.
