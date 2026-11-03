@@ -12,6 +12,10 @@ import {
   MODEL_INTENT_COMBO,
   MODEL_INTENT_MAX_TOKENS,
   MODEL_INTENT_TIMEOUT_MS,
+  DEFAULT_INTERPRETER_MODEL,
+  resolveInterpreterModel,
+  extractJsonObject,
+  classifyIntentNlu,
 } from "../src/intent.js";
 import { runTask, EXECUTOR_NOT_CONFIGURED } from "../src/executor.js";
 import {
@@ -38,7 +42,10 @@ import {
   CHAT_CONTEXT_LIMIT,
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
-import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, parseNoteQuery, parseSummaryQuery, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, stripMiddleFolderTag } from "../src/daily.js";
+import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, parseNoteQuery, parseSummaryQuery, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, stripMiddleFolderTag, normalizeDaypartToken } from "../src/daily.js";
+import { callRouter, runCombo } from "../src/router.js";
+import { sendProgressMessage, finalizeProgressMessage, splitTelegramText } from "../src/telegram.js";
+import { answerChatText } from "../src/index.js";
 import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
 import { buildInterpreterPrompt, parseInterpreterOutput, interpretText, callInterpreterModel, validateAmountText, validateDateTexts, matchProject, validateInterpreterAction, INTERPRETER_MAX_ACTIONS } from "../src/interpreter.js";
 import { scoreEvalResults, mapOutcome, scoreSlots, runCaseEvaluation, iranNowIso, median } from "../scripts/eval-intent.mjs";
@@ -425,7 +432,13 @@ function newEnv(extra = {}) {
     // failure notice now names the failed stage (stage-specific notice).
     await sendTg(env, msgUpdate("add a /health endpoint to the worker"));
     check(world.calls.github.filter((c) => c.url.includes("/actions/workflows/")).length === 0, "free-text dev must not dispatch");
-    const devMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    // Phase 1-e Pillar 1 (intentional expectation upgrade, spec-required):
+    // the chat failure notice is now DELIVERED by finalizing the ⏳
+    // placeholder (editMessageText on the progress message), not by a
+    // second sendMessage — so the delivered text is the last edit, with
+    // the last sendMessage as the no-progress fallback.
+    const devEdit = world.calls.telegram.filter((c) => c.method === "editMessageText").at(-1);
+    const devMsg = devEdit ?? world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
     check(!String(devMsg?.payload?.text ?? "").includes("با /dev بفرست"), "1-d-1: free-text dev must not get the /dev suggestion");
     check(String(devMsg?.payload?.text ?? "").includes("مرحله‌ی چت شکست خورد"), "1-d-1: free-text dev flows to the chat path");
     check((await env.STATE.get("dev:active:4242")) === null, "free-text dev must not set active");
@@ -1131,7 +1144,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, chatFailureNotice, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard } from "../src/everyday.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
   check(askText("period").includes("دوره") && askText("expense-or-income").includes("درآمد"), "ask texts");
@@ -1637,13 +1650,386 @@ if (DatabaseSync) {
   check(iranNowIso(MS) === "2026-10-31T15:30:00.456+03:30" && Date.parse(iranNowIso(MS)) === MS, "0-c fix2: Iran timestamp keeps milliseconds for the same instant");
 }
 
+// ── Phase 1-e & Phase 2: zero-drop engine, NLU interpreter, disambiguation ──
+// (Autonomous directive §4 — every case below is a directive case.
+// Tests sit BEFORE the final enforced failure check, so failures report.)
+// ── P4.1: telegram progress helpers + JSON extraction + model resolution ──
+{
+  check(JSON.stringify(splitTelegramText("a".repeat(5000))) === JSON.stringify(["a".repeat(4096), "a".repeat(904)]), "1-e: splitTelegramText slices at the 4096-char cap");
+  check(JSON.stringify(splitTelegramText("")) === JSON.stringify([""]), "1-e: splitTelegramText of empty text is one empty chunk");
+  check(await sendProgressMessage({}, 1) === null, "1-e: sendProgressMessage without TG_TOKEN returns null and never fetches");
+  {
+    const calls = [];
+    const prev = global.fetch;
+    global.fetch = async (url, init = {}) => {
+      const m = /\/bot[^/]+\/(\w+)$/.exec(String(url));
+      let payload = {};
+      try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+      calls.push({ method: m ? m[1] : "", payload });
+      if (m?.[1] === "sendMessage") return Response.json({ ok: true, result: { message_id: 99 } });
+      if (m?.[1] === "editMessageText") return Response.json({ ok: true, result: true });
+      return Response.json({ ok: true, result: true });
+    };
+    try {
+      const env = { TG_TOKEN: "x" };
+      const id = await sendProgressMessage(env, 7);
+      check(id === 99, "1-e: sendProgressMessage returns the numeric message_id");
+      await finalizeProgressMessage(env, 7, id, "hello", { replyMarkup: { inline_keyboard: [[{ text: "b", callback_data: "x" }]] } });
+      const edit = calls.find((c) => c.method === "editMessageText");
+      check(edit?.payload?.message_id === 99 && edit?.payload?.text === "hello" && JSON.stringify(edit?.payload?.reply_markup) === JSON.stringify({ inline_keyboard: [[{ text: "b", callback_data: "x" }]] }), "1-e: finalizeProgressMessage edits the exact progress message_id with markup on the single chunk");
+      calls.length = 0;
+      await finalizeProgressMessage(env, 7, id, "z".repeat(5000), {});
+      const edit2 = calls.find((c) => c.method === "editMessageText");
+      const sends = calls.filter((c) => c.method === "sendMessage");
+      check(edit2?.payload?.text?.length === 4096 && sends.length === 1 && sends[0].payload.text.length === 904, "1-e: finalizeProgressMessage edits the first chunk and sends the rest sequentially");
+    } finally { global.fetch = prev; }
+  }
+  {
+    const calls = [];
+    const prev = global.fetch;
+    global.fetch = async (url, init = {}) => {
+      const m = /\/bot[^/]+\/(\w+)$/.exec(String(url));
+      let payload = {};
+      try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+      calls.push({ method: m ? m[1] : "", payload });
+      if (m?.[1] === "sendMessage") return Response.json({ ok: true, result: { message_id: 5 } });
+      if (m?.[1] === "editMessageText") return Response.json({ ok: false, description: "gone" });
+      return Response.json({ ok: true, result: true });
+    };
+    try {
+      const env = { TG_TOKEN: "x" };
+      const id = await sendProgressMessage(env, 7, "⏳ در حال پردازش...");
+      await finalizeProgressMessage(env, 7, id, "fallback answer", {});
+      const sends = calls.filter((c) => c.method === "sendMessage");
+      check(sends.length === 2 && sends[1].payload.text === "fallback answer", "1-e: finalizeProgressMessage falls back to sendMessage when the edit returns { ok: false }");
+      await finalizeProgressMessage(env, 7, null, "no-id answer", {});
+      check(calls.filter((c) => c.method === "sendMessage").at(-1)?.payload?.text === "no-id answer", "1-e: finalizeProgressMessage without a progress id sends plainly");
+    } finally { global.fetch = prev; }
+  }
+  check(JSON.stringify(extractJsonObject("<think>reasoning {\"x\":1}</think>\n```json\n{\"intent\":\"note\",\"confidence\":0.9}\n```")) === JSON.stringify({ intent: "note", confidence: 0.9 }), "1-e: extractJsonObject strips closed <think> blocks and ```json fences");
+  check(JSON.stringify(extractJsonObject("```\n{\"intent\":\"task\",\"confidence\":0.8}\n```")) === JSON.stringify({ intent: "task", confidence: 0.8 }), "1-e: extractJsonObject strips bare fences");
+  check(JSON.stringify(extractJsonObject("pre {\"intent\":\"note\",\"body\":\"a {b} c\"} post")) === JSON.stringify({ intent: "note", body: "a {b} c" }), "1-e: extractJsonObject parses the first balanced object, braces inside strings ignored");
+  check(extractJsonObject("just prose, no json") === null && extractJsonObject("<think>unclosed, nothing after") === null, "1-e: extractJsonObject returns null when no object exists");
+  check(DEFAULT_INTERPRETER_MODEL === "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "1-e: DEFAULT_INTERPRETER_MODEL is the directive model");
+  check(resolveInterpreterModel({ INTERPRETER_MODEL: "off", AI: { run() {} } }) === null, "1-e: resolveInterpreterModel off disables");
+  check(resolveInterpreterModel({ INTERPRETER_MODEL: "none", AI: { run() {} } }) === null, "1-e: resolveInterpreterModel none disables");
+  check(resolveInterpreterModel({ INTERPRETER_MODEL: "  @cf/foo  ", AI: { run() {} } }) === "@cf/foo", "1-e: resolveInterpreterModel trims an explicit model");
+  check(resolveInterpreterModel({ AI: { run() {} } }) === DEFAULT_INTERPRETER_MODEL, "1-e: resolveInterpreterModel defaults to Workers AI when the binding exists and INTERPRETER_MODEL is unset");
+  check(resolveInterpreterModel({}) === null, "1-e: resolveInterpreterModel is null without a binding or setting");
+  check(normalizeDaypartToken("صبخ") === "صبح" && normalizeDaypartToken("واسه صبح") === "صبح" && normalizeDaypartToken("برای عصر") === "عصر" && normalizeDaypartToken("عصری") === "عصر" && normalizeDaypartToken("ظهر") === "عصر" && normalizeDaypartToken("شبی") === "شب" && normalizeDaypartToken("کنسل") === "cancel" && normalizeDaypartToken("انصراف") === "cancel" && normalizeDaypartToken("نیمه") === null, "1-e: normalizeDaypartToken maps the full typo/phrase map");
+  check(JSON.stringify(hourAmbiguousKeyboard()) === JSON.stringify([[{ text: "☀️ صبح", callback_data: "ask:dp:صبح" }, { text: "🌇 عصر", callback_data: "ask:dp:عصر" }], [{ text: "❌ انصراف", callback_data: "ask:cancel" }]]), "1-e: hourAmbiguousKeyboard is exactly the directive keyboard");
+  {
+    const rows = [
+      { role: "user", content: "سلام" },
+      { role: "assistant", content: "✅ **یادداشت جدید: سیمان و گچ" },
+      { role: "assistant", content: "✅ یادداشت ذخیره شد." },
+      { role: "assistant", content: "⏰ یادآوری ثبت شد." },
+      { role: "assistant", content: "این یک جواب واقعی است." },
+    ];
+    const ctxRows = buildChatContext(rows);
+    check(ctxRows.length === 2 && ctxRows[0].content === "سلام" && ctxRows[1].content === "این یک جواب واقعی است.", "1-e: buildChatContext excludes fake ✅/⏰ confirmation headers from history");
+  }
+  {
+    const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+    const cl = (s) => classifyDaily(s, { nowMs: NOW });
+    check(cl("یادداشت کن که خرید نان").intent === "note" && cl("یادداشت کن که خرید نان").text === "خرید نان", "1-e: natural note strips که from the body");
+    check(cl("اینو یادداشت کن قرارداد را بررسی کن").intent === "note" && cl("بنویس توی یادداشت‌هام خرید نان").intent === "note", "1-e: natural note اینو/بنویس forms");
+    check(cl("یه تسک بذار ادیت ویدیوی جدید").intent === "task-create" && cl("یه تسک بذار ادیت ویدیوی جدید").text === "ادیت ویدیوی جدید", "1-e: natural task form without a colon");
+    check(cl("یه خلاصه از یادداشت‌هام بده").intent === "summary" && cl("یه خلاصه از یادداشت‌هام بده").kind === "note", "1-e: flexible note summary without a trailing verb");
+    check(cl("تسک‌هام رو جدول کن").intent !== "summary", "1-e: bare task form stays excluded from summaries (1-d-4 pin preserved)");
+  }
+}
+// ── P4.1: router timeout contract ──
+{
+  const hungFetch = async (url, init = {}) => new Promise((_, rej) => { init.signal?.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))); });
+  const prev = global.fetch;
+  try {
+    global.fetch = hungFetch;
+    const env = { STATE: fakeKV(), XKIRO_API_KEY: "k" };
+    const t0 = Date.now();
+    const r = await callRouter(env, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, { attemptTimeoutMs: 200, totalTimeoutMs: 20000 });
+    const elapsed = Date.now() - t0;
+    check(r.ok === false && r.text === "" && r.model === null && r.error === "timeout" && elapsed < 5000, `1-e: hung fetch in callRouter aborts within budget returning { ok: false, error: timeout } (elapsed ${elapsed}ms)`);
+    const r2 = await runCombo(env, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, { attemptTimeoutMs: 200, totalTimeoutMs: 20000 });
+    check(r2.ok === false && Array.isArray(r2.errors) && r2.errors[0]?.reason === "timeout", "1-e: runCombo keeps its established { ok: false, errors } shape on timeout");
+    const t1 = Date.now();
+    const r3 = await callRouter(env, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, { attemptTimeoutMs: 200, totalTimeoutMs: 1000 });
+    check(r3.ok === false && r3.error === "timeout" && Date.now() - t1 < 1500, "1-e: a total budget under the 1500ms floor stops before any attempt");
+  } finally { global.fetch = prev; }
+  {
+    const prev2 = global.fetch;
+    global.fetch = async (url) => String(url).includes("api.xkiro.com") ? Response.json({ choices: [{ message: { content: "hello back" } }] }) : new Response("unexpected", { status: 500 });
+    try {
+      const env = { STATE: fakeKV(), XKIRO_API_KEY: "k" };
+      const r = await callRouter(env, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, {});
+      check(r.ok === true && r.text === "hello back" && r.model === "xkiro/test-model" && r.error === null, "1-e: callRouter returns text + model on success");
+    } finally { global.fetch = prev2; }
+  }
+}
+
+// ── P4.1: answerChatText sends ⏳ and finalizes that exact message ──
+if (DatabaseSync) {
+  const freshChat = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } } };
+  };
+  const tgStub = (calls, msgId) => async (url, init = {}) => {
+    const u = String(url);
+    if (u.startsWith("https://api.telegram.org/")) {
+      const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+      let payload = {};
+      try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+      calls.push({ method: m ? m[1] : "", payload });
+      return Response.json({ ok: true, result: { message_id: msgId } });
+    }
+    return Response.json({ choices: [{ message: { content: "سلام! این جواب است." } }] });
+  };
+  // Failure: no provider keys -> stage notice finalizes the ⏳ message.
+  {
+    const { db } = freshChat();
+    const calls = [];
+    const prev = global.fetch;
+    global.fetch = tgStub(calls, 99);
+    try {
+      await answerChatText({ STATE: fakeKV(), DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1" }, 1, 1, "سلام", false, { saveText: "", retryEntryId: 42, quickConvertId: 42 });
+    } finally { global.fetch = prev; }
+    const send = calls.find((c) => c.method === "sendMessage");
+    const edit = calls.find((c) => c.method === "editMessageText");
+    check(send?.payload?.text === "⏳ در حال پردازش...", "1-e: answerChatText sends the ⏳ placeholder first");
+    check(edit?.payload?.message_id === 99 && String(edit?.payload?.text ?? "").includes("مرحله‌ی چت شکست خورد"), "1-e: answerChatText failure edits that exact progress message_id with the stage notice");
+    const kb = edit?.payload?.reply_markup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+    check(kb.includes("chat:retry:42") && kb.includes("qconv:note:42") && kb.includes("qconv:task:42"), "1-e: answerChatText failure notice carries retry + quick-convert buttons on the edit");
+  }
+  // Success: seeded catalog + key -> the answer edits the same message.
+  {
+    const { db } = freshChat();
+    const calls = [];
+    const prev = global.fetch;
+    global.fetch = tgStub(calls, 99);
+    try {
+      const kv = fakeKV();
+      await kv.put("catalog:xkiro", JSON.stringify({ models: [{ id: "qwen3-32b", provider: "xkiro", context: 131072 }] }));
+      await answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "سلام", false, { saveText: "" });
+    } finally { global.fetch = prev; }
+    const edit = calls.find((c) => c.method === "editMessageText");
+    check(edit?.payload?.message_id === 99 && edit?.payload?.text === "سلام! این جواب است.", "1-e: answerChatText success edits the exact ⏳ message_id with the answer");
+    check(calls.filter((c) => c.method === "sendMessage").length === 1, "1-e: answerChatText success sends no second message");
+  }
+  // Caller-sent progress id is reused, not replaced.
+  {
+    const { db } = freshChat();
+    const calls = [];
+    const prev = global.fetch;
+    global.fetch = tgStub(calls, 77);
+    try {
+      await answerChatText({ STATE: fakeKV(), DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1" }, 1, 1, "سلام", false, { saveText: "", progressMsgId: 1234, retryEntryId: 42, quickConvertId: 42 });
+    } finally { global.fetch = prev; }
+    check(!calls.some((c) => c.method === "sendMessage" && c.payload?.text === "⏳ در حال پردازش..."), "1-e: answerChatText with opts.progressMsgId sends no second ⏳");
+    const edit = calls.find((c) => c.method === "editMessageText");
+    check(edit?.payload?.message_id === 1234, "1-e: answerChatText finalizes the caller-supplied progressMsgId");
+  }
+}
+
+// ── P4.2/P4.3: disambiguation + NLU interpreter, end to end ──
+if (DatabaseSync) {
+  const fresh1e = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } }, rows: (sql, params = []) => sq.prepare(sql).all(...params) };
+  };
+  const seedProjE = (sq, uid, name, aliases = [], isDefault = 0) => { sq.prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (?, ?, ?, 'active', ?, '2026-10-01T00:00:00.000Z')").run(uid, name, JSON.stringify(aliases), isDefault); return sq.prepare("SELECT id FROM projects WHERE user_id = ? AND name = ?").all(uid, name)[0].id; };
+  const mkSE = () => { const sent = []; const chats = []; const edits = []; return { sent, chats, edits, send: async (t, opts) => { sent.push({ text: t, opts }); }, chat: async (t, copts) => { chats.push({ text: t, opts: copts }); }, editMarkup: async () => { edits.push(1); } }; };
+  const convoE = (sc, extraEnv = {}) => { const s = mkSE(); const env = { STATE: fakeKV(), DB: sc.db, ...extraEnv }; const say = async (text, nowMs) => handleDailyText(env, { chatId: 1, userId: 1, text, send: s.send, chat: s.chat, editMarkup: s.editMarkup, nowMs }); const slot = async () => env.STATE.get("daily:pending-ask:1", "json"); return { s, env, say, slot }; };
+  const tapE = (c, data, nowMs) => resolveAskCallback(c.env, { fromId: 1, chatId: 1, data, nowMs, send: c.s.send, editMarkup: c.s.editMarkup });
+  const MORNING = Date.UTC(2026, 9, 28, 5, 0, 0); // 08:30 Tehran
+  const REM_TOMORROW = "یادآوری کن فردا ساعت ۰۳:۳۰ تست یادآور";
+  const aiJson = (obj) => ({ run: async () => ({ response: JSON.stringify(obj) }) });
+  const askKb = (sentEntry) => sentEntry?.opts?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+  // P4.2a: the ask carries the exact ☀️/🌇/❌ buttons.
+  {
+    const sc = fresh1e(); const c = convoE(sc);
+    await c.say(REM_TOMORROW, MORNING);
+    const last = c.s.sent.at(-1);
+    const kb = askKb(last);
+    check(last?.text === "ساعت را با صبح یا عصر مشخص کن." && kb.includes("ask:dp:صبح") && kb.includes("ask:dp:عصر") && kb.includes("ask:cancel"), "1-e: hour-ambiguous ask sends WITH ask:dp:صبح/عصر/cancel buttons");
+    check((await c.slot())?.kind === "hour-ambiguous", "1-e: hour-ambiguous slot stored");
+  }
+  // P4.2b: صبخ resolves to 03:30 tomorrow + D1 save, never chat.
+  {
+    const sc = fresh1e(); const c = convoE(sc);
+    await c.say(REM_TOMORROW, MORNING);
+    const r = await c.say("صبخ", MORNING);
+    const task = sc.rows("SELECT title, remind_at FROM tasks WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(r === "handled" && task?.title === "تست یادآور" && task?.remind_at === "2026-10-29T03:30:00+03:30" && c.s.chats.length === 0 && (await c.slot()) === null, "1-e: صبخ resolves to 03:30 tomorrow + D1 save, never chat, typo stripped from title");
+  }
+  // P4.2c: ask:dp:عصر tap resolves 15:30 tomorrow + D1 save + slot cleared + markup removed.
+  {
+    const sc = fresh1e(); const c = convoE(sc);
+    await c.say(REM_TOMORROW, MORNING);
+    await tapE(c, "ask:dp:عصر", MORNING);
+    const task = sc.rows("SELECT title, remind_at FROM tasks WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(task?.remind_at === "2026-10-29T15:30:00+03:30" && c.s.sent.at(-1)?.text === "⏰ یادآوری به‌عنوان تسک ذخیره شد." && (await c.slot()) === null && c.s.edits.length === 1, "1-e: ask:dp:عصر tap resolves 15:30 tomorrow + D1 save + slot cleared + keyboard removed");
+  }
+  // P4.2d: ask:cancel tap clears + confirms cancellation.
+  {
+    const sc = fresh1e(); const c = convoE(sc);
+    await c.say(REM_TOMORROW, MORNING);
+    await tapE(c, "ask:cancel", MORNING);
+    check(c.s.sent.at(-1)?.text === "❌ یادآوری لغو شد." && (await c.slot()) === null && sc.rows("SELECT id FROM tasks WHERE user_id = 1").length === 0, "1-e: ask:cancel tap clears + ❌ یادآوری لغو شد., no task stored");
+  }
+  // P4.2e: انصراف reply clears + confirms cancellation, never chat.
+  {
+    const sc = fresh1e(); const c = convoE(sc);
+    await c.say(REM_TOMORROW, MORNING);
+    const r = await c.say("انصراف", MORNING);
+    check(r === "handled" && c.s.sent.at(-1)?.text === "❌ یادآوری لغو شد." && (await c.slot()) === null && c.s.chats.length === 0, "1-e: انصراف reply clears + ❌ یادآوری لغو شد., never chat");
+  }
+  // P4.2f: a real question while hour-ambiguous clears the slot and answers in chat.
+  {
+    const sc = fresh1e(); const c = convoE(sc);
+    await c.say(REM_TOMORROW, MORNING);
+    const n = c.s.sent.length;
+    const r = await c.say("تفاوت Cloudflare D1 و KV چیه و کدوم برای ذخیره پیام‌ها بهتره؟", MORNING);
+    check(r === "chat" && c.s.sent.length === n && (await c.slot()) === null, "1-e: real question while hour-ambiguous clears pending_ask and routes to chat");
+  }
+  // P4.2g: short unknown token holds the slot + buttons, then عصر still resolves.
+  {
+    const sc = fresh1e(); const c = convoE(sc);
+    await c.say(REM_TOMORROW, MORNING);
+    const r = await c.say("xyz", MORNING);
+    const held = c.s.sent.at(-1);
+    check(r === "handled" && String(held?.text ?? "").startsWith("متوجه نشدم؛") && askKb(held).includes("ask:dp:صبح") && (await c.slot())?.kind === "hour-ambiguous" && c.s.chats.length === 0, "1-e: short unknown token holds pending_ask + re-asks with buttons, never chat");
+    await c.say("عصر", MORNING);
+    const task = sc.rows("SELECT title, remind_at FROM tasks WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(task?.remind_at === "2026-10-29T15:30:00+03:30" && (await c.slot()) === null, "1-e: held slot still resolves on the next daypart reply");
+  }
+  // P4.2h: short token consults the NLU first when the AI binding exists.
+  {
+    const sc = fresh1e(); const c = convoE(sc, { AI: aiJson({ intent: "daypart_reply", confidence: 0.9, daypart: "عصر" }) });
+    await c.say(REM_TOMORROW, MORNING);
+    await c.say("xyzq", MORNING);
+    const task = sc.rows("SELECT title, remind_at FROM tasks WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(task?.remind_at === "2026-10-29T15:30:00+03:30" && (await c.slot()) === null, "1-e: short token resolved by the NLU daypart_reply instead of holding");
+  }
+  // P4.3a: NLU note — natural tag-free sentence, INTERPRETER_MODEL unset, project resolved + badge.
+  {
+    const sc = fresh1e(); const gol = seedProjE(sc.sq, 1, "گلبهار", ["گل"]); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    const c = convoE(sc, { AI: aiJson({ intent: "note", confidence: 0.92, project: "گلبهار", body: "سیمان و گچ فردا صبح تحویل گرفته میشه" }) });
+    const r = await c.say("فردا سیمان و گچ برای پروژه گلبهار تحویل گرفته میشه", MORNING);
+    const note = sc.rows("SELECT text, project_id FROM notes WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(r === "handled" && note?.text === "سیمان و گچ فردا صبح تحویل گرفته میشه" && note?.project_id === gol && c.s.sent.at(-1)?.text === "✅ یادداشت ذخیره شد. [📁 گلبهار]", "1-e: NLU note saves to گلبهار with [📁 گلبهار] reply, INTERPRETER_MODEL unset");
+  }
+  // P4.3b: NLU task — natural tag-free sentence, project یوتیوب.
+  {
+    const sc = fresh1e(); const yt = seedProjE(sc.sq, 1, "یوتیوب", []); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    const c = convoE(sc, { AI: aiJson({ intent: "task", confidence: 0.9, project: "یوتیوب", body: "ادیت ویدیوی جدید" }) });
+    const r = await c.say("یه تسک برای پروژه یوتیوب بذار ادیت ویدیوی جدید", MORNING);
+    const task = sc.rows("SELECT title, project_id FROM tasks WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(r === "handled" && task?.title === "ادیت ویدیوی جدید" && task?.project_id === yt && c.s.sent.at(-1)?.text === "✅ تسک ثبت شد. [📁 یوتیوب]", "1-e: NLU task saves to یوتیوب with [📁 یوتیوب] reply");
+  }
+  // P4.3c: NLU reminder — deterministic re-parse decides the due time.
+  {
+    const sc = fresh1e(); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    const c = convoE(sc, { AI: aiJson({ intent: "reminder", confidence: 0.91, body: "به علی زنگ بزنم", date_ref: "فردا", time_ref: "5", daypart: "عصر" }) });
+    const r = await c.say("فردا ساعت ۵ عصر به علی زنگ بزنم", MORNING);
+    const task = sc.rows("SELECT title, remind_at FROM tasks WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(r === "handled" && task?.title === "به علی زنگ بزنم" && task?.remind_at === "2026-10-29T17:00:00+03:30", "1-e: NLU reminder re-parsed deterministically to tomorrow 17:00");
+  }
+  // P4.3d: NLU reminder without a daypart asks WITH buttons.
+  {
+    const sc = fresh1e(); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    const c = convoE(sc, { AI: aiJson({ intent: "reminder", confidence: 0.88, body: "به علی زنگ بزنم", date_ref: "فردا", time_ref: "5", daypart: null }) });
+    await c.say("فردا ساعت ۵ به علی زنگ بزنم", MORNING);
+    const last = c.s.sent.at(-1);
+    const slot = await c.slot();
+    check(last?.text === "ساعت را با صبح یا عصر مشخص کن." && askKb(last).includes("ask:dp:صبح") && slot?.kind === "hour-ambiguous", "1-e: NLU hour-ambiguous reminder asks WITH buttons");
+  }
+  // P4.3e: NLU summary routes to the verified D1 handler (900 tokens).
+  {
+    const sc = fresh1e(); const yt = seedProjE(sc.sq, 1, "یوتیوب", []); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    sc.sq.prepare("INSERT INTO tasks (user_id, title, status, project_id, created_at) VALUES (1, 'ادیت ویدیو', 'open', ?, '2026-10-28T00:00:00.000Z')").run(yt);
+    const c = convoE(sc, { AI: aiJson({ intent: "summary", confidence: 0.9, project: "یوتیوب", summary_target: "tasks" }) });
+    const r = await c.say("تسک‌های یوتیوب رو برام جمع‌بندی کن", MORNING);
+    check(r === "handled" && c.s.chats.length === 1 && c.s.chats[0].opts.maxTokens === 900 && c.s.chats[0].text.includes("ادیت ویدیو"), "1-e: NLU summary routes to the verified D1 handler with 900 tokens");
+  }
+  // P4.3f: NLU expense executes ONLY on a deterministic integer amount (draft, never a direct insert).
+  {
+    const sc = fresh1e(); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    const c = convoE(sc, { AI: aiJson({ intent: "expense", confidence: 0.9 }) });
+    await c.say("برای نون ۵۰۰ تومان دادم", MORNING);
+    const draftKeys = [...c.env.STATE.store.keys()].filter((k) => k.startsWith("daily:draft:"));
+    check(draftKeys.length === 1 && String(c.s.sent.at(-1)?.text ?? "").includes("💰 خرج: 500") && sc.rows("SELECT id FROM expenses WHERE user_id = 1").length === 0, "1-e: NLU expense creates the 10-minute confirm draft on a deterministic amount, no direct insert");
+  }
+  // P4.3g: NLU expense with no deterministic amount falls through to chat — the model number is never trusted.
+  {
+    const sc = fresh1e(); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    const c = convoE(sc, { AI: aiJson({ intent: "expense", confidence: 0.95, body: "خرید بزرگ" }) });
+    const r = await c.say("یه خرج داشتم", MORNING);
+    const draftKeys = [...c.env.STATE.store.keys()].filter((k) => k.startsWith("daily:draft:"));
+    check(r === "chat" && draftKeys.length === 0 && c.s.sent.length === 0, "1-e: NLU expense without a deterministic amount falls through to chat, no draft");
+  }
+  // P4.3h: low confidence falls through to chat, nothing stored.
+  {
+    const sc = fresh1e(); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    const c = convoE(sc, { AI: aiJson({ intent: "note", confidence: 0.4, body: "چیزی" }) });
+    const r = await c.say("فردا سیمان و گچ برای پروژه گلبهار تحویل گرفته میشه", MORNING);
+    check(r === "chat" && sc.rows("SELECT id FROM notes WHERE user_id = 1").length === 0, "1-e: NLU confidence < 0.75 falls through to chat, nothing stored");
+  }
+  // P4.3i: AI timeout falls through to chat without dropping (direct unit: fast timeoutMs; integration: full 4500ms race).
+  {
+    const fast = await classifyIntentNlu({ AI: { run: () => new Promise(() => {}) } }, "hi", {}, { timeoutMs: 50 });
+    check(fast.ok === false && fast.reason === "timeout", "1-e: classifyIntentNlu times out cleanly with { ok: false, reason: timeout }");
+    const sc = fresh1e(); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    const c = convoE(sc, { AI: { run: () => new Promise(() => {}) } });
+    const t0 = Date.now();
+    const r = await c.say("فردا سیمان و گچ برای پروژه گلبهار تحویل گرفته میشه", MORNING);
+    check(r === "chat" && Date.now() - t0 >= 4400 && sc.rows("SELECT id FROM notes WHERE user_id = 1").length === 0, "1-e: hanging AI.run falls through to chat after the 4500ms race, nothing dropped");
+  }
+  // P4.3j: <think>/fenced interpreter output parses cleanly through the NLU path.
+  {
+    const sc = fresh1e(); const gol = seedProjE(sc.sq, 1, "گلبهار", ["گل"]); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    const c = convoE(sc, { AI: { run: async () => ({ response: "<think>reasoning</think>\n```json\n{\"intent\":\"note\",\"confidence\":0.93,\"project\":\"گلبهار\",\"body\":\"سیمان و گچ\"}\n```" }) } });
+    const r = await c.say("فردا سیمان و گچ برای پروژه گلبهار تحویل گرفته میشه", MORNING);
+    const note = sc.rows("SELECT text, project_id FROM notes WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(r === "handled" && note?.text === "سیمان و گچ" && note?.project_id === gol, "1-e: <think>-wrapped + fenced NLU output parses and executes");
+  }
+  // P4.1 (summary side): rows verified -> ⏳ summary placeholder sent, id plumbed to o.chat, 900 tokens.
+  {
+    const sc = fresh1e(); const gol = seedProjE(sc.sq, 1, "گلبهار", ["گل"]); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    sc.sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'صبحانه گلبهار', 'text', '2026-10-28T01:24:00+03:30', ?)").run(gol);
+    const tgCalls = [];
+    const prev = global.fetch;
+    global.fetch = async (url, init = {}) => {
+      const m = /\/bot[^/]+\/(\w+)$/.exec(String(url));
+      let payload = {};
+      try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+      tgCalls.push({ method: m ? m[1] : "", payload });
+      return Response.json({ ok: true, result: { message_id: 555 } });
+    };
+    try {
+      const c = convoE(sc, { TG_TOKEN: "x" });
+      await c.say("یادداشت‌های گلبهار رو خلاصه کن", MORNING);
+      const prog = tgCalls.find((x) => x.method === "sendMessage");
+      check(prog?.payload?.text === "⏳ در حال آماده‌سازی خلاصه و جدول..." && c.s.chats.length === 1 && c.s.chats[0].opts.progressMsgId === 555 && c.s.chats[0].opts.maxTokens === 900, "1-e: summary sends the ⏳ placeholder after D1 verification and plumbs its id + 900 tokens to o.chat");
+    } finally { global.fetch = prev; }
+  }
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);
   process.exitCode = 1;
   process.exit(1);
 }
-console.log("\n✓ assertهای pipeline 3i برقرار شد.");
 
 // ── Step 1b-1c: note/translate/remember branches, on top of 1b-1b ──
 {
@@ -1913,7 +2299,9 @@ if (DatabaseSync) {
     try {
       const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", DB: d1, ROUTER_KEY: "k-test", GITHUB_DISPATCH_TOKEN: "gh-fake" };
       await sendTg(env, msgUpdate("پروژه"));
-      const texts = world.calls.telegram.filter((c) => c.method === "sendMessage").map((c) => String(c.payload?.text ?? ""));
+      // Phase 1-e Pillar 1: delivered text may arrive via the ⏳
+      // placeholder's edit, not a second sendMessage.
+      const texts = world.calls.telegram.filter((c) => c.method === "sendMessage" || c.method === "editMessageText").map((c) => String(c.payload?.text ?? ""));
       check(texts.some((x) => x.includes("مرحله‌ی چت شکست خورد")) && !texts.some((x) => x.includes("با /dev بفرست")), "full flow: model chat skips classifyIntent, no dev suggestion");
     } finally { global.fetch = prevFetch; world.restore(); }
   }
@@ -4428,7 +4816,7 @@ if (DatabaseSync) {
     const sc = scenario4();
     const { s } = await flow4(sc, "یادداشت‌های گلبهار رو خلاصه کن");
     check(s.chats.length === 1 && s.chats[0].text.includes("صبحانه گلبهار") && !s.chats[0].text.includes("تماس عمومی") && !s.chats[0].text.includes("بدون پروژه"), "1-d-4: project note summary passes ONLY that project's rows");
-    check(s.chats[0].text.includes("۱۱ آبان ۱۴۰۵") && s.chats[0].opts.systemPrompt && s.chats[0].opts.noHistory === true && s.chats[0].opts.saveText === "" && s.chats[0].opts.maxTokens === 1600, "1-d-4: summary input carries Jalali dates + grounded chat options (noHistory, no save, 1600 tokens)");
+    check(s.chats[0].text.includes("۱۱ آبان ۱۴۰۵") && s.chats[0].opts.systemPrompt && s.chats[0].opts.noHistory === true && s.chats[0].opts.saveText === "" && s.chats[0].opts.maxTokens === 900, "1-d-4: summary input carries Jalali dates + grounded chat options (noHistory, no save, 900 tokens — Phase 1-e spec change from 1600)");
     const all = await flow4(sc, "یادداشت‌هام رو خلاصه کن");
     check(all.s.chats.length === 1 && all.s.chats[0].text.includes("صبحانه گلبهار") && all.s.chats[0].text.includes("تماس عمومی") && all.s.chats[0].text.includes("بدون پروژه"), "1-d-4: unfiltered note summary passes all rows");
   }
@@ -4584,7 +4972,10 @@ if (DatabaseSync) {
       const { db } = fresh1d5();
       const env = { ...newEnv(), DB: db };
       await sendTg(env, msgUpdate("add a /health endpoint to the worker"));
-      const failMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+      // Phase 1-e Pillar 1: the failure notice finalizes the ⏳
+      // placeholder (editMessageText, markup on the edit) instead of a
+      // second sendMessage.
+      const failMsg = world.calls.telegram.filter((c) => c.method === "editMessageText").at(-1) ?? world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
       check(String(failMsg?.payload?.text ?? "").includes("مرحله‌ی چت شکست خورد"), "1-d-5: worker chat failure notice names the stage");
       const kb = failMsg?.payload?.reply_markup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
       check(kb.some((c) => c.startsWith("chat:retry:")) && kb.some((c) => c.startsWith("qconv:note:")) && kb.some((c) => c.startsWith("qconv:task:")), "1-d-5: worker chat failure notice carries retry + quick-convert buttons");
@@ -4669,7 +5060,7 @@ if (DatabaseSync) {
     sc.sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'صبحانه گلبهار', 'text', '2026-10-28T01:24:00+03:30', ?)").run(gol);
     const c = convo6(sc);
     await c.say("یادداشت‌های گلبهار رو خلاصه کن", MORNING);
-    check(c.s.chats.length === 1 && c.s.chats[0].opts.maxTokens === 1600 && String(c.s.chats[0].opts.systemPrompt ?? "").includes("۴ تا ۵ خط") && String(c.s.chats[0].opts.systemPrompt ?? "").includes("| ردیف | تاریخ | پوشه | خلاصه |"), "1-d-6: summary passes 1600 tokens + concise-then-table instruction");
+    check(c.s.chats.length === 1 && c.s.chats[0].opts.maxTokens === 900 && String(c.s.chats[0].opts.systemPrompt ?? "").includes("۴ تا ۵ خط") && String(c.s.chats[0].opts.systemPrompt ?? "").includes("| ردیف | تاریخ | پوشه | خلاصه |"), "1-d-6: summary passes 900 tokens (Phase 1-e spec change from 1600) + concise-then-table instruction");
   }
 }
 
