@@ -38,7 +38,7 @@ import {
   CHAT_CONTEXT_LIMIT,
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
-import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, parseNoteQuery, parseSummaryQuery } from "../src/daily.js";
+import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, parseNoteQuery, parseSummaryQuery, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, stripMiddleFolderTag } from "../src/daily.js";
 import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
 import { buildInterpreterPrompt, parseInterpreterOutput, interpretText, callInterpreterModel, validateAmountText, validateDateTexts, matchProject, validateInterpreterAction, INTERPRETER_MAX_ACTIONS } from "../src/interpreter.js";
 import { scoreEvalResults, mapOutcome, scoreSlots, runCaseEvaluation, iranNowIso, median } from "../scripts/eval-intent.mjs";
@@ -4428,7 +4428,7 @@ if (DatabaseSync) {
     const sc = scenario4();
     const { s } = await flow4(sc, "یادداشت‌های گلبهار رو خلاصه کن");
     check(s.chats.length === 1 && s.chats[0].text.includes("صبحانه گلبهار") && !s.chats[0].text.includes("تماس عمومی") && !s.chats[0].text.includes("بدون پروژه"), "1-d-4: project note summary passes ONLY that project's rows");
-    check(s.chats[0].text.includes("۱۱ آبان ۱۴۰۵") && s.chats[0].opts.systemPrompt && s.chats[0].opts.noHistory === true && s.chats[0].opts.saveText === "" && s.chats[0].opts.maxTokens === 700, "1-d-4: summary input carries Jalali dates + grounded chat options (noHistory, no save, 700 tokens)");
+    check(s.chats[0].text.includes("۱۱ آبان ۱۴۰۵") && s.chats[0].opts.systemPrompt && s.chats[0].opts.noHistory === true && s.chats[0].opts.saveText === "" && s.chats[0].opts.maxTokens === 1600, "1-d-4: summary input carries Jalali dates + grounded chat options (noHistory, no save, 1600 tokens)");
     const all = await flow4(sc, "یادداشت‌هام رو خلاصه کن");
     check(all.s.chats.length === 1 && all.s.chats[0].text.includes("صبحانه گلبهار") && all.s.chats[0].text.includes("تماس عمومی") && all.s.chats[0].text.includes("بدون پروژه"), "1-d-4: unfiltered note summary passes all rows");
   }
@@ -4589,6 +4589,87 @@ if (DatabaseSync) {
       const kb = failMsg?.payload?.reply_markup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
       check(kb.some((c) => c.startsWith("chat:retry:")) && kb.some((c) => c.startsWith("qconv:note:")) && kb.some((c) => c.startsWith("qconv:task:")), "1-d-5: worker chat failure notice carries retry + quick-convert buttons");
     } finally { world.restore(); }
+  }
+}
+
+// ── Phase 1-d-6: live-QA hotfix — hour-ambiguous discharge, middle folder tag, summary budget ──
+{
+  const NOW6 = Date.UTC(2026, 9, 28, 5, 0, 0); // 2026-10-28 08:30 Tehran: 03:30/05:00 today ambiguous, 15:30/17:00 still future
+  const cl6 = (s) => classifyDaily(s, { nowMs: NOW6 });
+  check(cl6("یادداشت توی پروژه گلبهار: سیمان و گچ فردا صبح تحویل گرفته شود").intent === "note", "1-d-6: middle-tagged note classifies as note");
+  check(cl6("تسک توی پروژه گلبهار: خرید سیمان").intent === "task-create", "1-d-6: middle-tagged task classifies as task-create");
+  check(cl6("یادآوری توی پروژه گلبهار: فردا ساعت ۹ تماس").intent === "reminder" && cl6("یادآوری توی پروژه گلبهار: فردا ساعت ۹ تماس").due === "2026-10-29T09:00:00+03:30", "1-d-6: middle-tagged reminder (bare یادآوری) classifies as reminder");
+  const tg6 = extractFolderTag("یادداشت توی پروژه گلبهار: سیمان و گچ فردا صبح تحویل گرفته شود");
+  check(tg6?.at === "middle" && tg6?.name === "گلبهار" && tg6?.body === "یادداشت: سیمان و گچ فردا صبح تحویل گرفته شود", "1-d-6: middle folder tag extracts name + stripped body");
+  check(hasDaypartReply("عصر") && hasDaypartReply("ساعت ۳ عصر") && !hasDaypartReply("تفاوت Cloudflare D1 و KV چیه؟") && !hasDaypartReply("تفاوت صبح و عصر چیه؟"), "1-d-6: daypart detection is exact-shape, not substring");
+  check(mergeHourAmbiguousFollowup("عصر", "یادآوری کن امروز ساعت ۰۳:۳۰ تست یادآور") === "یادآوری کن امروز ساعت 03:30 عصر تست یادآور", "1-d-6: daypart merge splices onto the stored hour");
+}
+if (DatabaseSync) {
+  const fresh1d6 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } }, rows: (sql, params = []) => sq.prepare(sql).all(...params) };
+  };
+  const seedProj6 = (sq, uid, name, aliases = [], isDefault = 0) => { sq.prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (?, ?, ?, 'active', ?, '2026-10-01T00:00:00.000Z')").run(uid, name, JSON.stringify(aliases), isDefault); return sq.prepare("SELECT id FROM projects WHERE user_id = ? AND name = ?").all(uid, name)[0].id; };
+  const mkS6 = () => { const sent = []; const chats = []; return { sent, chats, send: async (t, opts) => { sent.push({ text: t, opts }); }, chat: async (t, copts) => { chats.push({ text: t, opts: copts }); }, editMarkup: async () => {} }; };
+  const convo6 = (sc) => { const s = mkS6(); const env = { STATE: fakeKV(), DB: sc.db }; const say = async (text, nowMs) => handleDailyText(env, { chatId: 1, userId: 1, text, send: s.send, chat: s.chat, nowMs }); const slot = async () => env.STATE.get("daily:pending-ask:1", "json"); return { s, env, say, slot }; };
+  const MORNING = Date.UTC(2026, 9, 28, 5, 0, 0); // 08:30 Tehran
+  const REM6 = "یادآوری کن امروز ساعت ۰۳:۳۰ تست یادآور";
+  // Bug 1a: daypart reply resolves + stores, zero model calls, slot gone.
+  {
+    const sc = fresh1d6(); const c = convo6(sc);
+    await c.say(REM6, MORNING);
+    check(c.s.sent.at(-1)?.text === "ساعت را با صبح یا عصر مشخص کن." && (await c.slot())?.kind === "hour-ambiguous", "1-d-6: ambiguous reminder asks + stores hour-ambiguous slot");
+    const r = await c.say("عصر", MORNING);
+    const task = sc.rows("SELECT title, remind_at FROM tasks WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(r === "handled" && task?.title === "تست یادآور" && task?.remind_at === "2026-10-28T15:30:00+03:30" && c.s.sent.at(-1)?.text === "⏰ یادآوری به‌عنوان تسک ذخیره شد." && c.s.chats.length === 0 && (await c.slot()) === null, "1-d-6: عصر resolves 15:30 + stores task, 0 model calls, slot cleared");
+  }
+  // Bug 1b: unrelated question is fresh chat, never trapped, slot cleared.
+  {
+    const sc = fresh1d6(); const c = convo6(sc);
+    await c.say(REM6, MORNING);
+    const n = c.s.sent.length;
+    const r = await c.say("تفاوت Cloudflare D1 و KV چیه؟", MORNING);
+    check(r === "chat" && c.s.sent.length === n && (await c.slot()) === null, "1-d-6: unrelated question routes to chat, no re-ask, slot cleared");
+  }
+  // Bug 1c: still-ambiguous re-asks once WITH the original body, then resolves.
+  {
+    const sc = fresh1d6(); const c = convo6(sc);
+    await c.say("یادآوری کن امروز ساعت ۵ تست شب", MORNING);
+    await c.say("شب", MORNING);
+    const slot = await c.slot();
+    check(c.s.sent.at(-1)?.text === "ساعت را با صبح یا عصر مشخص کن." && slot?.kind === "hour-ambiguous" && slot?.pendingBody === "یادآوری کن امروز ساعت ۵ تست شب", "1-d-6: still-ambiguous re-asks once, original body preserved");
+    await c.say("عصر", MORNING);
+    const task = sc.rows("SELECT title, remind_at FROM tasks WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(task?.title === "تست شب" && task?.remind_at === "2026-10-28T17:00:00+03:30" && (await c.slot()) === null, "1-d-6: preserved slot then resolves 17:00");
+  }
+  // Bug 1d: hour-only daypart ("ساعت ۳ عصر") resolves per the directive.
+  {
+    const sc = fresh1d6(); const c = convo6(sc);
+    await c.say("یادآوری کن امروز ساعت ۳ تست ساعت", MORNING);
+    await c.say("ساعت ۳ عصر", MORNING);
+    const task = sc.rows("SELECT title, remind_at FROM tasks WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(task?.remind_at === "2026-10-28T15:00:00+03:30", "1-d-6: ساعت ۳ عصر resolves 15:00");
+  }
+  // Bug 2: middle-tagged note stores with the project, exact confirm, 0 model calls.
+  {
+    const sc = fresh1d6(); const gol = seedProj6(sc.sq, 1, "گلبهار", ["گل"]); seedProj6(sc.sq, 1, "عمومی", [], 1);
+    const c = convo6(sc);
+    await c.say("یادداشت توی پروژه گلبهار: سیمان و گچ فردا صبح تحویل گرفته شود", MORNING);
+    const note = sc.rows("SELECT text, project_id FROM notes WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(note?.text === "سیمان و گچ فردا صبح تحویل گرفته شود" && note?.project_id === gol && c.s.sent.at(-1)?.text === "✅ یادداشت ذخیره شد. [📁 گلبهار]" && c.s.chats.length === 0, "1-d-6: middle-tagged note saves to گلبهار, exact confirm, 0 model calls");
+  }
+  // Bug 3: summary handler passes 1600 tokens + the tightened instruction.
+  {
+    const sc = fresh1d6(); const gol = seedProj6(sc.sq, 1, "گلبهار", ["گل"]);
+    sc.sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'صبحانه گلبهار', 'text', '2026-10-28T01:24:00+03:30', ?)").run(gol);
+    const c = convo6(sc);
+    await c.say("یادداشت‌های گلبهار رو خلاصه کن", MORNING);
+    check(c.s.chats.length === 1 && c.s.chats[0].opts.maxTokens === 1600 && String(c.s.chats[0].opts.systemPrompt ?? "").includes("۴ تا ۵ خط") && String(c.s.chats[0].opts.systemPrompt ?? "").includes("| ردیف | تاریخ | پوشه | خلاصه |"), "1-d-6: summary passes 1600 tokens + concise-then-table instruction");
   }
 }
 

@@ -154,42 +154,54 @@ export function parseReminder(text, nowMs, origText) {
 }
 // Phase 1-c-3: deterministic rule-tier fill for a pending hour-ambiguous
 // reminder slot. The slot's pendingBody carries the ORIGINAL reminder
-// message; the answer supplies only what was missing. Two shapes resolve,
-// both by re-running parseReminder on a merged text (so its qualifier
-// rules decide, never a second time parser, and AM/PM is never guessed):
+// message; the answer supplies only what was missing. Shapes resolve by
+// re-running parseReminder on a merged text (so its qualifier rules
+// decide, never a second time parser, and AM/PM is never guessed):
 //   Shape 1 — bare daypart ("صبح", "بامداد", "ظهر", "عصر", "بعدازظهر",
 //     "بعد از ظهر", "شب"): the qualifier is spliced onto the original
 //     ambiguous hour, replacing any stale qualifier it already carried.
 //   Shape 2 — time + daypart, with or without "ساعت" ("01:17 صبح",
 //     "۱:۱۷ صبح", "ساعت ۱:۱۷ عصر"): the whole original hour phrase is
 //     replaced by the clarified time + daypart.
-// Returns { text, due } on a clean parse, else null: the caller falls
-// through to the existing routing unchanged (a still-ambiguous merge
-// re-asks through the normal path; a non-matching answer is untouched).
+//   Shape 3 (1-d-6) — hour + daypart without minutes ("ساعت ۳ عصر",
+//     "۳ عصر"): same replacement with minutes 00.
+// Returns { text, due } on a clean parse, else null.
 // The merged hour phrase also absorbs a trailing half/quarter tail so a
 // body never keeps a stray "و نیم". "بعدازظهر"/"بعداز ظهر" are spelled
 // "بعد از ظهر" in the merge because qualifierNearHour only recognises
 // the spaced form.
+// 1-d-6: the answer parser and the merge are split out so the caller can
+// tell "daypart reply, but unresolvable" (route the merged reminder) from
+// "not a daypart reply at all" (clear the slot, never trap the message).
+// Daypart detection is EXACT-SHAPE (full answer after trim/punct-strip),
+// never substring: a question that merely mentions a daypart word (e.g.
+// "تفاوت صبح و عصر چیه؟") must stay chat, not become a reminder answer.
 const DAYPART_ALT = "بعد از ظهر|بعدازظهر|بعداز ظهر|بامداد|صبح|ظهر|عصر|شب";
 function normalizeDaypartToken(s) { return s === "بعدازظهر" || s === "بعداز ظهر" ? "بعد از ظهر" : s; }
-export function resolveHourAmbiguousFollowup(answer, original, nowMs) {
+export function parseDaypartReply(answer) {
   const ans = normalizeDigits(normalizeText(answer ?? "")).trim().replace(/[؟?!.،,:：\s]+$/u, "");
   if (!ans) return null;
   const m2 = new RegExp(`^(?:ساعت\\s+)?(\\d{1,2}):(\\d{1,2})\\s+(${DAYPART_ALT})$`).exec(ans);
-  let bare = null;
-  if (!m2) { const bm = new RegExp(`^(${DAYPART_ALT})$`).exec(ans); if (bm) bare = normalizeDaypartToken(bm[1]); }
-  if (!m2 && !bare) return null;
+  if (m2) { const hh = Number(m2[1]), mm = Number(m2[2]); if (hh > 23 || mm > 59) return null; return { hh, mm, daypart: normalizeDaypartToken(m2[3]) }; }
+  const m3 = new RegExp(`^(?:ساعت\\s+)?(\\d{1,2}|${HOUR_ALTS})\\s+(${DAYPART_ALT})$`).exec(ans);
+  if (m3) { const hh = /^\d+$/.test(m3[1]) ? Number(m3[1]) : (Object.hasOwn(HOURW, m3[1]) ? HOURW[m3[1]] : undefined); if (hh === undefined || hh > 23) return null; return { hh, mm: 0, daypart: normalizeDaypartToken(m3[2]) }; }
+  const bm = new RegExp(`^(${DAYPART_ALT})$`).exec(ans);
+  if (bm) return { bare: normalizeDaypartToken(bm[1]) };
+  return null;
+}
+export function hasDaypartReply(answer) { return parseDaypartReply(answer) !== null; }
+export function mergeHourAmbiguousFollowup(answer, original) {
+  const parsed = parseDaypartReply(answer);
+  if (!parsed) return null;
   const orig = normalizeDigits(normalizeText(original ?? ""));
   const phrase = new RegExp(`ساعت\\s*(?:\\d{1,2}|${HOUR_ALTS})(?::\\d{1,2})?(?:\\s+و\\s+(?:ربع|نیم))?(?:\\s+(?:${DAYPART_ALT}))?`).exec(orig);
   if (!phrase) return null;
-  let merged;
-  if (m2) {
-    const hh = Number(m2[1]), mm = Number(m2[2]);
-    if (hh > 23 || mm > 59) return null;
-    merged = orig.slice(0, phrase.index) + `ساعت ${pad(hh)}:${pad(mm)} ${normalizeDaypartToken(m2[3])}` + orig.slice(phrase.index + phrase[0].length);
-  } else {
-    merged = orig.slice(0, phrase.index + phrase[0].length) + ` ${bare}` + orig.slice(phrase.index + phrase[0].length);
-  }
+  if (parsed.bare) return orig.slice(0, phrase.index + phrase[0].length) + ` ${parsed.bare}` + orig.slice(phrase.index + phrase[0].length);
+  return orig.slice(0, phrase.index) + `ساعت ${pad(parsed.hh)}:${pad(parsed.mm)} ${parsed.daypart}` + orig.slice(phrase.index + phrase[0].length);
+}
+export function resolveHourAmbiguousFollowup(answer, original, nowMs) {
+  const merged = mergeHourAmbiguousFollowup(answer, original);
+  if (!merged) return null;
   const r = parseReminder(merged, nowMs, merged);
   if (r.ask || !r.due) return null;
   // Defensive bound: parseHour does not bound minutes, so never store a
@@ -423,6 +435,14 @@ export function classifyDaily(text, opts = {}) {
       return { intent: "remember", confidence: 1, refused: true };
     }
   }
+  // 1-d-6: a folder phrase between the leading keyword and the colon
+  // ("یادداشت توی پروژه گلبهار: ...") must not fall through to chat:
+  // classify the phrase-stripped body; the branch re-derives the
+  // project from the original text via extractFolderTag's middle form.
+  // Only note/task-create/reminder verdicts return here, so any other
+  // stripped reading falls through to the normal checks below.
+  const mid = stripMiddleFolderTag(text);
+  if (mid) { const c2 = classifyDaily(mid.body, opts); if (c2.intent === "note" || c2.intent === "task-create" || c2.intent === "reminder") return c2; }
   const note = NOTE_RE.exec(raw); if (note && note[1].trim().replace(/[؟?!.،,:：\s]+/gu, "")) return { intent: "note", confidence: 1, text: text.slice(note.index + note[0].length - note[1].length).trim() };
   // Bare note: only a note trigger, no body. Ask for the text at rule
   // level instead of falling through to chat, where the live model
@@ -534,8 +554,26 @@ export function classifyDaily(text, opts = {}) {
 // the text after the phrase, for longest-name-prefix resolution in
 // everyday.js; end form returns { at: "end", body, name } — the body
 // before the phrase and the trailing name, for exact resolution.
+// 1-d-6 middle form: a folder phrase between a leading keyword and the
+// colon ("یادداشت توی پروژه گلبهار: ...") returns { at: "middle",
+// body, name } — body is the phrase-stripped, re-classifiable text
+// ("یادداشت: ...", "تسک: ...", "یادآوری کن ..."), name is exact for
+// resolution. The colon is required: without it the name boundary is
+// ambiguous in a pure function, so colon-less middle phrases keep the
+// old behaviour (no tag).
 const FOLDER_START_RE = /^(?:توی|در|برای)\s+پروژه\s+([\s\S]+)$/u;
 const FOLDER_END_RE = /^([\s\S]+?)\s+(?:توی|در|برای)\s+پروژه\s+(.+?)\s*[؟?!.،,]*$/u;
+const MIDDLE_KEYWORDS = "یادداشت کن|یادداشت|تسک جدید|تسک|یادآوری کن|یادآوری"; // longest first
+const MIDDLE_TAG_RE = new RegExp(`^\\s*(?:(?:لطفا|لطفاً|ببین)\\s+)?(${MIDDLE_KEYWORDS})\\s+(?:توی|در|برای)\\s+پروژه(?:\\s+ی)?\\s+(.+?)\\s*[:：]\\s*([\\s\\S]+)$`, "ud");
+function middleTagBody(keyword, rest) { const base = keyword === "یادآوری" || keyword === "یادآوری کن" ? "یادآوری کن" : keyword.split(" ")[0]; return base === "یادآوری کن" ? `${base} ${rest}` : `${base}: ${rest}`; }
+export function stripMiddleFolderTag(text) {
+  const raw = normalizeText(text ?? "");
+  const m = MIDDLE_TAG_RE.exec(raw);
+  if (!m) return null;
+  const keyword = m[1], name = m[2].trim(), rest = m[3].trim();
+  if (!name || !rest) return null;
+  return { keyword, name, body: middleTagBody(keyword, rest), nameSpan: m.indices[2], restSpan: m.indices[3] };
+}
 export function extractFolderTag(text) {
   const raw = normalizeText(text);
   const orig = String(text ?? "");
@@ -544,6 +582,14 @@ export function extractFolderTag(text) {
   // the same length: the start rest is the tail of orig, the end body
   // is the head of orig — ZWNJ survives in the returned body/rest.
   if (s) { const rest = orig.slice(orig.length - s[1].length).trim(); if (rest) return { at: "start", rest }; }
+  // Middle before end: the end regex would otherwise swallow a middle
+  // tag whole (name = "گلبهار: <body>"), which never resolves exactly.
+  const mid = stripMiddleFolderTag(text);
+  if (mid) {
+    const name = orig.slice(mid.nameSpan[0], mid.nameSpan[1]).trim();
+    const rest = orig.slice(mid.restSpan[0], mid.restSpan[1]).trim();
+    if (name && rest) return { at: "middle", body: middleTagBody(mid.keyword, rest), name };
+  }
   const e = FOLDER_END_RE.exec(raw);
   if (e) { const body = orig.slice(0, e[1].length).trim(); const name = e[2].trim(); if (body && name) return { at: "end", body, name }; }
   return null;
