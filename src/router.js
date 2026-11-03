@@ -22,9 +22,30 @@ const MAX_HEALTH_CHECKS = 20;
 // first in 0 ms instead of re-hitting the same dead 503/404/timeout
 // at the top of the list. Success clears the entry.
 const TARGET_HEALTH_COOLDOWN_MS = 600_000;
-const BREAKER_FAILURE_STATUSES = new Set([404, 503, 502, 401, 402, 429]);
+const BREAKER_FAILURE_STATUSES = new Set([404, 503, 502, 504, 401, 402, 429]);
 const targetHealthMap = new Map();
 export function resetRouterHealthForTests() { targetHealthMap.clear(); }
+// Test-only snapshot (copy) of the in-memory breaker map, so tests can
+// assert a failure was actually recorded — same precedent as
+// resetRouterHealthForTests above.
+export function getRouterHealthSnapshotForTests() {
+  return new Map(targetHealthMap);
+}
+
+// Phase 2-c: Workers/V8 abort surfacing. Aborting with a string reason
+// (controller.abort("timeout")) or a runtime timeout does NOT reliably
+// surface as AbortError with reason "timeout": it can arrive as the bare
+// string "timeout", or as an Error whose message is "timeout" (name
+// "Error", reason undefined). The old narrow check (reason/AbortError/
+// TimeoutError only) let those fall into the else branch and become
+// "network: timeout" — mislabeling a Worker-side abort as a network
+// throw. Any of these shapes is a timeout.
+export function isTimeoutError(err) {
+  if (err === "timeout") return true;
+  if (err?.reason === "timeout") return true;
+  if (err?.name === "AbortError" || err?.name === "TimeoutError") return true;
+  return typeof err?.message === "string" && /\b(?:timeout|timed?\s*out|aborted)\b/i.test(err.message);
+}
 function recordTargetFailure(used, statusOrReason) {
   const prev = targetHealthMap.get(used);
   targetHealthMap.set(used, {
@@ -327,11 +348,10 @@ async function tryTarget(env, ctx, model, body, timeoutMs) {
       body: JSON.stringify({ ...body, model }),
     });
   } catch (err) {
-    // Timer aborts surface as AbortError (Workers: abort("timeout")
-    // rejects with a DOMException, not the string reason), so all three
-    // shapes count as a timeout — never an uncaught exception.
-    const isTimeout =
-      err?.reason === "timeout" || err?.name === "AbortError" || err?.name === "TimeoutError";
+    // Phase 2-c: use the broad isTimeoutError predicate (see above) —
+    // a Worker timer abort can surface as the bare string "timeout" or
+    // an Error with message "timeout", not only as AbortError.
+    const isTimeout = isTimeoutError(err);
     return {
       error: {
         target: used,
@@ -407,17 +427,18 @@ export async function runCombo(
     comboName = resolved.name;
   }
 
-  // Phase 1-e Pillar 1: hard wall-clock budgets, always. Per-attempt
-  // timeout defaults to 6s (Phase 2-b: 11s + 8.5s used to exhaust the
-  // whole 20s budget after only 2 targets; 2 x 6s still leaves 8s for
-  // 2-3 more models) and is capped at 14s; the total deadline across
-  // all targets/retries defaults to 20s and is capped at 22s,
+  // Phase 1-e Pillar 1: hard wall-clock budgets, always. Phase 2-c:
+  // per-attempt timeout defaults to 13s (capped at 15s) — inside the
+  // [5s, 20s) window pinned by test-dev.mjs, and long enough for
+  // working nvidia/* generations (8-12s) that 2-b's 6s killed at 6.0s
+  // while the provider finished seconds later. The total deadline
+  // across all targets/retries defaults to 22s and is capped at 22s,
   // leaving >= 8s before Cloudflare's 30s waitUntil limit. The legacy
   // deadlineMs / perTargetTimeoutMs knobs keep working as aliases,
   // capped by the same bounds. A manual combo's old up-to-55s deadline
   // is capped by the total budget too — that was the silent-death hole.
-  const attemptTimeoutMs = Math.min(attemptOpt ?? perTargetTimeoutMs ?? 6000, 14000);
-  const totalTimeoutMs = Math.min(totalOpt ?? deadlineMs ?? 20000, 22000);
+  const attemptTimeoutMs = Math.min(attemptOpt ?? perTargetTimeoutMs ?? 13000, 15000);
+  const totalTimeoutMs = Math.min(totalOpt ?? deadlineMs ?? 22000, 22000);
   const started = Date.now();
   const errors = [];
   const maxRetries = manualCfg?.retries ?? 0;
@@ -436,12 +457,17 @@ export async function runCombo(
   // every healthy target has failed.
   targets = partitionTargetsByHealth(targets);
 
-  for (const t of targets) {
+  for (let ti = 0; ti < targets.length; ti++) {
+    const t = targets[ti];
     if (rejectedProviders.has(t.provider)) continue;
     const usedModel = `${t.provider}/${t.model}`;
     const remaining = deadline - (Date.now() - started);
     if (remaining < 1200) {
-      errors.push({ target: usedModel, reason: lastErr || "timeout" });
+      // Phase 2-c: never push a fake entry for a target that was
+      // never fetched. Only when the whole call started with < 1200ms
+      // of budget (errors still empty) is an entry pushed, preserving
+      // the test-dev empty-budget behavior.
+      if (errors.length === 0) errors.push({ target: usedModel, reason: lastErr || "timeout" });
       break;
     }
 
@@ -529,12 +555,26 @@ export async function runCombo(
         }
       }
       // Phase 2-b: breaker-listed failures deprioritize this target
-      // for 10 minutes on the next request (timeout / 404 / 503 / 502
-      // / 401 / 402 / 429 only — network errors and bad json do not
-      // cool a target).
+      // for 10 minutes on the next request. Phase 2-c: a "network:
+      // timeout" string also cools its target (it is a timing-out
+      // target by another name), and 504 joins the breaker statuses.
+      // Bad json and other network errors still do not cool a target.
       if (isTimeout) recordTargetFailure(usedModel, "timeout");
+      else if (cause === "network: timeout") recordTargetFailure(usedModel, cause);
       else if (typeof cause === "number" && BREAKER_FAILURE_STATUSES.has(cause)) {
         recordTargetFailure(usedModel, cause);
+      }
+      // Phase 2-c: intra-call provider demotion. When a provider
+      // returns 503/502/504/429, its remaining untried targets in this
+      // call move to the end of the remaining list, so healthy
+      // providers get the full attempt budget immediately. Demoted
+      // targets stay at the tail and are still tried, so same-provider
+      // fallback pairs (e.g. [m1, m2]) keep working.
+      if (typeof cause === "number" && [503, 502, 504, 429].includes(cause)) {
+        const rest = targets.slice(ti + 1);
+        const keep = rest.filter((x) => x.provider !== t.provider);
+        const demoted = rest.filter((x) => x.provider === t.provider);
+        targets.splice(ti + 1, rest.length, ...keep, ...demoted);
       }
     } else if (stream) {
       const res = attempt.res;
@@ -564,7 +604,10 @@ export async function runCombo(
       // stalled body stream must not outlive the <= 22s guarantee.
       const remJson = deadline - (Date.now() - started);
       if (remJson < 1200) {
-        errors.push({ target: usedModel, reason: lastErr || "timeout" });
+        // Phase 2-c: same phantom rule as the loop floor — never
+        // attribute the previous error to this target, whose body was
+        // never read, when real attempts already failed.
+        if (errors.length === 0) errors.push({ target: usedModel, reason: lastErr || "timeout" });
         lastErr = lastErr || "timeout";
         continue;
       }
@@ -575,7 +618,11 @@ export async function runCombo(
           new Promise((_, rej) => { jsonTimer = setTimeout(() => rej(new Error("timeout")), remJson); }),
         ]);
       } catch (err) {
-        if (err && err.message === "timeout") {
+        // Phase 2-c: the body-read race uses the same broad timeout
+        // predicate as tryTarget (a body-stream abort can surface as
+        // AbortError or a "timeout"/"timed out" message, not only as
+        // the race's own Error("timeout")).
+        if (isTimeoutError(err)) {
           console.log(JSON.stringify({ event: "router_timeout", target: usedModel, ms: Date.now() - t0 }));
           errors.push({ target: usedModel, reason: "timeout" });
           lastErr = "timeout";
