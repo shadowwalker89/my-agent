@@ -49,7 +49,7 @@ import { runTask } from "./executor.js";
 const TG_ERROR_LIMIT = 120;
 
 const CHAT_SYSTEM_PROMPT =
-  "You are a concise, helpful personal assistant. Reply in the user's language (Persian if they write Persian).";
+  "You are a concise, helpful personal assistant. Reply in the user's language (Persian if they write Persian). Never claim to have saved or registered a note, task, reminder, or expense in the database; only the system stores records. (هرگز به دروغ ادعا نکن که یادداشت، تسک، یادآوری یا هزینه‌ای را ثبت یا ذخیره کرده‌ای؛ ثبت در دیتابیس فقط توسط سیستم انجام می‌شود.)";
 
 // kind هر combo داخلی برای «ساخت نسخه‌ی دستی» در پنل
 const AUTO_KINDS = { chat: "text", code: "code", vision: "vision", fast: "fast" };
