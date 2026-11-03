@@ -857,7 +857,16 @@ export async function renderNoteList(env, userId, { projectName = null, projectI
 // immediate-table instruction; 900 keeps the table intact while leaving
 // headroom inside the 22s router budget).
 // Returns false ONLY on a D1 failure (the branch gates markDaily on it).
-const SUMMARY_SYSTEM = "فقط از روی ردیف‌هایی که در پیام کاربر آمده خلاصه بساز. هیچ ردیفی را اضافه، حذف یا حدس نزن و هیچ دانسته‌ی بیرونی را قاطی نکن؛ تاریخ‌ها و نام پروژه‌ها را دقیقاً همان‌طور که داده شده بنویس. خلاصه حداکثر ۴ تا ۵ خط کوتاه باشد و بلافاصله بعد از آن جدول مارک‌داون با ستون‌های | ردیف | تاریخ | پوشه | خلاصه | بیاید.";
+// Stable v1 addendum: Telegram does NOT render Markdown tables — a
+// | ... | table arrives as literal pipe text. The summary therefore
+// renders as a short lead plus a numbered list (one line per row:
+// number, date, folder, one-line summary), which Telegram displays
+// cleanly. The list covers exactly the rows given (at most 30 — the
+// runSummary input cap); project/date filters in the D1 queries below
+// are unchanged, and the 900-token cap is unchanged (no evidence the
+// contract itself caused the 00:38/00:39 failures, which were empty
+// output and a timeout, not truncation).
+const SUMMARY_SYSTEM = "فقط از روی ردیف‌هایی که در پیام کاربر آمده خلاصه بساز. هیچ ردیفی را اضافه، حذف یا حدس نزن و هیچ دانسته‌ی بیرونی را قاطی نکن؛ تاریخ‌ها و نام پروژه‌ها را دقیقاً همان‌طور که داده شده بنویس. خلاصه حداکثر ۴ تا ۵ خط کوتاه باشد و بلافاصله بعد از آن فهرست شماره‌دار همان ردیف‌ها بیاید؛ هر ردیف در یک خط: شماره. تاریخ ـ پوشه ـ خلاصه یک‌خطی. فهرست دقیقاً ردیف‌های داده‌شده (حداکثر ۳۰ ردیف) را پوشش دهد.";
 async function runSummary(env, o, kind, projectId, userId, retryData = null) {
   const rp = await listProjectsResult(env, userId);
   const names = new Map();
