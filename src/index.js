@@ -8,7 +8,7 @@ import {
   removeCombo,
 } from "./config.js";
 import { RULES, capabilityTags } from "./combos.js";
-import { runCombo, getComboTargets, directCall } from "./router.js";
+import { runCombo, getComboTargets, directCall, clearRouterHealthTarget, clearRouterHealthForProvider, resetRouterHealthForTests } from "./router.js";
 import { classifyTask, comboCandidates, fallbackCombo, updateHasImage } from "./task-route.js";
 import { getPrefs, setPrefs } from "./tgprefs.js";
 import { syncProvider, getSyncReport, loadCatalog } from "./catalog.js";
@@ -22,11 +22,11 @@ import {
   validatePattern,
 } from "./overrides.js";
 import { tgApi, tgSend, tgBroadcast, sendProgressMessage, finalizeProgressMessage } from "./telegram.js";
-import { healthCounts } from "./health.js";
+import { healthCounts, getMedianLatency, getHealthEntry } from "./health.js";
 import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation } from "./intent.js";
 import { getChatContext } from "./memory.js";
-import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, chatFailureNotice, runReminderTick, quickConvertKeyboard } from "./everyday.js";
+import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, chatFailureNotice, formatFailureDetail, runReminderTick, quickConvertKeyboard } from "./everyday.js";
 import { handleVoice, handleVoiceRetry } from "./voice.js";
 import { saveMessage } from "./db.js";
 import {
@@ -166,14 +166,6 @@ function wrapSseStream(upstream, used) {
   return { readable, done };
 }
 
-function splitMessage(text) {
-  const chunks = [];
-  for (let i = 0; i < text.length; i += 4000) {
-    chunks.push(text.slice(i, i + 4000));
-  }
-  return chunks;
-}
-
 // combo ای «قابل استفاده» باشد یعنی شناخته (دستی یا داخلی) و حداقل یک هدف سالم داشته باشد.
 async function comboUsable(env, name) {
   try {
@@ -250,16 +242,19 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
   }
 
   if (!result.ok) {
-    const lines = result.errors
-      .map((e) => `${e.target}: ${e.status ?? e.reason}`)
-      .join("\n");
+    // Phase 2-d: compact failure detail — line 1 stays the stage
+    // notice (existing tests assert it), followed by a Persian count
+    // line, at most the first 3 target: status lines, and a (+N)
+    // overflow line, so a 7-target failure never dumps a wall of text.
+    const lines = result.errors.map((e) => `${e.target}: ${e.status ?? e.reason}`);
+    const detail = formatFailureDetail(lines);
     // 1-d-5: the failure notice names the failed stage (chat, or the
     // summary stage via opts.failureLabel) and carries retry +
     // quick-convert buttons when the caller supplied the ids (a failed
     // summary retries via its sum re-tap, not via a chat retry — see
     // the handleDailyText chat wrap). A voice turn still shows what was
     // heard, because the notice IS the bot's response.
-    const notice = chatFailureNotice(opts.failureLabel || "چت", lines, opts);
+    const notice = chatFailureNotice(opts.failureLabel || "چت", detail, opts);
     await finalizeProgressMessage(env, chatId, progressMsgId, (opts.voiceHeader || "") + notice.text, notice.replyMarkup ? { replyMarkup: notice.replyMarkup } : {});
     console.log(JSON.stringify({ combo: usedCombo, used: null, routed }));
     return; // failed turn stores nothing, neither side
@@ -332,7 +327,7 @@ async function tgModels(env, chatId, combo) {
       await tgSend(env, chatId, `combo ناشناس: ${combo}\ncomboها: ${[...new Set(names)].join(", ")}`);
       return;
     }
-    const sel = await getComboTargets(env, combo);
+    const sel = await getComboTargets(env, combo, { preview: true });
     if (sel.error) {
       const msg = sel.error.startsWith("catalog is empty")
         ? "کاتالوگ خالی است؛ اول /refresh بزن 🙏"
@@ -930,6 +925,18 @@ async function handleCallbackQuery(env, cb) {
 }
 
 async function handleUpdate(env, update) {
+  // Phase 2-d: webhook update_id dedup. Telegram may redeliver the
+  // exact same update; without this the whole turn runs twice (a
+  // second answer, a second note/task). In-memory only (per isolate,
+  // like targetHealthMap) and capped at the last 200 ids, so a
+  // cross-isolate redelivery can still slip through — but the common
+  // same-isolate redelivery is ignored immediately, before any work.
+  const uid = update?.update_id;
+  if (Number.isInteger(uid)) {
+    if (seenUpdateIds.has(uid)) return;
+    if (seenUpdateIds.size >= 200) seenUpdateIds.delete(seenUpdateIds.values().next().value);
+    seenUpdateIds.add(uid);
+  }
   if (update?.callback_query) {
     await handleCallbackQuery(env, update.callback_query);
     return;
@@ -983,6 +990,13 @@ async function handleUpdate(env, update) {
     await handlePlainText(env, msg, text);
   }
 }
+
+// Phase 2-d: in-memory webhook dedup set (see handleUpdate). Exported
+// reset for the offline suite, same precedent as
+// resetRouterHealthForTests.
+const seenUpdateIds = new Set();
+export function resetSeenUpdateIdsForTests() { seenUpdateIds.clear(); }
+export { handleUpdate, adminApi };
 
 // ── POST /dev/callback — امضاشده با HMAC از GitHub Actions ───────────────────
 async function devCallback(request, env) {
@@ -1278,7 +1292,7 @@ async function adminCatalog(request, env) {
     return new Response("unauthorized", { status: 401 });
   }
   const combo = new URL(request.url).searchParams.get("combo") ?? "chat";
-  const sel = await getComboTargets(env, combo);
+  const sel = await getComboTargets(env, combo, { preview: true });
   if (sel.error) {
     return Response.json({ ok: false, error: sel.error }, { status: 400 });
   }
@@ -1403,14 +1417,26 @@ async function adminApiListModels(request, env) {
   const cooled = new Set(
     (await env.STATE.list({ prefix: `health:${provider}/` })).keys.map((k) => k.name),
   );
-  const out = (cat?.models ?? [])
+  // Phase 2-d: per-model cooldown reason + remaining-TTL estimate +
+  // median latency for the admin Models table. Additive fields only —
+  // the established { id, status, tags, vision } shape is unchanged.
+  const listed = (cat?.models ?? [])
     .filter((m) => !q || m.id.toLowerCase().includes(q))
-    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-    .map((m) => {
-      const target = `${provider}/${m.id}`.toLowerCase();
-      const status = banSet.has(target) ? "banned" : cooled.has(`health:${target}`) ? "cooldown" : "ok";
-      return { id: m.id, status, tags: capabilityTags(m), vision: m.vision === true };
-    });
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const out = [];
+  for (const m of listed) {
+    const target = `${provider}/${m.id}`.toLowerCase();
+    const status = banSet.has(target) ? "banned" : cooled.has(`health:${target}`) ? "cooldown" : "ok";
+    let cooldownReason = null;
+    let cooldownRemainingSec = null;
+    if (status === "cooldown") {
+      const entry = await getHealthEntry(env, target);
+      cooldownReason = entry?.label ?? entry?.reason ?? null;
+      cooldownRemainingSec = entry?.remainingSec ?? null;
+    }
+    const medianLatencyMs = await getMedianLatency(env, target);
+    out.push({ id: m.id, status, tags: capabilityTags(m), vision: m.vision === true, cooldownReason, cooldownRemainingSec, medianLatencyMs });
+  }
   return json({ ok: true, provider, models: out });
 }
 
@@ -1521,6 +1547,52 @@ function normalizeTestResult(r, provider, model) {
   };
 }
 
+// Phase 2-d: one-click unblock. { target } clears one model's KV
+// cooldown + its in-memory breaker entry; { provider } clears that
+// provider's model keys + provider block + breaker entries; { all: true }
+// clears every health:* key + the whole breaker map. KV list is
+// filtered client-side by prefix (mock KVs ignore the prefix argument).
+async function adminApiHealthClear(request, env) {
+  const body = await readJsonBody(request);
+  if (!body) return json({ ok: false, error: "invalid json body" }, 400);
+  if (!env.STATE) return json({ ok: true, cleared: [] });
+  const cleared = [];
+  const delKey = async (key) => {
+    await env.STATE.delete(key);
+    cleared.push(key);
+  };
+  const listHealthKeys = async () => {
+    const keys = [];
+    let cursor;
+    do {
+      const page = await env.STATE.list({ prefix: "health:", cursor });
+      for (const k of page.keys) if (k.name.startsWith("health:")) keys.push(k.name);
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+    return keys;
+  };
+  if (body.all === true) {
+    for (const k of await listHealthKeys()) await delKey(k);
+    resetRouterHealthForTests();
+    return json({ ok: true, cleared });
+  }
+  if (body.provider) {
+    const p = String(body.provider);
+    for (const k of await listHealthKeys()) {
+      if (k === `health:provider:${p}` || k.startsWith(`health:${p}/`)) await delKey(k);
+    }
+    clearRouterHealthForProvider(p);
+    return json({ ok: true, cleared });
+  }
+  if (body.target) {
+    const t = String(body.target);
+    await delKey(`health:${t}`);
+    clearRouterHealthTarget(t);
+    return json({ ok: true, cleared });
+  }
+  return json({ ok: false, error: "target, provider or all is required" }, 400);
+}
+
 // بدون mutation خطرناک: خطای apiError → 400 با پیام کوتاه؛ بقیه ۵۰۰ با نام خطا
 async function adminApi(request, env, method, pathname) {
   const parts = pathname.split("/").filter(Boolean); // ["admin","api",...]
@@ -1537,6 +1609,43 @@ async function adminApi(request, env, method, pathname) {
 
     if (kind === "models" && method === "GET") return await adminApiListModels(request, env);
     if (kind === "test" && method === "POST") return await adminApiTest(request, env);
+
+    // Phase 2-d: pin / ban / prefer overrides + cooldown clearing.
+    // Auth already ran in route() (X-Setup-Key or signed session).
+    if (kind === "overrides" && method === "GET" && !id) {
+      const ov = await getOverrides(env);
+      const { providerBlocked } = await healthCounts(env);
+      return json({ ok: true, pins: ov.pins, bans: ov.bans, prefer: ov.prefer, providerBlocks: providerBlocked });
+    }
+    if (kind === "overrides" && id === "pin" && (method === "POST" || method === "DELETE")) {
+      const body = await readJsonBody(request);
+      if (!body) return json({ ok: false, error: "invalid json body" }, 400);
+      const combo = String(body.combo ?? "");
+      const target = String(body.target ?? "");
+      if (!combo || !target) return json({ ok: false, error: "combo and target are required" }, 400);
+      if (method === "POST") {
+        // Catalog validation: an unknown provider/model is a 400, never
+        // a silently dropped pin (the audit's bad-pin failure mode).
+        const catalog = await loadCatalog(env);
+        const known = catalog.some((m) => `${m.provider}/${m.id}`.toLowerCase() === target.toLowerCase());
+        if (!known) return json({ ok: false, error: `unknown model in catalog: ${target}` }, 400);
+        const ov = await addPin(env, combo, target);
+        return json({ ok: true, pins: ov.pins });
+      }
+      const ov = await removePin(env, combo, target);
+      return json({ ok: true, pins: ov.pins });
+    }
+    if (kind === "overrides" && id === "ban" && (method === "POST" || method === "DELETE")) {
+      const body = await readJsonBody(request);
+      if (!body) return json({ ok: false, error: "invalid json body" }, 400);
+      const target = String(body.target ?? "");
+      if (!target) return json({ ok: false, error: "target is required" }, 400);
+      const ov = method === "POST" ? await addBan(env, target) : await removeBan(env, target);
+      return json({ ok: true, bans: ov.bans });
+    }
+    if (kind === "health" && id === "clear" && method === "POST") {
+      return await adminApiHealthClear(request, env);
+    }
 
     if (kind === "providers") {
       if (method === "POST" && !id && !sub) {
@@ -1583,11 +1692,12 @@ async function adminApi(request, env, method, pathname) {
     }
 
     // انتخاب زنده‌ی combo خودکار (chat/code/vision/fast) — targets cap ۸ برای «ساخت نسخه‌ی دستی»
+    // Phase 2-d: preview — reading the auto list must not advance rr:<combo>.
     if (kind === "auto" && method === "GET" && id && !sub) {
       if (!Object.prototype.hasOwnProperty.call(RULES, id)) {
         return json({ ok: false, error: `unknown auto combo: ${id}` }, 404);
       }
-      const sel = await getComboTargets(env, id);
+      const sel = await getComboTargets(env, id, { preview: true });
       if (sel.error) return json({ ok: false, error: sel.error }, 400);
       return json({
         ok: true,
