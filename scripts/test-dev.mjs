@@ -43,7 +43,7 @@ import {
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
 import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, resolveProjectName, matchKnownProjectAt, parseNoteQuery, parseSummaryQuery, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, stripMiddleFolderTag, normalizeDaypartToken } from "../src/daily.js";
-import { callRouter, runCombo, resetRouterHealthForTests, getRouterHealthSnapshotForTests, extractAssistantText, extractFinalText, getComboTargets, classifyFailure } from "../src/router.js";
+import { callRouter, runCombo, resetRouterHealthForTests, getRouterHealthSnapshotForTests, extractAssistantText, extractFinalText, getComboTargets, classifyFailure, getEmptyFinalCounts, resetEmptyFinalCountsForTests } from "../src/router.js";
 import { PROVIDERS } from "../src/providers.js";
 import { sendProgressMessage, finalizeProgressMessage, splitTelegramText } from "../src/telegram.js";
 import { answerChatText, adminApi, handleUpdate, resetSeenUpdateIdsForTests } from "../src/index.js";
@@ -1961,13 +1961,13 @@ if (DatabaseSync) {
     const slot = await c.slot();
     check(last?.text === "ساعت را با صبح یا عصر مشخص کن." && askKb(last).includes("ask:dp:صبح") && slot?.kind === "hour-ambiguous", "1-e: NLU hour-ambiguous reminder asks WITH buttons");
   }
-  // P4.3e: NLU summary routes to the verified D1 handler (900 tokens).
+  // P4.3e: NLU summary routes to the verified D1 handler (2200 tokens).
   {
     const sc = fresh1e(); const yt = seedProjE(sc.sq, 1, "یوتیوب", []); seedProjE(sc.sq, 1, "عمومی", [], 1);
     sc.sq.prepare("INSERT INTO tasks (user_id, title, status, project_id, created_at) VALUES (1, 'ادیت ویدیو', 'open', ?, '2026-10-28T00:00:00.000Z')").run(yt);
     const c = convoE(sc, { AI: aiJson({ intent: "summary", confidence: 0.9, project: "یوتیوب", summary_target: "tasks" }) });
     const r = await c.say("تسک‌های یوتیوب رو برام جمع‌بندی کن", MORNING);
-    check(r === "handled" && c.s.chats.length === 1 && c.s.chats[0].opts.maxTokens === 900 && c.s.chats[0].text.includes("ادیت ویدیو"), "1-e: NLU summary routes to the verified D1 handler with 900 tokens");
+    check(r === "handled" && c.s.chats.length === 1 && c.s.chats[0].opts.maxTokens === 2200 && c.s.chats[0].text.includes("ادیت ویدیو"), "1-e: NLU summary routes to the verified D1 handler with 2200 tokens (Phase 2-f: 900 -> 2200 reasoning-model headroom)");
   }
   // P4.3f: NLU expense executes ONLY on a deterministic integer amount (draft, never a direct insert).
   {
@@ -2010,7 +2010,7 @@ if (DatabaseSync) {
     const note = sc.rows("SELECT text, project_id FROM notes WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
     check(r === "handled" && note?.text === "سیمان و گچ" && note?.project_id === gol, "1-e: <think>-wrapped + fenced NLU output parses and executes");
   }
-  // P4.1 (summary side): rows verified -> ⏳ summary placeholder sent, id plumbed to o.chat, 900 tokens.
+  // P4.1 (summary side): rows verified -> ⏳ summary placeholder sent, id plumbed to o.chat, 2200 tokens.
   {
     const sc = fresh1e(); const gol = seedProjE(sc.sq, 1, "گلبهار", ["گل"]); seedProjE(sc.sq, 1, "عمومی", [], 1);
     sc.sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'صبحانه گلبهار', 'text', '2026-10-28T01:24:00+03:30', ?)").run(gol);
@@ -2027,7 +2027,7 @@ if (DatabaseSync) {
       const c = convoE(sc, { TG_TOKEN: "x" });
       await c.say("یادداشت‌های گلبهار رو خلاصه کن", MORNING);
       const prog = tgCalls.find((x) => x.method === "sendMessage");
-      check(prog?.payload?.text === "⏳ در حال آماده‌سازی خلاصه و جدول..." && c.s.chats.length === 1 && c.s.chats[0].opts.progressMsgId === 555 && c.s.chats[0].opts.maxTokens === 900, "1-e: summary sends the ⏳ placeholder after D1 verification and plumbs its id + 900 tokens to o.chat");
+      check(prog?.payload?.text === "⏳ در حال آماده‌سازی خلاصه و جدول..." && c.s.chats.length === 1 && c.s.chats[0].opts.progressMsgId === 555 && c.s.chats[0].opts.maxTokens === 2200, "1-e: summary sends the ⏳ placeholder after D1 verification and plumbs its id + 2200 tokens to o.chat (Phase 2-f: 900 -> 2200)");
     } finally { global.fetch = prev; }
   }
 }
@@ -4829,7 +4829,7 @@ if (DatabaseSync) {
     const sc = scenario4();
     const { s } = await flow4(sc, "یادداشت‌های گلبهار رو خلاصه کن");
     check(s.chats.length === 1 && s.chats[0].text.includes("صبحانه گلبهار") && !s.chats[0].text.includes("تماس عمومی") && !s.chats[0].text.includes("بدون پروژه"), "1-d-4: project note summary passes ONLY that project's rows");
-    check(s.chats[0].text.includes("۱۱ آبان ۱۴۰۵") && s.chats[0].opts.systemPrompt && s.chats[0].opts.noHistory === true && s.chats[0].opts.saveText === "" && s.chats[0].opts.maxTokens === 900, "1-d-4: summary input carries Jalali dates + grounded chat options (noHistory, no save, 900 tokens — Phase 1-e spec change from 1600)");
+    check(s.chats[0].text.includes("۱۱ آبان ۱۴۰۵") && s.chats[0].opts.systemPrompt && s.chats[0].opts.noHistory === true && s.chats[0].opts.saveText === "" && s.chats[0].opts.maxTokens === 2200, "1-d-4: summary input carries Jalali dates + grounded chat options (noHistory, no save, 2200 tokens — Phase 2-f spec change from 900)");
     const all = await flow4(sc, "یادداشت‌هام رو خلاصه کن");
     check(all.s.chats.length === 1 && all.s.chats[0].text.includes("صبحانه گلبهار") && all.s.chats[0].text.includes("تماس عمومی") && all.s.chats[0].text.includes("بدون پروژه"), "1-d-4: unfiltered note summary passes all rows");
   }
@@ -5073,7 +5073,7 @@ if (DatabaseSync) {
     sc.sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'صبحانه گلبهار', 'text', '2026-10-28T01:24:00+03:30', ?)").run(gol);
     const c = convo6(sc);
     await c.say("یادداشت‌های گلبهار رو خلاصه کن", MORNING);
-    check(c.s.chats.length === 1 && c.s.chats[0].opts.maxTokens === 900 && String(c.s.chats[0].opts.systemPrompt ?? "").includes("۴ تا ۵ خط") && String(c.s.chats[0].opts.systemPrompt ?? "").includes("فهرست شماره‌دار") && String(c.s.chats[0].opts.systemPrompt ?? "").includes("۳۰ ردیف") && !String(c.s.chats[0].opts.systemPrompt ?? "").includes("| ردیف |"), "sumstab: summary passes 900 tokens + concise lead + numbered-list rows (Stable v1 addendum supersedes the 1-d-6 Markdown-table instruction: Telegram does not render Markdown tables)");
+    check(c.s.chats.length === 1 && c.s.chats[0].opts.maxTokens === 2200 && String(c.s.chats[0].opts.systemPrompt ?? "").includes("۴ تا ۵ خط") && String(c.s.chats[0].opts.systemPrompt ?? "").includes("فهرست شماره‌دار") && String(c.s.chats[0].opts.systemPrompt ?? "").includes("۳۰ ردیف") && !String(c.s.chats[0].opts.systemPrompt ?? "").includes("| ردیف |"), "sumstab: summary passes 2200 tokens + concise lead + numbered-list rows (Phase 2-f raises the Stable v1 addendum's 900-token cap for reasoning-model headroom; numbered-list form unchanged)");
   }
   // ── Phase 2-b Pillar C ──
   // Static resource boundary (Pillar A.1): there is no DEFAULT_COMBOS
@@ -5521,12 +5521,20 @@ if (DatabaseSync) {
         diags = await captureDiag(() => answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k", AI: { run: async () => { aiCalls++; return { response: "{}" }; } } }, 1, 1, "سلام", false, { saveText: "" }));
       } finally { global.fetch = prev; }
       const edit = calls.find((c) => c.method === "editMessageText");
-      check(edit?.payload?.message_id === 99 && String(edit?.payload?.text ?? "").includes("مرحله‌ی چت شکست خورد") && String(edit?.payload?.text ?? "").includes("پاسخ خالی بود."), "sumstab: reasoning-only answer becomes a classified empty failure on the same progress id (00:38 shape)");
+      // Phase 2-f: with in-combo failover (requireFinalText from
+      // answerChatText), an all-reasoning-only combo no longer lands in
+      // the ok-but-empty "پاسخ خالی بود." branch — it returns ok:false
+      // with empty_response entries, so Telegram renders the compact
+      // Phase 2-d failure notice (line 1 + count + first lines) on the
+      // same progress id, with the diag carrying one errors[] entry
+      // per empty_response target. The old bare-empty assertion is
+      // superseded by this behavior (directive test 2).
+      check(edit?.payload?.message_id === 99 && String(edit?.payload?.text ?? "").includes("مرحله‌ی چت شکست خورد") && String(edit?.payload?.text ?? "").includes("تعداد مدل‌های بررسی‌شده:") && String(edit?.payload?.text ?? "").includes("empty_response") && !String(edit?.payload?.text ?? "").includes("پاسخ خالی بود."), "2-f: reasoning-only all targets → compact failure notice with empty_response lines on the same progress id, NOT bare پاسخ خالی بود. (00:38 shape, supersedes sumstab (a))");
       check(!deliveredTexts(calls).some((t) => String(t).includes("استدلال طولانی مدل")), "sumstab: reasoning text is never delivered as the Telegram answer");
       check(calls.filter((c) => c.method === "sendMessage").length === 1, "sumstab: reasoning-only failure sends no extra message (no orphan, no duplicate)");
       check(aiCalls === 0 && !seenUrls.some((u) => u.includes("generativelanguage")), "sumstab: chat generation uses zero Workers AI / Gemini calls");
       const d = diags[0] ?? {};
-      check(d.event === "telegram_answer_diag" && d.stage === "چت" && d.ok === true && d.finalChars === 0 && d.reasoningChars === 18 && d.timerFired === false && d.usage === null, "sumstab: failure diag records final/reasoning chars + provenance, never message text");
+      check(d.event === "telegram_answer_diag" && d.stage === "چت" && d.ok === false && Array.isArray(d.errors) && d.errors.length >= 1 && d.errors.every((e) => e.reason === "empty_response"), "2-f: failure diag carries one errors[] entry per empty_response target, never message text");
     }
     // (b) Closed think + final: final delivered, think stripped, same id.
     {
@@ -5564,7 +5572,7 @@ if (DatabaseSync) {
       global.fetch = tgProvStub(calls, () => (++n === 1 ? { content: "", reasoning_content: "استدلال" } : { content: "جواب نهایی" }));
       try { await answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "```\nکد\n```", false, { saveText: "" }); } finally { global.fetch = prev; }
       const edit = calls.find((c) => c.method === "editMessageText");
-      check(n === 2 && edit?.payload?.text === "جواب نهایی", "sumstab: reasoning-only primary recovers via the fallback combo inside the shared budget");
+      check(n === 2 && edit?.payload?.text === "جواب نهایی", "2-f: reasoning-only first target recovers via IN-COMBO failover (next target, same combo) inside the shared budget (supersedes the sumstab fallback-combo wording; assertion unchanged)");
     }
     // (e) finish_reason=length: delivered with an incompleteness warning,
     // never labeled complete.
@@ -5646,13 +5654,85 @@ if (DatabaseSync) {
       const chats = [];
       const sent = [];
       await handleDailyText({ STATE: fakeKV(), DB: db }, { chatId: 1, userId: 1, text: "یادداشت‌های گلبهار رو خلاصه کن", send: async (t) => { sent.push(t); }, chat: async (t, o) => { chats.push({ text: t, opts: o }); }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
-      check(chats.length === 1 && chats[0].opts.maxTokens === 900 && chats[0].opts.failureLabel === "خلاصه‌سازی" && String(chats[0].text).includes("یادداشت گلبهار") && !String(chats[0].text).includes("یادداشت عمومی"), "sumstab: project summary passes only that project's verified rows, 900 tokens, summary failure label");
+      check(chats.length === 1 && chats[0].opts.maxTokens === 2200 && chats[0].opts.failureLabel === "خلاصه‌سازی" && String(chats[0].text).includes("یادداشت گلبهار") && !String(chats[0].text).includes("یادداشت عمومی"), "sumstab: project summary passes only that project's verified rows, 2200 tokens, summary failure label (Phase 2-f: 900 -> 2200)");
       const chats2 = []; const sent2 = [];
       await handleDailyText({ STATE: fakeKV(), DB: mkDbSum().db }, { chatId: 1, userId: 1, text: "یادداشت‌هام رو خلاصه کن", send: async (t) => { sent2.push(t); }, chat: async (t, o) => { chats2.push(t); }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
       check(sent2[0] === "موردی برای خلاصه‌سازی پیدا نشد." && chats2.length === 0, "sumstab: empty folder reports none found with zero model calls");
       const chats3 = []; const sent3 = [];
       await handleDailyText({ STATE: fakeKV(), DB: { prepare() { throw new Error("boom"); } } }, { chatId: 1, userId: 1, text: "یادداشت‌هام رو خلاصه کن", send: async (t) => { sent3.push(t); }, chat: async (t, o) => { chats3.push(t); }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
       check(String(sent3[0]).includes("خوانده نشد") && chats3.length === 0, "sumstab: D1 failure reports a read failure (not an empty notice) with zero model calls");
+    }
+    // ── Phase 2-f: in-combo empty-final failover (Telegram-only),
+    // summary 2200-token headroom, /admin Empty-final counter ──
+    // (a) Telegram all-reasoning-only WITH a retry id: compact notice +
+    // retry button on the same progress id, no orphan ⏳, no extra send.
+    {
+      resetRouterHealthForTests(); resetEmptyFinalCountsForTests();
+      const { db } = mkDbSum();
+      const kv = fakeKV(); await seedCatalogSum(kv);
+      const calls = [];
+      const prev = global.fetch;
+      global.fetch = tgProvStub(calls, () => ({ content: "", reasoning_content: "استدلال طولانی مدل" }));
+      try { await answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "سلام", false, { saveText: "", retryEntryId: 42 }); } finally { global.fetch = prev; }
+      const edit = calls.find((c) => c.method === "editMessageText");
+      const kb = edit?.payload?.reply_markup?.inline_keyboard ?? [];
+      check(edit?.payload?.message_id === 99 && String(edit?.payload?.text ?? "").includes("مرحله‌ی چت شکست خورد") && String(edit?.payload?.text ?? "").includes("empty_response") && !String(edit?.payload?.text ?? "").includes("پاسخ خالی بود.") && kb.flat().some((b) => b.callback_data === "chat:retry:42"), "2-f: all-reasoning-only Telegram turn renders the compact failure notice WITH retry button on the same progress id (no orphan ⏳)");
+      check(calls.filter((c) => c.method === "sendMessage").length === 1, "2-f: compact failure notice sends no extra message");
+    }
+    // (b) Normal chat sends NO max_tokens key at all (only summaries do).
+    {
+      resetRouterHealthForTests();
+      const { db } = mkDbSum();
+      const kv = fakeKV(); await seedCatalogSum(kv);
+      const calls = []; let providerBody = null;
+      const prev = global.fetch;
+      global.fetch = async (url, init = {}) => {
+        const u = String(url);
+        if (u.startsWith("https://api.telegram.org/")) {
+          const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+          let payload = {};
+          try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+          calls.push({ method: m ? m[1] : "", payload });
+          return Response.json({ ok: true, result: { message_id: 99 } });
+        }
+        if (u.includes("api.xkiro.com")) {
+          try { providerBody = JSON.parse(String(init.body ?? "{}")); } catch {}
+          return Response.json({ choices: [{ message: { content: "سلام! چطور می‌توانم کمک کنم؟" }, finish_reason: "stop" }] });
+        }
+        return new Response("unexpected", { status: 500 });
+      };
+      try { await answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "سلام", false, { saveText: "" }); } finally { global.fetch = prev; }
+      check(providerBody !== null && !("max_tokens" in providerBody) && providerBody.temperature === 0.7, "2-f: normal chat sends no max_tokens key at all (temperature 0.7 only)");
+      const edit = calls.find((c) => c.method === "editMessageText");
+      check(String(edit?.payload?.text ?? "").includes("سلام! چطور می‌توانم کمک کنم؟"), "2-f: normal chat still delivers its final answer");
+    }
+    // (c) Empty-final counter: in-memory only (no KV counter keys),
+    // surfaced by GET /admin/api/models as emptyFinal24h (0 unknown).
+    {
+      resetRouterHealthForTests(); resetEmptyFinalCountsForTests();
+      const kv = fakeKV(); await seedCatalogSum(kv);
+      // runCombo needs the provider key (as in the sumstab Telegram
+      // tests); without it the targets are skipped, not fetched.
+      const env = { STATE: kv, XKIRO_API_KEY: "k" };
+      const call = async (method, pathname, body, url = null) => {
+        const req = { method, url: url ?? `http://x${pathname}`, json: async () => body };
+        const res = await adminApi(req, env, method, pathname);
+        return { status: res.status, data: await res.json() };
+      };
+      const before = await call("GET", "/admin/api/models", null, "http://x/admin/api/models?provider=xkiro");
+      const rowBefore = (before.data.models ?? []).find((m) => m.id === "qwen3-32b");
+      check(before.status === 200 && rowBefore?.emptyFinal24h === 0, "2-f: GET /admin/api/models reports emptyFinal24h 0 when unknown");
+      const prev = global.fetch;
+      global.fetch = tgProvStub([], () => ({ content: "", reasoning_content: "استدلال" }));
+      let r;
+      try { r = await runCombo(env, "chat", { messages: [{ role: "user", content: "سلام" }] }, { requireFinalText: true }); } finally { global.fetch = prev; }
+      check(r.ok === false && Array.isArray(r.tried) && r.tried.length === 2 && r.tried.every((t) => t.endsWith(": empty_response")), "2-f: all-reasoning-only chat combo exhausts with one tried empty_response entry per target");
+      const counts = getEmptyFinalCounts();
+      check(counts.get("xkiro/qwen3-32b") === 1 && counts.get("xkiro/qwen3-coder-32b") === 1, "2-f: Empty-final counter increments in-memory per target on empty_response");
+      check([...kv.store.keys()].every((k) => !k.startsWith("emptyFinal")), "2-f: Empty-final counter writes no KV keys (health cooldown keys are the separate Task 1 markFailure path)");
+      const after = await call("GET", "/admin/api/models", null, "http://x/admin/api/models?provider=xkiro");
+      const rowAfter = (after.data.models ?? []).find((m) => m.id === "qwen3-32b");
+      check(after.status === 200 && rowAfter?.emptyFinal24h === 1, "2-f: GET /admin/api/models surfaces the Empty-final counter per target");
     }
   }
 }
