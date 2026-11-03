@@ -112,6 +112,24 @@ export function extractAssistantText(message) {
   return "";
 }
 
+// Stable v1 addendum (Telegram presentation only — the router//v1 layer keeps
+// extractAssistantText above): FINAL assistant content, never reasoning.
+// Closed <think> blocks are stripped without losing final text outside them;
+// an unclosed <think> block is dropped entirely (only text BEFORE it is kept),
+// never exposed as the answer; reasoning_content/reasoning are NEVER a fallback.
+// Returns "" for reasoning-only, unclosed-think-only, and genuinely empty output.
+export function extractFinalText(message) {
+  const msg = message ?? {};
+  let raw = typeof msg.content === "string" ? msg.content : "";
+  if (Array.isArray(msg.content)) {
+    raw = msg.content.map((p) => (typeof p?.text === "string" ? p.text : "")).join("");
+  }
+  let text = String(raw).replace(/<think>[\s\S]*?<\/think>/g, "");
+  const openIdx = text.indexOf("<think>");
+  if (openIdx !== -1) text = text.slice(0, openIdx);
+  return text.trim();
+}
+
 function truncate(text) {
   const s = String(text ?? "");
   return s.length > 200 ? s.slice(0, 200) : s;
@@ -383,6 +401,11 @@ async function tryTarget(env, ctx, model, body, timeoutMs) {
     // Phase 2-c: use the broad isTimeoutError predicate (see above) —
     // a Worker timer abort can surface as the bare string "timeout" or
     // an Error with message "timeout", not only as AbortError.
+    // Stable v1 addendum: record ABORT PROVENANCE, not just the string.
+    // controller.signal.aborted is true ONLY when OUR timer fired; a
+    // network throw that merely says "timeout" (e.g. the gateway's own
+    // timeout surfacing as Error("timeout")) leaves it false. The two
+    // cases share the reason string but have different timerFired values.
     const isTimeout = isTimeoutError(err);
     return {
       error: {
@@ -390,6 +413,7 @@ async function tryTarget(env, ctx, model, body, timeoutMs) {
         reason: isTimeout ? "timeout" : truncate(`network: ${err && err.message}`),
       },
       cause: isTimeout ? "timeout" : `network: ${err && err.message}`,
+      timerFired: controller.signal.aborted,
     };
   } finally {
     clearTimeout(timer);
@@ -547,7 +571,7 @@ export async function runCombo(
         isTimeout ||
         (typeof attempt.cause === "number" && (attempt.cause === 429 || attempt.cause >= 500));
       if (retryable && attemptNo < maxRetries) continue;
-      failure = { isTimeout, cls, cause: attempt.cause };
+      failure = { isTimeout, cls, cause: attempt.cause, timerFired: attempt.timerFired ?? null };
       break;
     }
 
@@ -557,7 +581,7 @@ export async function runCombo(
       errors.push({ target: usedModel, reason: attempt.skipReason });
       lastErr = attempt.skipReason;
     } else if (failure) {
-      const { isTimeout, cls, cause } = failure;
+      const { isTimeout, cls, cause, timerFired } = failure;
       if (isTimeout) console.log(JSON.stringify({ event: "router_timeout", target: usedModel, ms: latencyMs }));
       if (cls.scope === "provider") {
         rejectedProviders.add(t.provider);
@@ -576,6 +600,10 @@ export async function runCombo(
         } else {
           entry.reason = truncate(cause);
         }
+        // Stable v1 addendum: abort provenance for diagnostics. Present
+        // only when the attempt reported it (tryTarget failures); the
+        // budget-floor and key-rejected entries carry none (null in diag).
+        if (timerFired != null) entry.timerFired = timerFired;
         errors.push(entry);
         lastErr = entry.reason;
       }
@@ -644,25 +672,30 @@ export async function runCombo(
         continue;
       }
       let jsonTimer;
+      let jsonTimerFired = false;
       try {
         data = await Promise.race([
           res.json(),
-          new Promise((_, rej) => { jsonTimer = setTimeout(() => rej(new Error("timeout")), remJson); }),
+          new Promise((_, rej) => { jsonTimer = setTimeout(() => { jsonTimerFired = true; rej(new Error("timeout")); }, remJson); }),
         ]);
       } catch (err) {
         // Phase 2-c: the body-read race uses the same broad timeout
         // predicate as tryTarget (a body-stream abort can surface as
         // AbortError or a "timeout"/"timed out" message, not only as
-        // the race's own Error("timeout")).
+        // the race's own Error("timeout")). Stable v1 addendum: the
+        // provenance flag records whether OUR jsonTimer fired, not
+        // merely whether the error string looks like a timeout — a
+        // body-stream network throw with a timeout-ish message must
+        // not be misreported as a local deadline.
         if (isTimeoutError(err)) {
           console.log(JSON.stringify({ event: "router_timeout", target: usedModel, ms: Date.now() - t0 }));
-          errors.push({ target: usedModel, reason: "timeout" });
+          errors.push({ target: usedModel, reason: "timeout", timerFired: jsonTimerFired });
           lastErr = "timeout";
           await markFailure(env, usedModel, classifyFailure(null, "", true), "timeout");
           recordTargetFailure(usedModel, "timeout");
           continue;
         }
-        errors.push({ target: usedModel, reason: truncate(`bad json: ${err && err.message}`) });
+        errors.push({ target: usedModel, reason: truncate(`bad json: ${err && err.message}`), timerFired: false });
         lastErr = `bad json: ${err && err.message}`;
         await markFailure(env, usedModel, classifyFailure(null, "", false), "bad json response");
         continue;
@@ -689,8 +722,28 @@ export async function runCombo(
         recordTargetFailure(usedModel, "empty assistant message");
         continue;
       }
+      // Stable v1 addendum: Telegram presentation metadata, computed from
+      // the RAW message BEFORE surfacing/normalization below. Surfacing
+      // would overwrite content with reasoning text (making a
+      // reasoning-only response indistinguishable from a final answer),
+      // and normalizeOpenAiChat fabricates usage zeros when absent — so
+      // both finalText and usage must be captured here, raw. /v1 keeps
+      // receiving result.data unchanged; answerChatText (Telegram) uses
+      // answerMeta.finalText. finishReason is raw too: a supplied
+      // "length" must survive (normalize only fills when null).
+      const answerMeta = {
+        finalText: extractFinalText(message),
+        reasoningChars:
+          (typeof message?.reasoning_content === "string" ? message.reasoning_content.length : 0) +
+          (typeof message?.reasoning === "string" ? message.reasoning.length : 0),
+        finishReason: data?.choices?.[0]?.finish_reason ?? null,
+        usage: data?.usage ?? null,
+        toolCalls: hasToolCalls,
+      };
       // Surface the extracted text as the message content so the
-      // caller (answerChatText, callRouter) sees the generation.
+      // router//v1 callers (callRouter, chatCompletions) see the
+      // generation exactly as before. answerChatText does NOT use this
+      // surfaced content — it uses answerMeta.finalText (see above).
       if (text && typeof content === "string" && text !== content) {
         data.choices[0].message.content = text;
       }
@@ -707,6 +760,7 @@ export async function runCombo(
         used: usedModel,
         combo: comboName,
         latencyMs,
+        answerMeta,
       };
     }
   }
