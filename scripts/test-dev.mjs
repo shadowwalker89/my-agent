@@ -43,7 +43,7 @@ import {
   DEFAULT_CURRENCY,
 } from "../src/memory.js";
 import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, resolveProjectName, matchKnownProjectAt, parseNoteQuery, parseSummaryQuery, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, stripMiddleFolderTag, normalizeDaypartToken } from "../src/daily.js";
-import { callRouter, runCombo, resetRouterHealthForTests, getRouterHealthSnapshotForTests, extractAssistantText, getComboTargets, classifyFailure } from "../src/router.js";
+import { callRouter, runCombo, resetRouterHealthForTests, getRouterHealthSnapshotForTests, extractAssistantText, extractFinalText, getComboTargets, classifyFailure } from "../src/router.js";
 import { PROVIDERS } from "../src/providers.js";
 import { sendProgressMessage, finalizeProgressMessage, splitTelegramText } from "../src/telegram.js";
 import { answerChatText, adminApi, handleUpdate, resetSeenUpdateIdsForTests } from "../src/index.js";
@@ -5073,7 +5073,7 @@ if (DatabaseSync) {
     sc.sq.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'صبحانه گلبهار', 'text', '2026-10-28T01:24:00+03:30', ?)").run(gol);
     const c = convo6(sc);
     await c.say("یادداشت‌های گلبهار رو خلاصه کن", MORNING);
-    check(c.s.chats.length === 1 && c.s.chats[0].opts.maxTokens === 900 && String(c.s.chats[0].opts.systemPrompt ?? "").includes("۴ تا ۵ خط") && String(c.s.chats[0].opts.systemPrompt ?? "").includes("| ردیف | تاریخ | پوشه | خلاصه |"), "1-d-6: summary passes 900 tokens (Phase 1-e spec change from 1600) + concise-then-table instruction");
+    check(c.s.chats.length === 1 && c.s.chats[0].opts.maxTokens === 900 && String(c.s.chats[0].opts.systemPrompt ?? "").includes("۴ تا ۵ خط") && String(c.s.chats[0].opts.systemPrompt ?? "").includes("فهرست شماره‌دار") && String(c.s.chats[0].opts.systemPrompt ?? "").includes("۳۰ ردیف") && !String(c.s.chats[0].opts.systemPrompt ?? "").includes("| ردیف |"), "sumstab: summary passes 900 tokens + concise lead + numbered-list rows (Stable v1 addendum supersedes the 1-d-6 Markdown-table instruction: Telegram does not render Markdown tables)");
   }
   // ── Phase 2-b Pillar C ──
   // Static resource boundary (Pillar A.1): there is no DEFAULT_COMBOS
@@ -5083,6 +5083,11 @@ if (DatabaseSync) {
   // translate combos by construction. Guard that here.
   check(Object.keys(PROVIDERS).every((k) => ["nvidia", "openrouter", "xkiro"].includes(k)) && !Object.values(PROVIDERS).some((p) => /workers-ai|gemini/i.test(p.baseUrl ?? "")), "2-b: builtin providers contain no workers-ai/Gemini targets (Pillar A.1 by construction)");
   // Pure reasoning extraction (Pillar A.4).
+  // Stable v1 addendum SCOPE NOTE (assertions unchanged): these assert
+  // ROUTER-layer extraction, which the /v1 passthrough still relies on.
+  // Telegram delivery (answerChatText) no longer delivers reasoning-only
+  // or unclosed-think text as the user's answer — see the sumstab tests
+  // below, which assert the Telegram layer rejects both.
   check(extractAssistantText({ content: "", reasoning_content: "خلاصه یادداشت‌ها..." }) === "خلاصه یادداشت‌ها...", "2-b: reasoning_content fallback extracts text");
   check(extractAssistantText({ content: "<think>خلاصه یادداشت‌ها..." }) === "خلاصه یادداشت‌ها...", "2-b: unclosed <think> extracts inner text instead of empty");
   check(extractAssistantText({ content: "<think>فکر</think>پاسخ نهایی" }) === "پاسخ نهایی", "2-b: closed <think> block stripped, answer kept");
@@ -5205,6 +5210,10 @@ if (DatabaseSync) {
     } finally { global.fetch = prev2; }
   }
   // Reasoning-model fix through callRouter + runCombo (Pillar C.3).
+  // Stable v1 addendum SCOPE NOTE (assertions unchanged): callRouter /
+  // runCombo keep surfacing reasoning text as message content for the
+  // router//v1 layer. The Telegram layer (answerChatText) applies the
+  // final-content rule on top via answerMeta.finalText — see sumstab.
   {
     resetRouterHealthForTests();
     const mkReasonFetch = (message) => async (url) => String(url).includes("api.xkiro.com") ? Response.json({ choices: [{ message }] }) : new Response("unexpected", { status: 500 });
@@ -5455,6 +5464,196 @@ if (DatabaseSync) {
     await c2.say("یادآوری کن فردا ساعت ۰۳:۳۰ تست یادآور", MORNING);
     await resolveAskCallback(c2.env, { fromId: 1, chatId: 1, data: "ask:cancel", nowMs: MORNING, send: c2.s.send, editMarkup: async () => {} });
     check(c2.s.sent.at(-1)?.text === "❌ یادآوری لغو شد.", "2-d: ask:cancel without editText still falls back to send");
+  }
+  // ── Stable v1 addendum: diagnose + stabilize summary delivery ──
+  // Telegram-layer final-content rule, diagnostic metadata, truncation
+  // marking, body-stall provenance, summary D1 distinctions. The 2-b
+  // router tests above are intentionally untouched: they pin the
+  // router//v1 layer, which this addendum preserves.
+  {
+    check(extractFinalText({ content: "<think>فکر</think>پاسخ نهایی" }) === "پاسخ نهایی", "sumstab: extractFinalText strips a closed <think> block, keeps the final answer");
+    check(extractFinalText({ content: "", reasoning_content: "فقط استدلال" }) === "", "sumstab: extractFinalText never falls back to reasoning_content (reasoning-only yields empty)");
+    check(extractFinalText({ content: "<think>ناتمام" }) === "", "sumstab: extractFinalText never exposes an unclosed <think> block as the answer");
+    check(extractFinalText({ content: "سلام <think>ناتمام" }) === "سلام", "sumstab: extractFinalText keeps text before an unclosed <think> block, drops the block");
+    check(extractFinalText({ content: "" }) === "" && extractFinalText({ content: "   " }) === "", "sumstab: extractFinalText genuinely empty stays empty");
+    check(extractFinalText({ content: [{ text: "<think>x</think>الف" }, { text: "ب" }] }) === "الفب", "sumstab: extractFinalText joins array content parts, then strips think blocks");
+    const mkDbSum = () => {
+      const sq = new DatabaseSync(":memory:");
+      sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+      sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+      sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+      sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+      const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+      return { sq, db: { prepare(sql) { return base(sql); } } };
+    };
+    const seedCatalogSum = async (kv) => { await kv.put("catalog:xkiro", JSON.stringify({ models: [{ id: "qwen3-32b", provider: "xkiro", context: 131072 }, { id: "qwen3-coder-32b", provider: "xkiro", context: 131072 }] })); };
+    const tgProvStub = (calls, replyFn, seenUrls) => async (url, init = {}) => {
+      const u = String(url);
+      if (seenUrls) seenUrls.push(u);
+      if (u.startsWith("https://api.telegram.org/")) {
+        const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+        let payload = {};
+        try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+        calls.push({ method: m ? m[1] : "", payload });
+        return Response.json({ ok: true, result: { message_id: 99 } });
+      }
+      if (u.includes("api.xkiro.com")) return Response.json({ choices: [{ message: replyFn(), finish_reason: "stop" }] });
+      return new Response("unexpected", { status: 500 });
+    };
+    const deliveredTexts = (calls) => calls.filter((c) => (c.method === "editMessageText" || c.method === "sendMessage") && c.payload?.text !== "⏳ در حال پردازش...").map((c) => c.payload.text);
+    const captureDiag = async (fn) => {
+      const orig = console.log;
+      const lines = [];
+      console.log = (...a) => { try { const s = a.map(String).join(" "); if (s.includes("telegram_answer_diag")) lines.push(JSON.parse(s)); } catch {} };
+      try { await fn(); } finally { console.log = orig; }
+      return lines;
+    };
+    // (a) Reasoning-only through Telegram: classified failure, never delivered.
+    {
+      resetRouterHealthForTests();
+      const { db } = mkDbSum();
+      const kv = fakeKV(); await seedCatalogSum(kv);
+      const calls = []; const seenUrls = []; let aiCalls = 0;
+      const prev = global.fetch;
+      global.fetch = tgProvStub(calls, () => ({ content: "", reasoning_content: "استدلال طولانی مدل" }), seenUrls);
+      let diags = [];
+      try {
+        diags = await captureDiag(() => answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k", AI: { run: async () => { aiCalls++; return { response: "{}" }; } } }, 1, 1, "سلام", false, { saveText: "" }));
+      } finally { global.fetch = prev; }
+      const edit = calls.find((c) => c.method === "editMessageText");
+      check(edit?.payload?.message_id === 99 && String(edit?.payload?.text ?? "").includes("مرحله‌ی چت شکست خورد") && String(edit?.payload?.text ?? "").includes("پاسخ خالی بود."), "sumstab: reasoning-only answer becomes a classified empty failure on the same progress id (00:38 shape)");
+      check(!deliveredTexts(calls).some((t) => String(t).includes("استدلال طولانی مدل")), "sumstab: reasoning text is never delivered as the Telegram answer");
+      check(calls.filter((c) => c.method === "sendMessage").length === 1, "sumstab: reasoning-only failure sends no extra message (no orphan, no duplicate)");
+      check(aiCalls === 0 && !seenUrls.some((u) => u.includes("generativelanguage")), "sumstab: chat generation uses zero Workers AI / Gemini calls");
+      const d = diags[0] ?? {};
+      check(d.event === "telegram_answer_diag" && d.stage === "چت" && d.ok === true && d.finalChars === 0 && d.reasoningChars === 18 && d.timerFired === false && d.usage === null, "sumstab: failure diag records final/reasoning chars + provenance, never message text");
+    }
+    // (b) Closed think + final: final delivered, think stripped, same id.
+    {
+      resetRouterHealthForTests();
+      const { db } = mkDbSum();
+      const kv = fakeKV(); await seedCatalogSum(kv);
+      const calls = [];
+      const prev = global.fetch;
+      global.fetch = tgProvStub(calls, () => ({ content: "<think>استدلال</think>پاسخ نهایی" }));
+      try { await answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "سلام", false, { saveText: "" }); } finally { global.fetch = prev; }
+      const edit = calls.find((c) => c.method === "editMessageText");
+      check(edit?.payload?.message_id === 99 && edit?.payload?.text === "پاسخ نهایی", "sumstab: closed <think> + final answer delivers only the final text on the same progress id");
+    }
+    // (c) Unclosed think with pre-text: pre-text only, inner think never delivered.
+    {
+      resetRouterHealthForTests();
+      const { db } = mkDbSum();
+      const kv = fakeKV(); await seedCatalogSum(kv);
+      const calls = [];
+      const prev = global.fetch;
+      global.fetch = tgProvStub(calls, () => ({ content: "سلام <think>ناتمام" }));
+      try { await answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "سلام", false, { saveText: "" }); } finally { global.fetch = prev; }
+      const edit = calls.find((c) => c.method === "editMessageText");
+      check(edit?.payload?.text === "سلام", "sumstab: unclosed <think> delivers pre-text only, never the think block");
+    }
+    // (d) Empty-final fallback within the shared budget: code-combo first
+    // call reasoning-only, chat fallback delivers final text.
+    {
+      resetRouterHealthForTests();
+      const { db } = mkDbSum();
+      const kv = fakeKV(); await seedCatalogSum(kv);
+      const calls = [];
+      let n = 0;
+      const prev = global.fetch;
+      global.fetch = tgProvStub(calls, () => (++n === 1 ? { content: "", reasoning_content: "استدلال" } : { content: "جواب نهایی" }));
+      try { await answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "```\nکد\n```", false, { saveText: "" }); } finally { global.fetch = prev; }
+      const edit = calls.find((c) => c.method === "editMessageText");
+      check(n === 2 && edit?.payload?.text === "جواب نهایی", "sumstab: reasoning-only primary recovers via the fallback combo inside the shared budget");
+    }
+    // (e) finish_reason=length: delivered with an incompleteness warning,
+    // never labeled complete.
+    {
+      resetRouterHealthForTests();
+      const { db } = mkDbSum();
+      const kv = fakeKV(); await seedCatalogSum(kv);
+      const calls = [];
+      const prev = global.fetch;
+      global.fetch = async (url, init = {}) => {
+        const u = String(url);
+        if (u.startsWith("https://api.telegram.org/")) {
+          const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+          let payload = {};
+          try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+          calls.push({ method: m ? m[1] : "", payload });
+          return Response.json({ ok: true, result: { message_id: 99 } });
+        }
+        if (u.includes("api.xkiro.com")) return Response.json({ choices: [{ message: { content: "خلاصه کوتاه" }, finish_reason: "length" }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } });
+        return new Response("unexpected", { status: 500 });
+      };
+      try { await answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "سلام", false, { saveText: "" }); } finally { global.fetch = prev; }
+      const edit = calls.find((c) => c.method === "editMessageText");
+      check(String(edit?.payload?.text ?? "").includes("خلاصه کوتاه") && String(edit?.payload?.text ?? "").includes("ناقص"), "sumstab: finish_reason=length is delivered with an incompleteness warning, never labeled complete");
+    }
+    // (f) Summary-stage diag: failing summary records stage + budget metadata.
+    {
+      resetRouterHealthForTests();
+      const { db } = mkDbSum();
+      const kv = fakeKV(); await seedCatalogSum(kv);
+      const calls = [];
+      const prev = global.fetch;
+      global.fetch = tgProvStub(calls, () => { throw new Error("boom"); });
+      let diags = [];
+      try {
+        diags = await captureDiag(() => answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "خلاصه", false, { saveText: "", failureLabel: "خلاصه‌سازی", maxTokens: 900 }));
+      } finally { global.fetch = prev; }
+      const d = diags[0] ?? {};
+      check(d.stage === "خلاصه‌سازی" && d.budgetMs === 22000 && d.ok === false && typeof d.elapsedMs === "number", "sumstab: summary failure diag carries stage + configured budget + elapsed time");
+    }
+    // (g) Timer provenance: same "timeout" string, different provenance.
+    {
+      resetRouterHealthForTests();
+      const hungFetch = async (url, init = {}) => new Promise((_, rej) => { init.signal?.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))); });
+      const prev = global.fetch;
+      try {
+        global.fetch = hungFetch;
+        const r = await runCombo({ STATE: fakeKV(), XKIRO_API_KEY: "k" }, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, { attemptTimeoutMs: 1500 });
+        check(r.ok === false && r.errors[0]?.reason === "timeout" && r.errors[0]?.timerFired === true, "sumstab: own attempt-timer abort records timerFired=true");
+      } finally { global.fetch = prev; }
+      resetRouterHealthForTests();
+      try {
+        global.fetch = async () => { throw new Error("timeout"); };
+        const r2 = await runCombo({ STATE: fakeKV(), XKIRO_API_KEY: "k" }, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, {});
+        check(r2.ok === false && r2.errors[0]?.reason === "timeout" && r2.errors[0]?.timerFired === false, "sumstab: network Error(timeout) without an abort records timerFired=false (string alone proves nothing)");
+      } finally { global.fetch = prev; }
+      resetRouterHealthForTests();
+    }
+    // (h) Headers arrive but the body stalls: the body-read race times out
+    // against the remaining budget (timerFired=true), it does not hang.
+    {
+      resetRouterHealthForTests();
+      const prev = global.fetch;
+      try {
+        global.fetch = async (url) => String(url).includes("api.xkiro.com") ? { ok: true, json: () => new Promise(() => {}) } : new Response("unexpected", { status: 500 });
+        const t0 = Date.now();
+        const r = await runCombo({ STATE: fakeKV(), XKIRO_API_KEY: "k" }, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, { totalTimeoutMs: 2500 });
+        const elapsed = Date.now() - t0;
+        check(r.ok === false && r.errors[0]?.reason === "timeout" && r.errors[0]?.timerFired === true && elapsed >= 2000 && elapsed < 8000, "sumstab: stalled body read times out via the remaining-budget race (timerFired=true)");
+      } finally { global.fetch = prev; }
+      resetRouterHealthForTests();
+    }
+    // (i) Summary D1 distinctions + project filter, zero model calls on
+    // empty/error (handleDailyText level, mock o.chat).
+    {
+      const { sq, db } = mkDbSum();
+      sq.exec("INSERT INTO projects (id, user_id, name, aliases, is_default) VALUES (1, 1, 'عمومی', '[]', 1), (2, 1, 'گلبهار', '[\"گل\"]', 0)");
+      sq.exec("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (1, 'یادداشت عمومی', 'text', '2026-10-28T01:24:00+03:30', 1), (1, 'یادداشت گلبهار', 'text', '2026-10-28T02:24:00+03:30', 2)");
+      const chats = [];
+      const sent = [];
+      await handleDailyText({ STATE: fakeKV(), DB: db }, { chatId: 1, userId: 1, text: "یادداشت‌های گلبهار رو خلاصه کن", send: async (t) => { sent.push(t); }, chat: async (t, o) => { chats.push({ text: t, opts: o }); }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+      check(chats.length === 1 && chats[0].opts.maxTokens === 900 && chats[0].opts.failureLabel === "خلاصه‌سازی" && String(chats[0].text).includes("یادداشت گلبهار") && !String(chats[0].text).includes("یادداشت عمومی"), "sumstab: project summary passes only that project's verified rows, 900 tokens, summary failure label");
+      const chats2 = []; const sent2 = [];
+      await handleDailyText({ STATE: fakeKV(), DB: mkDbSum().db }, { chatId: 1, userId: 1, text: "یادداشت‌هام رو خلاصه کن", send: async (t) => { sent2.push(t); }, chat: async (t, o) => { chats2.push(t); }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+      check(sent2[0] === "موردی برای خلاصه‌سازی پیدا نشد." && chats2.length === 0, "sumstab: empty folder reports none found with zero model calls");
+      const chats3 = []; const sent3 = [];
+      await handleDailyText({ STATE: fakeKV(), DB: { prepare() { throw new Error("boom"); } } }, { chatId: 1, userId: 1, text: "یادداشت‌هام رو خلاصه کن", send: async (t) => { sent3.push(t); }, chat: async (t, o) => { chats3.push(t); }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+      check(String(sent3[0]).includes("خوانده نشد") && chats3.length === 0, "sumstab: D1 failure reports a read failure (not an empty notice) with zero model calls");
+    }
   }
 }
 
