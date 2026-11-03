@@ -42,6 +42,20 @@ export function getRouterHealthSnapshotForTests() {
   return new Map(targetHealthMap);
 }
 
+// Phase 2-f: in-memory Empty-final (24h) counters for /admin. Incremented
+// whenever in-combo failover records an empty_response for a target.
+// Deliberately NOT KV: KV is capped at 1000 writes/day, and a counter
+// write per empty response would burn that budget. LIMITATION (stated
+// plainly in the completion note): this is per-isolate memory, so it
+// resets when the isolate recycles and is NOT a true durable 24h window
+// — the Models tab label follows the directive, but the value is a
+// since-isolate-start count, displayed as 0 when unknown.
+const emptyFinalCounts = new Map();
+export function getEmptyFinalCounts() {
+  return new Map(emptyFinalCounts);
+}
+export function resetEmptyFinalCountsForTests() { emptyFinalCounts.clear(); }
+
 // Phase 2-c: Workers/V8 abort surfacing. Aborting with a string reason
 // (controller.abort("timeout")) or a runtime timeout does NOT reliably
 // surface as AbortError with reason "timeout": it can arrive as the bare
@@ -461,7 +475,7 @@ export async function runCombo(
   env,
   comboNameOrProviderModel,
   body,
-  { deadlineMs, perTargetTimeoutMs, attemptTimeoutMs: attemptOpt, totalTimeoutMs: totalOpt, stream = false } = {},
+  { deadlineMs, perTargetTimeoutMs, attemptTimeoutMs: attemptOpt, totalTimeoutMs: totalOpt, stream = false, requireFinalText = false } = {},
 ) {
   const wanted = String(comboNameOrProviderModel);
   const resolved = await resolveRouterTarget(env, wanted);
@@ -469,14 +483,14 @@ export async function runCombo(
   let manualCfg = null;
   let comboName = null;
   if (resolved.fail) {
-    return { ok: false, errors: resolved.fail };
+    return { ok: false, errors: resolved.fail, tried: [] };
   } else if (resolved.direct) {
     const d = resolved.direct;
     targets = [{ provider: d.provider, model: d.model, score: 0, pinned: false, ctx: d.ctx }];
   } else {
     const sel = resolved.sel;
     if (sel.error) {
-      return { ok: false, errors: [{ target: truncate(resolved.name), reason: truncate(sel.error) }] };
+      return { ok: false, errors: [{ target: truncate(resolved.name), reason: truncate(sel.error) }], tried: [] };
     }
     targets = sel.targets;
     manualCfg = sel.manual ?? null;
@@ -497,6 +511,12 @@ export async function runCombo(
   const totalTimeoutMs = Math.min(totalOpt ?? deadlineMs ?? 22000, 22000);
   const started = Date.now();
   const errors = [];
+  // Phase 2-f: empty-final attempts skipped by in-combo failover, in
+  // order, as `${target}: empty_response` strings. Returned on both ok
+  // and ok:false results (the ok:false rendering still comes from
+  // `errors` via formatFailureDetail; `tried` is the failover audit trail
+  // and the test hook for Task 1).
+  const tried = [];
   const maxRetries = manualCfg?.retries ?? 0;
   const perTargetTimeout = manualCfg?.timeoutMs
     ? Math.min(manualCfg.timeoutMs, attemptTimeoutMs)
@@ -740,6 +760,46 @@ export async function runCombo(
         usage: data?.usage ?? null,
         toolCalls: hasToolCalls,
       };
+      // Phase 2-f Task 1: in-combo failover on empty final answer
+      // (OPT-IN, Telegram only — requireFinalText, default false, so
+      // /v1 and callRouter keep returning reasoning-only and
+      // tool-call-only responses verbatim). A HTTP 200 whose cleaned
+      // visible answer is empty and which carries no tool_calls is NOT
+      // a usable Telegram answer: record it as empty_response, cool the
+      // target briefly via the existing markFailure path (transient-5xx
+      // family: model scope, 900s — a SHORT transient cooldown, never a
+      // ban), count it for the /admin Empty-final counter, and try the
+      // next target in the SAME combo inside the shared budget. The
+      // in-memory breaker entry matches the transient-5xx pattern.
+      if (requireFinalText && !hasToolCalls && answerMeta.finalText === "") {
+        tried.push(`${usedModel}: empty_response`);
+        errors.push({ target: usedModel, reason: "empty_response" });
+        lastErr = "empty_response";
+        emptyFinalCounts.set(usedModel, (emptyFinalCounts.get(usedModel) ?? 0) + 1);
+        if (env.STATE) {
+          try {
+            await markFailure(env, usedModel, { scope: "model", cooldownSec: 900, label: "empty_response" }, "empty_response");
+          } catch (err) {
+            console.error("markFailure failed:", err && err.message);
+          }
+        }
+        recordTargetFailure(usedModel, "empty_response");
+        // Budget discipline: a further failover attempt needs >= 1500ms
+        // of the shared budget left (the directive's floor — stricter
+        // than runCombo's 1200ms loop/JSON floors, which still govern
+        // ordinary attempts; the 1500ms figure is also the chat
+        // fallback gate in answerChatText). Below that, stop cleanly
+        // with a budget-floor entry and attempt no further fetch. The
+        // entry names the already-attempted target, never an
+        // unattempted one (no phantom entries, per Phase 2-c).
+        const remAfter = deadline - (Date.now() - started);
+        if (remAfter < 1500) {
+          errors.push({ target: usedModel, reason: "budget floor" });
+          lastErr = "budget floor";
+          break;
+        }
+        continue;
+      }
       // Surface the extracted text as the message content so the
       // router//v1 callers (callRouter, chatCompletions) see the
       // generation exactly as before. answerChatText does NOT use this
@@ -761,11 +821,12 @@ export async function runCombo(
         combo: comboName,
         latencyMs,
         answerMeta,
+        tried,
       };
     }
   }
 
-  return { ok: false, errors };
+  return { ok: false, errors, tried };
 }
 
 // فراخوانی مستقیم یک هدف (همان کد مسیر روتتر؛ بدون فیلتر سلامت) برای /test.
