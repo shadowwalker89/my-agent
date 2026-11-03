@@ -8,7 +8,7 @@ import {
   removeCombo,
 } from "./config.js";
 import { RULES, capabilityTags } from "./combos.js";
-import { runCombo, getComboTargets, directCall, clearRouterHealthTarget, clearRouterHealthForProvider, resetRouterHealthForTests, extractFinalText } from "./router.js";
+import { runCombo, getComboTargets, directCall, clearRouterHealthTarget, clearRouterHealthForProvider, resetRouterHealthForTests, extractFinalText, getEmptyFinalCounts } from "./router.js";
 import { classifyTask, comboCandidates, fallbackCombo, updateHasImage } from "./task-route.js";
 import { getPrefs, setPrefs } from "./tgprefs.js";
 import { syncProvider, getSyncReport, loadCatalog } from "./catalog.js";
@@ -228,7 +228,13 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
   // the total at 22s, so this whole block always finishes in <= 22s.
   const chatBudgetStart = Date.now();
   const CHAT_TOTAL_BUDGET_MS = 22000;
-  let result = await runCombo(env, combo, body, { totalTimeoutMs: CHAT_TOTAL_BUDGET_MS });
+  // Phase 2-f Task 1: Telegram delivery ONLY passes requireFinalText,
+  // so an empty final answer fails over to the next target inside the
+  // same combo instead of surfacing as "پاسخ خالی بود.". /v1
+  // (chatCompletions) and callRouter never set this flag (default
+  // false) and keep returning reasoning-only / tool-call-only
+  // responses verbatim to API clients.
+  let result = await runCombo(env, combo, body, { totalTimeoutMs: CHAT_TOTAL_BUDGET_MS, requireFinalText: true });
   let usedCombo = combo;
   let routed = autoPick ? "auto" : "manual";
   if (!result.ok && fallback && fallback !== usedCombo) {
@@ -237,7 +243,7 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
       console.warn(`[tg] combo ${usedCombo} failed -> fallback ${fallback}`);
       routed = "manual";
       usedCombo = fallback;
-      result = await runCombo(env, fallback, body, { totalTimeoutMs: remaining });
+      result = await runCombo(env, fallback, body, { totalTimeoutMs: remaining, requireFinalText: true });
     }
   }
 
@@ -262,7 +268,7 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
       console.warn(`[tg] combo ${usedCombo} empty final -> fallback ${fallback}`);
       routed = "manual";
       usedCombo = fallback;
-      result = await runCombo(env, fallback, body, { totalTimeoutMs: remaining });
+      result = await runCombo(env, fallback, body, { totalTimeoutMs: remaining, requireFinalText: true });
       answer = result.ok ? finalOf(result) : "";
     }
   }
@@ -1516,7 +1522,11 @@ async function adminApiListModels(request, env) {
       cooldownRemainingSec = entry?.remainingSec ?? null;
     }
     const medianLatencyMs = await getMedianLatency(env, target);
-    out.push({ id: m.id, status, tags: capabilityTags(m), vision: m.vision === true, cooldownReason, cooldownRemainingSec, medianLatencyMs });
+    // Phase 2-f Task 3: read-only Empty-final counter, in-memory per
+    // isolate (no KV writes). 0 when unknown. See router.js for the
+    // per-isolate limitation — this is not durable 24h accounting.
+    const emptyFinal24h = getEmptyFinalCounts().get(target) ?? 0;
+    out.push({ id: m.id, status, tags: capabilityTags(m), vision: m.vision === true, cooldownReason, cooldownRemainingSec, medianLatencyMs, emptyFinal24h });
   }
   return json({ ok: true, provider, models: out });
 }
