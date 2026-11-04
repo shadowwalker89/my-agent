@@ -375,13 +375,19 @@ const NOTE_RE = /^\s*(?:(?:لطفا|لطفاً|ببین)\s+)?(?:یادداشت\s
 // project forms -> the named project (bare name, or after the project word); a trailing show verb and trailing punctuation
 // are stripped from the name. The old unanchored possessive match stays as a fallback, so joined transcriptions still reach
 // note-query. Date words are explicit only — no today default. Precedence: date beats project; no combined filter.
-const NOTE_SHOW_TAIL = /(?:\s+را)?(?:\s+(?:نشان\s+بده|نشون\s+بده|نمایش\s+بده|بگو|بگوید|بگویید))?\s*$/u;
+const NOTE_SHOW_TAIL = /(?:\s+(?:را|رو))?(?:\s+(?:نشان\s+بده|نشون\s+بده|نمایش\s+بده|بگو|بگوید|بگویید))?\s*$/u;
 export function parseNoteQuery(raw, now) {
   const t = String(raw ?? "").trim().replace(/[؟?!.،,]+$/u, "");
   const day = /دیروز/.test(t) ? addDays(iranDate(now), -1) : /امروز/.test(t) ? iranDate(now) : null;
-  const head = /^(?:(?:لیست|فهرست)\s+)?یادداشت\s*های?/u.exec(t);
+  // Phase 2-g: نوت is a note synonym, but only in its plural form
+  // (نوت‌ها/نوت‌هام): a bare نوت head would misread "نوت جدید" as a
+  // project-filtered list, while یادداشت keeps its pinned bare forms.
+  const head = /^(?:(?:لیست|فهرست)\s+)?(?:یادداشت\s*های?|نوت\s*های)/u.exec(t);
   if (head) {
-    const rest = t.slice(head[0].length).trim().replace(NOTE_SHOW_TAIL, "").replace(/[؟?!.،,]+$/u, "").trim();
+    // Phase 2-g: after the show-verb tail is stripped, a leftover
+    // colloquial «رو» marker ("یادداشت‌ها رو نشون بده" → "رو") must
+    // not become a bogus project filter — strip it before the branches.
+    const rest = t.slice(head[0].length).trim().replace(NOTE_SHOW_TAIL, "").replace(/[؟?!.،,]+$/u, "").trim().replace(/^(?:رو|را)(?:\s+|$)/u, "").trim();
     if (/^(?:امروز|دیروز)(?:\s|$)/.test(rest)) return { intent: "note-query", confidence: 1, date: day, projectName: null };
     if (day && /(?:امروز|دیروز)/.test(rest)) return { intent: "note-query", confidence: 1, date: day, projectName: null };
     if (/^(?:م|مو|من)(?:\s|$)/.test(rest)) return { intent: "note-query", confidence: 1, date: day, projectName: null };
@@ -414,15 +420,46 @@ export function parseSummaryQuery(raw) {
   if (pm && pm[1].trim()) return { intent: "summary", confidence: 1, kind, projectName: pm[1].trim() };
   return { intent: "summary", confidence: 1, kind, projectName: rest };
 }
-const NOTE_QUERY_RE = /(یادداشت\s*های(م|مو| امروز)?|یادداشت\s*هامو?)/;
-// Task list (1-b-1): anchored CLOSED list of clear list-request forms
-// (spaced/ZWNJ/joined تسک‌هام / تسک‌هایم + a show verb). Bare تسک,
-// تسک جدید, تسک بساز, and any message with a task body MUST NOT match.
-// 1-c-1 (live-QA catch): an explicit list prefix (لیست / فهرست) is part
-// of the same closed rule, so «لیست تسک‌هام» and its spacing/ZWNJ
-// variants route deterministically to D1 with zero model calls instead
-// of falling through to chat (which hallucinated a fake task table).
-const TASK_LIST_RE = /^\s*(?:(?:لیست|فهرست)\s*)?(?:تسک\s*های(?:م|مو)|تسک\s*هامو?)(?:\s+را)?(?:\s+(?:نشان\s+بده|نشون\s+بده|نمایش\s+بده))?\s*[؟?!.،,]*$/u;
+const NOTE_QUERY_RE = /(یادداشت\s*های(م|مو| امروز)?|یادداشت\s*هامو?|نوت\s*های(م|مو)?|نوت\s*هامو?)/;
+// Phase 2-g: colloquial list routing for tasks and reminders (zero
+// model calls). This replaces the 1-b-1 TASK_LIST_RE closed list, which
+// missed the colloquial object marker «رو» (it allowed only formal
+// «را»), the verbs بیار/لیست کن, the «های من» possessive, and the
+// کار/یادآوری/ریمایندر subjects — so «تسک‌هام رو نشون بده» fell
+// through to free chat while «یادداشت‌هام رو نشون بده» matched
+// deterministically (that divergence is the proven 2-g trace finding).
+// Grammar: [لیست|فهرست] SUBJECT [پروژه <name>] [رو|را] [show verb],
+// where SUBJECT is تسک/کار (→ task-list) or یادآوری/ریمایندر
+// (→ reminder-list) with a plural/possessive ending. A bare subject
+// or a marker-only tail still requires a possessive or a project
+// segment; any other tail (a body word, ببینم, جلسه, جدول کن)
+// rejects, so creation and chat keep their existing routes.
+const LIST_SUBJECT_RE = /^(تسک|کار|یادآوری|ریمایندر)\s*(?:(های|ها)\s*(مو|من|یم|م)?|(هامو|هام))\s*/u;
+const LIST_TAIL_RE = /^(?:(رو|را)\s+)?(نشان\s+بده|نشون\s+بده|نمایش\s+بده|بیار|بیاور|لیست\s+کنید|لیست\s+کن|لیست|چی\s+دارم|چه\s+دارم|چه\s+(?:\S+\s+){0,3}دارم)$/u;
+// NOTE: no \b here — JavaScript \b is ASCII-only, so it never matches
+// after a Persian word (رو followed by a space has no ASCII boundary
+// and the project name would swallow the whole tail). The verb is
+// instead followed by an explicit whitespace-or-end guard.
+const LIST_PROJECT_RE = /(?:^|\s+)(?:(?:توی|تو|در|برای|بابت)\s+)?پروژه\s+(.+?)(?=\s+(?:رو|را|نشان\s+بده|نشون\s+بده|نمایش\s+بده|بیار|بیاور|لیست|چی|چه)(?:\s|$)|\s*$)/u;
+export function parseListRequest(raw) {
+  let s = String(raw ?? "").trim().replace(/[؟?!.،,]+$/u, "");
+  s = s.replace(/^(?:لیست|فهرست)\s+/u, "");
+  const subj = LIST_SUBJECT_RE.exec(s);
+  if (!subj) return null;
+  const intent = subj[1] === "تسک" || subj[1] === "کار" ? "task-list" : "reminder-list";
+  const possessive = Boolean(subj[3] || subj[4]);
+  let rest = s.slice(subj[0].length).trim();
+  let projectName = null;
+  const pm = LIST_PROJECT_RE.exec(rest);
+  if (pm && pm[1].trim()) {
+    projectName = pm[1].trim().replace(/[؟?!.،,]+$/u, "").trim();
+    rest = `${rest.slice(0, pm.index)} ${rest.slice(pm.index + pm[0].length)}`.replace(/\s+/g, " ").trim();
+  }
+  if (rest === "") return possessive || projectName ? { intent, confidence: 1, projectName } : null;
+  if (/^(رو|را)$/.test(rest)) return possessive || projectName ? { intent, confidence: 1, projectName } : null;
+  if (LIST_TAIL_RE.test(rest)) return { intent, confidence: 1, projectName };
+  return null;
+}
 const FILE_RE = /(?<!\p{L})(خلاصه\s+اش\s+کن(?![\p{L}])|خلاصه\s+کن(?![\p{L}])|خلاصه\s+اش|این فایل را خلاصه\s+کن(?![\p{L}]))/u;
 const TRANSLATE_VERB = /(?<!\p{L})(?:ترجمه\s+(?:کن|کنید|بکن))(?![\p{L}])/u;
 function countAnchoredAmounts(text) { const toks = stripThousands(normalizeDigits(normalizeText(text))).replace(/[؟?!.،,]/g, " ").split(/\s+/).filter(Boolean); let n = 0; for (let ci = 0; ci < toks.length; ci++) if (CUR_WORDS.includes(toks[ci])) for (let s = Math.max(0, ci - 7); s < ci; s++) { const ph = parseNumberPhrase(toks.slice(s, ci), 0); if (ph && !ph.error && ph.consumed === ci - s) { n++; break; } } return n; }
@@ -591,7 +628,7 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   if (amount?.error === "decimal") return { intent: "ask", confidence: 0.5, question: "decimal" };
   if (amount?.error === "amount") return { intent: "ask", confidence: 0.5, question: "amount" };
   if (amount?.error === "unknown-number") return { intent: "chat", confidence: 1 }; // no verb: a bare-thousand statement is chat, not an amount question
-  if (TASK_LIST_RE.test(raw)) return { intent: "task-list", confidence: 1 };
+  const lr = parseListRequest(raw); if (lr) return lr;
   const sq = parseSummaryQuery(raw); if (sq) return sq;
   // Phase 1-e Pillar 2: flexible summary phrasings without a trailing
   // "خلاصه/جدول کن" verb ("یه خلاصه از یادداشت‌هام بده"). NOTE-ONLY
