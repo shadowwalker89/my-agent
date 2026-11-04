@@ -353,7 +353,10 @@ export async function insertTask(envOrDb, task) {
 // Phase 1-b-0a (Fix A): result-shaped open-task read, same ok rule as
 // listProjectsResult. The offset parameter lands with the core here;
 // listOpenTasks gains it in 1-b-0b, so this slice's delegate passes 0.
-export async function listOpenTasksResult(envOrDb, userId, projectId = null, limit = 50, offset = 0) {
+// Phase 2-g: opts.remindOnly restricts to tasks with a reminder set
+// (remind_at IS NOT NULL) — the reminder-list render. Default callers
+// are unaffected: the generated SQL is identical without the option.
+export async function listOpenTasksResult(envOrDb, userId, projectId = null, limit = 50, offset = 0, opts = {}) {
   const db = dbOf(envOrDb);
   const id = validUserId(userId);
   if (!db || id === null) return { ok: false, tasks: [] };
@@ -361,9 +364,9 @@ export async function listOpenTasksResult(envOrDb, userId, projectId = null, lim
   const off = Math.max(0, Math.floor(Number(offset) || 0));
   try {
     const pid = optInt(projectId);
-    const res = pid === null
-      ? await db.prepare("SELECT id, title, project_id, status, due_at, remind_at, reminded_at, remind_attempts, source, created_at, completed_at FROM tasks WHERE user_id = ? AND status = 'open' ORDER BY id ASC LIMIT ? OFFSET ?").bind(id, n, off).all()
-      : await db.prepare("SELECT id, title, project_id, status, due_at, remind_at, reminded_at, remind_attempts, source, created_at, completed_at FROM tasks WHERE user_id = ? AND status = 'open' AND project_id = ? ORDER BY id ASC LIMIT ? OFFSET ?").bind(id, pid, n, off).all();
+    const where = ["user_id = ?", "status = 'open'", ...(pid === null ? [] : ["project_id = ?"]), ...(opts?.remindOnly === true ? ["remind_at IS NOT NULL"] : [])].join(" AND ");
+    const params = pid === null ? [id, n, off] : [id, pid, n, off];
+    const res = await db.prepare(`SELECT id, title, project_id, status, due_at, remind_at, reminded_at, remind_attempts, source, created_at, completed_at FROM tasks WHERE ${where} ORDER BY id ASC LIMIT ? OFFSET ?`).bind(...params).all();
     return { ok: true, tasks: Array.isArray(res?.results) ? res.results : [] };
   } catch {
     return { ok: false, tasks: [] };
