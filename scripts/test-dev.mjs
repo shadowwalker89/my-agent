@@ -46,7 +46,7 @@ import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, 
 import { callRouter, runCombo, resetRouterHealthForTests, getRouterHealthSnapshotForTests, extractAssistantText, extractFinalText, getComboTargets, classifyFailure, getEmptyFinalCounts, resetEmptyFinalCountsForTests } from "../src/router.js";
 import { PROVIDERS } from "../src/providers.js";
 import { sendProgressMessage, finalizeProgressMessage, splitTelegramText } from "../src/telegram.js";
-import { answerChatText, adminApi, handleUpdate, resetSeenUpdateIdsForTests } from "../src/index.js";
+import { answerChatText, adminApi, handleUpdate, resetSeenUpdateIdsForTests, CHAT_SYSTEM_PROMPT } from "../src/index.js";
 import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
 import { buildInterpreterPrompt, parseInterpreterOutput, interpretText, callInterpreterModel, validateAmountText, validateDateTexts, matchProject, validateInterpreterAction, INTERPRETER_MAX_ACTIONS } from "../src/interpreter.js";
 import { scoreEvalResults, mapOutcome, scoreSlots, runCaseEvaluation, iranNowIso, median } from "../scripts/eval-intent.mjs";
@@ -1151,7 +1151,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion, SUMMARY_SYSTEM } from "../src/everyday.js";
 import { markFailure, isModelHealthy } from "../src/health.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
@@ -5734,6 +5734,188 @@ if (DatabaseSync) {
       const rowAfter = (after.data.models ?? []).find((m) => m.id === "qwen3-32b");
       check(after.status === 200 && rowAfter?.emptyFinal24h === 1, "2-f: GET /admin/api/models surfaces the Empty-final counter per target");
     }
+  }
+}
+
+// ── Phase 2-g: colloquial list routing + NLU diag + chat memory-claim guard ──
+{
+  // (a) Phrase → route matrix. classifyDaily is pure (no env.AI, no
+  // provider fetch); the runtime tests below count both at the
+  // handleDailyText/handleUpdate level.
+  const cl2g = (t) => classifyDaily(t, { nowMs: Date.UTC(2026, 10, 4, 12, 0, 0) });
+  const taskForms2g = ["تسک‌هام رو نشون بده", "تسک‌هام رو بیار", "تسک‌های من رو نشون بده", "کارهام رو نشون بده", "تسک‌ها رو نشون بده", "تسک‌هام چی دارم", "تسک‌هام چه کارهایی دارم", "تسک‌هام رو لیست کن", "تسک‌هامو لیست کن", "لیست کارهام", "تسک‌هام"];
+  for (const t of taskForms2g) check(cl2g(t).intent === "task-list", `2-g: task list form ${t}`);
+  const noteForms2g = ["یادداشت‌هام رو نشون بده", "یادداشت‌هام رو بیار", "نوت‌هام رو نشون بده", "نوت‌هامو لیست کن", "یادداشت‌های من رو نشون بده", "یادداشت‌هام چی دارم", "لیست نوت‌هام", "یادداشت‌ها رو نشون بده"];
+  for (const t of noteForms2g) check(cl2g(t).intent === "note-query", `2-g: note list form ${t}`);
+  check(cl2g("یادداشت‌ها رو نشون بده").projectName == null, "2-g: plural note list without possessive carries no bogus project filter");
+  const remForms2g = ["یادآوری‌هام رو نشون بده", "ریمایندرهام رو نشون بده", "یادآوری‌های من رو نشون بده", "یادآوری‌هام رو بیار", "یادآوری‌هام چی دارم", "لیست یادآوری‌هام"];
+  for (const t of remForms2g) check(cl2g(t).intent === "reminder-list", `2-g: reminder list form ${t}`);
+  check(cl2g("تسک‌های پروژه گلبهار رو نشون بده").intent === "task-list" && cl2g("تسک‌های پروژه گلبهار رو نشون بده").projectName === "گلبهار", "2-g: task list extracts پروژه <name>");
+  check(cl2g("تسک‌هام توی پروژه گلبهار رو نشون بده").intent === "task-list" && cl2g("تسک‌هام توی پروژه گلبهار رو نشون بده").projectName === "گلبهار", "2-g: task list extracts توی پروژه <name>");
+  // Creation phrases never match .list (creation patterns are checked
+  // before the list position in classifyDaily).
+  check(cl2g("یه تسک جدید ثبت کن جلسه فردا").intent === "task-create", "2-g: task creation still routes to creation");
+  check(cl2g("یادم بنداز فردا ساعت ۵ به علی زنگ بزنم").intent === "reminder", "2-g: reminder creation still routes to creation");
+  check(cl2g("اینو یادداشت کن که فردا جلسه دارم").intent === "note", "2-g: note creation still routes to creation");
+  check(cl2g("تسک هام شیر بخرم").intent !== "task-list" && cl2g("تسک هام را ببینم").intent !== "task-list" && cl2g("تسک‌هام رو ببینم").intent !== "task-list" && cl2g("کارهام انجام شد").intent !== "task-list" && cl2g("تسک‌هام رو جدول کن").intent !== "summary", "2-g: body/junk/verb forms never route to .list");
+
+  const fresh2g = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } } };
+  };
+  const mkS2g = () => { const sent = []; const chats = []; return { sent, chats, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); }, chat: async (text) => { chats.push(text); }, editMarkup: async () => {} }; };
+  const NOW2g = Date.UTC(2026, 10, 4, 12, 0, 0);
+
+  // (b) Runtime routing: every matrix phrase routes through
+  // handleDailyText with 0 env.AI.run calls and 0 chat calls.
+  {
+    const { db } = fresh2g();
+    let aiCalls = 0;
+    const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1", DB: db, AI: { run: async () => { aiCalls++; return { response: JSON.stringify({ intent: "chat", confidence: 0.9 }) }; } } };
+    const s = mkS2g();
+    for (const t of [...taskForms2g, ...noteForms2g, ...remForms2g]) {
+      const before = s.sent.length, chatsBefore = s.chats.length;
+      await handleDailyText(env, { chatId: 1, userId: 1, text: t, send: s.send, chat: s.chat, nowMs: NOW2g });
+      check(s.sent.length > before && s.chats.length === chatsBefore, `2-g: ${t} routes deterministically (sent, no chat call)`);
+    }
+    check(aiCalls === 0, "2-g: deterministic list routing makes 0 env.AI.run calls across the matrix");
+  }
+
+  // (c) Project-filtered task list + reminder-only render.
+  {
+    const { sq, db } = fresh2g();
+    sq.prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (1, 'گلبهار', '[]', 'active', 0, '2026-10-01T00:00:00.000Z')").run();
+    const golId = sq.prepare("SELECT id FROM projects WHERE user_id = 1 AND name = 'گلبهار'").all()[0].id;
+    sq.prepare("INSERT INTO tasks (user_id, title, status, project_id, source, created_at) VALUES (1, 'سیمان گلبهار', 'open', ?, 'text', '2026-10-30T00:00:00.000Z')").run(golId);
+    sq.prepare("INSERT INTO tasks (user_id, title, status, project_id, source, created_at) VALUES (1, 'کار عمومی', 'open', NULL, 'text', '2026-10-30T00:00:00.000Z')").run();
+    sq.prepare("INSERT INTO tasks (user_id, title, status, project_id, source, created_at, remind_at) VALUES (1, 'زنگ به علی', 'open', NULL, 'text', '2026-10-30T00:00:00.000Z', '2026-11-04T15:00:00.000Z')").run();
+    let aiCalls = 0;
+    const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1", DB: db, AI: { run: async () => { aiCalls++; return { response: JSON.stringify({ intent: "chat", confidence: 0.9 }) }; } } };
+    const s = mkS2g();
+    await handleDailyText(env, { chatId: 1, userId: 1, text: "تسک‌های پروژه گلبهار رو نشون بده", send: s.send, chat: s.chat, nowMs: NOW2g });
+    const projText = String(s.sent.at(-1)?.text ?? "");
+    check(projText.includes("سیمان گلبهار") && !projText.includes("کار عمومی") && aiCalls === 0, "2-g: project-filtered task list shows only that project's tasks, 0 AI calls");
+    await handleDailyText(env, { chatId: 1, userId: 1, text: "یادآوری‌هام رو نشون بده", send: s.send, chat: s.chat, nowMs: NOW2g });
+    const remText = String(s.sent.at(-1)?.text ?? "");
+    check(remText.includes("زنگ به علی") && !remText.includes("کار عمومی") && !remText.includes("سیمان گلبهار"), "2-g: reminder list shows only tasks with a reminder set");
+  }
+
+  // (d) Reminder paging keeps the filter (rem:more, never task:more).
+  {
+    const { sq, db } = fresh2g();
+    for (let i = 1; i <= 9; i++) sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at, remind_at) VALUES (1, ?, 'open', 'text', '2026-10-30T00:00:00.000Z', '2026-11-04T15:00:00.000Z')").run(`یادآوری ${i}`);
+    sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'کار بدون یادآوری', 'open', 'text', '2026-10-30T00:00:00.000Z')").run();
+    const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1", DB: db };
+    const s = mkS2g();
+    await handleDailyText(env, { chatId: 1, userId: 1, text: "یادآوری‌هام رو نشون بده", send: s.send, chat: s.chat, nowMs: NOW2g });
+    const first = s.sent.at(-1);
+    const moreBtn = (first?.replyMarkup?.inline_keyboard ?? []).flat().find((b) => String(b.callback_data ?? "").startsWith("rem:more:"));
+    check(String(first?.text ?? "").includes("یادآوری 8") && !String(first?.text ?? "").includes("یادآوری 9") && moreBtn?.callback_data === "rem:more:8", "2-g: reminder list pages 8 at a time with a rem:more button");
+    await resolveTaskCallback(env, { fromId: 1, chatId: 1, data: "rem:more:8", send: s.send, editMarkup: async () => {}, chat: s.chat, nowMs: NOW2g });
+    const second = String(s.sent.at(-1)?.text ?? "");
+    check(second.includes("یادآوری 9") && !second.includes("کار بدون یادآوری"), "2-g: rem:more page 2 stays reminder-only");
+  }
+
+  // (e) End-to-end: the live phrase via handleUpdate delivers the D1
+  // task list with the compact 2-d keyboard and 0 model calls.
+  {
+    resetSeenUpdateIdsForTests();
+    const { sq, db } = fresh2g();
+    sq.prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (1, 'گلبهار', '[]', 'active', 0, '2026-10-01T00:00:00.000Z'), (1, 'ایجنت', '[]', 'active', 0, '2026-10-01T00:00:00.000Z'), (1, 'یوتیوب', '[]', 'active', 0, '2026-10-01T00:00:00.000Z'), (1, 'قرارها و ملاقات‌ها', '[]', 'active', 0, '2026-10-01T00:00:00.000Z')").run();
+    sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'ضبط ویدیوی معرفی', 'open', 'text', '2026-10-30T00:00:00.000Z'), (1, 'خرید سیمان', 'open', 'text', '2026-10-30T00:00:00.000Z')").run();
+    let aiCalls = 0, providerCalls = 0;
+    const sends = [];
+    const prev = global.fetch;
+    global.fetch = async (url, init = {}) => {
+      const u = String(url);
+      if (u.startsWith("https://api.telegram.org/")) {
+        const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+        let payload = {};
+        try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+        sends.push({ method: m ? m[1] : "", payload });
+        return Response.json({ ok: true, result: { message_id: 7 } });
+      }
+      providerCalls++;
+      return new Response("must not be called", { status: 500 });
+    };
+    try {
+      const env = { STATE: fakeKV(), TG_TOKEN: "x", TG_SECRET: "x", ALLOWED_TG_IDS: "1", DB: db, AI: { run: async () => { aiCalls++; return { response: "{}" }; } } };
+      await handleUpdate(env, { update_id: 770000001, message: { message_id: 11, from: { id: 1 }, chat: { id: 1 }, text: "تسک‌هام رو نشون بده" } });
+    } finally { global.fetch = prev; }
+    const listMsg = sends.filter((x) => x.method === "sendMessage").find((x) => String(x.payload.text ?? "").includes("ضبط ویدیوی معرفی"));
+    check(!!listMsg && aiCalls === 0 && providerCalls === 0, "2-g: handleUpdate «تسک‌هام رو نشون بده» delivers the D1 task list with 0 AI and 0 provider calls");
+    const kb = listMsg?.payload?.reply_markup?.inline_keyboard ?? [];
+    const taskRows = kb.filter((row) => row.some((b) => String(b.callback_data ?? "").startsWith("task:done:")));
+    const filterRows = kb.filter((row) => row.every((b) => String(b.callback_data ?? "").startsWith("task:proj:")));
+    check(taskRows.length === 1 && taskRows[0].length === 4 && filterRows.every((r) => r.length <= 3), "2-g: end-to-end task keyboard packs 2 tasks/row and project filters ≤3/row");
+  }
+
+  // (f) intent_nlu_diag: one privacy-safe line per NLU invocation.
+  const captureNluDiag = async (fn) => {
+    const orig = console.log; const lines = [];
+    console.log = (...a) => { try { const s = a.map(String).join(" "); if (s.includes("intent_nlu_diag")) lines.push(JSON.parse(s)); } catch {} };
+    try { await fn(); } finally { console.log = orig; }
+    return lines;
+  };
+  const nluEnv2g = (aiRun) => { const { db } = fresh2g(); return { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1", DB: db, AI: { run: aiRun } }; };
+  {
+    const env = nluEnv2g(async () => ({ response: JSON.stringify({ intent: "task_list", confidence: 0.9 }) }));
+    const s = mkS2g();
+    const lines = await captureNluDiag(() => handleDailyText(env, { chatId: 1, userId: 1, text: "ZZMARKER2G لطفا تسک‌هایم را نشان بده", send: s.send, chat: s.chat, nowMs: NOW2g }));
+    const d = lines[0] ?? {};
+    check(lines.length === 1 && d.event === "intent_nlu_diag" && Array.isArray(d.models) && d.models[0] === DEFAULT_INTERPRETER_MODEL && d.perModel?.[0]?.status === "ok" && d.parseOk === true && d.finalDomain === "task" && d.finalAction === "list" && d.confidence === 0.9 && d.routedTo === "task-list" && typeof d.elapsedMs === "number" && d.fallbackReason === null, "2-g: intent_nlu_diag on a routed NLU turn carries exactly the specified fields");
+    check(!JSON.stringify(lines).includes("ZZMARKER2G"), "2-g: intent_nlu_diag never contains user text");
+    check([...env.STATE.store.keys()].every((k) => !k.includes("nlu") && !k.includes("diag")), "2-g: intent_nlu_diag writes no KV keys");
+  }
+  {
+    const env = nluEnv2g(async () => ({ response: JSON.stringify({ intent: "chat", confidence: 0.9 }) }));
+    const s = mkS2g();
+    const lines = await captureNluDiag(() => handleDailyText(env, { chatId: 1, userId: 1, text: "ZZMARKER2G چیزی بگو", send: s.send, chat: s.chat, nowMs: NOW2g }));
+    check(lines.length === 1 && lines[0].routedTo === "chat" && lines[0].fallbackReason === "chat-intent" && lines[0].finalDomain === "chat" && lines[0].finalAction === null, "2-g: intent_nlu_diag on a chat verdict reports chat-intent");
+  }
+  {
+    const env = nluEnv2g(async () => ({ response: JSON.stringify({ intent: "task_list", confidence: 0.5 }) }));
+    const s = mkS2g();
+    const lines = await captureNluDiag(() => handleDailyText(env, { chatId: 1, userId: 1, text: "ZZMARKER2G تسک‌ها", send: s.send, chat: s.chat, nowMs: NOW2g }));
+    check(lines.length === 1 && lines[0].routedTo === "chat" && lines[0].fallbackReason === "low-confidence" && lines[0].confidence === 0.5, "2-g: intent_nlu_diag on low confidence reports low-confidence");
+  }
+  {
+    const env = nluEnv2g(async () => ({ response: "this is not json" }));
+    const s = mkS2g();
+    const lines = await captureNluDiag(() => handleDailyText(env, { chatId: 1, userId: 1, text: "ZZMARKER2G سلام", send: s.send, chat: s.chat, nowMs: NOW2g }));
+    check(lines.length === 1 && lines[0].fallbackReason === "bad-json" && lines[0].parseOk === false && lines[0].finalDomain === null, "2-g: intent_nlu_diag on unparseable output reports bad-json");
+  }
+  {
+    const { db } = fresh2g();
+    const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1", DB: db };
+    const s = mkS2g();
+    const lines = await captureNluDiag(() => handleDailyText(env, { chatId: 1, userId: 1, text: "ZZMARKER2G سلام", send: s.send, chat: s.chat, nowMs: NOW2g }));
+    check(lines.length === 0, "2-g: no intent_nlu_diag when no model resolves (env.AI never invoked)");
+  }
+
+  // (g) Chat memory-claim guard: free-chat prompt only, never summary.
+  check(CHAT_SYSTEM_PROMPT.includes("no access to the user's notes") && CHAT_SYSTEM_PROMPT.includes("برای دیدن تسک‌ها بنویس: تسک‌هام رو نشون بده"), "2-g: free-chat system prompt carries the memory-claim guard");
+  check(!SUMMARY_SYSTEM.includes("no access to the user's notes") && SUMMARY_SYSTEM.includes("فهرست شماره‌دار"), "2-g: summary system prompt has no guard and keeps its numbered-list instruction");
+  {
+    const { db } = fresh2g();
+    const kv = fakeKV();
+    await kv.put("catalog:xkiro", JSON.stringify({ models: [{ id: "qwen3-32b", provider: "xkiro", context: 131072 }] }));
+    let providerBody = null;
+    const prev = global.fetch;
+    global.fetch = async (url, init = {}) => {
+      const u = String(url);
+      if (u.startsWith("https://api.telegram.org/")) return Response.json({ ok: true, result: { message_id: 99 } });
+      if (u.includes("api.xkiro.com")) { try { providerBody = JSON.parse(String(init.body ?? "{}")); } catch {} return Response.json({ choices: [{ message: { content: "سلام!" }, finish_reason: "stop" }] }); }
+      return new Response("unexpected", { status: 500 });
+    };
+    try { await answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "سلام", false, { saveText: "" }); } finally { global.fetch = prev; }
+    const sysMsg = (providerBody?.messages ?? []).find((m) => m.role === "system");
+    check(typeof sysMsg?.content === "string" && sysMsg.content.includes("no access to the user's notes"), "2-g: chat provider request carries the memory-claim guard in its system prompt");
   }
 }
 
