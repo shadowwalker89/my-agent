@@ -2,7 +2,7 @@
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, extractFolderTag, matchKnownProjectAt, IRAN_OFFSET_MIN } from "./daily.js";
-import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO } from "./intent.js";
+import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO, resolveInterpreterModel } from "./intent.js";
 import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
@@ -336,7 +336,25 @@ async function runDailyBranch(env, o, c, ctx) {
     if (r.ok) await markDaily(env, o);
     return "handled";
   }
-  if (c.intent === "task-list") { const r = await renderTaskList(env, userId); await sendListMessage(o, r); if (r.ok) await markDaily(env, o); return "handled"; }
+  // Phase 2-g: task-list resolves an extracted پروژه <name> against
+  // D1 (same pattern as the summary branch); an unknown name reports
+  // instead of silently listing everything. reminder-list renders the
+  // same compact task view restricted to tasks with a reminder set,
+  // with its own rem:more paging so the filter survives paging.
+  if (c.intent === "task-list" || c.intent === "reminder-list") {
+    let projectId = null;
+    if (c.projectName) {
+      const rp = await listProjectsResult(env, userId);
+      if (!rp.ok) { await o.send(TASK_LIST_FAILED_TEXT); return "handled"; }
+      const hit = findProjectByName(rp.projects, c.projectName);
+      if (!hit) { await o.send(`📁 پروژه «${c.projectName}» پیدا نشد.`); await markDaily(env, o); return "handled"; }
+      projectId = hit.id;
+    }
+    const r = c.intent === "reminder-list"
+      ? await renderTaskList(env, userId, projectId, 0, { remindOnly: true, morePrefix: "rem:more", hideFilters: true, hideSummary: true, emptyText: "یادآوری بازی پیدا نشد." })
+      : await renderTaskList(env, userId, projectId);
+    await sendListMessage(o, r); if (r.ok) await markDaily(env, o); return "handled";
+  }
   // 1-d-2: natural project creation / listing / deterministic task creation.
   if (c.intent === "project-create") {
     const r = await insertProject(env, userId, c.name);
@@ -752,10 +770,18 @@ const TASK_LIST_FAILED_TEXT = "تسک‌ها خوانده نشد؛ دوباره 
 // ONLY on a task-read failure (Fix A); name resolution degrades to
 // titles only when IT fails, since names are decoration. The more
 // button renders ONLY on a full page; beyond-end renders no-more.
-export async function renderTaskList(env, userId, projectId = null, offset = 0) {
-  const r = await listOpenTasksResult(env, userId, projectId, 8, offset);
+// Phase 2-g: opts.remindOnly renders only tasks with a reminder set
+// (the reminder-list view); opts.morePrefix renames the paging
+// callback (rem:more for reminders, so paging never drops the filter);
+// opts.hideFilters/hideSummary drop the project-filter and
+// archive/summary rows for reminders (those rows would switch to the
+// unfiltered task list); opts.emptyText overrides the empty message.
+// Defaults reproduce the pre-2-g output byte for byte.
+export async function renderTaskList(env, userId, projectId = null, offset = 0, opts = {}) {
+  const r = await listOpenTasksResult(env, userId, projectId, 8, offset, { remindOnly: opts.remindOnly === true });
   if (!r.ok) return { ok: false, text: TASK_LIST_FAILED_TEXT, keyboard: null };
-  if (r.tasks.length === 0) return { ok: true, text: offset > 0 ? "صفحه‌ی دیگری نیست." : "تسک بازی پیدا نشد.", keyboard: offset > 0 ? [[{ text: "↩ فهرست", callback_data: projectId == null ? "task:more:0" : `task:more:0:${projectId}` }]] : null };
+  const morePrefix = opts.morePrefix ?? "task:more";
+  if (r.tasks.length === 0) return { ok: true, text: offset > 0 ? "صفحه‌ی دیگری نیست." : (opts.emptyText ?? "تسک بازی پیدا نشد."), keyboard: offset > 0 ? [[{ text: "↩ فهرست", callback_data: projectId == null ? `${morePrefix}:0` : `${morePrefix}:0:${projectId}` }]] : null };
   const rp = await resolveProjects(env, userId);
   const names = new Map();
   if (rp.ok && !rp.fallback) for (const p of rp.projects) if (p.id != null) names.set(p.id, p.name);
@@ -770,9 +796,13 @@ export async function renderTaskList(env, userId, projectId = null, offset = 0) 
   for (let i = 0; i < perTask.length; i += 2) {
     keyboard.push([...perTask[i], ...(perTask[i + 1] ?? [])]);
   }
-  if (r.tasks.length === 8) keyboard.push([{ text: "بیشتر", callback_data: projectId == null ? `task:more:${offset + 8}` : `task:more:${offset + 8}:${projectId}` }]);
-  keyboard.push([{ text: "📦 آرشیو", callback_data: "task:arch:0" }, { text: "📊 خلاصه و جدول", callback_data: `task:sum:${projectId == null ? "all" : projectId}` }]);
-  if (rp.ok && !rp.fallback) {
+  if (r.tasks.length === 8) keyboard.push([{ text: "بیشتر", callback_data: projectId == null ? `${morePrefix}:${offset + 8}` : `${morePrefix}:${offset + 8}:${projectId}` }]);
+  if (opts.hideSummary) {
+    keyboard.push([{ text: "↩ تسک‌ها", callback_data: "task:more:0" }]);
+  } else {
+    keyboard.push([{ text: "📦 آرشیو", callback_data: "task:arch:0" }, { text: "📊 خلاصه و جدول", callback_data: `task:sum:${projectId == null ? "all" : projectId}` }]);
+  }
+  if (!opts.hideFilters && rp.ok && !rp.fallback) {
     const filters = rp.projects.filter((p) => p.id != null).map((p) => ({ text: p.name, callback_data: `task:proj:${p.id}:0` }));
     if (projectId != null) filters.push({ text: "همه", callback_data: "task:more:0" });
     // Phase 2-d: project filters chunked to at most 3 per row, never
@@ -867,7 +897,7 @@ export async function renderNoteList(env, userId, { projectName = null, projectI
 // runSummary input cap); project/date filters in the D1 queries below
 // are unchanged, and the summary token cap is 2200 (Phase 2-f,
 // reasoning-model headroom — see above).
-const SUMMARY_SYSTEM = "فقط از روی ردیف‌هایی که در پیام کاربر آمده خلاصه بساز. هیچ ردیفی را اضافه، حذف یا حدس نزن و هیچ دانسته‌ی بیرونی را قاطی نکن؛ تاریخ‌ها و نام پروژه‌ها را دقیقاً همان‌طور که داده شده بنویس. خلاصه حداکثر ۴ تا ۵ خط کوتاه باشد و بلافاصله بعد از آن فهرست شماره‌دار همان ردیف‌ها بیاید؛ هر ردیف در یک خط: شماره. تاریخ ـ پوشه ـ خلاصه یک‌خطی. فهرست دقیقاً ردیف‌های داده‌شده (حداکثر ۳۰ ردیف) را پوشش دهد.";
+export const SUMMARY_SYSTEM = "فقط از روی ردیف‌هایی که در پیام کاربر آمده خلاصه بساز. هیچ ردیفی را اضافه، حذف یا حدس نزن و هیچ دانسته‌ی بیرونی را قاطی نکن؛ تاریخ‌ها و نام پروژه‌ها را دقیقاً همان‌طور که داده شده بنویس. خلاصه حداکثر ۴ تا ۵ خط کوتاه باشد و بلافاصله بعد از آن فهرست شماره‌دار همان ردیف‌ها بیاید؛ هر ردیف در یک خط: شماره. تاریخ ـ پوشه ـ خلاصه یک‌خطی. فهرست دقیقاً ردیف‌های داده‌شده (حداکثر ۳۰ ردیف) را پوشش دهد.";
 async function runSummary(env, o, kind, projectId, userId, retryData = null) {
   const rp = await listProjectsResult(env, userId);
   const names = new Map();
@@ -1044,6 +1074,10 @@ export async function resolveTaskCallback(env, o) {
   if (done) return actTaskStatus(env, o, Number(done[2]), done[1] === "done" ? "done" : "deleted", done[1] === "done" ? "✅ انجام شد." : "🗑 حذف شد.");
   const more = /^task:more:([^:]+)(?::(\d+))?$/.exec(o.data);
   if (more) { await sendListMessage(o, await renderTaskList(env, o.fromId, more[2] !== undefined ? Number(more[2]) : null, parseListOffset(more[1]))); return true; }
+  // Phase 2-g: reminder-list paging — same shape as task:more, but the
+  // remindOnly filter rides along so page 2 is still reminders only.
+  const remMore = /^rem:more:([^:]+)(?::(\d+))?$/.exec(o.data);
+  if (remMore) { await sendListMessage(o, await renderTaskList(env, o.fromId, remMore[2] !== undefined ? Number(remMore[2]) : null, parseListOffset(remMore[1]), { remindOnly: true, morePrefix: "rem:more", hideFilters: true, hideSummary: true, emptyText: "یادآوری بازی پیدا نشد." })); return true; }
   const arch = /^task:arch:([^:]+)$/.exec(o.data);
   if (arch) { await sendListMessage(o, await renderTaskArchive(env, o.fromId, parseListOffset(arch[1]))); return true; }
   const proj = /^task:proj:([^:]+):([^:]+)$/.exec(o.data);
@@ -1774,8 +1808,25 @@ async function runNluBranch(env, o, ctx) {
   if (isUnambiguousQuestion(text)) return null;
   const now = ctx.now ?? o.nowMs ?? Date.now();
   const pres = await resolveProjects(env, userId);
+  // Phase 2-g: intent_nlu_diag — one privacy-safe console line per
+  // NLU invocation (never message text, slots, or note/task bodies;
+  // no KV writes). Emitted only when a model actually resolved, i.e.
+  // when env.AI is really invoked; a no-model miss logs nothing.
+  // Fields: event, models tried, per-model status, parseOk (a JSON
+  // object was extracted — bad-intent still parsed), finalDomain /
+  // finalAction (the NLU intent split on "_"), confidence, routedTo
+  // (the branch target, "handled" for a write, "chat" on any null),
+  // elapsedMs, fallbackReason (null on a routed turn).
+  const nluModel = resolveInterpreterModel(env);
+  const nluT0 = Date.now();
   const nlu = await classifyIntent(env, text, { projects: (pres.projects || []).map((p) => p.name), pendingAsk: null });
-  if (!nlu.ok || nlu.confidence < 0.75 || nlu.intent === "chat") return null;
+  let nluRoutedTo = "chat";
+  const emitNluDiag = (fallbackReason) => {
+    if (!nluModel) return;
+    const parts = String(nlu.intent || "").split("_");
+    console.log(JSON.stringify({ event: "intent_nlu_diag", models: [nluModel], perModel: [{ model: nluModel, status: nlu.ok ? "ok" : nlu.reason }], parseOk: nlu.ok || nlu.reason === "bad-intent", finalDomain: nlu.ok ? parts[0] : null, finalAction: nlu.ok ? (parts.slice(1).join("_") || null) : null, confidence: nlu.ok ? nlu.confidence : null, routedTo: nluRoutedTo, elapsedMs: Date.now() - nluT0, fallbackReason }));
+  };
+  if (!nlu.ok || nlu.confidence < 0.75 || nlu.intent === "chat") { emitNluDiag(!nlu.ok ? nlu.reason : nlu.confidence < 0.75 ? "low-confidence" : "chat-intent"); return null; }
   const trace = async (projectName) => { try { await insertIntentFeedback(env, { userId, text, predictedType: nlu.intent, correctType: nlu.intent, project: projectName ?? null }); } catch {} };
   const tag = await resolveFolderTag(env, userId, text);
   const resolveProject = () => {
@@ -1786,7 +1837,11 @@ async function runNluBranch(env, o, ctx) {
     }
     return null;
   };
-  const viaBranch = async (cc) => { const r = await runDailyBranch(env, o, cc, ctx); return r === "handled" ? "handled" : null; };
+  const viaBranch = async (cc) => { const r = await runDailyBranch(env, o, cc, ctx); if (r === "handled") nluRoutedTo = cc.intent; return r === "handled" ? "handled" : null; };
+  // Phase 2-g: the switch runs inside this wrapper so every arm's
+  // return lands in nluOut and exactly one diag line is emitted below
+  // (the arms themselves are unchanged).
+  const nluOut = await (async () => {
   switch (nlu.intent) {
     case "note":
     case "task": {
@@ -1859,6 +1914,10 @@ async function runNluBranch(env, o, ctx) {
     default:
       return null;
   }
+  })();
+  if (nluOut === "handled" && nluRoutedTo === "chat") nluRoutedTo = "handled";
+  emitNluDiag(null);
+  return nluOut;
 }
 
 export async function handleDailyText(env, o) {
