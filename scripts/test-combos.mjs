@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { RULES, pickModels, diversify, WEIGHTS } from "../src/combos.js";
+import { RULES, pickModels, diversify, WEIGHTS, sizeBOf } from "../src/combos.js";
 import { mapNvidia, mapXkiro, mapOpenRouter } from "../src/providers.js";
 import { classifyFailure, sortForStrategy, normalizeOpenAiChat, runCombo, resetRouterHealthForTests, getEmptyFinalCounts, resetEmptyFinalCountsForTests } from "../src/router.js";
 import {
@@ -168,6 +168,32 @@ check(
     check(
       ranked[iUltra]?.score < ranked[iInstruct]?.score,
       `${name}: امتیاز ultra-550b باید کمتر از 70b باشد (${ranked[iUltra]?.score} مقابل ${ranked[iInstruct]?.score})`,
+    );
+  }
+}
+
+// ── Phase 2-i: 1t parsing + unstable/workhorse ordering in chat/fast ─────────
+{
+  const trillionId = "nvidia/mistralai/mistral-large-4-1t-a52b";
+  check(sizeBOf(trillionId) === 1000, `2-i: sizeBOf must parse 1t as 1000B (got ${sizeBOf(trillionId)})`);
+  const base = { provider: "nvidia", context: 128000, created: now - 10 * DAY };
+  const trillion = { id: trillionId, ...base };
+  const instruct = { id: "meta/llama-3.3-70b-instruct", ...base };
+  const unstable = { id: "xkiro/qwen/qwen3.8-max:free", provider: "xkiro", context: 128000, created: now - 10 * DAY };
+  for (const name of ["chat", "fast"]) {
+    const ranked = pickModels([trillion, instruct], RULES[name], {});
+    const iInstruct = ranked.findIndex((m) => m.id === instruct.id);
+    const iTrillion = ranked.findIndex((m) => m.id === trillion.id);
+    check(
+      iInstruct !== -1 && iTrillion !== -1 && iInstruct < iTrillion,
+      `2-i ${name}: 70b instruct باید بالاتر از mistral-large-4-1t باشد (${ranked.map((m) => m.id).join(", ")})`,
+    );
+    const rankedUnstable = pickModels([unstable, instruct], RULES[name], {});
+    const iStable = rankedUnstable.findIndex((m) => m.id === instruct.id);
+    const iUnstable = rankedUnstable.findIndex((m) => m.id === unstable.id);
+    check(
+      iStable !== -1 && iUnstable !== -1 && iStable < iUnstable,
+      `2-i ${name}: 70b instruct باید بالاتر از qwen3.8-max باشد (${rankedUnstable.map((m) => m.id).join(", ")})`,
     );
   }
 }
@@ -1561,6 +1587,73 @@ for (const [label, status] of [["429", 429], ["5xx", 500]]) {
     mock.restore();
   }
   check(r.ok === true && r.used === "gwprov/m1" && r.data?.choices?.[0]?.message?.content === "OK!", `runCombo نام ساده: ${JSON.stringify(r).slice(0, 200)}`);
+}
+
+// 13) Phase 2-i: provider failure demotion across targets and turns.
+{
+  const mkEnv = async () => {
+    const env = { STATE: fakeKV(), XKIRO_API_KEY: "k", NVIDIA_API_KEY: "k" };
+    await upsertProvider(env, { id: "xkiro", name: "xkiro", baseUrl: "https://xkiro.test/v1", secretName: "XKIRO_API_KEY", enabled: true });
+    await upsertProvider(env, { id: "nvidia", name: "nvidia", baseUrl: "https://nvidia.test/v1", secretName: "NVIDIA_API_KEY", enabled: true });
+    return env;
+  };
+  const okBody = (m) => new Response(JSON.stringify({ choices: [{ message: { content: "ok-" + m } }] }), { status: 200 });
+  const down = () => new Response(JSON.stringify({ error: { message: "down" } }), { status: 503 });
+
+  // (a) same call: xkiro/a 503 -> nvidia/c is tried BEFORE xkiro/b.
+  {
+    resetRouterHealthForTests();
+    const env = await mkEnv();
+    await upsertCombo(env, {
+      name: "demoa", kind: "custom", strategy: "priority", timeoutMs: 8000, retries: 0,
+      targets: [{ provider: "xkiro", model: "a" }, { provider: "xkiro", model: "b" }, { provider: "nvidia", model: "c" }],
+    });
+    const seen = [];
+    const prev = global.fetch;
+    global.fetch = async (url, init = {}) => {
+      let model = "";
+      try { model = JSON.parse(String(init.body ?? "{}")).model ?? ""; } catch {}
+      seen.push(model);
+      return model === "a" ? down() : okBody(model);
+    };
+    let r;
+    try {
+      r = await runCombo(env, "demoa", { messages: [{ role: "user", content: "hi" }] }, {});
+    } finally { global.fetch = prev; resetRouterHealthForTests(); }
+    check(r.ok === true && r.used === "nvidia/c" && seen.join(",") === "a,c", `2-i: 503 on xkiro/a tries nvidia/c before xkiro/b (seen=${seen.join(",")})`);
+  }
+
+  // (b) across turns: after xkiro accumulated 2 consecutive failures, a
+  // fresh xkiro target is deprioritized behind a healthy other provider.
+  {
+    resetRouterHealthForTests();
+    const env = await mkEnv();
+    await upsertCombo(env, {
+      name: "seedfail", kind: "custom", strategy: "priority", timeoutMs: 8000, retries: 0,
+      targets: [{ provider: "xkiro", model: "a2" }, { provider: "xkiro", model: "b2" }],
+    });
+    await upsertCombo(env, {
+      name: "streakb", kind: "custom", strategy: "priority", timeoutMs: 8000, retries: 0,
+      targets: [{ provider: "xkiro", model: "d" }, { provider: "nvidia", model: "e" }],
+    });
+    const seen = [];
+    const prev = global.fetch;
+    global.fetch = async (url, init = {}) => {
+      let model = "";
+      try { model = JSON.parse(String(init.body ?? "{}")).model ?? ""; } catch {}
+      seen.push(model);
+      return ["a2", "b2"].includes(model) ? down() : okBody(model);
+    };
+    let r1;
+    let r2;
+    try {
+      r1 = await runCombo(env, "seedfail", { messages: [{ role: "user", content: "hi" }] }, {});
+      seen.length = 0;
+      r2 = await runCombo(env, "streakb", { messages: [{ role: "user", content: "hi" }] }, {});
+    } finally { global.fetch = prev; resetRouterHealthForTests(); }
+    check(r1.ok === false, `2-i: seed failures leave the first combo failed (${JSON.stringify(r1.errors)})`);
+    check(r2.ok === true && r2.used === "nvidia/e" && seen.join(",") === "e", `2-i: after 2 xkiro failures, nvidia/e runs before the fresh xkiro/d (seen=${seen.join(",")})`);
+  }
 }
 
 if (failures.length) {

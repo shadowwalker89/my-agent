@@ -5155,7 +5155,7 @@ if (DatabaseSync) {
       }
     } finally { global.fetch = prev; }
   }
-    // Circuit breaker + 13s default timeout (Pillar C.2, A.2/A.3; 2-c raised 6s to 13s).
+    // Circuit breaker + 7.5s default timeout (Pillar C.2, A.2/A.3; 2-c raised 6s to 13s, 2-i lowered to 7.5s).
   {
     resetRouterHealthForTests();
     const attempts = [];
@@ -5197,7 +5197,7 @@ if (DatabaseSync) {
       const r4 = await runCombo(await mkEnv(), "cbtest", body, {});
       check(r4.ok === true && attempts.join(",") === "xkiro/dead-503,xkiro/good", "2-b: resetRouterHealthForTests restores original order");
     } finally { global.fetch = prev; }
-    // Default per-attempt timeout is 13s (no explicit timeout option).
+    // Default per-attempt timeout is 7.5s (no explicit timeout option).
     const hungFetch = async (url, init = {}) => new Promise((_, rej) => { init.signal?.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))); });
     const prev2 = global.fetch;
     try {
@@ -5206,7 +5206,7 @@ if (DatabaseSync) {
       const t0 = Date.now();
       const r = await callRouter(env, "xkiro/test-model", { messages: [{ role: "user", content: "hi" }] }, {});
       const elapsed = Date.now() - t0;
-      check(r.ok === false && r.error === "timeout" && elapsed >= 5000 && elapsed < 20000, `2-d: default per-attempt timeout is ~13s (within [5s, 20s) window) (elapsed ${elapsed}ms)`);
+      check(r.ok === false && r.error === "timeout" && elapsed >= 5000 && elapsed < 20000, `2-d: default per-attempt timeout is ~7.5s (within [5s, 20s) window) (elapsed ${elapsed}ms)`);
     } finally { global.fetch = prev2; }
   }
   // Reasoning-model fix through callRouter + runCombo (Pillar C.3).
@@ -5669,8 +5669,11 @@ if (DatabaseSync) {
       const { sq, db } = mkDbSum();
       sq.exec("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, 'باگ در روتر کد و خطا در Cloudflare Workers و function test() { return 1; }', 'text', '2026-10-28T01:24:00+03:30')");
       const kv = fakeKV();
+      // 2-i: the chat rule now demotes qwen3.8 (unstable in production) and
+      // boosts proven workhorses, so the fixture uses llama-3.3-70b as the
+      // healthy chat target; qwen3-coder-plus remains the code-only decoy.
       await kv.put("catalog:xkiro", JSON.stringify({ models: [
-        { id: "qwen3.8-plus", provider: "xkiro", context: 131072 },
+        { id: "meta/llama-3.3-70b-instruct", provider: "xkiro", context: 131072 },
         { id: "qwen3-coder-plus", provider: "xkiro", context: 131072 },
       ] }));
       const calls = [];

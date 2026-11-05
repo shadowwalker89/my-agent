@@ -17,6 +17,8 @@ export const RULES = {
     needsVision: false,
     maxTargets: 8,
     demoteUltra: true,
+    demoteUnstable: true,
+    boostWorkhorse: true,
   },
   code: {
     prefer: [
@@ -48,6 +50,8 @@ export const RULES = {
     needsVision: false,
     maxTargets: 8,
     demoteUltra: true,
+    demoteUnstable: true,
+    boostWorkhorse: true,
   },
 };
 
@@ -173,7 +177,9 @@ export const WEIGHTS = {
   sizeHugeBonus: 5,     // ≥100B — مدل بزرگ، معمولاً خانواده‌ی قوی‌تر
   legacyPenalty: 15,    // نسل‌های قدیمی: llama2/3.0/3.1، mixtral، gemma-2/3، ...
   vlOmniPenalty: 12,    // vision/vl/omni در comboهای غیر از vision (برای کدنویسی بد هستند)
-  ultraPenalty: 35,     // مدل‌های فوق‌سنگین ≥400B (550b/405b) — در chat/fast دیر پاسخ می‌دهند
+  ultraPenalty: 35,     // مدل‌های فوق‌سنگین ≥400B (550b/405b/1t) — در chat/fast دیر پاسخ می‌دهند
+  unstablePenalty: 40,  // مدل‌های ناپایدار/هنگ‌کننده (gemma-4/glm-5/qwen3.7-3.8/...) در production
+  workhorseBoost: 25,   // مدل‌های instruct سریع و اثبات‌شده (llama-3.3-70b/...) در chat/fast
 };
 
 const NOVELTY_RE = /preview|beta|alpha|exp|-rc\d/i;
@@ -181,6 +187,10 @@ const LEGACY_RE =
   /llama-3\.[01]|llama3-|mixtral|mistral-7b|mistral-nemo|gemma-2|gemma-3-|phi-3|yi-large|dbrx|jamba-1|granite|arctic|zamba|recurrentgemma|palmyra|codestral|minitron|chatqa|nemotron-4|nemotron-51b|nemotron-70b/i;
 // مدل‌های چندوجهی (vision/vl/omni) برای چت متنیِ سبک و کدنویسی گزینه‌ی خوبی نیستند
 const VL_OMNI_RE = /vision|\bvl\b|omni/i;
+// مدل‌های سنگینی که در production با 503/timeout پاسخ می‌دهند — در chat/fast جریمه می‌شوند.
+const UNSTABLE_RE = /gemma-4|glm-5|nemotron-3\.5-lightning|mistral-large-4|qwen3\.8|qwen3\.7/i;
+// instructهای سریع و پایدار که در production جواب داده‌اند — در chat/fast تقویت می‌شوند.
+const WORKHORSE_RE = /llama-3\.3-70b-instruct|llama-3\.1-70b-instruct|qwen2\.5-72b-instruct|qwen-2\.5-72b-instruct|gemma-3-27b-it|mistral-small-24b-instruct|llama-3\.3-nemotron-super-49b/i;
 
 function compileSafe(pattern, flags) {
   try {
@@ -205,12 +215,21 @@ export function namePartOf(id) {
 // بزرگ‌ترین توکن «<عدد>b» در نام مدل — MoE مثل a12b مؤلفه‌ی فعال است،
 // پس مجموعِ واقعی = بزرگ‌ترین عدد (مثلاً 30b-a3b → 30).
 const SIZE_TOKEN_RE = /(\d+(?:\.\d+)?)b(?![a-z0-9.])/gi;
+// تریلیون: 1t = 1000B. بدون این الگو، "mistral-large-4-1t-a52b" فقط a52b را
+// می‌دید و 5B-امتیاز اندازه‌ی ایده‌آل می‌گرفت به‌جای جریمه‌ی ultra.
+const TRILLION_TOKEN_RE = /\b(\d+(?:\.\d+)?)t\b/gi;
 export function sizeBOf(name) {
+  const s = String(name);
   let max = 0;
   let match;
   SIZE_TOKEN_RE.lastIndex = 0;
-  while ((match = SIZE_TOKEN_RE.exec(String(name)))) {
+  while ((match = SIZE_TOKEN_RE.exec(s))) {
     const v = parseFloat(match[1]);
+    if (Number.isFinite(v) && v > max) max = v;
+  }
+  TRILLION_TOKEN_RE.lastIndex = 0;
+  while ((match = TRILLION_TOKEN_RE.exec(s))) {
+    const v = parseFloat(match[1]) * 1000;
     if (Number.isFinite(v) && v > max) max = v;
   }
   return max;
@@ -261,12 +280,14 @@ export function applyVersionBonus(scored) {
   }
 }
 
-export function scoreModel(m, compiledPrefer, { skipVlPenalty = false, demoteUltra = false } = {}) {
+export function scoreModel(m, compiledPrefer, { skipVlPenalty = false, demoteUltra = false, demoteUnstable = false, boostWorkhorse = false } = {}) {
   const name = namePartOf(m.id);
   const sizeB = sizeBOf(name);
   const sizeAdj = sizeAdjust(sizeB);
   let score = sizeAdj;
   if (demoteUltra && sizeB >= 400) score -= WEIGHTS.ultraPenalty;
+  if (demoteUnstable && UNSTABLE_RE.test(m.id)) score -= WEIGHTS.unstablePenalty;
+  if (boostWorkhorse && WORKHORSE_RE.test(m.id)) score += WEIGHTS.workhorseBoost;
   compiledPrefer.forEach((entry, i) => {
     if (!entry?.re) return;
     // الگوی «coder» فقط وقتی مدل جریمه‌ی اندازه نخورده اعمال می‌شود —
@@ -305,7 +326,12 @@ export function pickModels(catalog, rule, { prefer = null, bans = [] } = {}) {
   // جریمه‌ی vl/omni فقط وقتی combo خودش vision است معلق می‌شود
   const scored = eligible.map((m) => ({
     ...m,
-    score: scoreModel(m, compiledPrefer, { skipVlPenalty: rule.needsVision === true, demoteUltra: rule.demoteUltra === true }),
+    score: scoreModel(m, compiledPrefer, {
+      skipVlPenalty: rule.needsVision === true,
+      demoteUltra: rule.demoteUltra === true,
+      demoteUnstable: rule.demoteUnstable === true,
+      boostWorkhorse: rule.boostWorkhorse === true,
+    }),
   }));
   applyVersionBonus(scored);
   scored.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));

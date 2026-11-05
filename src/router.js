@@ -14,6 +14,11 @@ import {
 const DEADLINE_MS = 25000;
 const PER_TARGET_TIMEOUT_MS = 20000;
 const MAX_HEALTH_CHECKS = 20;
+// Phase 2-i: 7.5s per attempt inside the 22s total budget. Two hung
+// targets used to eat 13s + 8s of the budget, leaving #3..#8 untried;
+// 7.5s allows 3-4 attempts even when multiple targets time out.
+const DEFAULT_ATTEMPT_TIMEOUT_MS = 7500;
+const DEFAULT_TOTAL_TIMEOUT_MS = 22000;
 
 // Phase 2-b Pillar A: in-memory target health circuit-breaker. This is
 // separate from the KV health layer (markFailure): the map lives in
@@ -24,7 +29,17 @@ const MAX_HEALTH_CHECKS = 20;
 const TARGET_HEALTH_COOLDOWN_MS = 600_000;
 const BREAKER_FAILURE_STATUSES = new Set([404, 503, 502, 504, 401, 402, 429]);
 const targetHealthMap = new Map();
-export function resetRouterHealthForTests() { targetHealthMap.clear(); }
+// Phase 2-i: in-memory per-provider consecutive-failure streaks. A single
+// dead provider (e.g. xkiro returning 503 for every model) used to be
+// demoted one model at a time, so each turn picked another xkiro model
+// first. After two consecutive transient failures the provider is
+// deprioritized for 5 minutes, but only while another provider is healthy;
+// single-provider combos never lose or drop targets.
+const PROVIDER_STREAK_COOLDOWN_MS = 5 * 60 * 1000;
+const PROVIDER_STREAK_THRESHOLD = 2;
+const providerStreakMap = new Map();
+export function resetProviderStreaks() { providerStreakMap.clear(); }
+export function resetRouterHealthForTests() { targetHealthMap.clear(); providerStreakMap.clear(); }
 // Phase 2-d: admin "Unblock" clears one target's in-memory breaker entry
 // (the KV health:<target> delete alone would leave the 10-minute
 // in-memory cooldown in place for the rest of the isolate's life).
@@ -77,6 +92,45 @@ function recordTargetFailure(used, statusOrReason) {
     lastFailAt: Date.now(),
     lastStatus: statusOrReason,
   });
+}
+// A provider is deprioritized only when its streak is current and at
+// least one target from another provider is healthy (count < threshold).
+function currentProviderStreak(provider) {
+  const entry = providerStreakMap.get(provider);
+  return entry && entry.until > Date.now() ? entry : null;
+}
+function providerStreakActive(provider) {
+  const entry = currentProviderStreak(provider);
+  return Boolean(entry && entry.count >= PROVIDER_STREAK_THRESHOLD);
+}
+function recordProviderFailure(provider) {
+  const prev = currentProviderStreak(provider);
+  providerStreakMap.set(provider, {
+    count: (prev?.count ?? 0) + 1,
+    until: Date.now() + PROVIDER_STREAK_COOLDOWN_MS,
+  });
+}
+function recordProviderSuccess(provider) { providerStreakMap.delete(provider); }
+// Stable partition: healthy providers first, streak-failing providers last.
+// Never reorders when every candidate is from the same failing provider (or
+// when there is no healthy alternative), so single-provider combos are intact.
+function partitionTargetsByProviderStreak(targets) {
+  const failing = targets.filter((t) => providerStreakActive(t.provider));
+  if (!failing.length) return targets;
+  const failingProviders = new Set(failing.map((t) => t.provider));
+  const hasHealthyOther = targets.some((t) => !failingProviders.has(t.provider));
+  if (!hasHealthyOther) return targets;
+  const healthy = targets.filter((t) => !failingProviders.has(t.provider));
+  return [...healthy, ...failing];
+}
+// Move every remaining target from one provider behind the others; targets
+// are never dropped, so same-provider fallbacks still run after the rest.
+function demoteRemainingProvider(targets, fromIdx, provider) {
+  const rest = targets.slice(fromIdx + 1);
+  if (!rest.some((x) => x.provider === provider)) return;
+  const keep = rest.filter((x) => x.provider !== provider);
+  const demoted = rest.filter((x) => x.provider === provider);
+  targets.splice(fromIdx + 1, rest.length, ...keep, ...demoted);
 }
 function partitionTargetsByHealth(targets) {
   const now = Date.now();
@@ -305,9 +359,13 @@ export async function getComboTargets(env, name, opts = {}) {
     if (ordered.length >= rule.maxTargets) break;
     ordered.push({ ...m, pinned: true });
   }
+  // Phase 2-i: a provider with >= 2 consecutive transient failures drops
+  // behind healthy providers for 5 minutes (auto combos only). Single
+  // provider combos keep their order because no healthy alternative exists.
+  const reordered = partitionTargetsByProviderStreak(ordered);
   return {
     name,
-    targets: ordered.map((m) => ({
+    targets: reordered.map((m) => ({
       provider: m.provider,
       model: m.id,
       score: m.score,
@@ -497,18 +555,19 @@ export async function runCombo(
     comboName = resolved.name;
   }
 
-  // Phase 1-e Pillar 1: hard wall-clock budgets, always. Phase 2-c:
-  // per-attempt timeout defaults to 13s (capped at 15s) — inside the
-  // [5s, 20s) window pinned by test-dev.mjs, and long enough for
-  // working nvidia/* generations (8-12s) that 2-b's 6s killed at 6.0s
-  // while the provider finished seconds later. The total deadline
-  // across all targets/retries defaults to 22s and is capped at 22s,
-  // leaving >= 8s before Cloudflare's 30s waitUntil limit. The legacy
-  // deadlineMs / perTargetTimeoutMs knobs keep working as aliases,
-  // capped by the same bounds. A manual combo's old up-to-55s deadline
-  // is capped by the total budget too — that was the silent-death hole.
-  const attemptTimeoutMs = Math.min(attemptOpt ?? perTargetTimeoutMs ?? 13000, 15000);
-  const totalTimeoutMs = Math.min(totalOpt ?? deadlineMs ?? 22000, 22000);
+  // Phase 1-e Pillar 1: hard wall-clock budgets, always. Phase 2-i:
+  // per-attempt timeout defaults to 7.5s (capped at 15s) — inside the
+  // [5s, 20s) window pinned by test-dev.mjs. The old 13s default let two
+  // hung targets eat the whole 22s budget, leaving #3..#8 untried; 7.5s
+  // still fits working nvidia/* generations while allowing 3-4 attempts.
+  // The total deadline across all targets/retries defaults to 22s and is
+  // capped at 22s, leaving >= 8s before Cloudflare's 30s waitUntil limit.
+  // The legacy deadlineMs / perTargetTimeoutMs knobs keep working as
+  // aliases, capped by the same bounds. A manual combo's old up-to-55s
+  // deadline is capped by the total budget too — that was the
+  // silent-death hole.
+  const attemptTimeoutMs = Math.min(attemptOpt ?? perTargetTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS, 15000);
+  const totalTimeoutMs = Math.min(totalOpt ?? deadlineMs ?? DEFAULT_TOTAL_TIMEOUT_MS, 22000);
   const started = Date.now();
   const errors = [];
   // Phase 2-f: empty-final attempts skipped by in-combo failover, in
@@ -530,10 +589,18 @@ export async function runCombo(
   let lastErr = null;
   // Phase 2-b Pillar A: healthy targets first; cooled-down targets
   // (breaker-listed failure within the last 10 minutes) only after
-  // every healthy target has failed.
-  targets = partitionTargetsByHealth(targets);
+  // every healthy target has failed. Phase 2-i then demotes targets of a
+  // provider with an active failure streak behind healthy providers.
+  targets = partitionTargetsByProviderStreak(partitionTargetsByHealth(targets));
 
   for (let ti = 0; ti < targets.length; ti++) {
+    // Re-evaluate provider streaks each iteration: a failure earlier in
+    // this same call can push a provider over the threshold.
+    if (ti > 0 && ti < targets.length) {
+      const rest = targets.slice(ti);
+      const reordered = partitionTargetsByProviderStreak(rest);
+      targets.splice(ti, rest.length, ...reordered);
+    }
     const t = targets[ti];
     if (rejectedProviders.has(t.provider)) continue;
     const usedModel = `${t.provider}/${t.model}`;
@@ -644,17 +711,20 @@ export async function runCombo(
       else if (typeof cause === "number" && BREAKER_FAILURE_STATUSES.has(cause)) {
         recordTargetFailure(usedModel, cause);
       }
-      // Phase 2-c: intra-call provider demotion. When a provider
-      // returns 503/502/504/429, its remaining untried targets in this
-      // call move to the end of the remaining list, so healthy
-      // providers get the full attempt budget immediately. Demoted
+      // Phase 2-c / 2-i: intra-call provider demotion. When a provider
+      // returns 503/502/504/429 or times out, its remaining untried
+      // targets in this call move to the end of the remaining list, so
+      // healthy providers get the full attempt budget immediately. The
+      // provider streak also increments, so later calls and auto-combo
+      // selection deprioritize it after two consecutive failures. Demoted
       // targets stay at the tail and are still tried, so same-provider
       // fallback pairs (e.g. [m1, m2]) keep working.
-      if (typeof cause === "number" && [503, 502, 504, 429].includes(cause)) {
-        const rest = targets.slice(ti + 1);
-        const keep = rest.filter((x) => x.provider !== t.provider);
-        const demoted = rest.filter((x) => x.provider === t.provider);
-        targets.splice(ti + 1, rest.length, ...keep, ...demoted);
+      const transientProviderFailure =
+        isTimeout ||
+        (typeof cause === "number" && [503, 502, 504, 429].includes(cause));
+      if (transientProviderFailure) {
+        recordProviderFailure(t.provider);
+        demoteRemainingProvider(targets, ti, t.provider);
       }
     } else if (stream) {
       const res = attempt.res;
@@ -665,6 +735,7 @@ export async function runCombo(
           console.error("recordLatency failed:", err && err.message);
         }
         targetHealthMap.delete(usedModel);
+        recordProviderSuccess(t.provider);
         return {
           ok: true,
           stream: res.body,
@@ -713,6 +784,8 @@ export async function runCombo(
           lastErr = "timeout";
           await markFailure(env, usedModel, classifyFailure(null, "", true), "timeout");
           recordTargetFailure(usedModel, "timeout");
+          recordProviderFailure(t.provider);
+          demoteRemainingProvider(targets, ti, t.provider);
           continue;
         }
         errors.push({ target: usedModel, reason: truncate(`bad json: ${err && err.message}`), timerFired: false });
@@ -814,6 +887,7 @@ export async function runCombo(
         console.error("recordLatency failed:", err && err.message);
       }
       targetHealthMap.delete(usedModel);
+      recordProviderSuccess(t.provider);
       return {
         ok: true,
         data: normalizeOpenAiChat(data),
