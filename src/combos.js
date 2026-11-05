@@ -19,6 +19,7 @@ export const RULES = {
     demoteUltra: true,
     demoteUnstable: true,
     boostWorkhorse: true,
+    neutralizeVersion: true,
   },
   code: {
     prefer: [
@@ -52,6 +53,7 @@ export const RULES = {
     demoteUltra: true,
     demoteUnstable: true,
     boostWorkhorse: true,
+    neutralizeVersion: true,
   },
 };
 
@@ -178,8 +180,8 @@ export const WEIGHTS = {
   legacyPenalty: 15,    // نسل‌های قدیمی: llama2/3.0/3.1، mixtral، gemma-2/3، ...
   vlOmniPenalty: 12,    // vision/vl/omni در comboهای غیر از vision (برای کدنویسی بد هستند)
   ultraPenalty: 35,     // مدل‌های فوق‌سنگین ≥400B (550b/405b/1t) — در chat/fast دیر پاسخ می‌دهند
-  unstablePenalty: 40,  // مدل‌های ناپایدار/هنگ‌کننده (gemma-4/glm-5/qwen3.7-3.8/...) در production
-  workhorseBoost: 25,   // مدل‌های instruct سریع و اثبات‌شده (llama-3.3-70b/...) در chat/fast
+  unstablePenalty: 50,  // مدل‌های ناپایدار/هنگ‌کننده (gemma-4/glm-5/qwen3.5-3.9/deepseek-v4/...) در production
+  workhorseBoost: 45,   // مدل‌های instruct سریع و اثبات‌شده (llama-3.3-70b/...) در chat/fast
 };
 
 const NOVELTY_RE = /preview|beta|alpha|exp|-rc\d/i;
@@ -188,9 +190,9 @@ const LEGACY_RE =
 // مدل‌های چندوجهی (vision/vl/omni) برای چت متنیِ سبک و کدنویسی گزینه‌ی خوبی نیستند
 const VL_OMNI_RE = /vision|\bvl\b|omni/i;
 // مدل‌های سنگینی که در production با 503/timeout پاسخ می‌دهند — در chat/fast جریمه می‌شوند.
-const UNSTABLE_RE = /gemma-4|glm-5|nemotron-3\.5-lightning|mistral-large-4|qwen3\.8|qwen3\.7/i;
+const UNSTABLE_RE = /qwen3\.[5-9]|deepseek-v4|deepseek-r1|glm-5|gemma-4|nemotron-3|mistral-large-4|preview|thinking|reasoning|-r1\b|omni/i;
 // instructهای سریع و پایدار که در production جواب داده‌اند — در chat/fast تقویت می‌شوند.
-const WORKHORSE_RE = /llama-3\.3-70b-instruct|llama-3\.1-70b-instruct|qwen2\.5-72b-instruct|qwen-2\.5-72b-instruct|gemma-3-27b-it|mistral-small-24b-instruct|llama-3\.3-nemotron-super-49b/i;
+const WORKHORSE_RE = /llama-3\.3-70b-instruct|llama-3\.1-70b-instruct|llama-3\.1-8b-instruct|qwen2\.5-72b-instruct|qwen-2\.5-72b-instruct|qwen2\.5-32b-instruct|gemma-3-27b-it|gemma-2-27b-it|mistral-small|ministral|phi-4|openrouter\/free/i;
 
 function compileSafe(pattern, flags) {
   try {
@@ -260,7 +262,8 @@ export function versionOf(id) {
 
 // هیوریستیک نسخه: درون هر provider+family، مدل‌های نسخه‌ی بالاتر بونوس کوچک
 // می‌گیرند تا نسل جدیدترِ همان خانواده اول بیاید. صرفاً هیوریستیک است.
-export function applyVersionBonus(scored) {
+export function applyVersionBonus(scored, { enabled = true } = {}) {
+  if (!enabled) return;
   const groups = new Map();
   for (const m of scored) {
     const ver = versionOf(m.id);
@@ -333,7 +336,7 @@ export function pickModels(catalog, rule, { prefer = null, bans = [] } = {}) {
       boostWorkhorse: rule.boostWorkhorse === true,
     }),
   }));
-  applyVersionBonus(scored);
+  applyVersionBonus(scored, { enabled: rule.neutralizeVersion !== true });
   scored.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
   return scored;
 }

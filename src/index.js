@@ -7,8 +7,8 @@ import {
   upsertCombo,
   removeCombo,
 } from "./config.js";
-import { RULES, capabilityTags } from "./combos.js";
-import { runCombo, getComboTargets, directCall, clearRouterHealthTarget, clearRouterHealthForProvider, resetRouterHealthForTests, extractFinalText, getEmptyFinalCounts } from "./router.js";
+import { RULES, capabilityTags, pickModels } from "./combos.js";
+import { runCombo, getComboTargets, directCall, clearRouterHealthTarget, clearRouterHealthForProvider, resetRouterHealthForTests, extractFinalText, getEmptyFinalCounts, classifyFailure } from "./router.js";
 import { classifyTask, comboCandidates, fallbackCombo, updateHasImage } from "./task-route.js";
 import { getPrefs, setPrefs } from "./tgprefs.js";
 import { syncProvider, getSyncReport, loadCatalog } from "./catalog.js";
@@ -22,7 +22,8 @@ import {
   validatePattern,
 } from "./overrides.js";
 import { tgApi, tgSend, tgBroadcast, sendProgressMessage, finalizeProgressMessage } from "./telegram.js";
-import { healthCounts, getMedianLatency, getHealthEntry } from "./health.js";
+import { healthCounts, getMedianLatency, getHealthEntry, markFailure, recordLatency } from "./health.js";
+import { recordVerifiedModel, recordProviderCircuitSuccess } from "./circuit.js";
 import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation } from "./intent.js";
 import { getChatContext } from "./memory.js";
@@ -203,7 +204,7 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
       { role: "user", content: text },
     ],
     temperature: 0.7,
-    ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
+    max_tokens: opts.maxTokens ?? 700,
   };
 
   const cfg = await getConfig(env);
@@ -1686,6 +1687,74 @@ async function adminApiHealthClear(request, env) {
   return json({ ok: false, error: "target, provider or all is required" }, 400);
 }
 
+// Phase 2-j: live model probe. Top 3 candidates per enabled provider (or
+// the requested provider), capped by {limit}, with a tiny 5s request. A
+// verified success (HTTP 200, non-empty final content, < 5s) records the
+// latency, clears that target's cooldown and provider circuit, and feeds
+// tier-0 routing; listed failures refresh the normal KV cooldown.
+async function adminApiProbe(request, env) {
+  const body = (await readJsonBody(request)) ?? {};
+  const rl = Number(body.limit);
+  const limit = Math.max(1, Math.min(24, Number.isFinite(rl) && rl > 0 ? Math.floor(rl) : 6));
+  const cfg = await getConfig(env);
+  const catalog = await loadCatalog(env);
+  const wanted = body.provider ? String(body.provider) : "";
+  if (wanted && !cfg.providers.some((p) => p.id === wanted)) {
+    return json({ ok: false, error: `unknown provider: ${wanted}` }, 400);
+  }
+  const providers = cfg.providers.filter((p) => p.id === wanted || (!wanted && p.enabled !== false));
+  const scored = pickModels(catalog, RULES.chat, { prefer: null, bans: [] });
+  const selected = [];
+  for (const p of providers) {
+    for (const m of scored.filter((x) => x.provider === p.id).slice(0, 3)) {
+      selected.push({ provider: p.id, model: m.id });
+    }
+  }
+  const probeBody = {
+    messages: [{ role: "user", content: "سلام" }],
+    max_tokens: 24,
+    temperature: 0.1,
+  };
+  const results = [];
+  for (const m of selected.slice(0, limit)) {
+    const target = `${m.provider}/${m.model}`.toLowerCase();
+    const r = await directCall(env, m.provider, m.model, probeBody, { timeoutMs: 5000 });
+    const finalChars = Number(r.finalChars) || 0;
+    const reasoningChars = Number(r.reasoningChars) || 0;
+    const ok = r.ok === true && r.latencyMs < 5000 && finalChars > 0;
+    let error = null;
+    if (ok) {
+      try {
+        await recordLatency(env, target, r.latencyMs);
+        if (env.STATE) await env.STATE.delete(`health:${target}`);
+      } catch {}
+      await recordProviderCircuitSuccess(env, m.provider, { force: true });
+      await recordVerifiedModel(env, target, m.provider, r.latencyMs, null);
+    } else {
+      error = r.ok === true ? "empty_final" : String(r.snippet || "probe failed").slice(0, 200);
+      const isTimeout = /^timeout/.test(error);
+      const status = typeof r.status === "number" ? r.status : null;
+      if (isTimeout || (status !== null && [400, 404, 429, 500, 502, 503, 504].includes(status))) {
+        try {
+          await markFailure(env, target, classifyFailure(status, r.snippet, isTimeout), error);
+        } catch {}
+      }
+      await recordVerifiedModel(env, target, m.provider, r.latencyMs, error);
+    }
+    results.push({
+      target,
+      provider: m.provider,
+      ok,
+      status: r.status ?? null,
+      elapsedMs: r.latencyMs ?? 0,
+      finalChars,
+      reasoningChars,
+      error,
+    });
+  }
+  return json({ ok: true, results });
+}
+
 // بدون mutation خطرناک: خطای apiError → 400 با پیام کوتاه؛ بقیه ۵۰۰ با نام خطا
 async function adminApi(request, env, method, pathname) {
   const parts = pathname.split("/").filter(Boolean); // ["admin","api",...]
@@ -1702,6 +1771,7 @@ async function adminApi(request, env, method, pathname) {
 
     if (kind === "models" && method === "GET") return await adminApiListModels(request, env);
     if (kind === "test" && method === "POST") return await adminApiTest(request, env);
+    if (kind === "probe" && method === "POST") return await adminApiProbe(request, env);
 
     // Phase 2-d: pin / ban / prefer overrides + cooldown clearing.
     // Auth already ran in route() (X-Setup-Key or signed session).

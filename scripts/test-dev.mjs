@@ -44,6 +44,7 @@ import {
 } from "../src/memory.js";
 import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, resolveProjectName, matchKnownProjectAt, parseNoteQuery, parseSummaryQuery, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, stripMiddleFolderTag, normalizeDaypartToken } from "../src/daily.js";
 import { callRouter, runCombo, resetRouterHealthForTests, getRouterHealthSnapshotForTests, extractAssistantText, extractFinalText, getComboTargets, classifyFailure, getEmptyFinalCounts, resetEmptyFinalCountsForTests } from "../src/router.js";
+import { recordProviderCircuitFailure, recordProviderCircuitSuccess, getOpenProviderCircuits, recordVerifiedModel, getVerifiedLatencies } from "../src/circuit.js";
 import { PROVIDERS } from "../src/providers.js";
 import { sendProgressMessage, finalizeProgressMessage, splitTelegramText } from "../src/telegram.js";
 import { answerChatText, adminApi, handleUpdate, resetSeenUpdateIdsForTests, CHAT_SYSTEM_PROMPT } from "../src/index.js";
@@ -5726,7 +5727,8 @@ if (DatabaseSync) {
       check(edit?.payload?.message_id === 99 && String(edit?.payload?.text ?? "").includes("مرحله‌ی چت شکست خورد") && String(edit?.payload?.text ?? "").includes("empty_response") && !String(edit?.payload?.text ?? "").includes("پاسخ خالی بود.") && kb.flat().some((b) => b.callback_data === "chat:retry:42"), "2-f: all-reasoning-only Telegram turn renders the compact failure notice WITH retry button on the same progress id (no orphan ⏳)");
       check(calls.filter((c) => c.method === "sendMessage").length === 1, "2-f: compact failure notice sends no extra message");
     }
-    // (b) Normal chat sends NO max_tokens key at all (only summaries do).
+    // (b) Normal chat always sends the mandatory 700-token cap; summaries
+    // still pass their own 2200 override.
     {
       resetRouterHealthForTests();
       const { db } = mkDbSum();
@@ -5749,7 +5751,7 @@ if (DatabaseSync) {
         return new Response("unexpected", { status: 500 });
       };
       try { await answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "سلام", false, { saveText: "" }); } finally { global.fetch = prev; }
-      check(providerBody !== null && !("max_tokens" in providerBody) && providerBody.temperature === 0.7, "2-f: normal chat sends no max_tokens key at all (temperature 0.7 only)");
+      check(providerBody !== null && providerBody.max_tokens === 700 && providerBody.temperature === 0.7, "2-j: normal chat sends max_tokens 700 with temperature 0.7");
       const edit = calls.find((c) => c.method === "editMessageText");
       check(String(edit?.payload?.text ?? "").includes("سلام! چطور می‌توانم کمک کنم؟"), "2-f: normal chat still delivers its final answer");
     }
@@ -5970,6 +5972,63 @@ if (DatabaseSync) {
       const sysMsg = (providerBody?.messages ?? []).find((m) => m.role === "system");
       check(typeof sysMsg?.content === "string" && sysMsg.content.includes("no access to the user's notes"), "2-g: chat provider request carries the memory-claim guard in its system prompt");
       }
+    // (h) Phase 2-j: POST /admin/api/probe reports ok/failed rows and cools
+    // a failed target through the normal markFailure path.
+    {
+      resetRouterHealthForTests();
+      const kv = fakeKV();
+      await kv.put("catalog:xkiro", JSON.stringify({ models: [
+        { id: "probe-ok", provider: "xkiro", context: 131072 },
+        { id: "probe-down", provider: "xkiro", context: 131072 },
+      ] }));
+      const env = { STATE: kv, XKIRO_API_KEY: "k" };
+      const prev = global.fetch;
+      global.fetch = async (url, init = {}) => {
+        if (String(url).includes("api.xkiro.com")) {
+          let model = "";
+          try { model = JSON.parse(String(init.body ?? "{}")).model ?? ""; } catch {}
+          if (model === "probe-down") return new Response(JSON.stringify({ error: { message: "down" } }), { status: 503 });
+          return Response.json({ choices: [{ message: { content: "سلام از مدل" } }] });
+        }
+        return new Response("unexpected", { status: 500 });
+      };
+      let data;
+      try {
+        const req = { method: "POST", url: "http://x/admin/api/probe", json: async () => ({ provider: "xkiro", limit: 2 }) };
+        const res = await adminApi(req, env, "POST", "/admin/api/probe");
+        data = await res.json();
+      } finally { global.fetch = prev; }
+      const okRow = data?.results?.find((x) => x.target === "xkiro/probe-ok");
+      const failRow = data?.results?.find((x) => x.target === "xkiro/probe-down");
+      check(data?.ok === true && data.results.length === 2 && okRow?.ok === true && okRow.finalChars > 0 && typeof okRow.elapsedMs === "number" && failRow?.ok === false && failRow.status === 503, "2-j: probe reports ok/failed rows with latency + final chars");
+      check((await kv.get("health:xkiro/probe-down")) !== null, "2-j: probe failure records the target cooldown");
+      resetRouterHealthForTests();
+    }
+    // (i) Phase 2-j: D1 provider circuit opens after 2 failures in 120s,
+    // closes on success, and only sub-6s verified latencies enter tier-0.
+    {
+      resetRouterHealthForTests();
+      const sq = new DatabaseSync(":memory:");
+      const stmt = (sql) => {
+        const st = sq.prepare(sql);
+        return { bind(...p) { return { run: async () => { st.run(...p); return { success: true }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } };
+      };
+      const db = { prepare(sql) { return stmt(sql); } };
+      const env = { STATE: fakeKV(), DB: db };
+      await recordProviderCircuitFailure(env, "xkiro", 503);
+      check((await getOpenProviderCircuits(env)).size === 0, "2-j: one provider failure keeps the circuit closed");
+      await recordProviderCircuitFailure(env, "xkiro", 429);
+      check((await getOpenProviderCircuits(env)).has("xkiro"), "2-j: two failures within 120s open the provider circuit");
+      const row = await db.prepare("SELECT state, fail_count FROM router_provider_cb WHERE provider = ?").bind("xkiro").first();
+      check(row?.state === "open" && row.fail_count === 2, "2-j: open circuit state is persisted in D1");
+      await recordProviderCircuitSuccess(env, "xkiro");
+      check((await getOpenProviderCircuits(env)).size === 0, "2-j: provider success closes the circuit");
+      await recordVerifiedModel(env, "xkiro/fast-model", "xkiro", 1200, null);
+      check((await getVerifiedLatencies(env)).get("xkiro/fast-model") === 1200, "2-j: a 1.2s verified probe is stored for tier-0");
+      await recordVerifiedModel(env, "xkiro/slow-model", "xkiro", 7000, null);
+      check(!(await getVerifiedLatencies(env)).has("xkiro/slow-model"), "2-j: a 7s probe is not tier-0 verified");
+      resetRouterHealthForTests();
+    }
   }
 }
 

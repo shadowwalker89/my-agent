@@ -319,8 +319,12 @@ input::placeholder{color:var(--muted)}
       <div class="card">
         <div class="sec-head">
           <div><h2 data-i18n="combos"></h2><p class="help" data-i18n="combosHelp"></p></div>
-          <button id="comboAdd" class="primary lg" data-i18n="comboAdd"></button>
+          <div class="line">
+            <button id="probeBtn" class="lg">⚡ تست زنده مدل‌ها (Probe Live)</button>
+            <button id="comboAdd" class="primary lg" data-i18n="comboAdd"></button>
+          </div>
         </div>
+        <div id="probeResult"></div>
         <div class="toolbar" id="comboTemplates">
           <span class="lbl" data-i18n="templatesLabel"></span>
           <button type="button" data-template="code" data-i18n="kindCode" data-i18n-aria="createTemplate"></button>
@@ -2153,6 +2157,58 @@ function renderAutoCombos() {
   });
 }
 
+// ── Phase 2-j: live model probe (POST /admin/api/probe) ────────────────────
+function renderProbeResults(data) {
+  var box = $('probeResult');
+  if (!box) return;
+  box.textContent = '';
+  var rows = (data && data.results) || [];
+  var card = el('div', 'card');
+  card.appendChild(el('h3', '', '⚡ Probe Live'));
+  if (!rows.length) {
+    card.appendChild(el('p', 'help', 'No enabled models to probe.'));
+    box.appendChild(card);
+    return;
+  }
+  var wrap = el('div', 'table-wrap');
+  var table = el('table');
+  var thead = el('thead');
+  var headRow = el('tr');
+  ['Model', 'Provider', 'Status', 'Latency (ms)', 'Final chars', 'Reasoning chars'].forEach(function (text) {
+    headRow.appendChild(el('th', '', text));
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+  var tbody = el('tbody');
+  rows.forEach(function (r) {
+    var row = el('tr');
+    row.appendChild(el('td', 'mono', r.target));
+    row.appendChild(el('td', '', r.provider));
+    row.appendChild(el('td', r.ok ? 'badge b-ok' : 'badge b-cool', r.ok ? 'ok' : 'failed'));
+    row.appendChild(el('td', '', String(r.elapsedMs)));
+    row.appendChild(el('td', '', String(r.finalChars)));
+    row.appendChild(el('td', '', String(r.reasoningChars)));
+    tbody.appendChild(row);
+  });
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  card.appendChild(wrap);
+  box.appendChild(card);
+}
+
+async function runProbe(btnEl) {
+  busy(btnEl);
+  var r = await api('POST', '/admin/api/probe', { limit: 6 });
+  idle(btnEl);
+  if (r.data && r.data.ok) {
+    renderProbeResults(r.data);
+    await refreshCfg();
+    renderAutoCombos();
+  } else {
+    toast(r.error || T('loadFail'), 'err');
+  }
+}
+
 async function createManualCopy(name, btnEl) {
   if (!CFG) return;
   if ((CFG.combos || []).some(function (c) { return c.name === name; })) {
@@ -2431,6 +2487,7 @@ $('provAdd').addEventListener('click', function () { openProviderForm(null); });
 $('provSave').addEventListener('click', saveProvider);
 $('provCancel').addEventListener('click', function () { $('provForm').classList.add('hidden'); });
 $('comboAdd').addEventListener('click', openComboFormBlank);
+$('probeBtn').addEventListener('click', function () { runProbe(this); });
 $('comboSave').addEventListener('click', saveComboForm);
 $('comboCancel').addEventListener('click', function () { $('comboForm').classList.add('hidden'); });
 $('tgtAdd').addEventListener('click', function () {

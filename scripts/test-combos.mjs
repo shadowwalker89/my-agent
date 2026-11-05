@@ -198,6 +198,28 @@ check(
   }
 }
 
+// ── Phase 2-j: verified workhorse priority + version-bonus neutralization ──
+{
+  const base = { context: 128000, created: now - 10 * DAY };
+  const models = [
+    { id: "meta/llama-3.3-70b-instruct", provider: "nvidia", ...base },
+    { id: "qwen/qwen3.6-plus:free", provider: "xkiro", ...base },
+    { id: "deepseek-ai/deepseek-v4.1-flash", provider: "openrouter", ...base },
+    { id: "z-ai/glm-5.3-flash", provider: "nvidia", ...base },
+  ];
+  for (const name of ["chat", "fast"]) {
+    const ranked = pickModels(models, RULES[name], {});
+    const idx = ranked.findIndex((m) => m.id === "meta/llama-3.3-70b-instruct");
+    const unstableIdx = ranked.map((m) => m.id).filter((id) => id !== "meta/llama-3.3-70b-instruct");
+    check(
+      idx === 0 && ranked.length === models.length && unstableIdx.length === 3,
+      `2-j ${name}: llama-3.3-70b-instruct must rank above qwen3.6/deepseek-v4/glm-5.3 (${ranked.map((m) => m.id).join(", ")})`,
+    );
+  }
+  check(WEIGHTS.unstablePenalty === 50 && WEIGHTS.workhorseBoost === 45, "2-j: unstable -50 / workhorse +45 weights");
+  check(RULES.chat.neutralizeVersion === true && RULES.fast.neutralizeVersion === true, "2-j: chat/fast neutralize the version bonus");
+}
+
 const asserts = {
   code: (targets) => {
     const ids = targets.map((t) => t.id.toLowerCase());
@@ -1654,6 +1676,33 @@ for (const [label, status] of [["429", 429], ["5xx", 500]]) {
     check(r1.ok === false, `2-i: seed failures leave the first combo failed (${JSON.stringify(r1.errors)})`);
     check(r2.ok === true && r2.used === "nvidia/e" && seen.join(",") === "e", `2-i: after 2 xkiro failures, nvidia/e runs before the fresh xkiro/d (seen=${seen.join(",")})`);
   }
+}
+
+// 14) Phase 2-j: strict per-provider skip in multi-provider combos.
+{
+  resetRouterHealthForTests();
+  const env = { STATE: fakeKV(), XKIRO_API_KEY: "k", NVIDIA_API_KEY: "k" };
+  await upsertProvider(env, { id: "xkiro", name: "xkiro", baseUrl: "https://xkiro.test/v1", secretName: "XKIRO_API_KEY", enabled: true });
+  await upsertProvider(env, { id: "nvidia", name: "nvidia", baseUrl: "https://nvidia.test/v1", secretName: "NVIDIA_API_KEY", enabled: true });
+  await upsertCombo(env, {
+    name: "skipmulti", kind: "custom", strategy: "priority", timeoutMs: 8000, retries: 0,
+    targets: [{ provider: "xkiro", model: "a" }, { provider: "nvidia", model: "b" }, { provider: "xkiro", model: "c" }],
+  });
+  const seen = [];
+  const prev = global.fetch;
+  global.fetch = (url, init = {}) => {
+    let model = "";
+    try { model = JSON.parse(String(init.body ?? "{}")).model ?? ""; } catch {}
+    seen.push(model);
+    if (model === "a") return Promise.resolve(new Response(JSON.stringify({ error: { message: "down" } }), { status: 503 }));
+    if (model === "b") return new Promise((_, rej) => { init.signal?.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))); });
+    return Promise.resolve(Response.json({ choices: [{ message: { content: "ok" } }] }));
+  };
+  let r;
+  try {
+    r = await runCombo(env, "skipmulti", { messages: [{ role: "user", content: "hi" }] }, { attemptTimeoutMs: 50, totalTimeoutMs: 6000 });
+  } finally { global.fetch = prev; resetRouterHealthForTests(); }
+  check(r.ok === false && seen.join(",") === "a,b", `2-j: multi-provider strict skip tries a,b and skips xkiro/c (seen=${seen.join(",")})`);
 }
 
 if (failures.length) {

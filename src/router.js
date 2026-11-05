@@ -10,6 +10,13 @@ import {
   recordLatency,
   getMedianLatency,
 } from "./health.js";
+import {
+  getOpenProviderCircuits,
+  getVerifiedLatencies,
+  recordProviderCircuitFailure,
+  recordProviderCircuitSuccess,
+  resetCircuitForTests,
+} from "./circuit.js";
 
 const DEADLINE_MS = 25000;
 const PER_TARGET_TIMEOUT_MS = 20000;
@@ -39,7 +46,7 @@ const PROVIDER_STREAK_COOLDOWN_MS = 5 * 60 * 1000;
 const PROVIDER_STREAK_THRESHOLD = 2;
 const providerStreakMap = new Map();
 export function resetProviderStreaks() { providerStreakMap.clear(); }
-export function resetRouterHealthForTests() { targetHealthMap.clear(); providerStreakMap.clear(); }
+export function resetRouterHealthForTests() { targetHealthMap.clear(); providerStreakMap.clear(); resetCircuitForTests(); }
 // Phase 2-d: admin "Unblock" clears one target's in-memory breaker entry
 // (the KV health:<target> delete alone would leave the 10-minute
 // in-memory cooldown in place for the rest of the isolate's life).
@@ -123,14 +130,30 @@ function partitionTargetsByProviderStreak(targets) {
   const healthy = targets.filter((t) => !failingProviders.has(t.provider));
   return [...healthy, ...failing];
 }
-// Move every remaining target from one provider behind the others; targets
-// are never dropped, so same-provider fallbacks still run after the rest.
-function demoteRemainingProvider(targets, fromIdx, provider) {
-  const rest = targets.slice(fromIdx + 1);
-  if (!rest.some((x) => x.provider === provider)) return;
-  const keep = rest.filter((x) => x.provider !== provider);
-  const demoted = rest.filter((x) => x.provider === provider);
-  targets.splice(fromIdx + 1, rest.length, ...keep, ...demoted);
+// Phase 2-j: an open D1/memory provider circuit demotes that provider's
+// targets below every other provider, but never drops them — a combo with
+// no healthy alternative keeps its original order.
+function partitionTargetsByOpenProviders(targets, open) {
+  if (!open || !open.size) return targets;
+  const failing = targets.filter((t) => open.has(t.provider));
+  if (!failing.length) return targets;
+  const failingProviders = new Set(failing.map((t) => t.provider));
+  const hasHealthyOther = targets.some((t) => !failingProviders.has(t.provider));
+  if (!hasHealthyOther) return targets;
+  return [...targets.filter((t) => !failingProviders.has(t.provider)), ...failing];
+}
+// Phase 2-j: live-probe verified models (median/last success < 6s) form a
+// tier-0 block ahead of unverified targets in auto combos.
+function tierVerifiedFast(targets, latencies) {
+  if (!latencies || !latencies.size) return targets;
+  const fast = [];
+  const rest = [];
+  for (const t of targets) {
+    const ms = latencies.get(`${t.provider}/${t.model}`.toLowerCase());
+    if (ms != null && ms < 6000) fast.push(t);
+    else rest.push(t);
+  }
+  return fast.length ? [...fast, ...rest] : targets;
 }
 function partitionTargetsByHealth(targets) {
   const now = Date.now();
@@ -362,7 +385,15 @@ export async function getComboTargets(env, name, opts = {}) {
   // Phase 2-i: a provider with >= 2 consecutive transient failures drops
   // behind healthy providers for 5 minutes (auto combos only). Single
   // provider combos keep their order because no healthy alternative exists.
-  const reordered = partitionTargetsByProviderStreak(ordered);
+  // Phase 2-j: live-probe verified models get tier-0 priority, and a
+  // durable provider circuit (open after 2 failures / 120s, 180s cooldown)
+  // demotes that provider the same way, across isolates.
+  const verified = await getVerifiedLatencies(env);
+  const openCircuits = await getOpenProviderCircuits(env);
+  const reordered = partitionTargetsByOpenProviders(
+    partitionTargetsByProviderStreak(tierVerifiedFast(ordered, verified)),
+    openCircuits,
+  );
   return {
     name,
     targets: reordered.map((m) => ({
@@ -593,6 +624,14 @@ export async function runCombo(
   // provider with an active failure streak behind healthy providers.
   targets = partitionTargetsByProviderStreak(partitionTargetsByHealth(targets));
 
+  // Phase 2-j: in a multi-provider combo, one transient failure is enough
+  // to skip that provider's remaining targets for THIS call (strict
+  // per-provider skip, observed: a 503 on xkiro/a then a timeout on
+  // nvidia/b must not spend the budget on xkiro/c). Single-provider combos
+  // keep trying every target — there is no alternative to skip to.
+  const multiProvider = new Set(targets.map((t) => t.provider)).size > 1;
+  const skippedProviders = new Set();
+
   for (let ti = 0; ti < targets.length; ti++) {
     // Re-evaluate provider streaks each iteration: a failure earlier in
     // this same call can push a provider over the threshold.
@@ -602,7 +641,7 @@ export async function runCombo(
       targets.splice(ti, rest.length, ...reordered);
     }
     const t = targets[ti];
-    if (rejectedProviders.has(t.provider)) continue;
+    if (rejectedProviders.has(t.provider) || skippedProviders.has(t.provider)) continue;
     const usedModel = `${t.provider}/${t.model}`;
     const remaining = deadline - (Date.now() - started);
     if (remaining < 1200) {
@@ -672,6 +711,7 @@ export async function runCombo(
       if (isTimeout) console.log(JSON.stringify({ event: "router_timeout", target: usedModel, ms: latencyMs }));
       if (cls.scope === "provider") {
         rejectedProviders.add(t.provider);
+        await recordProviderCircuitFailure(env, t.provider, cause);
         errors.push({
           target: usedModel,
           reason: `provider ${t.provider}: key rejected (${cause})`,
@@ -721,10 +761,11 @@ export async function runCombo(
       // fallback pairs (e.g. [m1, m2]) keep working.
       const transientProviderFailure =
         isTimeout ||
-        (typeof cause === "number" && [503, 502, 504, 429].includes(cause));
+        (typeof cause === "number" && [500, 502, 503, 504, 429].includes(cause));
       if (transientProviderFailure) {
         recordProviderFailure(t.provider);
-        demoteRemainingProvider(targets, ti, t.provider);
+        await recordProviderCircuitFailure(env, t.provider, isTimeout ? "timeout" : cause);
+        if (multiProvider) skippedProviders.add(t.provider);
       }
     } else if (stream) {
       const res = attempt.res;
@@ -736,6 +777,7 @@ export async function runCombo(
         }
         targetHealthMap.delete(usedModel);
         recordProviderSuccess(t.provider);
+        await recordProviderCircuitSuccess(env, t.provider);
         return {
           ok: true,
           stream: res.body,
@@ -785,7 +827,8 @@ export async function runCombo(
           await markFailure(env, usedModel, classifyFailure(null, "", true), "timeout");
           recordTargetFailure(usedModel, "timeout");
           recordProviderFailure(t.provider);
-          demoteRemainingProvider(targets, ti, t.provider);
+          await recordProviderCircuitFailure(env, t.provider, "timeout");
+          if (multiProvider) skippedProviders.add(t.provider);
           continue;
         }
         errors.push({ target: usedModel, reason: truncate(`bad json: ${err && err.message}`), timerFired: false });
@@ -888,6 +931,7 @@ export async function runCombo(
       }
       targetHealthMap.delete(usedModel);
       recordProviderSuccess(t.provider);
+      await recordProviderCircuitSuccess(env, t.provider);
       return {
         ok: true,
         data: normalizeOpenAiChat(data),
@@ -941,14 +985,26 @@ export async function directCall(env, providerName, model, body, { timeoutMs = 2
   } catch (err) {
     return { ok: false, status: attempt.res.status, latencyMs, snippet: `bad json: ${err && err.message}` };
   }
-  const content = data?.choices?.[0]?.message?.content;
+  const message = data?.choices?.[0]?.message;
+  const content = message?.content;
   const text =
     typeof content === "string"
       ? content
       : Array.isArray(content)
         ? content.map((p) => p?.text ?? "").join("")
         : JSON.stringify(data ?? {});
-  return { ok: true, status: attempt.res.status, latencyMs, snippet: redact(text, [key], 200) };
+  const finalChars = extractFinalText(message).length;
+  const reasoningChars =
+    (typeof message?.reasoning_content === "string" ? message.reasoning_content.length : 0) +
+    (typeof message?.reasoning === "string" ? message.reasoning.length : 0);
+  return {
+    ok: true,
+    status: attempt.res.status,
+    latencyMs,
+    snippet: redact(text, [key], 200),
+    finalChars,
+    reasoningChars,
+  };
 }
 
 // Phase 1-e Pillar 1: thin directive-shaped wrapper over runCombo.
