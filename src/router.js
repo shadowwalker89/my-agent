@@ -142,7 +142,7 @@ function partitionTargetsByOpenProviders(targets, open) {
   if (!hasHealthyOther) return targets;
   return [...targets.filter((t) => !failingProviders.has(t.provider)), ...failing];
 }
-// Phase 2-j: live-probe verified models (median/last success < 6s) form a
+// Phase 2-k: live-probe verified models (last success <= 10s) form a
 // tier-0 block ahead of unverified targets in auto combos.
 function tierVerifiedFast(targets, latencies) {
   if (!latencies || !latencies.size) return targets;
@@ -150,7 +150,7 @@ function tierVerifiedFast(targets, latencies) {
   const rest = [];
   for (const t of targets) {
     const ms = latencies.get(`${t.provider}/${t.model}`.toLowerCase());
-    if (ms != null && ms < 6000) fast.push(t);
+    if (ms != null && ms <= 10000) fast.push(t);
     else rest.push(t);
   }
   return fast.length ? [...fast, ...rest] : targets;

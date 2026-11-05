@@ -2157,7 +2157,7 @@ function renderAutoCombos() {
   });
 }
 
-// ── Phase 2-j: live model probe (POST /admin/api/probe) ────────────────────
+// ── Phase 2-k: live model probe results table ──────────────────────────────
 function renderProbeResults(data) {
   var box = $('probeResult');
   if (!box) return;
@@ -2174,7 +2174,7 @@ function renderProbeResults(data) {
   var table = el('table');
   var thead = el('thead');
   var headRow = el('tr');
-  ['Model', 'Provider', 'Status', 'Latency (ms)', 'Final chars', 'Reasoning chars'].forEach(function (text) {
+  ['Model', 'Provider', 'Result', 'HTTP', 'Latency (ms)', 'Final chars', 'Reasoning chars'].forEach(function (text) {
     headRow.appendChild(el('th', '', text));
   });
   thead.appendChild(headRow);
@@ -2184,7 +2184,11 @@ function renderProbeResults(data) {
     var row = el('tr');
     row.appendChild(el('td', 'mono', r.target));
     row.appendChild(el('td', '', r.provider));
-    row.appendChild(el('td', r.ok ? 'badge b-ok' : 'badge b-cool', r.ok ? 'ok' : 'failed'));
+    var badgeCls = r.ok ? 'badge b-ok' : 'badge b-cool';
+    var badgeText = r.ok ? (r.statusLabel || 'ok') : 'failed';
+    row.appendChild(el('td', badgeCls, badgeText));
+    var httpText = r.status != null ? String(r.status) : (r.error ? String(r.error).slice(0, 40) : '—');
+    row.appendChild(el('td', 'mono', httpText));
     row.appendChild(el('td', '', String(r.elapsedMs)));
     row.appendChild(el('td', '', String(r.finalChars)));
     row.appendChild(el('td', '', String(r.reasoningChars)));

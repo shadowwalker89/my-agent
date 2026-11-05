@@ -190,9 +190,9 @@ const LEGACY_RE =
 // مدل‌های چندوجهی (vision/vl/omni) برای چت متنیِ سبک و کدنویسی گزینه‌ی خوبی نیستند
 const VL_OMNI_RE = /vision|\bvl\b|omni/i;
 // مدل‌های سنگینی که در production با 503/timeout پاسخ می‌دهند — در chat/fast جریمه می‌شوند.
-const UNSTABLE_RE = /qwen3\.[5-9]|deepseek-v4|deepseek-r1|glm-5|gemma-4|nemotron-3|mistral-large-4|preview|thinking|reasoning|-r1\b|omni/i;
+const UNSTABLE_RE = /qwen3\.[5-9]|deepseek-v4|deepseek-r1|glm-5|gemma-4|nemotron-3|mistral-large-4|mistral-large(?:-2)?(?:-instruct)?\b|kimi-k2|preview|thinking|reasoning|-r1\b|omni/i;
 // instructهای سریع و پایدار که در production جواب داده‌اند — در chat/fast تقویت می‌شوند.
-const WORKHORSE_RE = /llama-3\.3-70b-instruct|llama-3\.1-70b-instruct|llama-3\.1-8b-instruct|qwen2\.5-72b-instruct|qwen-2\.5-72b-instruct|qwen2\.5-32b-instruct|gemma-3-27b-it|gemma-2-27b-it|mistral-small|ministral|phi-4|openrouter\/free/i;
+const WORKHORSE_RE = /llama-3\.3-70b-instruct|llama-3\.1-70b-instruct|llama-3\.1-8b-instruct|llama-3\.[0-9]|qwen2\.5-72b-instruct|qwen-2\.5-72b-instruct|qwen2\.5-32b-instruct|gemma-3-27b-it|gemma-2-27b-it|mistral-small|ministral|phi-4|openrouter\/free|cohere\/north|flint-v1|nemotron-super/i;
 
 function compileSafe(pattern, flags) {
   try {

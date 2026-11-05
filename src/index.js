@@ -1703,38 +1703,78 @@ async function adminApiProbe(request, env) {
     return json({ ok: false, error: `unknown provider: ${wanted}` }, 400);
   }
   const providers = cfg.providers.filter((p) => p.id === wanted || (!wanted && p.enabled !== false));
-  const scored = pickModels(catalog, RULES.chat, { prefer: null, bans: [] });
+
+  // Build candidate list:
+  // (a) targets from manual combos in config:v1 (e.g. agent01)
+  // (b) openrouter/openrouter/free if openrouter enabled
+  // (c) top 3 scored candidates per enabled provider from catalog
+  const seen = new Set();
   const selected = [];
-  for (const p of providers) {
-    for (const m of scored.filter((x) => x.provider === p.id).slice(0, 3)) {
-      selected.push({ provider: p.id, model: m.id });
+  const addTarget = (provider, model) => {
+    const key = `${provider}/${model}`.toLowerCase();
+    if (!seen.has(key)) { seen.add(key); selected.push({ provider, model }); }
+  };
+
+  // (a) manual combo targets — iterate all combos, pick enabled targets whose provider is active
+  const activeProviderIds = new Set(providers.map((p) => p.id));
+  for (const combo of cfg.combos ?? []) {
+    for (const t of combo.targets ?? []) {
+      if (t.enabled !== false && activeProviderIds.has(t.provider)) {
+        addTarget(t.provider, t.model);
+      }
     }
   }
+
+  // (b) openrouter/openrouter/free special candidate
+  if (!wanted || wanted === "openrouter") {
+    if (activeProviderIds.has("openrouter")) addTarget("openrouter", "openrouter/auto");
+  }
+
+  // (c) top 3 from scored catalog per provider
+  const scored = pickModels(catalog, RULES.chat, { prefer: null, bans: [] });
+  for (const p of providers) {
+    for (const m of scored.filter((x) => x.provider === p.id).slice(0, 3)) {
+      addTarget(p.id, m.id);
+    }
+  }
+
+  // Probe body: 220 tokens so reasoning models can finish a short answer
   const probeBody = {
     messages: [{ role: "user", content: "سلام" }],
-    max_tokens: 24,
+    max_tokens: 220,
     temperature: 0.1,
   };
   const results = [];
   for (const m of selected.slice(0, limit)) {
     const target = `${m.provider}/${m.model}`.toLowerCase();
-    const r = await directCall(env, m.provider, m.model, probeBody, { timeoutMs: 5000 });
+    const r = await directCall(env, m.provider, m.model, probeBody, { timeoutMs: 8000 });
     const finalChars = Number(r.finalChars) || 0;
     const reasoningChars = Number(r.reasoningChars) || 0;
-    const ok = r.ok === true && r.latencyMs < 5000 && finalChars > 0;
-    let error = null;
-    if (ok) {
+
+    // HTTP 200 with any visible output (final or reasoning-only) = alive
+    const alive = r.ok === true && (finalChars > 0 || reasoningChars > 0);
+    // For verified tier-0 we require final text (not reasoning-only)
+    const verified = r.ok === true && finalChars > 0 && r.latencyMs <= 8000;
+    // statusLabel for the UI
+    const statusLabel = r.ok === true
+      ? (finalChars > 0 ? "200 OK" : "200 (reasoning)")
+      : null;
+
+    if (alive) {
       try {
         await recordLatency(env, target, r.latencyMs);
         if (env.STATE) await env.STATE.delete(`health:${target}`);
       } catch {}
       await recordProviderCircuitSuccess(env, m.provider, { force: true });
-      await recordVerifiedModel(env, target, m.provider, r.latencyMs, null);
+      if (verified) {
+        await recordVerifiedModel(env, target, m.provider, r.latencyMs, null);
+      }
     } else {
-      error = r.ok === true ? "empty_final" : String(r.snippet || "probe failed").slice(0, 200);
+      // Only call markFailure on real HTTP failures — never on HTTP 200
+      const error = String(r.snippet || "probe failed").slice(0, 200);
       const isTimeout = /^timeout/.test(error);
       const status = typeof r.status === "number" ? r.status : null;
-      if (isTimeout || (status !== null && [400, 404, 429, 500, 502, 503, 504].includes(status))) {
+      if (isTimeout || (status !== null && [400, 401, 403, 404, 429, 500, 502, 503, 504].includes(status))) {
         try {
           await markFailure(env, target, classifyFailure(status, r.snippet, isTimeout), error);
         } catch {}
@@ -1744,12 +1784,13 @@ async function adminApiProbe(request, env) {
     results.push({
       target,
       provider: m.provider,
-      ok,
+      ok: alive,
       status: r.status ?? null,
+      statusLabel: statusLabel ?? (r.ok === false ? String(r.snippet || "").slice(0, 60) : null),
       elapsedMs: r.latencyMs ?? 0,
       finalChars,
       reasoningChars,
-      error,
+      error: alive ? null : String(r.snippet || "probe failed").slice(0, 200),
     });
   }
   return json({ ok: true, results });

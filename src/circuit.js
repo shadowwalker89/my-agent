@@ -4,7 +4,7 @@
 const FAILURE_WINDOW_MS = 120_000;
 const COOLDOWN_MS = 180_000;
 const CACHE_TTL_MS = 30_000;
-const VERIFIED_FAST_MS = 6_000;
+const VERIFIED_FAST_MS = 10_000;
 const OPEN_FAILURE_STATUSES = new Set([429, 500, 502, 503, 504, 401, 403]);
 
 const providerFailures = new Map();
@@ -153,7 +153,7 @@ export async function getVerifiedLatencies(env) {
   let rows = [];
   try {
     rows = (await env.DB.prepare(
-      "SELECT target, latency_ms FROM router_model_verified WHERE status = 'ok' AND latency_ms > 0 AND latency_ms < 6000",
+      `SELECT target, latency_ms FROM router_model_verified WHERE status = 'ok' AND latency_ms > 0 AND latency_ms < ${VERIFIED_FAST_MS}`,
     ).all())?.results ?? [];
   } catch {
     rows = [];

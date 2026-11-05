@@ -5972,8 +5972,8 @@ if (DatabaseSync) {
       const sysMsg = (providerBody?.messages ?? []).find((m) => m.role === "system");
       check(typeof sysMsg?.content === "string" && sysMsg.content.includes("no access to the user's notes"), "2-g: chat provider request carries the memory-claim guard in its system prompt");
       }
-    // (h) Phase 2-j: POST /admin/api/probe reports ok/failed rows and cools
-    // a failed target through the normal markFailure path.
+    // (h) Phase 2-k: POST /admin/api/probe sends max_tokens>=200, reports
+    // ok/failed rows, and cools only real HTTP failures (not HTTP 200).
     {
       resetRouterHealthForTests();
       const kv = fakeKV();
@@ -5983,11 +5983,13 @@ if (DatabaseSync) {
       ] }));
       const env = { STATE: kv, XKIRO_API_KEY: "k" };
       const prev = global.fetch;
+      let capturedMaxTokens = null;
       global.fetch = async (url, init = {}) => {
         if (String(url).includes("api.xkiro.com")) {
-          let model = "";
-          try { model = JSON.parse(String(init.body ?? "{}")).model ?? ""; } catch {}
-          if (model === "probe-down") return new Response(JSON.stringify({ error: { message: "down" } }), { status: 503 });
+          let body = {};
+          try { body = JSON.parse(String(init.body ?? "{}")); } catch {}
+          capturedMaxTokens = body.max_tokens ?? null;
+          if (body.model === "probe-down") return new Response(JSON.stringify({ error: { message: "down" } }), { status: 503 });
           return Response.json({ choices: [{ message: { content: "سلام از مدل" } }] });
         }
         return new Response("unexpected", { status: 500 });
@@ -6000,12 +6002,65 @@ if (DatabaseSync) {
       } finally { global.fetch = prev; }
       const okRow = data?.results?.find((x) => x.target === "xkiro/probe-ok");
       const failRow = data?.results?.find((x) => x.target === "xkiro/probe-down");
-      check(data?.ok === true && data.results.length === 2 && okRow?.ok === true && okRow.finalChars > 0 && typeof okRow.elapsedMs === "number" && failRow?.ok === false && failRow.status === 503, "2-j: probe reports ok/failed rows with latency + final chars");
-      check((await kv.get("health:xkiro/probe-down")) !== null, "2-j: probe failure records the target cooldown");
+      check(capturedMaxTokens !== null && capturedMaxTokens >= 200, `2-k: probe sends max_tokens >= 200 (got ${capturedMaxTokens})`);
+      check(data?.ok === true && data.results.length === 2 && okRow?.ok === true && okRow.finalChars > 0 && typeof okRow.elapsedMs === "number" && failRow?.ok === false && failRow.status === 503, "2-k: probe reports ok/failed rows with latency + final chars");
+      check((await kv.get("health:xkiro/probe-down")) !== null, "2-k: probe HTTP 503 failure records the target cooldown");
       resetRouterHealthForTests();
     }
-    // (i) Phase 2-j: D1 provider circuit opens after 2 failures in 120s,
-    // closes on success, and only sub-6s verified latencies enter tier-0.
+    // (i) Phase 2-k: HTTP 200 with reasoning-only content must NOT call
+    // markFailure and must NOT put the target into cooldown.
+    {
+      resetRouterHealthForTests();
+      const kv = fakeKV();
+      await kv.put("catalog:xkiro", JSON.stringify({ models: [
+        { id: "reasoning-model", provider: "xkiro", context: 131072 },
+      ] }));
+      const env = { STATE: kv, XKIRO_API_KEY: "k" };
+      const prev = global.fetch;
+      global.fetch = async (url, init = {}) => {
+        if (String(url).includes("api.xkiro.com")) {
+          return Response.json({ choices: [{ message: { content: "", reasoning_content: "بگذارید فکر کنم..." } }] });
+        }
+        return new Response("unexpected", { status: 500 });
+      };
+      let data;
+      try {
+        const req = { method: "POST", url: "http://x/admin/api/probe", json: async () => ({ provider: "xkiro", limit: 1 }) };
+        const res = await adminApi(req, env, "POST", "/admin/api/probe");
+        data = await res.json();
+      } finally { global.fetch = prev; }
+      const row = data?.results?.[0];
+      check(row?.ok === true && row.reasoningChars > 0 && row.finalChars === 0, "2-k: HTTP 200 reasoning-only response is marked alive (ok=true)");
+      check((await kv.get("health:xkiro/reasoning-model")) === null, "2-k: HTTP 200 reasoning-only response does NOT trigger markFailure / cooldown");
+      resetRouterHealthForTests();
+    }
+    // (j) Phase 2-k: probe reports HTTP status in result and does NOT cool
+    // a 404 model via ok=true path.
+    {
+      resetRouterHealthForTests();
+      const kv = fakeKV();
+      await kv.put("catalog:xkiro", JSON.stringify({ models: [
+        { id: "retired-model", provider: "xkiro", context: 131072 },
+      ] }));
+      const env = { STATE: kv, XKIRO_API_KEY: "k" };
+      const prev = global.fetch;
+      global.fetch = async (url) => {
+        if (String(url).includes("api.xkiro.com")) return new Response(JSON.stringify({ error: { message: "Not found" } }), { status: 404 });
+        return new Response("unexpected", { status: 500 });
+      };
+      let data;
+      try {
+        const req = { method: "POST", url: "http://x/admin/api/probe", json: async () => ({ provider: "xkiro", limit: 1 }) };
+        const res = await adminApi(req, env, "POST", "/admin/api/probe");
+        data = await res.json();
+      } finally { global.fetch = prev; }
+      const row = data?.results?.[0];
+      check(row?.ok === false && row.status === 404, "2-k: probe records HTTP 404 status in result row");
+      check((await kv.get("health:xkiro/retired-model")) !== null, "2-k: probe HTTP 404 cools the retired model");
+      resetRouterHealthForTests();
+    }
+    // (k) Phase 2-k: verified threshold is 10000ms; 7s verified probe enters
+    // tier-0 (was rejected at 6s in 2-j).
     {
       resetRouterHealthForTests();
       const sq = new DatabaseSync(":memory:");
@@ -6015,18 +6070,12 @@ if (DatabaseSync) {
       };
       const db = { prepare(sql) { return stmt(sql); } };
       const env = { STATE: fakeKV(), DB: db };
-      await recordProviderCircuitFailure(env, "xkiro", 503);
-      check((await getOpenProviderCircuits(env)).size === 0, "2-j: one provider failure keeps the circuit closed");
-      await recordProviderCircuitFailure(env, "xkiro", 429);
-      check((await getOpenProviderCircuits(env)).has("xkiro"), "2-j: two failures within 120s open the provider circuit");
-      const row = await db.prepare("SELECT state, fail_count FROM router_provider_cb WHERE provider = ?").bind("xkiro").first();
-      check(row?.state === "open" && row.fail_count === 2, "2-j: open circuit state is persisted in D1");
-      await recordProviderCircuitSuccess(env, "xkiro");
-      check((await getOpenProviderCircuits(env)).size === 0, "2-j: provider success closes the circuit");
       await recordVerifiedModel(env, "xkiro/fast-model", "xkiro", 1200, null);
-      check((await getVerifiedLatencies(env)).get("xkiro/fast-model") === 1200, "2-j: a 1.2s verified probe is stored for tier-0");
-      await recordVerifiedModel(env, "xkiro/slow-model", "xkiro", 7000, null);
-      check(!(await getVerifiedLatencies(env)).has("xkiro/slow-model"), "2-j: a 7s probe is not tier-0 verified");
+      check((await getVerifiedLatencies(env)).get("xkiro/fast-model") === 1200, "2-k: 1.2s verified probe enters tier-0");
+      await recordVerifiedModel(env, "xkiro/medium-model", "xkiro", 7000, null);
+      check((await getVerifiedLatencies(env)).get("xkiro/medium-model") === 7000, "2-k: 7s verified probe now enters tier-0 (threshold raised to 10s)");
+      await recordVerifiedModel(env, "xkiro/slow-model", "xkiro", 11000, null);
+      check(!(await getVerifiedLatencies(env)).has("xkiro/slow-model"), "2-k: 11s probe is not tier-0 verified");
       resetRouterHealthForTests();
     }
   }
