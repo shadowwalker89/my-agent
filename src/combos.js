@@ -16,6 +16,7 @@ export const RULES = {
     minContext: 32000,
     needsVision: false,
     maxTargets: 8,
+    demoteUltra: true,
   },
   code: {
     prefer: [
@@ -46,6 +47,7 @@ export const RULES = {
     minContext: 8000,
     needsVision: false,
     maxTargets: 8,
+    demoteUltra: true,
   },
 };
 
@@ -171,6 +173,7 @@ export const WEIGHTS = {
   sizeHugeBonus: 5,     // ≥100B — مدل بزرگ، معمولاً خانواده‌ی قوی‌تر
   legacyPenalty: 15,    // نسل‌های قدیمی: llama2/3.0/3.1، mixtral، gemma-2/3، ...
   vlOmniPenalty: 12,    // vision/vl/omni در comboهای غیر از vision (برای کدنویسی بد هستند)
+  ultraPenalty: 35,     // مدل‌های فوق‌سنگین ≥400B (550b/405b) — در chat/fast دیر پاسخ می‌دهند
 };
 
 const NOVELTY_RE = /preview|beta|alpha|exp|-rc\d/i;
@@ -258,10 +261,12 @@ export function applyVersionBonus(scored) {
   }
 }
 
-export function scoreModel(m, compiledPrefer, { skipVlPenalty = false } = {}) {
+export function scoreModel(m, compiledPrefer, { skipVlPenalty = false, demoteUltra = false } = {}) {
   const name = namePartOf(m.id);
-  const sizeAdj = sizeAdjust(sizeBOf(name));
+  const sizeB = sizeBOf(name);
+  const sizeAdj = sizeAdjust(sizeB);
   let score = sizeAdj;
+  if (demoteUltra && sizeB >= 400) score -= WEIGHTS.ultraPenalty;
   compiledPrefer.forEach((entry, i) => {
     if (!entry?.re) return;
     // الگوی «coder» فقط وقتی مدل جریمه‌ی اندازه نخورده اعمال می‌شود —
@@ -300,7 +305,7 @@ export function pickModels(catalog, rule, { prefer = null, bans = [] } = {}) {
   // جریمه‌ی vl/omni فقط وقتی combo خودش vision است معلق می‌شود
   const scored = eligible.map((m) => ({
     ...m,
-    score: scoreModel(m, compiledPrefer, { skipVlPenalty: rule.needsVision === true }),
+    score: scoreModel(m, compiledPrefer, { skipVlPenalty: rule.needsVision === true, demoteUltra: rule.demoteUltra === true }),
   }));
   applyVersionBonus(scored);
   scored.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));

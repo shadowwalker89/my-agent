@@ -920,7 +920,7 @@ async function runSummary(env, o, kind, projectId, userId, retryData = null) {
   // second one. Without TG_TOKEN this is a silent null (no network).
   let progressMsgId = null;
   if (o.chatId != null) progressMsgId = await sendProgressMessage(env, o.chatId, "⏳ در حال آماده‌سازی خلاصه و جدول...");
-  await o.chat(`${kind === "note" ? "یادداشت‌ها" : "تسک‌ها"} (${scope}، ${rows.length} ردیف):\n${lines}`, { systemPrompt: SUMMARY_SYSTEM, saveText: "", noHistory: true, maxTokens: 2200, failureLabel: "خلاصه‌سازی", ...(retryData ? { retryData } : {}), ...(progressMsgId != null ? { progressMsgId } : {}) });
+  await o.chat(`${kind === "note" ? "یادداشت‌ها" : "تسک‌ها"} (${scope}، ${rows.length} ردیف):\n${lines}`, { systemPrompt: SUMMARY_SYSTEM, saveText: "", noHistory: true, maxTokens: 2200, taskType: "chat", failureLabel: "خلاصه‌سازی", ...(retryData ? { retryData } : {}), ...(progressMsgId != null ? { progressMsgId } : {}) });
   return true;
 }
 

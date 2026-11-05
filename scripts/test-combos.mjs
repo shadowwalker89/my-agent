@@ -152,6 +152,26 @@ check(
   `vision: جریمه‌ی vl/omni نباید اعمال می‌شد (${visPlus} مقابل ${visOmni})`,
 );
 
+// ── chat/fast: مدل فوق‌سنگین 550b نباید بالاتر از 70b instruct بیاید ─────────
+{
+  const base = { provider: "nvidia", context: 128000, created: now - 10 * DAY };
+  const ultra = { id: "nvidia/nemotron-3-ultra-550b-a55b", ...base };
+  const instruct = { id: "meta/llama-3.3-70b-instruct", ...base };
+  for (const name of ["chat", "fast"]) {
+    const ranked = pickModels([ultra, instruct], RULES[name], {});
+    const iInstruct = ranked.findIndex((m) => m.id === instruct.id);
+    const iUltra = ranked.findIndex((m) => m.id === ultra.id);
+    check(
+      iInstruct !== -1 && iUltra !== -1 && iInstruct < iUltra,
+      `${name}: 70b instruct باید بالاتر از ultra-550b باشد (${ranked.map((m) => m.id).join(", ")})`,
+    );
+    check(
+      ranked[iUltra]?.score < ranked[iInstruct]?.score,
+      `${name}: امتیاز ultra-550b باید کمتر از 70b باشد (${ranked[iUltra]?.score} مقابل ${ranked[iInstruct]?.score})`,
+    );
+  }
+}
+
 const asserts = {
   code: (targets) => {
     const ids = targets.map((t) => t.id.toLowerCase());

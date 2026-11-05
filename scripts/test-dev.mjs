@@ -5662,6 +5662,50 @@ if (DatabaseSync) {
       await handleDailyText({ STATE: fakeKV(), DB: { prepare() { throw new Error("boom"); } } }, { chatId: 1, userId: 1, text: "یادداشت‌هام رو خلاصه کن", send: async (t) => { sent3.push(t); }, chat: async (t, o) => { chats3.push(t); }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
       check(String(sent3[0]).includes("خوانده نشد") && chats3.length === 0, "sumstab: D1 failure reports a read failure (not an empty notice) with zero model calls");
     }
+    // (j) Phase 2-h: code-heavy notes must summarise via the chat combo,
+    // never the code combo (taskType:"chat" pins the route).
+    {
+      resetRouterHealthForTests();
+      const { sq, db } = mkDbSum();
+      sq.exec("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, 'باگ در روتر کد و خطا در Cloudflare Workers و function test() { return 1; }', 'text', '2026-10-28T01:24:00+03:30')");
+      const kv = fakeKV();
+      await kv.put("catalog:xkiro", JSON.stringify({ models: [
+        { id: "qwen3.8-plus", provider: "xkiro", context: 131072 },
+        { id: "qwen3-coder-plus", provider: "xkiro", context: 131072 },
+      ] }));
+      const calls = [];
+      const providerModels = [];
+      const prev = global.fetch;
+      global.fetch = async (url, init = {}) => {
+        const u = String(url);
+        if (u.startsWith("https://api.telegram.org/")) {
+          const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+          let payload = {};
+          try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+          calls.push({ method: m ? m[1] : "", payload });
+          return Response.json({ ok: true, result: { message_id: 99 } });
+        }
+        if (u.includes("api.xkiro.com")) {
+          let body = {};
+          try { body = JSON.parse(String(init.body ?? "{}")); } catch {}
+          providerModels.push(body.model ?? null);
+          return Response.json({ choices: [{ message: { content: "خلاصه‌ی یادداشت‌ها" }, finish_reason: "stop" }] });
+        }
+        return new Response("unexpected", { status: 500 });
+      };
+      const env = { STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k", SHOW_MODEL: "1" };
+      try {
+        await handleDailyText(env, {
+          chatId: 1, userId: 1, text: "یادداشت‌هام رو خلاصه کن", nowMs: Date.UTC(2026, 9, 28, 12, 0, 0),
+          send: async () => {},
+          chat: (t, copts) => answerChatText(env, 1, 1, t, false, copts),
+        });
+      } finally { global.fetch = prev; }
+      const edit = calls.find((c) => c.method === "editMessageText");
+      const answerText = String(edit?.payload?.text ?? "");
+      check(providerModels.length >= 1 && providerModels.every((m) => !/coder/i.test(String(m))), `2-h: code-heavy note summary uses a non-coder target (models: ${providerModels.join(", ")})`);
+      check(answerText.includes("- chat /") && !answerText.includes("- code /"), `2-h: code-heavy note summary routes to the chat combo, never code (${answerText})`);
+    }
     // ── Phase 2-f: in-combo empty-final failover (Telegram-only),
     // summary 2200-token headroom, /admin Empty-final counter ──
     // (a) Telegram all-reasoning-only WITH a retry id: compact notice +

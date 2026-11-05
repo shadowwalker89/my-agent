@@ -189,7 +189,9 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
   if (progressMsgId == null) progressMsgId = await sendProgressMessage(env, chatId);
 
   const prefs = await getPrefs(env, userId);
-  const task = classifyTask(text, { hasImage: hasImage === true });
+  const task = typeof opts.taskType === "string" && opts.taskType
+    ? opts.taskType
+    : classifyTask(text, { hasImage: hasImage === true });
   // Chat context: last 50 chat-kind rows, capped at 8,000 characters.
   // Translate skips history entirely: a weak model let note-themed history
   // override the translate system prompt (observed in Telegram tests).
