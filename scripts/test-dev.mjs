@@ -33,7 +33,8 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus } from "../src/db.js";
+import { encryptVaultValue, decryptVaultValue, isEncryptedVaultValue, getGoogleVaultConfig, googleVaultStatus, syncVaultItemToGoogle, syncVaultFileToGoogle, fetchVaultFromGoogle } from "../src/vault.js";
 import {
   getChatContext,
   getSetting,
@@ -6178,6 +6179,65 @@ if (DatabaseSync) {
       resetRouterHealthForTests();
     }
   }
+}
+
+// ── Phase 3-A: encrypted vault + Google mirror ────────────────────────────
+{
+  const env = { VAULT_SECRET: "s1" };
+  const c1 = await encryptVaultValue(env, "secret value");
+  const c2 = await encryptVaultValue(env, "secret value");
+  check(c1.startsWith("enc:v1:") && c1 !== c2 && !c1.includes("secret value") && isEncryptedVaultValue(c1), "3-a: vault encrypts with a random IV and hides the plaintext");
+  check((await decryptVaultValue(env, c1)) === "secret value" && (await decryptVaultValue(env, "plain")) === "plain", "3-a: vault round-trips ciphertext and passes plaintext through");
+  let wrongKey = false;
+  try { await decryptVaultValue({ VAULT_SECRET: "s2" }, c1); } catch { wrongKey = true; }
+  check(wrongKey, "3-a: vault decryption fails with the wrong secret");
+  check(
+    googleVaultStatus({}).configured === false &&
+      googleVaultStatus({ webhookUrl: "x", sheetId: "y", driveFolderId: "z" }).modes.join(",") === "webhook,sheets,drive",
+    "3-a: googleVaultStatus reports configured modes without secrets",
+  );
+}
+if (DatabaseSync) {
+  const sqlite = new DatabaseSync(":memory:");
+  const db = { prepare(sql) { const stmt = sqlite.prepare(sql); return { bind(...p) { return { run: async () => { const r = stmt.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: stmt.all(...p) }), first: async () => stmt.get(...p) ?? null }; } }; } };
+  const env = { VAULT_SECRET: "s1", DB: db };
+  const enc = await encryptVaultValue(env, "top secret");
+  const saved = await saveVaultItem(env, { userId: 1, label: "bank", valueEnc: enc, kind: "text" });
+  const list = await listVaultItems(env, 1);
+  const row = await getVaultItem(env, 1, saved.id);
+  check(saved.ok && saved.id === 1 && list.ok && list.items.length === 1 && list.items[0].label === "bank" && !("value_enc" in list.items[0]), "3-a: vault D1 list exposes metadata only");
+  check(row && (await decryptVaultValue(env, row.value_enc)) === "top secret" && (await getVaultItem(env, 2, saved.id)) === null, "3-a: vault D1 get is user-scoped and decryptable");
+  await setVaultSyncStatus(env, 1, saved.id, "synced", "g1");
+  const synced = await getVaultItem(env, 1, saved.id);
+  check(synced.sync_status === "synced" && synced.google_id === "g1", "3-a: vault sync status + google id persist");
+  check((await deleteVaultItem(env, 2, saved.id)).deleted === false && (await deleteVaultItem(env, 1, saved.id)).deleted === true, "3-a: vault delete is user-scoped");
+}
+{
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    if (String(url).includes("hook.test")) return Response.json({ ok: true, id: "w1" });
+    if (String(url).includes("sheets.googleapis")) return Response.json({ updates: { updatedRange: "A2:D2" } });
+    return Response.json({ ok: true });
+  };
+  const webhookEnv = { GOOGLE_VAULT_WEBHOOK_URL: "https://hook.test/vault", GOOGLE_VAULT_WEBHOOK_SECRET: "shh" };
+  const r1 = await syncVaultItemToGoogle(webhookEnv, { id: 1, userId: 1, label: "bank", value: "secret" }, fetchImpl);
+  const body1 = JSON.parse(String(calls[0].init.body));
+  check(
+    r1.ok && r1.mode === "webhook" && r1.googleId === "w1" && calls[0].init.headers["X-Vault-Secret"] === "shh" && body1.value === "secret",
+    "3-a: vault webhook sync sends the item with X-Vault-Secret",
+  );
+  const sheetsEnv = { GOOGLE_VAULT_SHEET_ID: "sheet1", GOOGLE_VAULT_ACCESS_TOKEN: "tok" };
+  const r2 = await syncVaultItemToGoogle(sheetsEnv, { id: 2, userId: 1, label: "pin", value: "1234" }, fetchImpl);
+  check(r2.ok && r2.mode === "sheets" && r2.googleId === "A2:D2" && calls[1].init.headers.authorization === "Bearer tok", "3-a: vault sheets sync appends a row with a bearer token");
+  const r3 = await syncVaultFileToGoogle(webhookEnv, { fileName: "a.txt", mimeType: "text/plain", data: new TextEncoder().encode("hi") }, fetchImpl);
+  const body3 = JSON.parse(String(calls[2].init.body));
+  check(r3.ok && body3.kind === "file" && body3.dataB64 === btoa("hi"), "3-a: vault file webhook sync carries base64 bytes");
+  const pulled = await fetchVaultFromGoogle(webhookEnv, { userId: 1 }, async (url) => {
+    check(String(url).includes("userId=1"), "3-a: vault webhook pull scopes by userId");
+    return Response.json({ ok: true, items: [{ label: "bank" }] });
+  });
+  check(pulled.ok && pulled.items[0].label === "bank", "3-a: vault webhook pull returns items");
 }
 
 if (failures.length) {

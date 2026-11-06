@@ -720,3 +720,126 @@ export async function setMemory(envOrDb, userId, kind, key, value) {
     return { ok: false };
   }
 }
+
+// Phase 3-A: encrypted vault items. The table is created lazily (like
+// the router circuit tables) so no migration is required; value_enc is
+// AES-GCM ciphertext and is never selected by the list helper.
+const vaultReadyDbs = new WeakSet();
+const VAULT_KINDS = ["text", "file"];
+
+async function ensureVaultTable(db) {
+  if (!db) return false;
+  if (vaultReadyDbs.has(db)) return true;
+  try {
+    await db
+      .prepare(
+        "CREATE TABLE IF NOT EXISTS vault_items (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, label TEXT NOT NULL, kind TEXT NOT NULL, value_enc TEXT, file_name TEXT, file_mime TEXT, google_id TEXT, sync_status TEXT NOT NULL DEFAULT 'local', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+      )
+      .bind()
+      .run();
+    vaultReadyDbs.add(db);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function saveVaultItem(envOrDb, item) {
+  const db = dbOf(envOrDb);
+  const userId = validUserId(item?.userId);
+  const label = typeof item?.label === "string" ? item.label.trim() : "";
+  const kind = VAULT_KINDS.includes(item?.kind) ? item.kind : "text";
+  if (!db || userId === null || !label) return { ok: false };
+  if (kind === "text" && typeof item?.valueEnc !== "string") return { ok: false };
+  if (kind === "file" && typeof item?.fileName !== "string") return { ok: false };
+  if (!(await ensureVaultTable(db))) return { ok: false };
+  const now = typeof item?.createdAt === "string" && item.createdAt ? item.createdAt : new Date().toISOString();
+  const syncStatus = typeof item?.syncStatus === "string" && item.syncStatus ? item.syncStatus : "local";
+  const id = Number(item?.id);
+  try {
+    if (Number.isInteger(id) && id > 0) {
+      await db
+        .prepare(
+          "UPDATE vault_items SET label = ?, kind = ?, value_enc = ?, file_name = ?, file_mime = ?, google_id = ?, sync_status = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+        )
+        .bind(label, kind, item?.valueEnc ?? null, item?.fileName ?? null, item?.mimeType ?? null, item?.googleId ?? null, syncStatus, now, id, userId)
+        .run();
+      return { ok: true, id };
+    }
+    await db
+      .prepare(
+        "INSERT INTO vault_items (user_id, label, kind, value_enc, file_name, file_mime, google_id, sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind(userId, label, kind, item?.valueEnc ?? null, item?.fileName ?? null, item?.mimeType ?? null, item?.googleId ?? null, syncStatus, now, now)
+      .run();
+    const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first();
+    return { ok: true, id: row?.id ?? null };
+  } catch {
+    return { ok: false };
+  }
+}
+
+export async function listVaultItems(envOrDb, userId, { limit = 20, offset = 0 } = {}) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  if (!db || id === null) return { ok: false, items: [] };
+  if (!(await ensureVaultTable(db))) return { ok: false, items: [] };
+  const n = Math.max(1, Math.min(50, Number(limit) || 20));
+  const off = Math.max(0, Number(offset) || 0);
+  try {
+    const res = await db
+      .prepare(
+        "SELECT id, label, kind, file_name, file_mime, google_id, sync_status, created_at, updated_at FROM vault_items WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+      )
+      .bind(id, n, off)
+      .all();
+    return { ok: true, items: Array.isArray(res?.results) ? res.results : [] };
+  } catch {
+    return { ok: false, items: [] };
+  }
+}
+
+export async function getVaultItem(envOrDb, userId, itemId) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  const vaultId = Number(itemId);
+  if (!db || id === null || !Number.isInteger(vaultId) || vaultId <= 0) return null;
+  if (!(await ensureVaultTable(db))) return null;
+  try {
+    return await db.prepare("SELECT * FROM vault_items WHERE id = ? AND user_id = ? LIMIT 1").bind(vaultId, id).first();
+  } catch {
+    return null;
+  }
+}
+
+export async function deleteVaultItem(envOrDb, userId, itemId) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  const vaultId = Number(itemId);
+  if (!db || id === null || !Number.isInteger(vaultId) || vaultId <= 0) return { ok: false, deleted: false };
+  if (!(await ensureVaultTable(db))) return { ok: false, deleted: false };
+  try {
+    const res = await db.prepare("DELETE FROM vault_items WHERE id = ? AND user_id = ?").bind(vaultId, id).run();
+    return { ok: true, deleted: (res?.meta?.changes ?? 0) > 0 };
+  } catch {
+    return { ok: false, deleted: false };
+  }
+}
+
+export async function setVaultSyncStatus(envOrDb, userId, itemId, status, googleId = null) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  const vaultId = Number(itemId);
+  const syncStatus = typeof status === "string" && status ? status : "local";
+  if (!db || id === null || !Number.isInteger(vaultId) || vaultId <= 0) return { ok: false };
+  if (!(await ensureVaultTable(db))) return { ok: false };
+  try {
+    await db
+      .prepare("UPDATE vault_items SET sync_status = ?, google_id = COALESCE(?, google_id), updated_at = ? WHERE id = ? AND user_id = ?")
+      .bind(syncStatus, googleId, new Date().toISOString(), vaultId, id)
+      .run();
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  }
+}
