@@ -727,29 +727,50 @@ export async function setMemory(envOrDb, userId, kind, key, value) {
 const vaultReadyDbs = new WeakSet();
 const VAULT_KINDS = ["text", "file"];
 
-async function ensureVaultTable(db) {
+function resolveDb(envOrDb) {
+  if (envOrDb && typeof envOrDb.prepare === "function") return envOrDb;
+  return dbOf(envOrDb);
+}
+
+export async function ensureVaultFilesTable(envOrDb) {
+  const db = resolveDb(envOrDb);
   if (!db) return false;
-  if (vaultReadyDbs.has(db)) return true;
   try {
     await db
+      .prepare(
+        "CREATE TABLE IF NOT EXISTS vault_files (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, tg_file_id TEXT NOT NULL, file_type TEXT NOT NULL, mime_type TEXT, title TEXT NOT NULL, file_name TEXT, caption TEXT, drive_url TEXT, doc_url TEXT, sync_status TEXT NOT NULL DEFAULT 'local', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+      )
+      .bind()
+      .run();
+  } catch {
+    return false;
+  }
+  const cols = ["category", "title", "tg_file_id", "file_type", "mime_type", "file_name", "caption", "sync_status", "drive_url", "doc_url", "created_at", "updated_at"];
+  for (const col of cols) {
+    try { await db.prepare(`ALTER TABLE vault_files ADD COLUMN ${col} TEXT`).bind().run(); } catch {}
+  }
+  return true;
+}
+
+export async function ensureVaultTable(db) {
+  const resolved = resolveDb(db);
+  if (!resolved) return false;
+  if (vaultReadyDbs.has(resolved)) return true;
+  try {
+    await resolved
       .prepare(
         "CREATE TABLE IF NOT EXISTS vault_items (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, label TEXT NOT NULL, kind TEXT NOT NULL, value_enc TEXT, file_name TEXT, file_mime TEXT, google_id TEXT, sync_status TEXT NOT NULL DEFAULT 'local', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
       )
       .bind()
       .run();
-    await db
-      .prepare(
-         "CREATE TABLE IF NOT EXISTS vault_files (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, tg_file_id TEXT NOT NULL, file_type TEXT NOT NULL, mime_type TEXT, title TEXT NOT NULL, file_name TEXT, caption TEXT, drive_url TEXT, doc_url TEXT, sync_status TEXT NOT NULL DEFAULT 'local', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
-      )
-      .bind()
-      .run();
     try {
-      await db.prepare("ALTER TABLE vault_items ADD COLUMN category TEXT").bind().run();
+      await resolved.prepare("ALTER TABLE vault_items ADD COLUMN category TEXT").bind().run();
     } catch {}
     try {
-      await db.prepare("ALTER TABLE vault_items ADD COLUMN extra TEXT").bind().run();
+      await resolved.prepare("ALTER TABLE vault_items ADD COLUMN extra TEXT").bind().run();
     } catch {}
-    vaultReadyDbs.add(db);
+    if (!(await ensureVaultFilesTable(resolved))) return false;
+    vaultReadyDbs.add(resolved);
     return true;
   } catch {
     return false;

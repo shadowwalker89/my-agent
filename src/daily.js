@@ -618,9 +618,9 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   const amount = parseAmount(raw, opts.rememberedCurrency);
   const hasHowMuch = /چقدر|چقد|مجموع/.test(raw), hasQuestion = /[؟?]\s*$/.test(raw);
   const periodWord = /این هفته/.test(raw) ? "week" : /این ماه/.test(raw) ? "month" : /دیروز/.test(raw) ? "yesterday" : /امروز/.test(raw) ? "today" : null;
-  const isReportQuery = /خرجای|خرج\s*ها|خرج‌ها|هزینه\s*ها|هزینه‌ها|هزینه‌های|مخارج|لیست\s*خرج|گزارش\s*(خرج|هزینه)|حساب\s*کتاب|چقدر\s*خرج\s*کردم/u.test(raw) && !/(گذشته|قبل|اخیر|پریروز|سال|پیش|تا\s*حالا|مجموع)/u.test(raw);
+  const isReportQuery = /خرجای|خرج\s*ها|خرج‌ها|خرج\s*(امروز|این\s*هفته|این\s*ماه)|هزینه\s*ها|هزینه‌ها|هزینه‌های|هزینه\s*(امروز|این\s*هفته|این\s*ماه)|مخارج|لیست\s*خرج|گزارش\s*(خرج|هزینه|مالی)|حساب\s*کتاب|چقدر\s*خرج\s*کردم/u.test(raw) && !/(گذشته|قبل|اخیر|پریروز|سال|پیش|تا\s*حالا|مجموع)/u.test(raw);
   const unknownPeriod = (/(گذشته|قبل|اخیر|پریروز|سال)/.test(raw) || /(?<!\p{L})پیش(?!\p{L})/u.test(raw) || (findMonth(raw) && !new RegExp(`[0-9۰-۹٠-٩]+\\s*${findMonth(raw)[0]}|${findMonth(raw)[0]}\\s*[0-9۰-۹٠-٩]+`).test(raw)));
-  const hasExpenseWord = /(?<!\p{L})(خرج|هزینه|مخارج)(?!\p{L})/u.test(raw);
+  const hasExpenseWord = /خرج|هزینه|مخارج/u.test(raw);
   // Last-expense question: answered from D1, never from the chat model.
   // Placed before the period query (so "آخرین خرج چقدر بود؟" is not a
   // period ask) but never steals a recordable expense (amount + verb).
@@ -634,7 +634,7 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
     if (period === "week") { range = weekRange(date); if (!range) return { intent: "expense-query", confidence: 0.5, ask: "date" }; }
     else if (period === "month") { range = monthRange(date); if (!range) return { intent: "expense-query", confidence: 0.5, ask: "date" }; }
     else range = { start: date, end: date };
-    return { intent: "expense-query", confidence: 1, period, range };
+    return { intent: "expense-query", confidence: 1, kind: "report", period, range };
   }
   // Declaration expense: a spoken-style "new expense" declaration with
   // خرید but no past-tense verb ("یک هزینه جدید خرید نون 1500 تومن")
@@ -727,6 +727,9 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
     if (/نشون\s*بده|\bلیست\b/u.test(raw)) return { intent: "vault_list", confidence: 1, category: cat ?? null, title, keywords: kws };
     if (/ثبت\s*ش?\s*کن|ثبت\s*کن|ذخیره\s*کن|بذار(?!\p{L})|بگذار|ذخیره‌اش\s*کن|ثبت‌اش\s*کن/u.test(raw)) return { intent: "vault_save", confidence: 1, category: cat ?? null, title, value, keywords: kws };
     if (/چنده(?!\p{L})|چقدر(?!\p{L})|بده(?!\p{L})/u.test(raw)) return { intent: "vault_get", confidence: 1, category: cat ?? null, title, keywords: kws };
+const isVaultLookup = /^(?:شماره\s*کارت|شماره\s*شبا|شماره\s*حساب|کد\s*ملی)/u.test(raw);
+const hasCardNumber = /\d{13,19}/.test(normalizeDigits(raw));
+if (isVaultLookup && !hasCardNumber && !/ثبت|ذخیره/u.test(raw)) return { intent: "vault_get", confidence: 1, category: cat ?? null, title, keywords: kws };
   }
   // Phase 3-A: archived file listing ("لیست مدارک آرشیو", "فایل‌های ذخیره شده").
   if (/لیست\s*(?:مادرک|مدیریت)|(?:مادرک|مدیریت)\s*آرشیو|آرشیو\s*(?:مادرک|مدیریت)|فایل\s*های\s*ذخیره\s*شدة|ذخیره\s*شدة\s*فایل/u.test(raw)) return { intent: "vault_list", confidence: 1, category: null, title: null, keywords: [], fileList: true };

@@ -63,7 +63,7 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
       if (i < maxPolls - 1) await sleep(pollIntervalMs);
     }
     if (!uri) { log(false, "not-active"); return { ok: false, reason: "not-active" }; }
-    const models = [env?.GEMINI_VOICE_MODEL || "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"];
+    const models = [env?.GEMINI_VOICE_MODEL || "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
     for (const model of models) {
       try {
         const res = await fetch(`${GEMINI_BASE}/v1beta/interactions`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ model, input: [{ type: "audio", uri, mime_type: mime }], generation_config: { transcription_config: { language_codes: [VOICE_LANGUAGE], custom_vocabulary: VOICE_CUSTOM_VOCABULARY } } }), signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) });

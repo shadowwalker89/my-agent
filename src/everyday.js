@@ -464,7 +464,7 @@ async function runDailyBranch(env, o, c, ctx) {
     await markDaily(env, o);
     let valueEnc;
     try { valueEnc = await encryptVaultValue(env, c.value ?? ""); } catch { await o.send(NOT_SAVED_TEXT); return "handled"; }
-    const saved = await saveVaultItem(env, { userId, label: c.title ?? "موردGaosc", kind: "text", valueEnc, category: c.category ?? null, extra: c.extra ?? null, syncStatus: "local" });
+    const saved = await saveVaultItem(env, { userId, label: c.title ?? "مورد گاوصندوق", kind: "text", valueEnc, category: c.category ?? null, extra: c.extra ?? null, syncStatus: "local" });
     let badge = "";
     if (saved.ok) {
       const row = await getVaultItem(env, userId, saved.id);
@@ -474,7 +474,7 @@ async function runDailyBranch(env, o, c, ctx) {
         badge = sync.ok ? "\n✅ گوگل‌شیت: ذخیره شد" : "\n⏳ در انتظار همگام‌سازی گوگل";
       }
     }
-    await o.send(`🔒 **در Gaosc امن ذخیره شد**\n📌 عنوان: **${c.title ?? ""}**\n💳 مقدار (ضربه برای کپی): \`${c.value ?? ""}\`${badge}`);
+    await o.send(`🔒 **در گاوصندوق امن ذخیره شد**\n📌 عنوان: **${c.title ?? ""}**\n💳 مقدار (ضربه برای کپی): \`${c.value ?? ""}\`${badge}`);
     return "handled";
   }
   if (c.intent === "vault_get") {
@@ -486,7 +486,7 @@ async function runDailyBranch(env, o, c, ctx) {
       const hay = `${it.label ?? ""} ${it.category ?? ""} ${it.extra ?? ""}`;
       if (keys.some((k) => hay.includes(k))) matches.push(it);
     }
-    if (matches.length === 0) { await o.send("هیچ موردی در Gaosc پیدا نشد."); return "handled"; }
+    if (matches.length === 0) { await o.send("هیچ موردی در گاوصندوق پیدا نشد."); return "handled"; }
     const lines = [];
     for (const it of matches) {
       const row = await getVaultItem(env, userId, it.id);
@@ -514,7 +514,7 @@ async function runDailyBranch(env, o, c, ctx) {
       return "handled";
     }
     const items = (await listVaultItems(env, userId)).items;
-    if (!(items || []).length) { await o.send("Gaosc خالی است."); return "handled"; }
+    if (!(items || []).length) { await o.send("گاوصندوق خالی است."); return "handled"; }
     const lines = [];
     let n = 0;
     for (const it of items || []) {
@@ -2130,7 +2130,7 @@ export function isUnambiguousQuestion(text) {
   return !NLU_SKIP_KEYWORDS.some((k) => t.includes(k));
 }
 
-async function runNluBranch(env, o, ctx) {
+export async function runNluBranch(env, o, ctx) {
   const { userId, text } = o;
   // Phase 2-c: unambiguous questions skip the NLU entirely — 0 AI.run
   // calls and no D1 projects query — and fall through to chat, which

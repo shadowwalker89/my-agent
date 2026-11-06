@@ -402,14 +402,14 @@ export async function classifyIntentNlu(env, text, context = {}, opts = {}) {
   try {
     const prompt = buildNluPrompt(text, context);
     const res = await Promise.race([
-      env.AI.run(model, {
-        messages: [
-          { role: "system", content: prompt.system },
-          { role: "user", content: prompt.user },
-        ],
-        temperature: 0,
-        max_tokens: NLU_MAX_TOKENS,
-      }),
+       env.AI.run(model, {
+         messages: [
+           { role: "system", content: prompt.system },
+           { role: "user", content: prompt.user },
+         ],
+         temperature: 0.1,
+         max_tokens: 240,
+       }),
       timeout,
     ]);
     const raw = typeof res === "string" ? res : (res?.response ?? res?.text ?? "");

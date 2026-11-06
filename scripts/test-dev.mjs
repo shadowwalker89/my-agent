@@ -33,7 +33,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, ensureVaultFilesTable, ensureVaultTable } from "../src/db.js";
 import { encryptVaultValue, decryptVaultValue, isEncryptedVaultValue, getGoogleVaultConfig, googleVaultStatus, syncVaultItemToGoogle, syncVaultFileToGoogle, fetchVaultFromGoogle } from "../src/vault.js";
 import {
   getChatContext,
@@ -1153,7 +1153,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, deriveNoteTitle, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion, SUMMARY_SYSTEM, handleVaultFile, resolveVaultCallback } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, deriveNoteTitle, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion, SUMMARY_SYSTEM, handleVaultFile, resolveVaultCallback, runNluBranch } from "../src/everyday.js";
 import { markFailure, isModelHealthy } from "../src/health.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
@@ -6299,7 +6299,7 @@ if (DatabaseSync) {
         const env = mkEnv(), s = fakeSend();
         await handleDailyText(env, o(env, 4242, "شماره کارت بانک رسالت من ۶۰۳۷۹۹۷۵۱۲۳۴۵۶۷۸ است ثبتش کن", { ...s, nowMs: NOW }));
         const last = String(s.sent.at(-1)?.text ?? "");
-        check(last.includes("در Gaosc امن ذخیره شد") && last.includes("کارت بانک رسالت") && last.includes("6037997512345678"), `vault save reply: ${JSON.stringify(s.sent.at(-1))}`);
+        check(last.includes("در گاوصندوق امن ذخیره شد") && last.includes("کارت بانک رسالت") && last.includes("6037997512345678"), `vault save reply: ${JSON.stringify(s.sent.at(-1))}`);
         const item = await getVaultItem(env, 4242, 1);
         check(item && (await decryptVaultValue(env, item.value_enc)) === "6037997512345678" && item.category === "bank_card", `vault item stored: ${JSON.stringify({ id: item?.id, category: item?.category, sync: item?.sync_status })}`);
         check(item.sync_status === "pending_google", "vault item pending google when no backend configured");
@@ -6316,7 +6316,7 @@ if (DatabaseSync) {
 
         const s4 = fakeSend();
         await handleDailyText(env, o(env, 9999, "کد ملی من چنده؟", { ...s4, nowMs: NOW }));
-        check(String(s4.sent.at(-1)?.text ?? "").includes("هیچ موردی در Gaosc پیدا نشد"), "vault get empty for stranger");
+        check(String(s4.sent.at(-1)?.text ?? "").includes("هیچ موردی در گاوصندوق پیدا نشد"), "vault get empty for stranger");
 
         const s5 = fakeSend();
         await handleDailyText(env, o(env, 9999, "شماره کارت‌هام رو نشون بده", { ...s5, nowMs: NOW }));
@@ -6459,6 +6459,163 @@ if (DatabaseSync) {
         check(flat.some((b) => b.text === "🗑 #1" && b.callback_data === `note:del:${noteId}`), "delete button on list");
       }
     }
+  } finally {
+    global.fetch = origFetch;
+  }
+}
+
+// ── Root-cause audit fixes: migration, report routing, vault lookup, NLU, voice ──
+{
+  // A) ensureVaultFilesTable migrates an older vault_files table
+  if (DatabaseSync) {
+    const sqlite = new DatabaseSync(":memory:");
+    sqlite.exec("CREATE TABLE vault_files (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, tg_file_id TEXT NOT NULL, file_type TEXT NOT NULL, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+    const db = {
+      prepare(sql) {
+        const stmt = sqlite.prepare(sql);
+        return {
+          bind(...params) {
+            return {
+              run: async () => { const r = stmt.run(...params); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; },
+              all: async () => ({ results: stmt.all(...params) }),
+              first: async () => stmt.get(...params) ?? null,
+            };
+          },
+        };
+      },
+    };
+    const migOk = await ensureVaultFilesTable(db);
+    check(migOk === true, "ensureVaultFilesTable migrates older table");
+    const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", VAULT_SECRET: "s1", DB: db };
+    const sentHolder = [];
+    const s = { send: async (text, opts) => { sentHolder.push({ text, replyMarkup: opts?.replyMarkup }); } };
+    const handled = await handleVaultFile(env, { userId: 4242, chatId: 4242, tgFileId: "file-x", fileType: "photo", mimeType: "image/jpeg", fileName: null, caption: null, send: s.send });
+    check(handled === true, "handleVaultFile photo no caption handled after migration");
+    const kb = (sentHolder.at(-1)?.replyMarkup?.inline_keyboard ?? []).flat().map((b) => b.callback_data);
+    check(kb.some((x) => x.startsWith("vault:analyze:")) && kb.some((x) => x.startsWith("vault:askname:")) && kb.some((x) => x.startsWith("vault:cancel:")), `3 choice buttons after migration: ${JSON.stringify(kb)}`);
+    check(!sentHolder.some((x) => String(x.text).includes("ذخیره نشد، دوباره تلاش کن")), "no not-saved after migration");
+  }
+}
+
+// B) handleDailyText expense report
+{
+  const sqlite = new (await import("node:sqlite")).DatabaseSync(":memory:");
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  const d1 = {
+    prepare(sql) {
+      const stmt = sqlite.prepare(sql);
+      return {
+        bind(...params) {
+          return {
+            run: async () => { const r = stmt.run(...params); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; },
+            all: async () => ({ results: stmt.all(...params) }),
+            first: async () => stmt.get(...params) ?? null,
+          };
+        },
+      };
+    },
+  };
+  sqlite.prepare("INSERT INTO expenses (user_id, type, amount, currency_code, item, date, created_at) VALUES (?,?,?,?,?,?,?)").run(4242, "expense", 1000, "TOMAN", "nan", "2026-10-28", new Date().toISOString());
+  const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", DB: d1 };
+  for (const txt of ["خرج امروز", "خرجای امروز"]) {
+    const sent = [];
+    const s = { send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); } };
+    let chats = 0;
+    const o = { chatId: 4242, userId: 4242, text: txt, send: s.send, chat: async () => { chats++; }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) };
+    const ret = await handleDailyText(env, o);
+    check(ret !== "chat", `${txt} must not fall to chat (got ${ret})`);
+    check(chats === 0, `${txt} must not call o.chat`);
+    check(sent.some((x) => String(x.text).includes("TOMAN") && String(x.text).includes("1000")), `${txt} report contains TOMAN 1000: ${JSON.stringify(sent)}`);
+  }
+}
+
+// C) handleDailyText vault get short lookup
+{
+  const sqlite = new (await import("node:sqlite")).DatabaseSync(":memory:");
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  const d1 = {
+    prepare(sql) {
+      const stmt = sqlite.prepare(sql);
+      return {
+        bind(...params) {
+          return {
+            run: async () => { const r = stmt.run(...params); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; },
+            all: async () => ({ results: stmt.all(...params) }),
+            first: async () => stmt.get(...params) ?? null,
+          };
+        },
+      };
+    },
+  };
+  const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", VAULT_SECRET: "s1", DB: d1 };
+  const sent0 = [];
+  await handleDailyText(env, { chatId: 4242, userId: 4242, text: "شماره کارت بانک رسالت من ۶۰۳۷۹۹۷۵۱۲۳۴۵۶۷۸ است ثبتش کن", send: async (t, o) => { sent0.push({ text: t, replyMarkup: o?.replyMarkup }); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+  const sent = [];
+  const s = { send: async (t, o) => { sent.push({ text: t, replyMarkup: o?.replyMarkup }); } };
+  let chats = 0;
+  const ret = await handleDailyText(env, { chatId: 4242, userId: 4242, text: "شماره کارت رسالت", send: s.send, chat: async () => { chats++; }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+  check(ret !== "chat", `vault lookup must not fall to chat (got ${ret})`);
+  check(chats === 0, "vault lookup must not call o.chat");
+  check(sent.some((x) => String(x.text).includes("6037997512345678")), `vault lookup returns card: ${JSON.stringify(sent)}`);
+}
+
+// D) runNluBranch calls env.AI.run
+{
+  const sqlite = new (await import("node:sqlite")).DatabaseSync(":memory:");
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  const d1 = {
+    prepare(sql) {
+      const stmt = sqlite.prepare(sql);
+      return {
+        bind(...params) {
+          return {
+            run: async () => { const r = stmt.run(...params); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; },
+            all: async () => ({ results: stmt.all(...params) }),
+            first: async () => stmt.get(...params) ?? null,
+          };
+        },
+      };
+    },
+  };
+  let aiCalled = null;
+  const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", DB: d1, VAULT_SECRET: "s1", INTERPRETER_MODEL: "custom-model", AI: { run: async (model, body) => { aiCalled = { model, body }; return { response: JSON.stringify({ intent: "note", confidence: 0.9, project: null, body: "hello", date_ref: null, time_ref: null, daypart: null, summary_target: null }) }; } } };
+  const sent = [];
+  const s = { send: async (t, o) => { sent.push({ text: t, replyMarkup: o?.replyMarkup }); } };
+  const o = { chatId: 4242, userId: 4242, text: "یه یادداشت برام ثبت کن سلام", send: s.send, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) };
+  const ret = await runNluBranch(env, o, { now: Date.UTC(2026, 9, 28, 12, 0, 0), remembered: "TOMAN" });
+  check(!!aiCalled, "runNluBranch calls env.AI.run");
+  check(aiCalled && aiCalled.model === "@cf/meta/llama-3.3-70b-instruct-fp8-fast", `model default: ${JSON.stringify(aiCalled?.model)}`);
+  check(aiCalled && aiCalled.body?.max_tokens === 240 && aiCalled.body?.temperature === 0.1, `params: ${JSON.stringify(aiCalled?.body)}`);
+  check(ret === "handled", `runNluBranch routed: ${ret}`);
+}
+
+// E) voice handleVoice at most one error message
+{
+  const origFetch = global.fetch;
+  global.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes("api.telegram.org")) return { ok: true, json: async () => ({ ok: true, result: { file_path: "voice/file.ogg" } }) };
+    if (u.includes("/file/bot")) return { ok: true, arrayBuffer: async () => new ArrayBuffer(8) };
+    if (u.includes("generativelanguage.googleapis.com")) {
+      if (init?.method === "DELETE") return { ok: true, json: async () => ({}) };
+      if (u.includes("/upload/v1beta/files")) return { ok: true, json: async () => ({ file: { name: "files/abc" } }) };
+      if (u.includes("/v1beta/files/abc")) return { ok: true, json: async () => ({ state: "ACTIVE", uri: "https://example/audio" }) };
+      if (u.includes("/v1beta/interactions")) throw new Error("boom");
+      return { ok: true, json: async () => ({}) };
+    }
+    throw new Error(`unexpected fetch: ${u}`);
+  };
+  try {
+    const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", GEMINI_API_KEY: "k" };
+    const sent = [];
+    const s = { send: async (t, opts) => { sent.push({ text: t, replyMarkup: opts?.replyMarkup }); } };
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: { file_id: "v", duration: 5, mime_type: "audio/ogg; codecs=opus" }, send: s.send, route: async () => {} });
+    check(r === "failed", "voice failed");
+    check(sent.length <= 1, `voice at most one error message: ${sent.length}`);
   } finally {
     global.fetch = origFetch;
   }
