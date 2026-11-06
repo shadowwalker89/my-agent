@@ -10,6 +10,7 @@ import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadDat
 import { encryptVaultValue, decryptVaultValue, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
+export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی مثل /یادداشت، /تسکم، یا /اضافه کردن هزینه به کاربر پیشنهاد نده. کاربر برای ثبت موارد فقط کافی است با زبان طبیعی بنویسد یا ویس بدهد (مثلاً: «یادداشت کن فردا جلسه دارم» یا «امروز ۲۰۰ تومن نون خریدم» یا «خرجای امروز»).";
 const DRAFT_TTL_SEC = 600;
 const EXPIRED_TEXT = "قبلاً ثبت شد یا مهلتش گذشته";
 const NOT_SAVED_TEXT = "ذخیره نشد، دوباره تلاش کن";
@@ -96,7 +97,7 @@ async function clearPendingAsk(env, userId) { await delKv(env, pendingKey(userId
 function askKeyboard(question, id) {
   return question === "expense-or-chat"
     ? [[{ text: "💰 خرج", callback_data: `daily:ask:${id}:expense` }, { text: "💬 چت", callback_data: `daily:ask:${id}:chat` }]]
-    : [[{ text: "💰 خرج", callback_data: `daily:ask:${id}:expense` }, { text: "📥 درآمد", callback_data: `daily:ask:${id}:income` }]];
+    : [[{ text: "💸 خرج", callback_data: `money:dir:spend:${id}` }, { text: "💰 درآمد", callback_data: `money:dir:income:${id}` }]];
 }
 // Phase 1-e Pillar 3: 1-tap disambiguation for hour-ambiguous asks.
 // Attached EVERY time the bot sends "ساعت را با صبح یا عصر مشخص کن."
@@ -1919,26 +1920,64 @@ async function fileBytesFromTelegram(env, tgFileId) {
   return data.data instanceof Uint8Array ? data.data : new Uint8Array(data.data ?? []);
 }
 
+const VAULT_CAPTION_RE = /(?:ذخیره|آرشیو|گاوصندوق|ثبت)\s*(?:کن)?|(?:کارت\s*ملی|شناسنامه|پاسپورت|گواهینامه|بیمه\s*نامه|بیمه‌نامه|آزمایش|سند|مدرک|قرارداد)/i;
+const VISION_CAPTION_RE = /(?:تحلیل|بررسی|بخون|بخوان|ترجمه|توضیح|چیه|چیست|خلاصه|OCR)/i;
+
+async function analyzeVaultImage(env, file, prompt) {
+  const data = await getFileDownloadData(env, file.tg_file_id);
+  if (!data || !env?.GEMINI_API_KEY) return null;
+  const arr = new Uint8Array(data.data);
+  let bin = "";
+  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+  const b64 = btoa(bin);
+  const mime = file.mime_type || "image/jpeg";
+  const userPrompt = prompt ? `${prompt}\\n` : "";
+  const fullPrompt = `${userPrompt}لطفاً این تصویر/فایل را تحلیل کن، متن آن را استخراج کن و به فارسی پاسخ بده.`;
+  for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) {
+    try {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: fullPrompt }, { inline_data: { mime_type: mime, data: b64 } }] }] }) });
+      const json = await res.json().catch(() => null);
+      const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+      if (res.ok && text) return text;
+    } catch {}
+  }
+  return null;
+}
+
 // Case A (caption) / Case B (no caption) for incoming document/photo uploads.
 export async function handleVaultFile(env, o) {
   const { userId, chatId, tgFileId, fileType, mimeType, fileName, caption, send } = o;
   if (!dbOf(env)) return false;
-  const title = caption ? stripCaptionPrefix(caption) : null;
-  if (title) {
-    const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title, fileName, syncStatus: "local" });
+  const cap = typeof caption === "string" ? caption.trim() : "";
+  // Case 1: explicit vault caption
+  if (cap && VAULT_CAPTION_RE.test(cap)) {
+    const title = stripCaptionPrefix(cap) || stripNamingPrefix(cap) || cap;
+    const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title, fileName, caption: cap, syncStatus: "local" });
     let syncInfo = "";
     if (saved.ok) {
       const bytes = await fileBytesFromTelegram(env, tgFileId);
       const sync = await syncVaultFileToGoogle(env, { id: saved.id, userId, label: title, fileName, mimeType, data: bytes ?? new Uint8Array(0), createdAt: new Date().toISOString() });
       await setFileSyncStatus(env, userId, saved.id, sync.ok ? "synced" : "pending_google", sync.googleId ?? null, null);
-      syncInfo = sync.ok ? `\n✅ گوگل Docs/Drive${sync.googleId ? ` (${sync.googleId})` : ""}: ذخیره شد` : "\n⏳ در انتظار همگام‌سازی گوگل";
+      syncInfo = sync.ok ? `\\n✅ گوگل Docs/Drive${sync.googleId ? ` (${sync.googleId})` : ""}: ذخیره شد` : "\\n⏳ در انتظار همگام‌سازی گوگل";
     }
     await send(`🔒📁 مدرک «**${mdEscape(title)}**» در آرشیو امن ذخیره شد.${syncInfo}`);
     return true;
   }
-  const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title: "__pending__", fileName, syncStatus: "local" });
+  // Case 2: explicit vision/analysis caption
+  if (cap && VISION_CAPTION_RE.test(cap)) {
+    const f = { tg_file_id: tgFileId, mime_type: mimeType, file_type: fileType };
+    const text = await analyzeVaultImage(env, f, cap);
+    await send(text || "تحلیل ممکن نشد.");
+    return true;
+  }
+  // Case 3: no caption / general caption -> choice buttons
+  const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title: "__choice__", fileName, caption: cap || null, syncStatus: "local" });
   if (!saved.ok) { await send(NOT_SAVED_TEXT); return true; }
-  await send("🔒📁 این مدرک/تصویر حساس با چه عنوانی در آرشیو امن و Google Docs ذخیره شود؟\n(مثلاً بنویسید یا ویس بدهید: «آخرین آزمایش» یا «تصویر کارت ملی»)");
+  await send("📎 <b>تصویر/فایل دریافت شد. چه کاری انجام دهم؟</b>", { replyMarkup: { inline_keyboard: [
+    [{ text: "🔍 تحلیل تصویر / استخراج متن", callback_data: `vault:analyze:${saved.id}` }],
+    [{ text: "🔒 ذخیره در گاوصندوق امن", callback_data: `vault:askname:${saved.id}` }],
+    [{ text: "❌ انصراف", callback_data: `vault:cancel:${saved.id}` }],
+  ] } });
   return true;
 }
 
@@ -1946,20 +1985,61 @@ export async function handleVaultFile(env, o) {
 // the incoming text/voice named the file.
 async function namePendingVaultFile(env, o) {
   const { userId, text, send } = o;
-  const title = stripNamingPrefix(text);
-  if (!title) return false;
-  const pend = await resolvePendingVaultFile(env, userId, title);
+  if (!text || /^\s*\//.test(text)) return false;
+  if (/لغو|انصراف/.test(String(text).trim())) return false;
+  const cleanTitle = stripNamingPrefix(text) || String(text).trim();
+  if (!cleanTitle) return false;
+  let pend = await resolvePendingVaultFile(env, Number(userId), cleanTitle);
+  if (!pend.ok || !pend.file) {
+    pend = await resolvePendingVaultFile(env, userId, cleanTitle);
+  }
   if (!pend.ok || !pend.file) return false;
   const f = pend.file;
   const bytes = await fileBytesFromTelegram(env, f.tg_file_id);
   const sync = await syncVaultFileToGoogle(env, { id: f.id, userId, label: f.title, fileName: f.fileName, mimeType: f.mimeType, data: bytes ?? new Uint8Array(0), createdAt: f.created_at });
   await setFileSyncStatus(env, userId, f.id, sync.ok ? "synced" : "pending_google", sync.googleId ?? null, null);
-  await send(`🔒📁 مدرک با عنوان «**${mdEscape(f.title)}**» در آرشیو امن و Google Docs ثبت شد.`);
+  await send(`🔒📁 مدرک «<b>${cleanTitle}</b>» در آرشیو امن و Google Docs ثبت شد.`);
   return true;
 }
 
 // Vault callbacks: vault:csv, vault:sync, vault:file:<id>.
 export async function resolveVaultCallback(env, o) {
+  const analyze = /^vault:analyze:(\d+)$/.exec(o.data);
+  if (analyze) {
+    const id = Number(analyze[1]);
+    const f = await getVaultFile(env, o.fromId, id);
+    if (!f) { await o.send("مدرکی پیدا نشد."); return true; }
+    const text = await analyzeVaultImage(env, f, null);
+    await o.send(text || "تحلیل ممکن نشد.");
+    return true;
+  }
+  const askname = /^vault:askname:(\d+)$/.exec(o.data);
+  if (askname) {
+    const id = Number(askname[1]);
+    const f = await getVaultFile(env, o.fromId, id);
+    if (!f) { await o.send("مدرکی پیدا نشد."); return true; }
+    const cap = typeof f.caption === "string" ? f.caption.trim() : "";
+    if (cap) {
+      await runDb(env, "UPDATE vault_files SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?", [cap, new Date().toISOString(), id, o.fromId]);
+      const row = await getVaultFile(env, o.fromId, id);
+      const bytes = await fileBytesFromTelegram(env, f.tg_file_id);
+      const sync = await syncVaultFileToGoogle(env, { id, userId: o.fromId, label: cap, fileName: f.file_name, mimeType: f.mime_type, data: bytes ?? new Uint8Array(0), createdAt: f.created_at });
+      await setFileSyncStatus(env, o.fromId, id, sync.ok ? "synced" : "pending_google", sync.googleId ?? null, null);
+      await o.send(`🔒📁 مدرک «<b>${cap}</b>» در گاوصندوق امن ذخیره شد.`);
+      return true;
+    }
+    await runDb(env, "UPDATE vault_files SET title = '__pending__', updated_at = ? WHERE id = ? AND user_id = ?", [new Date().toISOString(), id, o.fromId]);
+    await o.send("🔒 با چه عنوانی در گاوصندوق امن ذخیره شود؟ (مثلاً بنویسید یا ویس بدهید: «بیمه نامه ۲۰۶» یا «آخرین آزمایش»)");
+    return true;
+  }
+  const cancel = /^vault:cancel:(\d+)$/.exec(o.data);
+  if (cancel) {
+    const id = Number(cancel[1]);
+    await runDb(env, "DELETE FROM vault_files WHERE id = ? AND user_id = ?", [id, o.fromId]);
+    if (typeof o.editText === "function") { try { const r = await o.editText("❌ لغو شد."); if (r && r.ok !== false) return true; } catch {} }
+    await o.send("❌ لغو شد.");
+    return true;
+  }
   const csv = /^vault:csv$/.exec(o.data);
   if (csv) {
     const items = (await listVaultItems(env, o.fromId)).items || [];
@@ -2177,6 +2257,12 @@ export async function handleDailyText(env, o) {
   const { userId, text } = o;
   const now = o.nowMs ?? Date.now();
   if (!dbOf(env)) { await clearPendingAsk(env, userId); return "chat"; } // D1 unavailable: everyday off, chat keeps working
+  // Phase 3-A: name a pending __pending__ vault upload on the next turn
+  // (text message or voice transcript). At the very top, before classifyDaily.
+  if (text && !/^\s*\//.test(text)) {
+    const named = await namePendingVaultFile(env, o);
+    if (named) { return "handled"; }
+  }
   const remembered = await getDefaultCurrency(env, userId);
   const c = classifyDaily(text, { nowMs: now, rememberedCurrency: remembered });
   // Commands never enter the everyday path and stay unstored (Step 1b rule);
@@ -2203,12 +2289,6 @@ export async function handleDailyText(env, o) {
   if (o.chat) { const rawChat = o.chat; o.chat = (t, copts = {}) => rawChat(t, { ...copts, ...(o.voiceHeader && !copts.voiceHeader ? { voiceHeader: o.voiceHeader } : {}), ...(o.entryMessageId && !copts.retryEntryId && !copts.retryData ? { retryEntryId: o.entryMessageId } : {}), ...(o.entryMessageId && !copts.quickConvertId ? { quickConvertId: o.entryMessageId } : {}) }); }
   const finalizeEntry = async (kind) => { if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; await finalizeMessageKind(env, o.entryMessageId, userId, kind); } };
   const viaBranch = async (cc) => { const r = await runDailyBranch(env, o, cc, ctx); await finalizeEntry(r === "chat" ? "chat" : "daily"); return r; };
-  // Phase 3-A: name a pending __pending__ vault upload on the next turn
-  // (text message or voice transcript). Not a command.
-  if (text && !/^\s*\//.test(text)) {
-    const named = await namePendingVaultFile(env, o);
-    if (named) { await finalizeEntry("daily"); return "handled"; }
-  }
   // Bare-note ask bypasses the model step: the model is exactly what
   // failed live for bare notes (chat verdict -> hallucinated storage).
   // runDailyBranch asks for the text and sets the note-text slot itself.
@@ -2334,6 +2414,25 @@ export async function handleDailyText(env, o) {
 // daily: callbacks. Returns true when the data was a daily: callback.
 // Forbidden callbacks send nothing, store nothing, and delete nothing.
 export async function resolveDailyCallback(env, o) {
+  const md = /^money:dir:(spend|income):(.+)$/.exec(o.data);
+  if (md) {
+    const direction = md[1] === "spend" ? "expense" : "income";
+    const id = md[2];
+    const ask = await getKv(env, askKey(id));
+    const text = ask?.text ?? null;
+    if (!text) { await o.send(EXPIRED_TEXT); return true; }
+    const ex = parseExpense(text, { nowMs: o.nowMs ?? Date.now(), rememberedCurrency: await getDefaultCurrency(env, o.fromId) }, text);
+    if (ex?.error) { const q = askText(mapQuestion(ex.error)); await o.send(q); return true; }
+    await putKv(env, draftKey(id), { owner: o.fromId, type: direction, ...ex });
+    const r = await confirmExpenseDraft(env, o.fromId, id);
+    if (r.status === "forbidden") return true;
+    if (r.status === "missing") { await o.send(EXPIRED_TEXT); return true; }
+    if (r.status === "failed") { await o.send(NOT_SAVED_TEXT); return true; }
+    if (ask) await delKv(env, askKey(id));
+    await o.editMarkup?.();
+    await o.send("✅ ثبت شد.");
+    return true;
+  }
   const m = /^daily:(confirm|cancel|ask):([^:]+)(?::(chat|expense|income))?$/.exec(o.data);
   if (!m) return false;
   const [, action, id, choice] = m;

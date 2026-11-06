@@ -55,6 +55,7 @@ function extractModelText(res) {
 // Promise.race: env.AI.run takes no abort signal, so the race only stops
 // WAITING after 6s — it cannot cancel the binding call itself.
 export async function callInterpreterModel(env, model, prompt, callFn = null) {
+  if (typeof callFn !== "function" && typeof model === "string" && !model.startsWith("@cf/") && env?.AI && typeof env.AI.run === "function") model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
   const run = async () => {
     if (typeof callFn === "function") return await callFn(prompt);
     if (!env || !env.AI || typeof env.AI.run !== "function") throw new Error("AI binding unavailable");

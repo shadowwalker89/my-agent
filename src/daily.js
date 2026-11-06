@@ -375,7 +375,15 @@ const NOTE_FRAMING = String.raw`(?:(?:سلام|درود|سلام\s+علیکم|و
 const NOTE_VERB = String.raw`(?:ثبت\s+|ذخیره\s+|ایجاد\s+|نوشتن\s+)?(?:کنی|کنید|کن|بنویسی|بنویس|بذاری|بذار|بگذاری|بگذار|بکنی|بکن)(?!\p{L})`;
 const NOTE_LEAD_RE = new RegExp(String.raw`^${NOTE_FRAMING}(?:(?:یه|یک)\s+)?یادداشت(?:\s+جدید)?(?:\s+(?:برام|واسم|برای\s+من|برایم|برا\s+من))?\s*${NOTE_VERB}(?:\s+که(?!\p{L}))?\s*[:：]?\s*([\s\S]+)$`, "ud");
 const NOTE_TAIL_RE = new RegExp(String.raw`^([\s\S]{2,}?)\s*[،,؛;]?\s*(?:(?:اینو|این\s+رو|این\s+را|اونو|اون\s+رو|اون\s+را)\s+)?(?:برام|واسم|برای\s+من|برایم|برا\s+من)?\s*(?:(?:یه|یک)\s+)?یادداشت(?:\s+جدید)?\s*${NOTE_VERB}(?:\s+که(?!\p{L}))?\s*[.؟?!]?\s*$`, "ud");
+const CONV_NOTE_TRIGGER_A = String.raw`(?:یه|یک)?\s*(?:نوت|یادداشت|نوتی|یادداشتی)\s+(?:جدید\s+)?(?:برام\s+)?(?:ثبت\s*کن(?:م|ی|ید)?|بنویس(?:م|ی|ید)?|ذخیره\s*کن(?:م|ی|ید)?|بذار(?:م|ی|ید)?|اضافه\s*کن(?:م|ی|ید)?)`;
+const CONV_NOTE_TRIGGER_B = String.raw`(?:این(?:و|\s+رو|\s+را)?\s+(?:برام\s+)?(?:یادداشت|نوت|ثبت|ذخیره)\s*کن(?:م|ی|ید)?)`;
+const CONV_NOTE_RE = new RegExp(String.raw`^(?:(?:سلام|درود|وقت\s+بخیر|خسته\s+نباشی|بی\s*زحمت|لطفا|لطفاً|ببین)\s*[\s،,.:!-]*)*(?:(?:من|می\s*خوام|میخوام|می\s*خواستم|میشه|می\s*شه|میتونی|می\s*تونی)\s*[\s،,.:!-]*)*(?:${CONV_NOTE_TRIGGER_A}|${CONV_NOTE_TRIGGER_B})\\s*(?:\\s+که\\s+|[\\s:：.،,؛\\-]+)\\s*(.+)$`, "ud");
 export function stripNoteCommandPrefix(s) {
+  const raw = normalizeText(s ?? "");
+  const m = CONV_NOTE_RE.exec(raw);
+  if (m && m.indices && m.indices[1]) {
+    return String(s ?? "").slice(m.indices[1][0], m.indices[1][1]).trim();
+  }
   let out = String(s ?? "").trim();
   out = out.replace(new RegExp(String.raw`^(?:${NOTE_FRAMING})`, "u"), "").trim();
   out = out.replace(/^(?:که|این\s+که|اینکه)\s+/u, "").trim();
@@ -568,6 +576,8 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   // Phase 2-l: greeting/politeness/modal openers and the trailing
   // "… اینو برام یادداشت کن" form are notes too, with the framing
   // stripped from the stored body.
+  const convNoteDirect = CONV_NOTE_RE.exec(raw);
+  if (convNoteDirect && convNoteDirect[1] && String(convNoteDirect[1]).trim().replace(/[؟?!.،,:：\s]+/gu, "")) return { intent: "note", confidence: 1, text: text.slice(convNoteDirect.indices[1][0], convNoteDirect.indices[1][1]).trim() };
   const convNote = parseConversationalNote(raw, text);
   if (convNote) return { intent: "note", confidence: 1, text: convNote };
   // Bare note: only a note trigger, no body. Ask for the text at rule
@@ -608,16 +618,18 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   const amount = parseAmount(raw, opts.rememberedCurrency);
   const hasHowMuch = /چقدر|چقد|مجموع/.test(raw), hasQuestion = /[؟?]\s*$/.test(raw);
   const periodWord = /این هفته/.test(raw) ? "week" : /این ماه/.test(raw) ? "month" : /دیروز/.test(raw) ? "yesterday" : /امروز/.test(raw) ? "today" : null;
-  const unknownPeriod = /(گذشته|قبل|اخیر|پریروز|سال)/.test(raw) || /(?<!\p{L})پیش(?!\p{L})/u.test(raw) || (findMonth(raw) && !new RegExp(`[0-9۰-۹٠-٩]+\\s*${findMonth(raw)[0]}|${findMonth(raw)[0]}\\s*[0-9۰-۹٠-٩]+`).test(raw));
-  const hasExpenseWord = /(?<!\p{L})(خرج|هزینه)(?!\p{L})/u.test(raw);
+  const isReportQuery = /خرجای|خرج\s*ها|خرج‌ها|هزینه\s*ها|هزینه‌ها|هزینه‌های|مخارج|لیست\s*خرج|گزارش\s*(خرج|هزینه)|حساب\s*کتاب|چقدر\s*خرج\s*کردم/u.test(raw) && !/(گذشته|قبل|اخیر|پریروز|سال|پیش|تا\s*حالا|مجموع)/u.test(raw);
+  const unknownPeriod = (/(گذشته|قبل|اخیر|پریروز|سال)/.test(raw) || /(?<!\p{L})پیش(?!\p{L})/u.test(raw) || (findMonth(raw) && !new RegExp(`[0-9۰-۹٠-٩]+\\s*${findMonth(raw)[0]}|${findMonth(raw)[0]}\\s*[0-9۰-۹٠-٩]+`).test(raw)));
+  const hasExpenseWord = /(?<!\p{L})(خرج|هزینه|مخارج)(?!\p{L})/u.test(raw);
   // Last-expense question: answered from D1, never from the chat model.
   // Placed before the period query (so "آخرین خرج چقدر بود؟" is not a
   // period ask) but never steals a recordable expense (amount + verb).
   if (/(?<!\p{L})(خرج\s+قبلی|آخرین\s+خرج|خرج\s+آخر)(?!\p{L})/u.test(raw) && !(amount?.anchored && EXPENSE_VERBS.test(raw))) return { intent: "last-expense", confidence: 1 };
-  if (hasExpenseWord && (hasHowMuch || (periodWord && hasQuestion)) && !(amount?.anchored && EXPENSE_VERBS.test(raw))) {
-    if (unknownPeriod || (!periodWord && !findMonth(raw) && !/(?:\d{4}-\d{2}-\d{2}|\d{1,4}\/\d{1,2}\/\d{1,2})/.test(normalizeDigits(raw)))) return { intent: "expense-query", confidence: 0.5, ask: "period" };
+  const effectivePeriodWord = periodWord || (isReportQuery ? "today" : null);
+  if (hasExpenseWord && (hasHowMuch || (effectivePeriodWord && (hasQuestion || isReportQuery)) || isReportQuery) && !(amount?.anchored && EXPENSE_VERBS.test(raw))) {
+    if (unknownPeriod || (!effectivePeriodWord && !findMonth(raw) && !/(?:\d{4}-\d{2}-\d{2}|\d{1,4}\/\d{1,2}\/\d{1,2})/.test(normalizeDigits(raw)))) return { intent: "expense-query", confidence: 0.5, ask: "period" };
     const date = parseRelativeDate(raw, now); if (date === null) return { intent: "expense-query", confidence: 0.5, ask: "date" };
-    const period = periodWord || "today";
+    const period = effectivePeriodWord || "today";
     let range;
     if (period === "week") { range = weekRange(date); if (!range) return { intent: "expense-query", confidence: 0.5, ask: "date" }; }
     else if (period === "month") { range = monthRange(date); if (!range) return { intent: "expense-query", confidence: 0.5, ask: "date" }; }
@@ -654,15 +666,18 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
       return { intent: "expense", confidence: 1, extraction: { ...ex, item } };
     }
   }
-  const hasE = !NEGATED_RE.test(raw) && (EXPENSE_VERBS.test(raw) || (/(?<!\p{L})خرج(?!\p{L})/u.test(raw) && amount?.anchored));
-  const hasI = !NEGATED_RE.test(raw) && (INCOME_VERBS.test(raw) || (/(?<!\p{L})درآمد(?!\p{L})/u.test(raw) && amount?.anchored) || (/(?<!\p{L})گرفتم(?![\p{L}])/u.test(raw) && amount?.anchored));
+  const incomeWords = /حقوق|درآمد|پول\s+گرفتم|از\s+\S+\s+گرفتم|واریز|سود|پاداش|عیدی|بیعانه|قرض|وام/u.test(raw);
+  const ex0 = parseExpense(raw, opts, text);
+  const hasItem = Boolean(ex0 && !ex0.error && ex0.item && String(ex0.item).trim());
+  const hasE = !NEGATED_RE.test(raw) && (EXPENSE_VERBS.test(raw) || (/(?<!\p{L})خرج(?!\p{L})/u.test(raw) && amount?.anchored) || ((/(?<!\p{L})گرفتم(?![\p{L}])/u.test(raw)) && amount?.anchored && !incomeWords && hasItem));
+  const hasI = !NEGATED_RE.test(raw) && (INCOME_VERBS.test(raw) || ((/(?<!\p{L})درآمد(?!\p{L})/u.test(raw)) && amount?.anchored) || ((/(?<!\p{L})گرفتم(?![\p{L}])/u.test(raw)) && amount?.anchored && (incomeWords || !hasItem)));
   if (hasE || hasI) {
     if (countAnchoredAmounts(raw) >= 2) return { intent: "ask", confidence: 0.5, question: "amount" };
     if (amount?.error === "decimal") return { intent: "ask", confidence: 0.5, question: "decimal" };
     if (amount?.error === "amount" || amount?.error === "unknown-number") return { intent: "ask", confidence: 0.5, question: "amount" };
     const digits = amount?.anchored ? [] : bareDigits(raw); if (amount?.anchored || digits.length === 1) { const ex = parseExpense(raw, opts, text); if (ex?.error === "date") return { intent: "ask", confidence: 0.5, question: "date" }; if (ex?.error) return { intent: "ask", confidence: 0.5, question: ex.error }; // TODO 1b-2: map question "ambiguous" to "amount" before it reaches Telegram
-    if (hasI && !hasE && /(?<!\p{L})گرفتم(?![\p{L}])/u.test(raw) && !INCOME_VERBS.test(raw) && !/(?<!\p{L})درآمد(?![\p{L}])/u.test(raw) && ex.item) return { intent: "ask", confidence: 0.5, question: "expense-or-income" }; return { intent: hasI && !hasE ? "income" : "expense", confidence: 1, extraction: ex }; }
-  return { intent: "ask", confidence: 0.5, question: WEAK_BUY.test(raw) ? "expense-or-chat" : "amount" };
+    if (hasI && !hasE && /(?<!\p{L})گرفتم(?![\p{L}])/u.test(raw) && !INCOME_VERBS.test(raw) && !/(?<!\p{L})درآمد(?!\p{L})/u.test(raw) && ex.item && incomeWords) return { intent: "ask", confidence: 0.5, question: "expense-or-income" }; return { intent: hasI && !hasE ? "income" : "expense", confidence: 1, extraction: ex }; }
+    return { intent: "ask", confidence: 0.5, question: WEAK_BUY.test(raw) ? "expense-or-chat" : "amount" };
   }
   if (amount?.error === "decimal") return { intent: "ask", confidence: 0.5, question: "decimal" };
   if (amount?.error === "amount") return { intent: "ask", confidence: 0.5, question: "amount" };
@@ -716,7 +731,7 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   // Phase 3-A: archived file listing ("لیست مدارک آرشیو", "فایل‌های ذخیره شده").
   if (/لیست\s*(?:مادرک|مدیریت)|(?:مادرک|مدیریت)\s*آرشیو|آرشیو\s*(?:مادرک|مدیریت)|فایل\s*های\s*ذخیره\s*شدة|ذخیره\s*شدة\s*فایل/u.test(raw)) return { intent: "vault_list", confidence: 1, category: null, title: null, keywords: [], fileList: true };
   // Phase 3-A: archived file retrieval ("آخرین آزمایشم رو بفرست", "تصویر کارت ملی رو بده").
-  if (/فایل|مدرک|عکس|تصویر|کارت\s*ملی|آزمایشم/u.test(raw) && /بفرست(?!\p{L})|بده(?!\p{L})|رو\s*فرست/u.test(raw)) return { intent: "vault_file_get", confidence: 1, keywords: raw.split(/\s+/).filter(Boolean).slice(-6) };
+  if ((/فایل|مدرک|عکس|تصویر|کارت\s*ملی|آزمایش|بیمه|گواهینامه|شناسنامه|پاسپورت|سند/u.test(raw)) && /بفرست(?!\p{L})|بده(?!\p{L})|رو\s*فرست/u.test(raw)) return { intent: "vault_file_get", confidence: 1, keywords: raw.split(/\s+/).filter(Boolean).slice(-6) };
   return { intent: "chat", confidence: 1 };
 }
 

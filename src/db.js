@@ -739,7 +739,7 @@ async function ensureVaultTable(db) {
       .run();
     await db
       .prepare(
-        "CREATE TABLE IF NOT EXISTS vault_files (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, tg_file_id TEXT NOT NULL, file_type TEXT NOT NULL, mime_type TEXT, title TEXT NOT NULL, file_name TEXT, drive_url TEXT, doc_url TEXT, sync_status TEXT NOT NULL DEFAULT 'local', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+         "CREATE TABLE IF NOT EXISTS vault_files (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, tg_file_id TEXT NOT NULL, file_type TEXT NOT NULL, mime_type TEXT, title TEXT NOT NULL, file_name TEXT, caption TEXT, drive_url TEXT, doc_url TEXT, sync_status TEXT NOT NULL DEFAULT 'local', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
       )
       .bind()
       .run();
@@ -858,7 +858,7 @@ export async function setVaultSyncStatus(envOrDb, userId, itemId, status, google
   }
 }
 
-export async function saveVaultFile(envOrDb, { userId, tgFileId, fileType, mimeType, title, fileName = null, syncStatus = "local" } = {}) {
+export async function saveVaultFile(envOrDb, { userId, tgFileId, fileType, mimeType, title, fileName = null, caption = null, syncStatus = "local" } = {}) {
   const db = dbOf(envOrDb);
   const id = validUserId(userId);
   if (!db || id === null || !tgFileId || !fileType) return { ok: false };
@@ -867,9 +867,9 @@ export async function saveVaultFile(envOrDb, { userId, tgFileId, fileType, mimeT
   try {
     await db
       .prepare(
-        "INSERT INTO vault_files (user_id, tg_file_id, file_type, mime_type, title, file_name, sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO vault_files (user_id, tg_file_id, file_type, mime_type, title, file_name, caption, sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .bind(id, tgFileId, fileType, mimeType ?? null, String(title), fileName, syncStatus, now, now)
+      .bind(id, tgFileId, fileType, mimeType ?? null, String(title), fileName, caption ?? null, syncStatus, now, now)
       .run();
     const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first();
     return { ok: true, id: row?.id ?? null };

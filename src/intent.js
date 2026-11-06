@@ -316,7 +316,11 @@ export const NLU_VALID_INTENTS = Object.freeze([
 export function resolveInterpreterModel(env) {
   const v = env?.INTERPRETER_MODEL;
   if (v === "off" || v === "none") return null;
-  if (typeof v === "string" && v.trim()) return v.trim();
+  if (typeof v === "string" && v.trim()) {
+    const t = v.trim();
+    if (t.startsWith("@cf/") || !env?.AI || typeof env.AI.run !== "function") return t;
+    return DEFAULT_INTERPRETER_MODEL;
+  }
   if (env?.AI && typeof env.AI.run === "function") return DEFAULT_INTERPRETER_MODEL;
   return null;
 }

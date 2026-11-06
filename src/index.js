@@ -862,6 +862,11 @@ async function handleCallbackQuery(env, cb) {
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
     return;
   }
+  if (data.startsWith("money:dir:")) {
+    await resolveDailyCallback(env, { fromId, chatId, data, ...dailySenders(env, chatId, cb?.message?.message_id),
+      chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
+    return;
+  }
   if (data.startsWith("daily:")) {
     await resolveDailyCallback(env, { fromId, chatId, data, ...dailySenders(env, chatId, cb?.message?.message_id),
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
@@ -1073,7 +1078,7 @@ async function handleUpdate(env, update) {
     const fileId = photo?.file_id ?? doc?.file_id;
     if (fileId) {
       await ensureUserRow(env, msg.from.id);
-      const handled = await handleVaultFile(env, { userId: msg.from.id, chatId: msg.chat.id, tgFileId: fileId, fileType: photo ? "photo" : "document", mimeType: doc?.mime_type ?? (photo ? "image/jpeg" : null), fileName: doc?.file_name ?? null, caption: typeof msg.caption === "string" ? msg.caption : null, send: (msgText) => tgSend(env, msg.chat.id, msgText) });
+       const handled = await handleVaultFile(env, { userId: msg.from.id, chatId: msg.chat.id, tgFileId: fileId, fileType: photo ? "photo" : "document", mimeType: doc?.mime_type ?? (photo ? "image/jpeg" : null), fileName: doc?.file_name ?? null, caption: typeof msg.caption === "string" ? msg.caption : null, send: (msgText, opts) => tgSend(env, msg.chat.id, msgText, opts) });
       if (handled) return;
     }
     await tgSend(env, msg.chat.id, "فعلاً فقط پیام متنی پشتیبانی می‌شود 🙏");

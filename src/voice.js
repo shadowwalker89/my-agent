@@ -11,6 +11,7 @@ export const VOICE_TOO_LONG_TEXT = "صدایت طولانی‌تر از ۱۰ د�
 export const VOICE_FAILED_TEXT = "صدا را نفهمیدم یا رونویسی نشد؛ دوباره بفرست یا تایپ کن 🙏";
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com";
+const GEMINI_TIMEOUT_MS = 20000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function firstText(node) {
@@ -22,27 +23,23 @@ function firstText(node) {
   return "";
 }
 
-// Telegram getFile + download. Bot API download limit (20 MB) still applies;
-// a download failure is a fallback, never a crash.
 export async function downloadTelegramVoice(env, fileId) {
   try {
     const info = await tgApi(env, "getFile", { file_id: fileId });
     const path = info?.result?.file_path;
     if (!info?.ok || !path) return { ok: false };
-    const res = await fetch(`${"https://api.telegram.org"}/file/bot${env.TG_TOKEN}/${path}`);
+    const res = await fetch(`${"https://api.telegram.org"}/file/bot${env.TG_TOKEN}/${path}`, { signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) });
     if (!res.ok) return { ok: false };
     return { ok: true, bytes: await res.arrayBuffer() };
   } catch { return { ok: false }; }
 }
 
-// Gemini 3.5-transcribe via the Files API + Interactions API, mirroring the
-// proven helper flow: multipart upload, poll until ACTIVE, interact, then
-// best-effort delete of the uploaded file (a delete failure never blocks).
 export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {}) {
   const started = Date.now();
   const key = env?.GEMINI_API_KEY;
   const log = (ok, reason) => console.log(JSON.stringify({ voiceTranscribe: "gemini-3.5-transcribe", ms: Date.now() - started, ok, reason: reason ?? null }));
   if (!key) { log(false, "missing-key"); return { ok: false, reason: "missing-key" }; }
+  const mime = String(mimeType || "audio/ogg").split(";")[0].trim();
   const headers = { "x-goog-api-key": key };
   const pollIntervalMs = opts.pollIntervalMs ?? 1500;
   const maxPolls = opts.maxPolls ?? 8;
@@ -51,45 +48,50 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
     const boundary = `----voice${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
     const enc = new TextEncoder();
     const meta = JSON.stringify({ file: { display_name: "voice.ogg" } });
-    const head = enc.encode(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n--${boundary}\r\nContent-Type: ${mimeType || "audio/ogg"}\r\n\r\n`);
+    const head = enc.encode(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n--${boundary}\r\nContent-Type: ${mime}\r\n\r\n`);
     const tail = enc.encode(`\r\n--${boundary}--\r\n`);
-    const up = await fetch(`${GEMINI_BASE}/upload/v1beta/files`, { method: "POST", headers: { ...headers, "Content-Type": `multipart/related; boundary=${boundary}`, "X-Goog-Upload-Protocol": "multipart" }, body: new Blob([head, audioBytes, tail]) });
+    const up = await fetch(`${GEMINI_BASE}/upload/v1beta/files`, { method: "POST", headers: { ...headers, "Content-Type": `multipart/related; boundary=${boundary}`, "X-Goog-Upload-Protocol": "multipart" }, body: new Blob([head, audioBytes, tail]), signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) });
     const upJson = await up.json().catch(() => null);
     name = upJson?.file?.name ?? upJson?.name ?? null;
     if (!up.ok || !name) { log(false, "upload"); return { ok: false, reason: "upload" }; }
     let uri = null;
     for (let i = 0; i < maxPolls; i++) {
-      const poll = await fetch(`${GEMINI_BASE}/v1beta/${name}`, { headers });
+      const poll = await fetch(`${GEMINI_BASE}/v1beta/${name}`, { headers, signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) });
       const info = await poll.json().catch(() => null);
       if (info?.state === "ACTIVE" && info?.uri) { uri = info.uri; break; }
       if (info?.state === "FAILED" || !poll.ok) { log(false, "processing"); return { ok: false, reason: "processing" }; }
       if (i < maxPolls - 1) await sleep(pollIntervalMs);
     }
     if (!uri) { log(false, "not-active"); return { ok: false, reason: "not-active" }; }
-    const res = await fetch(`${GEMINI_BASE}/v1beta/interactions`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ model: "gemini-3.5-transcribe", input: [{ type: "audio", uri, mime_type: mimeType || "audio/ogg" }], generation_config: { transcription_config: { language_codes: [VOICE_LANGUAGE], custom_vocabulary: VOICE_CUSTOM_VOCABULARY } } }) });
-    const data = await res.json().catch(() => null);
-    if (!res.ok) { log(false, "interactions"); return { ok: false, reason: "interactions" }; }
-    const text = (data?.output_text || (data?.output && typeof data.output === "object" ? data.output.text : "") || firstText(data) || "").trim();
-    if (!text) { log(false, "empty"); return { ok: false, reason: "empty" }; }
-    log(true, null);
-    return { ok: true, text };
+    const models = [env?.GEMINI_VOICE_MODEL || "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"];
+    for (const model of models) {
+      try {
+        const res = await fetch(`${GEMINI_BASE}/v1beta/interactions`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ model, input: [{ type: "audio", uri, mime_type: mime }], generation_config: { transcription_config: { language_codes: [VOICE_LANGUAGE], custom_vocabulary: VOICE_CUSTOM_VOCABULARY } } }), signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) { console.warn("voice_transcribe_fail", { model, status: res.status, err: null }); continue; }
+        const text = (data?.output_text || (data?.output && typeof data.output === "object" ? data.output.text : "") || firstText(data) || "").trim();
+        if (!text) { console.warn("voice_transcribe_fail", { model, status: res.status, err: "empty" }); continue; }
+        log(true, null);
+        return { ok: true, text };
+      } catch (err) {
+        console.warn("voice_transcribe_fail", { model, status: null, err: String(err?.message ?? err) });
+      }
+    }
+    log(false, "interactions");
+    return { ok: false, reason: "interactions" };
   } catch { log(false, "error"); return { ok: false, reason: "error" }; }
   finally {
-    if (name) { try { await fetch(`${GEMINI_BASE}/v1beta/${name}`, { method: "DELETE", headers }); } catch {} }
+    if (name) { try { await fetch(`${GEMINI_BASE}/v1beta/${name}`, { method: "DELETE", headers, signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) }); } catch {} }
   }
 }
 
-// Voice Retry (0-b3): at receipt, only the Telegram file id is stashed in
-// KV (owner-scoped, 1-hour TTL) — audio bytes are never stored. A failure
-// message carries a Retry button; tapping it (owner-checked) re-downloads
-// via the existing path and re-transcribes, then enters the normal
-// plain-text path. A missing/expired stash yields the same clear message.
 const VOICE_STASH_TTL_SEC = 3600;
 function voiceStashKey(id) { return `voice:stash:${id}`; }
 async function stashVoice(env, userId, fileId, mimeType) {
   if (!env.STATE || !fileId) return null;
   const id = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-  try { await env.STATE.put(voiceStashKey(id), JSON.stringify({ owner: userId, file_id: fileId, mime_type: mimeType || "audio/ogg" }), { expirationTtl: VOICE_STASH_TTL_SEC }); return id; } catch { return null; }
+  const mime = String(mimeType || "audio/ogg").split(";")[0].trim();
+  try { await env.STATE.put(voiceStashKey(id), JSON.stringify({ owner: userId, file_id: fileId, mime_type: mime }), { expirationTtl: VOICE_STASH_TTL_SEC }); return id; } catch { return null; }
 }
 async function sendVoiceFailure(o, stashId) {
   if (stashId) await o.send(VOICE_FAILED_TEXT, { replyMarkup: { inline_keyboard: [[{ text: "🔄 ارسال مجدد", callback_data: `voice:retry:${stashId}` }]] } });
@@ -109,10 +111,6 @@ export async function handleVoiceRetry(env, o) {
   await o.route(tr.text);
   return "routed";
 }
-
-// Voice orchestration for handleUpdate. Over-cap voices get a clear reply
-// with no model call and nothing stored; every other failure gets the same
-// clear fallback reply, never a silent chat fallback that invents content.
 export async function handleVoice(env, o) {
   const voice = o.voice ?? {};
   const duration = Number(voice.duration);

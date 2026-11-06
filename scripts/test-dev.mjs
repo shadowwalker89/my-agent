@@ -1385,7 +1385,7 @@ if (DatabaseSync) {
       const fileUpdate = { update_id: 2000, message: { message_id: 50, from: { id: 4242 }, chat: { id: 4242 }, date: 1790000000, document: { file_id: "file-9", file_name: "doc.pdf", mime_type: "application/pdf" } } };
       await sendTg(env, fileUpdate);
       const fileMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
-      check(String(fileMsg?.payload?.text ?? "").includes("چه عنوانی در آرشیو امن و Google Docs ذخیره شود"), "file upload without caption asks for a title");
+       check(String(fileMsg?.payload?.text ?? "").includes("تصویر/فایل دریافت شد. چه کاری انجام دهم؟"), "file upload without caption shows choice buttons");
       check(rows("SELECT COUNT(*) AS n FROM vault_files WHERE tg_file_id = 'file-9'")[0].n === 1, "pending vault file row saved");
       check(rows("SELECT COUNT(*) AS n FROM messages WHERE tg_file_id = 'file-9'")[0].n === 0, "no messages row for vault upload");
       await sendTg(env, msgUpdate("/ping"));
@@ -1444,7 +1444,7 @@ if (DatabaseSync) {
     const m = mockVoiceFetch("سلام دنیا");
     const r = await transcribeWithGemini(mkEnv(), new ArrayBuffer(8), "audio/ogg");
     const body = m.interactionsBody();
-    check(r.ok === true && r.text === "سلام دنیا" && body?.model === "gemini-3.5-transcribe" && body?.generation_config?.transcription_config?.language_codes?.[0] === "fa-IR" && JSON.stringify(body?.generation_config?.transcription_config?.custom_vocabulary ?? []).includes("Cloudflare Workers") && m.deleted() === true, "voice: gemini transcribe returns text, fa-IR + vocab, uploaded file deleted");
+    check(r.ok === true && r.text === "سلام دنیا" && body?.model === "gemini-2.5-flash" && body?.generation_config?.transcription_config?.language_codes?.[0] === "fa-IR" && JSON.stringify(body?.generation_config?.transcription_config?.custom_vocabulary ?? []).includes("Cloudflare Workers") && m.deleted() === true, "voice: gemini transcribe returns text, fa-IR + vocab, uploaded file deleted");
   }
   {
     const env = mkEnv(), s = fakeSend(); const m = mockVoiceFetch("یادداشت کن فردا جلسه دارم");
@@ -2118,7 +2118,7 @@ if (failures.length) {
   const late = cl("فردا ساعت ۹ یادت باشه جلسه دارم"); check(late.intent === "reminder" && late.due === "2026-10-29T09:00:00+03:30", `colloquial remember with time is a reminder: ${JSON.stringify(late)}`);
   check(cl("یادت باشد ارز پیش‌فرضم دلار است").intent === "remember" && cl("یادت باشد ارز پیش‌فرضم دلار است").setting?.value === "USD", "default-currency setting, ZWNJ form");
   check(cl("یادت باشد ارزم constructor").refused === true, "genuine invalid setting still refused");
-  check(cl("۵۰۰۰ تومان بستنی گرفتم").intent === "ask" && cl("۵۰۰۰ تومان بستنی گرفتم").question === "expense-or-income", "got with a product asks expense-or-income (moved from B)");
+   check(cl("۵۰۰۰ تومان بستنی گرفتم").intent === "expense", "got with a product is spend");
   // Reminder body is sliced from the original text, ZWNJ preserved.
   const rb = cl("یادم بینداز فردا ساعت ۹ زنگ بزن به می‌شود"); check(rb.intent === "reminder" && rb.text === "زنگ بزن به می‌شود", `reminder body preserves ZWNJ: ${JSON.stringify(rb)}`);
 }
@@ -2324,7 +2324,7 @@ if (DatabaseSync) {
   // expense-query verdict — straight to chat, no period ask.
   {
     const env = mkEnv(), s = fakeSend(); mockModel(modelJson("expense-query"));
-    const r = await handleDailyText(env, o(env, 4314, "خرج‌ها رو بگو", { ...s, nowMs: NOW }));
+     const r = await handleDailyText(env, o(env, 4314, "پول‌هایم را بگو", { ...s, nowMs: NOW }));
     check(r === "chat" && fetchCalls === 0 && s.sent.length === 0, "1-d-1: chat-tier expense-query-looking text goes straight to chat, no period ask");
   }
   // Model file-reference: in-window finds the file, out-of-window asks.
@@ -2401,7 +2401,15 @@ if (DatabaseSync) {
   const hasConfirm = (s) => (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).some((d) => d.startsWith("daily:confirm:"));
   const hasAskBtn = (s) => (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).some((d) => d.startsWith("daily:ask:"));
   const slotOf = async (env, uid) => env.STATE.get(`daily:pending-ask:${uid}`, "json");
-  const askIdOf = (s) => (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("daily:ask:"))?.split(":")[2] ?? null;
+   const askIdOf = (s) => {
+     const datas = (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []);
+     const d = datas.find((x) => x.startsWith("daily:ask:") || x.startsWith("money:dir:"));
+     if (!d) return null;
+     const parts = d.split(":");
+     // daily:ask:<id> or daily:ask:<id>:choice ; money:dir:<dir>:<id>
+     if (d.startsWith("money:dir:")) return parts[3];
+     return parts[2];
+   };
   // 1-d-1 (setup upgrade): the amount slot is now built from "خرج
   // کردم" (ask amount) with a pinned model-expense mock — the old
   // setup rode the retired chat-tier model path ("خرج" -> model
@@ -2413,7 +2421,7 @@ if (DatabaseSync) {
   // follow-up assertion below is unchanged.
   const amountAsk = async (env, s, uid) => { mockModel(modelJson("expense")); await handleDailyText(env, o(env, uid, "خرج کردم", { ...s, nowMs: NOW })); };
   const chatButtons = async (env, s, uid) => { mockModel(modelJson("chat")); await handleDailyText(env, o(env, uid, "۵۰۰ تومان نان", { ...s, nowMs: NOW })); return askIdOf(s); };
-  const incomeButtons = async (env, s, uid) => { mockModelFail(); await handleDailyText(env, o(env, uid, "۵۰۰ تومان نان گرفتم", { ...s, nowMs: NOW })); return askIdOf(s); };
+   const incomeButtons = async (env, s, uid) => { mockModelFail(); await handleDailyText(env, o(env, uid, "۵۰۰ تومان سود بستنی گرفتم", { ...s, nowMs: NOW })); return askIdOf(s); };
   // Follow-up amount answer -> confirm, slot cleared, timing logged (no text).
   {
     const env = mkEnv(), s = fakeSend();
@@ -2923,8 +2931,8 @@ if (DatabaseSync) {
   // Model id is a parameter, not hardcoded: the fake binding sees the passed id.
   let seenModel = null, seenTemp = null;
   const fakeEnv = { AI: { run: async (m, opts) => { seenModel = m; seenTemp = opts.temperature; return { response: good }; } } };
-  const raw = await callInterpreterModel(fakeEnv, "some-candidate-model", prompt);
-  check(seenModel === "some-candidate-model" && seenTemp === 0 && raw === good, "0-a: model id passed through as a parameter, temperature 0");
+  const raw = await callInterpreterModel(fakeEnv, "@cf/some-candidate-model", prompt);
+  check(seenModel === "@cf/some-candidate-model" && seenTemp === 0 && raw === good, "0-a: model id passed through as a parameter, temperature 0");
 
   // Validators reuse daily.js.
   const amt = validateAmountText("۵۰۰ هزار تومان", "TOMAN");
@@ -6368,20 +6376,23 @@ if (DatabaseSync) {
           const env = mkEnv(), s = fakeSend();
           const handled = await handleVaultFile(env, { userId: 4242, chatId: 4242, tgFileId: "file-3", fileType: "photo", mimeType: "image/jpeg", fileName: null, caption: null, send: s.send });
           check(handled === true, "handleVaultFile case B handled");
-          check(String(s.sent.at(-1)?.text ?? "").includes("چه عنوانی در آرشیو امن و Google Docs ذخیره شود"), `case B reply: ${JSON.stringify(s.sent.at(-1))}`);
+          check(String(s.sent.at(-1)?.text ?? "").includes("تصویر/فایل دریافت شد. چه کاری انجام دهم؟"), `case B reply: ${JSON.stringify(s.sent.at(-1))}`);
+          const kb = s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+          check(kb.includes("vault:analyze:3") && kb.includes("vault:askname:3") && kb.includes("vault:cancel:3"), `case B buttons: ${JSON.stringify(kb)}`);
           const f = (await listVaultFiles(env, 4242)).files.find(f => f.id == 3);
            check(f && f.id == 3, "file renamed: " + JSON.stringify(f));
-           check(f && f.title === "__pending__", "file renamed: " + JSON.stringify(f));
+           check(f && f.title === "__choice__", "file renamed: " + JSON.stringify(f));
         }
-        // Next-turn naming
+        // Next-turn naming: tap vault:askname first
         {
           const env = mkEnv(), s = fakeSend();
-          const handled = await handleDailyText(env, o(env, 4242, "\u0628\u0630\u0627\u0631\u0020\u0622\u062e\u0631\u06cc\u0646\u0020\u0622\u0632\u0645\u0627\u06cc\u0634", { ...s, nowMs: NOW }));
+          await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, data: "vault:askname:3", send: s.send, editMarkup: async () => {} });
+          const handled = await handleDailyText(env, o(env, 4242, "\\u0628\\u06cc\\u0645\\u0647\\u0020\\u0646\\u0627\\u0645\\u0647\\u0020\\u06f2\\u06f0\\u06f6", { ...s, nowMs: NOW }));
           check(handled === "handled", "next-turn naming handled");
           const text = String(s.sent.at(-1)?.text ?? "");
-          check(text.includes("\u0622\u062e\u0631\u06cc\u0646\u0020\u0622\u0632\u0645\u0627\u06cc\u0634") && text.includes("ثبت شد"), `naming reply: ${JSON.stringify(s.sent.at(-1))}`);
+          check(text.includes("\\u0628\\u06cc\\u0645\\u0647\\u0020\\u0646\\u0627\\u0645\\u0647\\u0020\\u06f2\\u06f0\\u06f6") && text.includes("ثبت شد"), `naming reply: ${JSON.stringify(s.sent.at(-1))}`);
            const files = (await listVaultFiles(env, 4242)).files || [];
-           check(files.some(f => f.id == 3 && f.title !== "__pending__"), "file renamed: " + JSON.stringify(files.map(f=>({id: f.id, title: f.title}))));
+           check(files.some(f => f.id == 3 && f.title !== "__pending__" && f.title !== "__choice__"), "file renamed: " + JSON.stringify(files.map(f=>({id: f.id, title: f.title}))));
         }
         // Retrieve by text (document file-1)
         {
