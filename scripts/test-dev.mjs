@@ -46,7 +46,7 @@ import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, 
 import { callRouter, runCombo, resetRouterHealthForTests, getRouterHealthSnapshotForTests, extractAssistantText, extractFinalText, getComboTargets, classifyFailure, getEmptyFinalCounts, resetEmptyFinalCountsForTests } from "../src/router.js";
 import { recordProviderCircuitFailure, recordProviderCircuitSuccess, getOpenProviderCircuits, recordVerifiedModel, getVerifiedLatencies } from "../src/circuit.js";
 import { PROVIDERS } from "../src/providers.js";
-import { sendProgressMessage, finalizeProgressMessage, splitTelegramText } from "../src/telegram.js";
+import { sendProgressMessage, finalizeProgressMessage, splitTelegramText, escapeHtml, formatTelegramHtml, sendMessage, editMessage, sendDocument, sendPhoto, getFileDownloadData } from "../src/telegram.js";
 import { answerChatText, adminApi, handleUpdate, resetSeenUpdateIdsForTests, CHAT_SYSTEM_PROMPT } from "../src/index.js";
 import { classifyDaily, parseAmount, parseNumberPhrase, normalizeText, bareDigits, resolveDefaultCurrency, sumByCurrency } from "../src/daily.js";
 import { buildInterpreterPrompt, parseInterpreterOutput, interpretText, callInterpreterModel, validateAmountText, validateDateTexts, matchProject, validateInterpreterAction, INTERPRETER_MAX_ACTIONS } from "../src/interpreter.js";
@@ -1152,7 +1152,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion, SUMMARY_SYSTEM } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, deriveNoteTitle, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion, SUMMARY_SYSTEM } from "../src/everyday.js";
 import { markFailure, isModelHealthy } from "../src/health.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
@@ -1718,6 +1718,56 @@ if (DatabaseSync) {
   check(JSON.stringify(extractJsonObject("<think>reasoning {\"x\":1}</think>\n```json\n{\"intent\":\"note\",\"confidence\":0.9}\n```")) === JSON.stringify({ intent: "note", confidence: 0.9 }), "1-e: extractJsonObject strips closed <think> blocks and ```json fences");
   check(JSON.stringify(extractJsonObject("```\n{\"intent\":\"task\",\"confidence\":0.8}\n```")) === JSON.stringify({ intent: "task", confidence: 0.8 }), "1-e: extractJsonObject strips bare fences");
   check(JSON.stringify(extractJsonObject("pre {\"intent\":\"note\",\"body\":\"a {b} c\"} post")) === JSON.stringify({ intent: "note", body: "a {b} c" }), "1-e: extractJsonObject parses the first balanced object, braces inside strings ignored");
+  {
+    check(escapeHtml("<b>&") === "&lt;b&gt;&amp;", "3-a: escapeHtml escapes &, <, >");
+    check(
+      formatTelegramHtml("**bold** `<x>`\n```js\nconst a = 1 < 2;\n```") === "<b>bold</b> <code>&lt;x&gt;</code>\n<pre>const a = 1 &lt; 2;</pre>",
+      "3-a: formatTelegramHtml escapes HTML and converts the supported markdown subset",
+    );
+    check(formatTelegramHtml("plain text") === "plain text", "3-a: formatTelegramHtml leaves plain text unchanged");
+    const calls = [];
+    const prev = global.fetch;
+    global.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+      calls.push({ url: u, method: m?.[1] ?? "", body: init.body });
+      if (m?.[1] === "sendMessage" && calls.filter((c) => c.method === "sendMessage").length === 1) {
+        return Response.json({ ok: false, description: "can't parse entities" });
+      }
+      if (m?.[1] === "getFile") return Response.json({ ok: true, result: { file_path: "docs/x.txt" } });
+      if (u.includes("/file/bot")) return new Response("hello", { headers: { "content-type": "text/plain" } });
+      return Response.json({ ok: true, result: { message_id: 1 } });
+    };
+    try {
+      const env = { TG_TOKEN: "x" };
+      await sendMessage(env, 1, "**bold**");
+      const sends = calls.filter((c) => c.method === "sendMessage");
+      const first = JSON.parse(String(sends[0]?.body ?? "{}"));
+      const second = JSON.parse(String(sends[1]?.body ?? "{}"));
+      check(
+        sends.length === 2 && first.parse_mode === "HTML" && first.text === "<b>bold</b>" && second.text === "**bold**" && second.parse_mode === undefined,
+        "3-a: sendMessage retries plain text when Telegram rejects HTML",
+      );
+      calls.length = 0;
+      await editMessage(env, 1, 9, "**bold**");
+      const edit = JSON.parse(String(calls[0]?.body ?? "{}"));
+      check(calls[0]?.method === "editMessageText" && edit.message_id === 9 && edit.parse_mode === "HTML", "3-a: editMessage sends HTML with the message_id");
+      calls.length = 0;
+      await sendDocument(env, 1, "a.txt", new TextEncoder().encode("hi"), { caption: "c" });
+      const doc = calls[0]?.body;
+      check(calls[0]?.method === "sendDocument" && doc?.get("chat_id") === "1" && doc?.get("document")?.name === "a.txt" && doc?.get("caption") === "c", "3-a: sendDocument posts multipart form data");
+      calls.length = 0;
+      await sendPhoto(env, 1, "p.jpg", new Uint8Array([1, 2]), {});
+      const photo = calls[0]?.body;
+      check(calls[0]?.method === "sendPhoto" && photo?.get("photo")?.name === "p.jpg", "3-a: sendPhoto posts multipart form data");
+      calls.length = 0;
+      const file = await getFileDownloadData(env, "f1");
+      check(
+        file?.filePath === "docs/x.txt" && file?.contentType === "text/plain" && new TextDecoder().decode(file?.data) === "hello",
+        "3-a: getFileDownloadData resolves file_path then downloads the bytes",
+      );
+    } finally { global.fetch = prev; }
+  }
   check(extractJsonObject("just prose, no json") === null && extractJsonObject("<think>unclosed, nothing after") === null, "1-e: extractJsonObject returns null when no object exists");
   check(DEFAULT_INTERPRETER_MODEL === "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "1-e: DEFAULT_INTERPRETER_MODEL is the directive model");
   check(resolveInterpreterModel({ INTERPRETER_MODEL: "off", AI: { run() {} } }) === null, "1-e: resolveInterpreterModel off disables");
@@ -4773,8 +4823,8 @@ if (DatabaseSync) {
     const sc = scenario3();
     const { s } = await flow3(sc, "یادداشت‌هام");
     const first = s.sent[0].text;
-    check(first.startsWith("1. ") && first.includes("۵ آبان ۱۴۰۵") && first.includes("09:00") && first.includes("قدیمی چهار") && first.includes("[📁 گلبهار]"), "1-d-3: first row renders number + Jalali + Tehran time; a project note carries its badge");
-    check(first.includes("8. ") && !first.includes("9. ") && flatKb(s).includes("note:more:all:8") && flatKb(s).some((c) => c.startsWith("note:del:")), "1-d-3: first page holds 8 rows with delete + more buttons");
+    check(first.startsWith("📖 #1 · ") && first.includes("۵ آبان ۱۴۰۵") && first.includes("09:00") && first.includes("قدیمی چهار") && first.includes("📁 گلبهار"), "1-d-3: first row renders title-only number + Jalali + Tehran time; a project note carries its badge");
+    check(first.includes("📖 #8") && !first.includes("📖 #9") && flatKb(s).includes("note:more:all:8") && flatKb(s).some((c) => c.startsWith("note:del:")), "1-d-3: first page holds 8 rows with delete + more buttons");
   }
   // Date + project filters via the branch; unknown project; empty; D1 failure.
   {
@@ -4797,7 +4847,7 @@ if (DatabaseSync) {
   {
     const sc = scenario3();
     const pg = await tap3(sc, "note:more:all:8");
-    check(pg.s.sent[0].text.startsWith("9. ") && pg.s.sent[0].text.includes("صبحانه امروز") && pg.s.sent[0].text.includes("۱۱ آبان ۱۴۰۵") && pg.s.sent[0].text.includes("01:24") && pg.s.sent[0].text.includes("[📁 گلبهار]") && !flatKb(pg.s).some((c) => c.startsWith("note:more:")), "1-d-3: page 2 renders the oldest note (Jalali + Tehran time + badge) with no more button");
+    check(pg.s.sent[0].text.startsWith("📖 #9 · ") && pg.s.sent[0].text.includes("صبحانه امروز") && pg.s.sent[0].text.includes("۱۱ آبان ۱۴۰۵") && pg.s.sent[0].text.includes("01:24") && pg.s.sent[0].text.includes("📁 گلبهار") && !flatKb(pg.s).some((c) => c.startsWith("note:more:")), "1-d-3: page 2 renders the oldest note title (Jalali + Tehran time + badge) with no more button");
     const pf = await tap3(sc, `note:proj:${sc.gol}`);
     check(pf.s.sent[0].text.includes("صبحانه امروز") && !pf.s.sent[0].text.includes("تماس امروز") && flatKb(pf.s).includes("note:proj:all"), "1-d-3: project filter tap shows only that project + an all button");
     const pa = await tap3(sc, "note:proj:all");
@@ -4946,7 +4996,7 @@ if (DatabaseSync) {
     sq.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, ?, 'text', '2026-11-02T00:00:00Z')").run(long + "B");
     const s2 = mkS1d5();
     await handleDailyText({ STATE: fakeKV(), DB: db }, { chatId: 1, userId: 1, text: "یادداشت‌هام", send: s2.send, chat: s2.chat, nowMs: T, source: "voice", voiceHeader: "🎙 «یادداشت‌هام»\n\n" });
-    check(s2.sent.length === 2 && s2.sent[0].text.startsWith("🎙 «یادداشت‌هام»") && !s2.sent[1].text.includes("🎙"), "1-d-5: voice header rides the first chunk only");
+    check(s2.sent.length === 1 && s2.sent[0].text.startsWith("🎙 «یادداشت‌هام»") && s2.sent[0].text.includes("📖 #1"), "1-d-5: title-only note rows keep the voice list in one chunk with the header first");
   }
   // Chat wrap: voice summary passes the header + sum retry data (no chat retry alongside it).
   {
@@ -5454,6 +5504,8 @@ if (DatabaseSync) {
     const taskRows = tl.keyboard.filter((row) => row.some((b) => b.callback_data.startsWith("task:done:")));
     check(tl.ok === true && taskRows.length === 2 && taskRows[0].length === 4 && taskRows[0][0].text === "✅1" && tl.text.startsWith("1. تسک 1"), "2-d: task action buttons packed 2 tasks/row, numbered to match the list");
     check(stripLeadingNotePunct(". یه قابلیت") === "یه قابلیت" && stripLeadingNotePunct(": تست") === "تست" && stripLeadingNotePunct("- مورد") === "مورد" && stripLeadingNotePunct("سالم") === "سالم", "2-d: stripLeadingNotePunct trims leading . : - only");
+    check(deriveNoteTitle(". خط اول\nخط دوم") === "خط اول" && deriveNoteTitle("   ") === "بدون عنوان" && deriveNoteTitle("کوتاه") === "کوتاه", "3-a: deriveNoteTitle uses the first meaningful line and falls back to بدون عنوان");
+    check(deriveNoteTitle("ا".repeat(80)).length === 61 && deriveNoteTitle("ا".repeat(80)).endsWith("…"), "3-a: deriveNoteTitle caps a long title on a word boundary");
     const c = convo6(sc);
     await c.say("یادداشت: . یه قابلیت تازه", MORNING);
     const saved = sc.rows("SELECT text FROM notes WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];

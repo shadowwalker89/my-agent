@@ -22,6 +22,128 @@ export async function tgSend(env, chatId, text, opts) {
   }
 }
 
+// Phase 3-A: Telegram's HTML parse mode. Escape everything first, then
+// apply the small markdown subset we emit (fenced/inline code, bold,
+// strikethrough). Anything else stays literal, so a model answer can
+// never inject tags.
+export function escapeHtml(text) {
+  return String(text ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+export function formatTelegramHtml(text) {
+  const src = String(text ?? "");
+  const blocks = [];
+  let s = src.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
+    const i = blocks.push(`<pre>${escapeHtml(code.replace(/\n$/, ""))}</pre>`) - 1;
+    return `\u0000B${i}\u0000`;
+  });
+  s = escapeHtml(s);
+  s = s.replace(/`([^`\n]+)`/g, (_, code) => `<code>${code}</code>`);
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  s = s.replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
+  s = s.replace(/\u0000B(\d+)\u0000/g, (_, i) => blocks[Number(i)] ?? "");
+  return s;
+}
+
+function telegramPayload(chatId, text, opts = {}) {
+  const formatted = formatTelegramHtml(text);
+  const html = formatted !== String(text ?? "");
+  return {
+    html,
+    body: {
+      chat_id: chatId,
+      text: html ? formatted : text,
+      ...(opts.replyMarkup ? { reply_markup: opts.replyMarkup } : {}),
+      ...(html ? { parse_mode: "HTML" } : {}),
+    },
+  };
+}
+
+// Phase 3-A: rich send/edit with a plain-text retry. A rejected HTML
+// payload must not lose the message, so any {ok:false} falls back once
+// to the original text without parse_mode.
+export async function sendMessage(env, chatId, text, opts = {}) {
+  if (!env?.TG_TOKEN) return null;
+  const { html, body } = telegramPayload(chatId, text, opts);
+  try {
+    const res = await tgApi(env, "sendMessage", body);
+    if (html && res && res.ok === false) {
+      return await tgApi(env, "sendMessage", { ...body, text, parse_mode: undefined });
+    }
+    return res;
+  } catch (err) {
+    console.error("sendMessage failed:", err && err.message);
+    return null;
+  }
+}
+
+export async function editMessage(env, chatId, messageId, text, opts = {}) {
+  if (!env?.TG_TOKEN) return null;
+  const { html, body } = telegramPayload(chatId, text, opts);
+  const payload = { ...body, message_id: messageId };
+  try {
+    const res = await tgApi(env, "editMessageText", payload);
+    if (html && res && res.ok === false) {
+      return await tgApi(env, "editMessageText", { ...payload, text, parse_mode: undefined });
+    }
+    return res;
+  } catch (err) {
+    console.error("editMessageText failed:", err && err.message);
+    return null;
+  }
+}
+
+async function tgMultipart(env, method, form) {
+  if (!env?.TG_TOKEN) return null;
+  try {
+    const res = await fetch(`${TG_API}/bot${env.TG_TOKEN}/${method}`, { method: "POST", body: form });
+    return await res.json();
+  } catch (err) {
+    console.error(`${method} failed:`, err && err.message);
+    return null;
+  }
+}
+
+export async function sendDocument(env, chatId, filename, data, opts = {}) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("document", new Blob([data], { type: opts.contentType || "application/octet-stream" }), filename);
+  if (opts.caption) form.append("caption", opts.caption);
+  if (opts.replyMarkup) form.append("reply_markup", JSON.stringify(opts.replyMarkup));
+  return await tgMultipart(env, "sendDocument", form);
+}
+
+export async function sendPhoto(env, chatId, filename, data, opts = {}) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("photo", new Blob([data], { type: opts.contentType || "image/jpeg" }), filename);
+  if (opts.caption) form.append("caption", opts.caption);
+  if (opts.replyMarkup) form.append("reply_markup", JSON.stringify(opts.replyMarkup));
+  return await tgMultipart(env, "sendPhoto", form);
+}
+
+export async function getFileDownloadData(env, fileId) {
+  if (!env?.TG_TOKEN || !fileId) return null;
+  try {
+    const meta = await tgApi(env, "getFile", { file_id: fileId });
+    const filePath = meta?.result?.file_path;
+    if (!meta?.ok || !filePath) return null;
+    const res = await fetch(`${TG_API}/file/bot${env.TG_TOKEN}/${filePath}`);
+    if (!res.ok) return null;
+    return {
+      data: await res.arrayBuffer(),
+      filePath,
+      contentType: res.headers.get("content-type") || "application/octet-stream",
+    };
+  } catch (err) {
+    console.error("getFile failed:", err && err.message);
+    return null;
+  }
+}
+
 export async function tgBroadcast(env, text) {
   if (!env.TG_TOKEN) return;
   for (const raw of String(env.ALLOWED_TG_IDS ?? "").split(",")) {

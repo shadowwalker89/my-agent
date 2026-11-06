@@ -149,6 +149,19 @@ export function stripLeadingNotePunct(text) {
   // from that leading run (a trailing space is user content).
   return String(text ?? "").replace(/^[\s.·:؛،\-–—()[\]]+/u, "");
 }
+
+// Phase 3-A: the note list is a scannable index, not a transcript.
+// Derive a one-line title from the first meaningful line and cap it on
+// a word boundary so a long note never turns the list into a wall.
+export function deriveNoteTitle(text, maxLen = 60) {
+  const first = String(text ?? "").split(/\r?\n/).find((line) => stripLeadingNotePunct(line).trim()) ?? "";
+  const s = stripLeadingNotePunct(first).replace(/\s+/g, " ").trim();
+  if (!s) return "بدون عنوان";
+  if (s.length <= maxLen) return s;
+  const cut = s.slice(0, maxLen);
+  const sp = cut.lastIndexOf(" ");
+  return `${(sp > Math.floor(maxLen * 0.6) ? cut.slice(0, sp) : cut).trimEnd()}…`;
+}
 // Phase 2-d: chunk a flat button list into rows of at most n (Telegram
 // keyboards with one unbounded row overflow; one row per item towers).
 function chunkButtons(buttons, n) {
@@ -857,10 +870,11 @@ export async function renderNoteList(env, userId, { projectName = null, projectI
   const text = r.notes.map((n, i) => {
     const tp = tehranParts(n.created_at);
     const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : "";
-    const badge = n.project_id != null && names.get(n.project_id) ? ` [📁 ${names.get(n.project_id)}]` : "";
-    // Phase 2-d: legacy rows stored with a stray leading ". " render
-    // clean too (new saves are trimmed at save time).
-    return `${offset + i + 1}. ${when ? `${when} ` : ""}${badge ? `${badge} ` : ""}${stripLeadingNotePunct(n.text)}`;
+    const badge = n.project_id != null && names.get(n.project_id) ? `📁 ${names.get(n.project_id)}` : "";
+    const parts = [when, badge].filter(Boolean).join(" · ");
+    // Phase 3-A: title-only rows keep the list scannable; the full body
+    // is still available through the summary/delete actions.
+    return `📖 #${offset + i + 1}${parts ? ` · ${parts}` : ""} — ${deriveNoteTitle(n.text)}`;
   }).join("\n");
   // Phase 2-d: delete buttons numbered by row and packed 4 per row
   // (8 vertical rows become 2); project filters chunked to at most 3.
