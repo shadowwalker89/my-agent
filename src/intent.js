@@ -306,7 +306,7 @@ export function freeTextDevSuggestion() {
 // and the caller re-validates everything deterministically.
 export const DEFAULT_INTERPRETER_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 export const NLU_TIMEOUT_MS = 4500;
-export const NLU_MAX_TOKENS = 240;
+export const NLU_MAX_TOKENS = 360;
 export const NLU_VALID_INTENTS = Object.freeze([
   "note", "task", "reminder", "expense", "note_list", "task_list",
   "project_list", "project_create", "summary", "daypart_reply", "chat",
@@ -361,16 +361,17 @@ function buildNluPrompt(text, context = {}) {
   const system = [
     "You are a Persian intent classifier for a single-user personal assistant bot.",
     "Output ONLY one JSON object, no other text, no markdown fences:",
-    '{"intent": "...", "confidence": 0.0-1.0, "project": "name or null", "body": "text or null", "date_ref": "امروز|فردا|پس‌فردا|null", "time_ref": "HH:MM or hour text or null", "daypart": "صبح|عصر|شب|cancel|null", "summary_target": "notes|tasks|null"}',
+    '{"intent": "...", "confidence": 0.0-1.0, "project": "name or null", "body": "text or null", "date_ref": "امروز|فردا|پسفردا|null", "time_ref": "HH:MM or hour text or null", "daypart": "صبح|عصر|شب|cancel|null", "summary_target": "notes|tasks|null"}',
     "Intents: note, task, reminder, expense, note_list, task_list, project_list, project_create, summary, daypart_reply, chat.",
     "Rules:",
     "- Information/explanation questions (e.g. تفاوت Cloudflare D1 و KV چیه؟, چطور توی پایتون...) are ALWAYS chat.",
-    "- A natural statement asking to remember something (e.g. فردا سیمان و گچ برای پروژه گلبهار تحویل گرفته میشه اینو یادت بمونه, برای پروژه یوتیوب یادداشت کن که...) is note: body = the clean text, project = the matched project name.",
-    "- A natural to-do (e.g. یه تسک برای پروژه گلبهار بذار بررسی قرارداد پیمانکار, باید فردا قرارداد گلبهار رو بررسی کنم ثبتش کن جزو تسک‌ها) is task: body = the task title, project = matched name.",
-    "- A time-based request (e.g. یادم بنداز فردا ساعت ۵ عصر به علی زنگ بزنم توی پروژه گلبهار) is reminder: body = title, date_ref, time_ref, daypart, project.",
-    "- Summarize requests (e.g. یه خلاصه از یادداشت‌هام بده, یادداشت‌های گلبهار رو جدول کن) are summary with summary_target notes/tasks and project.",
+    "- A natural conversational note request — even if it starts with a greeting (سلام, درود), a politeness word (لطفاً, بیزحمت, ممنون), or a modal opener (میخوام, میخواستم, میشه) — is note with confidence >= 0.85. Strip ALL framing words from body; body must be ONLY the clean content to store. Examples: 'سلام یه یادداشت برام ثبت کن که فردا سیمان میرسه' → note, body='فردا سیمان میرسه'; 'میخوام یه یادداشت ثبت کنی فردا جلسه با مهندس ناظر ساعت ۱۰' → note, body='فردا جلسه با مهندس ناظر ساعت ۱۰'; 'فردا باید قرارداد رو امضا کنیم، اینو برام یادداشت کن' → note, body='فردا باید قرارداد رو امضا کنیم'.",
+    "- A natural conversational task request — even with greetings or modal openers — is task with confidence >= 0.85. body = the clean task title only. Examples: 'سلام یه تسک جدید برام ثبت کن برای پروژه یوتیوب ادیت ویدیو' → task, body='ادیت ویدیو', project='یوتیوب'; 'یه کار جدید برام ثبت کن بررسی قرارداد پیمانکار' → task, body='بررسی قرارداد پیمانکار'.",
+    "- A time-based request (e.g. یادم بنداز فردا ساعت ۵ عصر به علی زنگ بزنم, یادت نره فردا به علی زنگ بزنم) is reminder: body = title, date_ref, time_ref, daypart, project.",
+    "- Summarize requests (e.g. یه خلاصه از یادداشتهام بده, یادداشتهای گلبهار رو جدول کن) are summary with summary_target notes/tasks and project.",
     "- When a pending hour-ambiguous question is active and the message is a time/daypart clarification or cancellation, even with typos or conversational phrasing (صبخ, واسه صبح, عصری, کنسل), it is daypart_reply with daypart صبح/عصر/شب/cancel.",
     "- Never invent a project: project must be one of the listed names or null. Never invent numbers: the caller validates any amount deterministically.",
+    "- body must never contain command framing words like 'یادداشت کن', 'ثبت کن', 'بذار', 'تسک', 'یادداشت', 'برام', 'واسم', 'لطفاً', 'سلام', 'میخوام'. Extract only the meaningful content.",
     "- If unsure, return chat with low confidence.",
     `Projects: ${projects}`,
     `Pending question: ${pending}`,

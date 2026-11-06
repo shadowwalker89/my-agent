@@ -1937,6 +1937,16 @@ if (DatabaseSync) {
     const note = sc.rows("SELECT text, project_id FROM notes WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
     check(r === "handled" && note?.text === "سیمان و گچ فردا صبح تحویل گرفته میشه" && note?.project_id === gol && c.s.sent.at(-1)?.text === "✅ یادداشت ذخیره شد. [📁 گلبهار]", "1-e: NLU note saves to گلبهار with [📁 گلبهار] reply, INTERPRETER_MODEL unset");
   }
+  // 2-l: the NLU branch still activates when INTERPRETER_MODEL is set
+  // (production sets it) as long as the Workers AI binding exists and no
+  // legacy interpreterCallFn/interpreterModel is supplied on the call.
+  {
+    const sc = fresh1e(); const gol = seedProjE(sc.sq, 1, "گلبهار", ["گل"]); seedProjE(sc.sq, 1, "عمومی", [], 1);
+    const c = convoE(sc, { AI: aiJson({ intent: "note", confidence: 0.92, project: "گلبهار", body: "سیمان و گچ فردا صبح تحویل گرفته میشه" }), INTERPRETER_MODEL: DEFAULT_INTERPRETER_MODEL });
+    const r = await c.say("فردا سیمان و گچ برای پروژه گلبهار تحویل گرفته میشه", MORNING);
+    const note = sc.rows("SELECT text, project_id FROM notes WHERE user_id = 1 ORDER BY id DESC LIMIT 1")[0];
+    check(r === "handled" && note?.text === "سیمان و گچ فردا صبح تحویل گرفته میشه" && note?.project_id === gol, "2-l: NLU handles a note even when INTERPRETER_MODEL is set and the AI binding exists");
+  }
   // P4.3b: NLU task — natural tag-free sentence, project یوتیوب.
   {
     const sc = fresh1e(); const yt = seedProjE(sc.sq, 1, "یوتیوب", []); seedProjE(sc.sq, 1, "عمومی", [], 1);

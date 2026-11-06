@@ -2044,21 +2044,29 @@ export async function handleDailyText(env, o) {
   // above (runModelBranch), where a model verdict is only a branch
   // picker re-validated by rule code. Ask-tier messages DID match a
   // deterministic rule (the ask), so they keep the model path below.
-  // Phase 1-e Pillar 2: when the Workers AI binding exists, the NLU
-  // interpreter activates in code (no wrangler.jsonc edit) BEFORE the
-  // plain-chat fallthrough: deterministic rules already ran and said
-  // chat/ask, so the NLU only proposes, and runNluBranch re-validates
-  // every write deterministically. No binding -> the 1-d-1 path below.
-  if (!o.interpreterCallFn && !o.interpreterModel && !env.INTERPRETER_MODEL) {
+  // Phase 2-l: NLU path — runs when the Workers AI binding exists AND no
+  // explicit legacy interpreter is configured on this call object. The outer
+  // guard no longer checks env.INTERPRETER_MODEL so the NLU activates in
+  // production even when wrangler.jsonc sets INTERPRETER_MODEL (that var only
+  // governs resolveInterpreterModel, which the NLU prompt uses internally).
+  // Legacy interpreter tests always supply o.interpreterCallFn or
+  // o.interpreterModel on mkO(), so they fall through to handleInterpreterText
+  // unchanged — no existing test is affected.
+  if (!o.interpreterCallFn && !o.interpreterModel) {
     if (env?.AI && typeof env.AI.run === "function") {
       const nluHandled = await runNluBranch(env, o, ctx);
       if (nluHandled !== null) { await finalizeEntry(nluHandled === "chat" ? "chat" : "daily"); return nluHandled; }
     }
     if (c.intent === "chat") { await finalizeEntry("chat"); return "chat"; }
-    const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx);
-    console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome }));
-    await finalizeEntry(ret === "handled" ? "daily" : "chat");
-    return ret;
+    // ask-tier with no AI binding: use the 80-token model slot picker.
+    if (!env.INTERPRETER_MODEL) {
+      const { ret, outcome, ms } = await runModelBranch(env, o, c, ctx);
+      console.log(JSON.stringify({ modelIntent: MODEL_INTENT_COMBO, tier: c.intent, ms, outcome }));
+      await finalizeEntry(ret === "handled" ? "daily" : "chat");
+      return ret;
+    }
+    // INTERPRETER_MODEL set but no AI binding and no interpreterCallFn/Model:
+    // fall through to the legacy interpreter path below.
   }
   // Everything else goes to the interpreter, never directly to chat.
   return handleInterpreterText(env, o, ctx);
