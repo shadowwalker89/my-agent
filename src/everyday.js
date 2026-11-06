@@ -1965,8 +1965,9 @@ export async function resolveVaultCallback(env, o) {
     const items = (await listVaultItems(env, o.fromId)).items || [];
     const lines = ["ID,Category,Title,Value,Extra,UpdatedAt"];
     for (const it of items) {
+      const row = await getVaultItem(env, o.fromId, it.id);
       let value = "";
-      try { value = await decryptVaultValue(env, it.value_enc); } catch {}
+      try { if (row) value = await decryptVaultValue(env, row.value_enc); } catch {}
       lines.push(csvRow(it.id, it.category ?? "", it.label ?? "", value, it.extra ?? "", it.updated_at ?? ""));
     }
     const body = "\uFEFF" + lines.join("\r\n") + "\r\n";

@@ -33,7 +33,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus } from "../src/db.js";
 import { encryptVaultValue, decryptVaultValue, isEncryptedVaultValue, getGoogleVaultConfig, googleVaultStatus, syncVaultItemToGoogle, syncVaultFileToGoogle, fetchVaultFromGoogle } from "../src/vault.js";
 import {
   getChatContext,
@@ -1153,7 +1153,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, deriveNoteTitle, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion, SUMMARY_SYSTEM } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, deriveNoteTitle, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion, SUMMARY_SYSTEM, handleVaultFile, resolveVaultCallback } from "../src/everyday.js";
 import { markFailure, isModelHealthy } from "../src/health.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
@@ -1385,8 +1385,9 @@ if (DatabaseSync) {
       const fileUpdate = { update_id: 2000, message: { message_id: 50, from: { id: 4242 }, chat: { id: 4242 }, date: 1790000000, document: { file_id: "file-9", file_name: "doc.pdf", mime_type: "application/pdf" } } };
       await sendTg(env, fileUpdate);
       const fileMsg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
-      check(String(fileMsg?.payload?.text ?? "").includes("فایل ذخیره شد"), "file message gets the saved reply");
-      check(rows("SELECT COUNT(*) AS n FROM messages WHERE tg_file_id = 'file-9'")[0].n === 1, "file message row saved");
+      check(String(fileMsg?.payload?.text ?? "").includes("چه عنوانی در آرشیو امن و Google Docs ذخیره شود"), "file upload without caption asks for a title");
+      check(rows("SELECT COUNT(*) AS n FROM vault_files WHERE tg_file_id = 'file-9'")[0].n === 1, "pending vault file row saved");
+      check(rows("SELECT COUNT(*) AS n FROM messages WHERE tg_file_id = 'file-9'")[0].n === 0, "no messages row for vault upload");
       await sendTg(env, msgUpdate("/ping"));
       check(rows("SELECT COUNT(*) AS n FROM messages WHERE content = '/ping'")[0].n === 0, "command messages not in history");
       // Save-first fix: a failed turn keeps only its entry row (kind chat);
@@ -6238,6 +6239,218 @@ if (DatabaseSync) {
     return Response.json({ ok: true, items: [{ label: "bank" }] });
   });
   check(pulled.ok && pulled.items[0].label === "bank", "3-a: vault webhook pull returns items");
+}
+
+// ── Phase 3-A Part C: conversational vault + file archive ──
+{
+  const origFetch = global.fetch;
+  try {
+    if (DatabaseSync) {
+      const sqlite = new DatabaseSync(":memory:");
+      sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+      sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+      sqlite.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+      const d1 = {
+        prepare(sql) {
+          const stmt = sqlite.prepare(sql);
+          return {
+            bind(...p) {
+              return {
+                run: async () => { const r = stmt.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; },
+                all: async () => ({ results: stmt.all(...p) }),
+                first: async () => stmt.get(...p) ?? null,
+              };
+            },
+          };
+        },
+      };
+      const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
+      const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", VAULT_SECRET: "s1", DB: d1, ...extra });
+      const fakeSend = () => { const sent = []; return { sent, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); } }; };
+      const o = (env, userId, text, extra = {}) => ({ chatId: userId, userId, text, send: extra.send, chat: extra.chat ?? (async () => {}), nowMs: extra.nowMs });
+      const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
+      const cl = (s) => classifyDaily(s, { nowMs: NOW });
+
+      // 1) rule detection
+      {
+
+        const save = cl("شماره کارت بانک رسالت من ۶۰۳۷۹۹۷۵۱۲۳۴۵۶۷۸ است ثبتش کن");
+        check(save.intent === "vault_save", `vault_save: ${JSON.stringify(save)}`);
+        check(save.category === "bank_card" && save.title === "کارت بانک رسالت" && save.value === "6037997512345678", `vault_save fields: ${JSON.stringify({ category: save.category, title: save.title, value: save.value })}`);
+        check(cl("\u0634\u0645\u0627ره\u0020\u06a9ارت\u0020رسالتم\u0020چنده؟").intent === "vault_get", "vault_get detected");
+        check(cl("شماره کارت‌هام رو نشون بده").intent === "vault_list", "vault_list detected");
+        check(cl("شبا رسالت IR123 ذخیره کن").intent === "vault_save" && cl("شبا رسالت IR123 ذخیره کن").category === "sheba" && cl("شبا رسالت IR123 ذخیره کن").value === "123", "sheba save");
+        check(cl("کد ملی من 0012345678 را ذخیره کن").intent === "vault_save" && cl("کد ملی من 0012345678 را ذخیره کن").category === "national_id", "national id save");
+        check(cl("\u0622\u062e\u0631\u06cc\u0646\u0020\u0622\u0632\u0645\u0627\u06cc\u0634\u0645\u0020\u0631\u0648\u0020\u0628\u0641\u0631\u0633\u062a").intent === "vault_file_get", "vault_file_get detected");
+        check(cl("\u0644\u06cc\u0633\u062a\u0020\u0645\u062f\u06cc\u0631\u06cc\u062a\u0020\u0622\u0631\u0634\u06cc\u0648").intent === "vault_list" && cl("\u0644\u06cc\u0633\u062a\u0020\u0645\u062f\u06cc\u0631\u06cc\u062a\u0020\u0622\u0631\u0634\u06cc\u0648").fileList === true, "vault file list detected");
+        check(cl("چرا اینقدر خرج می‌کنم؟").intent === "chat", "spending chat stays chat");
+      }
+
+      // 2) save -> get -> list via handleDailyText
+      {
+        const env = mkEnv(), s = fakeSend();
+        await handleDailyText(env, o(env, 4242, "شماره کارت بانک رسالت من ۶۰۳۷۹۹۷۵۱۲۳۴۵۶۷۸ است ثبتش کن", { ...s, nowMs: NOW }));
+        const last = String(s.sent.at(-1)?.text ?? "");
+        check(last.includes("در Gaosc امن ذخیره شد") && last.includes("کارت بانک رسالت") && last.includes("6037997512345678"), `vault save reply: ${JSON.stringify(s.sent.at(-1))}`);
+        const item = await getVaultItem(env, 4242, 1);
+        check(item && (await decryptVaultValue(env, item.value_enc)) === "6037997512345678" && item.category === "bank_card", `vault item stored: ${JSON.stringify({ id: item?.id, category: item?.category, sync: item?.sync_status })}`);
+        check(item.sync_status === "pending_google", "vault item pending google when no backend configured");
+
+        const s2 = fakeSend();
+        await handleDailyText(env, o(env, 4242, "شماره کارت رسالتم چنده؟", { ...s2, nowMs: NOW }));
+        check(String(s2.sent.at(-1)?.text ?? "").includes("6037997512345678"), `vault get reply: ${JSON.stringify(s2.sent.at(-1))}`);
+
+        const s3 = fakeSend();
+        await handleDailyText(env, o(env, 4242, "شماره کارت‌هام رو نشون بده", { ...s3, nowMs: NOW }));
+        const listed = String(s3.sent.at(-1)?.text ?? "");
+        const kb = s3.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+        check(listed.includes("6037997512345678") && kb.includes("vault:csv") && kb.includes("vault:sync"), `vault list reply: ${JSON.stringify({ listed, kb })}`);
+
+        const s4 = fakeSend();
+        await handleDailyText(env, o(env, 9999, "کد ملی من چنده؟", { ...s4, nowMs: NOW }));
+        check(String(s4.sent.at(-1)?.text ?? "").includes("هیچ موردی در Gaosc پیدا نشد"), "vault get empty for stranger");
+
+        const s5 = fakeSend();
+        await handleDailyText(env, o(env, 9999, "شماره کارت‌هام رو نشون بده", { ...s5, nowMs: NOW }));
+        const sl = String(s5.sent.at(-1)?.text ?? "");
+        check(sl.includes("هیچ مقدار ذخیره‌شده‌ای پیدا نشد") || sl.includes("خالی است"), `vault list empty: ${JSON.stringify(sl)}`);
+      }
+
+      // 3) file uploads: Case A caption / Case B pending / next-turn naming / retrieval
+      const tgCalls = [];
+      let driveCalls = 0;
+      global.fetch = async (url, init = {}) => {
+        const u = String(url);
+        if (u.startsWith("https://api.telegram.org/")) {
+          const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+          const payload = {};
+          if (init && init.body) {
+            if (typeof init.body.get === "function") {
+              for (const key of ["chat_id", "document", "photo", "caption"]) {
+                const v = init.body.get(key);
+                if (v !== null) payload[key] = v;
+              }
+            } else if (typeof init.body === "string") {
+              try { Object.assign(payload, JSON.parse(init.body)); } catch {}
+            }
+          }
+          tgCalls.push({ method: m ? m[1] : "", payload });
+          return Response.json({ ok: true, result: { message_id: 1 } });
+        }
+        if (u.includes("/getFile")) return Response.json({ ok: true, result: { file_path: "docs/f1" } });
+        if (u.includes("/file/bot")) return { ok: true, arrayBuffer: async () => new ArrayBuffer(8) };
+        if (u.includes("googleapis.com/upload/drive")) { driveCalls++; return Response.json({ id: "drive-file-1" }); }
+        if (u.includes("googleapis.com") || u.includes("oauth2.googleapis.com")) return Response.json({ ok: true });
+        return Response.json({ ok: true });
+      };
+      try {
+        // Case A: captioned document
+        {
+          const env = mkEnv(), s = fakeSend();
+          const handled = await handleVaultFile(env, { userId: 4242, chatId: 4242, tgFileId: "file-1", fileType: "document", mimeType: "application/pdf", fileName: "scan.pdf", caption: "آخرین آزمایش", send: s.send });
+          check(handled === true, "handleVaultFile case A handled");
+          const text = String(s.sent.at(-1)?.text ?? "");
+          check(text.includes("مدرک") && text.includes("آخرین آزمایش") && text.includes("آرشیو امن"), `case A reply: ${JSON.stringify(s.sent.at(-1))}`);
+          const f = await getVaultFile(env, 4242, 1);
+          check(f && f.title === "آخرین آزمایش" && f.file_type === "document" && f.mime_type === "application/pdf" && f.sync_status === "pending_google", `file row: ${JSON.stringify(f)}`);
+        }
+        // Case A with Google Drive configured
+        {
+          const driveBefore = driveCalls;
+          const env = mkEnv({ GOOGLE_VAULT_DRIVE_FOLDER_ID: "folder1", GOOGLE_VAULT_ACCESS_TOKEN: "tok" }), s = fakeSend();
+          await handleVaultFile(env, { userId: 4242, chatId: 4242, tgFileId: "file-2", fileType: "document", mimeType: "image/png", fileName: "card.png", caption: "تصویر کارت ملی", send: s.send });
+          check(driveCalls === driveBefore + 1, "drive upload attempted for captioned file");
+          const f = await getVaultFile(env, 4242, 2);
+          check(f.sync_status === "synced" && f.drive_url === "drive-file-1", `synced file row: ${JSON.stringify(f)}`);
+        }
+        // Case B: no caption -> pending
+        {
+          const env = mkEnv(), s = fakeSend();
+          const handled = await handleVaultFile(env, { userId: 4242, chatId: 4242, tgFileId: "file-3", fileType: "photo", mimeType: "image/jpeg", fileName: null, caption: null, send: s.send });
+          check(handled === true, "handleVaultFile case B handled");
+          check(String(s.sent.at(-1)?.text ?? "").includes("چه عنوانی در آرشیو امن و Google Docs ذخیره شود"), `case B reply: ${JSON.stringify(s.sent.at(-1))}`);
+          const f = (await listVaultFiles(env, 4242)).files.find(f => f.id == 3);
+           check(f && f.id == 3, "file renamed: " + JSON.stringify(f));
+           check(f && f.title === "__pending__", "file renamed: " + JSON.stringify(f));
+        }
+        // Next-turn naming
+        {
+          const env = mkEnv(), s = fakeSend();
+          const handled = await handleDailyText(env, o(env, 4242, "\u0628\u0630\u0627\u0631\u0020\u0622\u062e\u0631\u06cc\u0646\u0020\u0622\u0632\u0645\u0627\u06cc\u0634", { ...s, nowMs: NOW }));
+          check(handled === "handled", "next-turn naming handled");
+          const text = String(s.sent.at(-1)?.text ?? "");
+          check(text.includes("\u0622\u062e\u0631\u06cc\u0646\u0020\u0622\u0632\u0645\u0627\u06cc\u0634") && text.includes("ثبت شد"), `naming reply: ${JSON.stringify(s.sent.at(-1))}`);
+           const files = (await listVaultFiles(env, 4242)).files || [];
+           check(files.some(f => f.id == 3 && f.title !== "__pending__"), "file renamed: " + JSON.stringify(files.map(f=>({id: f.id, title: f.title}))));
+        }
+        // Retrieve by text (document file-1)
+        {
+          const env = mkEnv(), s = fakeSend();
+          await handleDailyText(env, o(env, 4242, "آخرین آزمایشم رو بفرست", { ...s, nowMs: NOW }));
+          const fileSend = tgCalls.find((c) => (c.method === "sendDocument" && c.payload.document === "file-1") || (c.method === "sendPhoto" && c.payload.photo === "file-3"));
+          check(Boolean(fileSend), `retrieve re-sends archived file by file_id: ${JSON.stringify(tgCalls.filter((c) => c.method === "sendDocument" || c.method === "sendPhoto"))}`);
+          check(String(fileSend?.payload?.caption ?? "").includes("\u0622\u062e\u0631\u06cc\u0646\u0020\u0622\u0632\u0645\u0627\u06cc\u0634"), "retrieve caption has title");
+        }
+        // vault:file:<id> callback
+        {
+          const env = mkEnv();
+          check(await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, data: "vault:file:1" }) === true, "vault:file handled");
+          const cbSend = tgCalls.find((c) => c.method === "sendDocument" && c.payload.document === "file-1");
+          check(Boolean(cbSend), `vault:file callback re-sends document: ${JSON.stringify(cbSend)}`);
+        }
+        // List archived files
+        {
+          const env = mkEnv(), s = fakeSend();
+          await handleDailyText(env, o(env, 4242, "\u0644\u06cc\u0633\u062a\u0020\u0645\u062f\u06cc\u0631\u06cc\u062a\u0020\u0622\u0631\u0634\u06cc\u0648", { ...s, nowMs: NOW }));
+          const flist = String(s.sent.at(-1)?.text ?? "");
+          const fkb = s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? [];
+          check(flist.includes("\u0622\u062e\u0631\u06cc\u0646\u0020\u0622\u0632\u0645\u0627\u06cc\u0634") && fkb.includes("vault:file:1") && fkb.includes("vault:file:2"), `file list: ${JSON.stringify({ flist, fkb })}`);
+        }
+        // vault:csv callback
+        {
+          tgCalls.length = 0;
+          const env = mkEnv();
+          check(await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, data: "vault:csv" }) === true, "vault:csv handled");
+          const docs = tgCalls.filter((c) => c.method === "sendDocument");
+          const doc = docs[docs.length - 1];
+          check(Boolean(doc) && doc.payload.document.name === "personal-vault.csv", `sendDocument for csv: ${JSON.stringify(docs.map((d) => ({ name: d.payload.document?.name })))}`);
+          const csvText = await doc.payload.document.text();
+          check(csvText.includes("ID,Category,Title,Value,Extra,UpdatedAt") && csvText.includes("6037997512345678"), `csv content: ${JSON.stringify(csvText.slice(0, 80))}`);
+          check(csvText.includes("ID,Category,Title,Value,Extra,UpdatedAt"), "csv header present");
+          check(csvText.includes("bank_card") && csvText.includes("کارت بانک رسالت") && csvText.includes("6037997512345678"), `csv row present: ${JSON.stringify(csvText)}`);
+        }
+        // vault:sync via Google Sheets
+        {
+          const env = mkEnv({ GOOGLE_VAULT_SHEET_ID: "sheet1", GOOGLE_VAULT_ACCESS_TOKEN: "tok" }), s = fakeSend();
+          check(await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, data: "vault:sync", send: s.send }) === true, "vault:sync handled");
+          const item = await getVaultItem(env, 4242, 1);
+          check(item.sync_status === "synced", `item synced: ${item.sync_status}`);
+        }
+      } finally {
+        global.fetch = origFetch;
+      }
+
+      // 4) note:view callback + view buttons on the list
+      {
+        const env = mkEnv();
+        await d1.prepare("INSERT INTO notes (user_id, text, created_at) VALUES (?, ?, ?)").bind(4242, "یادداشت کامل برای نمایش و بررسی", "2026-10-28T12:00:00+03:30").run();
+         const nrow = await d1.prepare("SELECT id FROM notes WHERE user_id = 4242 ORDER BY id DESC LIMIT 1").bind().first();
+        const noteId = (nrow && typeof nrow.id === 'number') ? nrow.id : null;
+        check(noteId != null && noteId > 0, "note inserted: " + JSON.stringify(nrow));
+        const s = fakeSend();
+        check(await resolveNoteCallback(env, { fromId: 4242, chatId: 4242, data: `note:view:${noteId}`, send: s.send, editMarkup: async () => {} }) === true, "note:view handled");
+        const view = String(s.sent.at(-1)?.text ?? "");
+        const viewKb = String(s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? "");
+         check(view.includes("یادداشت کامل برای نمایش و بررسی") && viewKb.includes(`note:del:${noteId}`), `note view: ${JSON.stringify(s.sent.at(-1))}`);
+        const rendered = await renderNoteList(env, 4242);
+        const flat = rendered.keyboard.flat();
+        check(flat.some((b) => b.text === "📖 #1" && b.callback_data === `note:view:${noteId}`), `view button on list: ${JSON.stringify(rendered.keyboard)}`);
+        check(flat.some((b) => b.text === "🗑 #1" && b.callback_data === `note:del:${noteId}`), "delete button on list");
+      }
+    }
+  } finally {
+    global.fetch = origFetch;
+  }
 }
 
 if (failures.length) {
