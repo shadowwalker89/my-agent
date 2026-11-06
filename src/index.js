@@ -1,6 +1,7 @@
 import { redact, listProviderModels } from "./providers.js";
 import {
   getConfig,
+  setConfig,
   getProviderCtx,
   upsertProvider,
   removeProvider,
@@ -209,11 +210,14 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
 
   const cfg = await getConfig(env);
   const isKnown = (name) => Boolean(RULES[name]) || cfg.combos.some((c) => c.name === name);
-  const def = (prefs.combo && isKnown(prefs.combo) && prefs.combo) || "chat";
+  // Phase 2-l: the admin-set manual default fills the slot when the user
+  // has no /combo preference; an unknown or deleted default is ignored.
+  const adminDefault = typeof cfg.defaultCombo === "string" && isKnown(cfg.defaultCombo) ? cfg.defaultCombo : null;
+  const def = (prefs.combo && isKnown(prefs.combo) && prefs.combo) || adminDefault || "chat";
 
   // ترتیب: [task (فقط وقتی auto روشن)]، پیش‌فرض کاربر، chat — اولین شناخته‌ی دارای هدف سالم.
   let combo = null;
-  for (const name of comboCandidates(prefs, task)) {
+  for (const name of comboCandidates(prefs, task, adminDefault)) {
     if (!isKnown(name)) continue;
     if (await comboUsable(env, name)) {
       combo = name;
@@ -1807,7 +1811,25 @@ async function adminApi(request, env, method, pathname) {
     if (method === "GET" && kind === "config") {
       const cfg = await getConfig(env);
       // فقط نام راز (secretName) — مقدار هرگز
-      return json({ ok: true, providers: cfg.providers, combos: cfg.combos });
+      return json({ ok: true, providers: cfg.providers, combos: cfg.combos, defaultCombo: cfg.defaultCombo ?? null });
+    }
+
+    // Phase 2-l: admin-set manual default combo. POST {combo} sets it
+    // (validated against auto RULES + manual combos); DELETE clears it.
+    if (kind === "default-combo" && (method === "POST" || method === "DELETE")) {
+      const cfg = await getConfig(env);
+      let name = null;
+      if (method === "POST") {
+        const body = await readJsonBody(request);
+        if (!body) return json({ ok: false, error: "invalid json body" }, 400);
+        name = String(body.combo ?? body.name ?? "").trim() || null;
+        if (name && !RULES[name] && !cfg.combos.some((c) => c.name === name)) {
+          return json({ ok: false, error: `unknown combo: ${name}` }, 400);
+        }
+      }
+      cfg.defaultCombo = name;
+      await setConfig(env, cfg);
+      return json({ ok: true, defaultCombo: name });
     }
 
     if (kind === "models" && method === "GET") return await adminApiListModels(request, env);

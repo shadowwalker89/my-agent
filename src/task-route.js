@@ -59,10 +59,15 @@ export const BUILTIN_COMBOS = Object.freeze(["chat", "code", "vision", "fast"]);
 
 // ترتیب گزینه‌های combo برای پیام کاربر:
 // [task (فقط وقتی auto روشن)]، پیش‌فرض کاربر، «chat» — runtime اولین گزینه‌ی شناخته‌شده‌ی پُراِستفاده را برمی‌دارد.
-export function comboCandidates(prefs, task) {
+// Phase 2-l: defaultCombo is the admin-set manual default (config:v1);
+// it fills the "no user preference" slot, so a manual default wins over
+// the hardcoded "chat" without disabling auto-routing.
+export function comboCandidates(prefs, task, defaultCombo = null) {
   const p = prefs && typeof prefs === "object" && !Array.isArray(prefs) ? prefs : {};
   const auto = p.auto !== false;
-  const def = typeof p.combo === "string" && p.combo ? p.combo : "chat";
+  const userDef = typeof p.combo === "string" && p.combo ? p.combo : null;
+  const adminDef = typeof defaultCombo === "string" && defaultCombo ? defaultCombo : null;
+  const def = userDef || adminDef || "chat";
   const out = [];
   const push = (n) => {
     if (n && out.indexOf(n) === -1) out.push(n);

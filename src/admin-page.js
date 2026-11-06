@@ -465,6 +465,10 @@ var I18N = {
     unblock: 'Unblock',
     pinsLabel: 'Pins',
     shadowedBadge: '⚠️ Shadowed by manual combo',
+    setDefault: '⭐ Set as Default',
+    isDefault: '⭐ Default',
+    defaultSet: 'Default combo set',
+    defaultCleared: 'Default combo cleared',
     copyConfirm: 'This creates a manual combo with the same name and overrides automatic routing for this combo until deleted.',
     banDone: 'Banned',
     unbanDone: 'Unbanned',
@@ -649,6 +653,10 @@ var I18N = {
     unblock: 'رفع کول‌داون',
     pinsLabel: 'پین‌ها',
     shadowedBadge: '⚠️ زیر سایه‌ی combo دستی',
+    setDefault: '⭐ پیش‌فرض کن',
+    isDefault: '⭐ پیش‌فرض',
+    defaultSet: 'combo پیش‌فرض تنظیم شد',
+    defaultCleared: 'combo پیش‌فرض پاک شد',
     copyConfirm: 'این کار یک combo دستی با همین نام می‌سازد و تا وقتی حذفش نکنی، مسیریابی خودکار این combo را کنار می‌گذارد.',
     banDone: 'مسدود شد',
     unbanDone: 'رفع مسدودیت شد',
@@ -2152,6 +2160,12 @@ function renderAutoCombos() {
     var act = el('div', 'line');
     var b = btn(T('createManualCopy'), function () { createManualCopy(name, b); }, 'sm');
     act.appendChild(b);
+    if (CFG.defaultCombo === name) {
+      act.appendChild(el('span', 'badge b-ok', T('isDefault')));
+    } else {
+      var db = btn(T('setDefault'), function () { setDefaultCombo(name, db); }, 'sm');
+      act.appendChild(db);
+    }
     card.appendChild(act);
     list.appendChild(card);
   });
@@ -2298,6 +2312,18 @@ function gatherTargets(box) {
   return out;
 }
 
+async function setDefaultCombo(name, btnEl) {
+  busy(btnEl, 'saving');
+  var r = await api('POST', '/admin/api/default-combo', { combo: name });
+  idle(btnEl);
+  if (r.data && r.data.ok) {
+    toast(T('defaultSet') + ': ' + name, 'okly');
+    await refreshCfg();
+  } else {
+    toast(r.error || T('loadFail'), 'err');
+  }
+}
+
 function renderCombos() {
   var list = $('comboList');
   list.textContent = '';
@@ -2319,6 +2345,12 @@ function renderCombos() {
     var res = el('div', 'combo-res');
     var tb = btn(T('testCombo'), function () { testCombo(c.name, res, tb); }, 'sm');
     tools.appendChild(tb);
+    if (CFG.defaultCombo === c.name) {
+      tools.appendChild(el('span', 'badge b-ok', T('isDefault')));
+    } else {
+      var db = btn(T('setDefault'), function () { setDefaultCombo(c.name, db); }, 'sm');
+      tools.appendChild(db);
+    }
     tools.appendChild(btn(T('del'), function () { deleteCombo(c.name); }, 'sm danger'));
     card.appendChild(tools);
     card.appendChild(res);

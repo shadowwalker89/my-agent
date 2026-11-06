@@ -926,6 +926,12 @@ check(comboCandidates({ ...baseP, auto: false }, "code").join(",") === "chat", "
 check(comboCandidates({ ...baseP, combo: "mine" }, "code").join(",") === "code,mine,chat", "auto + پیش‌فرض دستی");
 check(comboCandidates({ ...baseP, combo: "mine" }, "chat").join(",") === "chat,mine", "task chat: chat اول (auto)");
 check(comboCandidates(null, undefined).join(",") === "chat", "بدون prefs/task = chat");
+// Phase 2-l: the admin default fills the no-user-preference slot, and a
+// user /combo preference still wins over it.
+check(comboCandidates(baseP, "code", "mine").join(",") === "code,mine,chat", "2-l: admin default after auto task");
+check(comboCandidates({ ...baseP, auto: false }, "code", "mine").join(",") === "mine,chat", "2-l: admin default replaces chat when auto is off");
+check(comboCandidates({ ...baseP, combo: "user" }, "code", "mine").join(",") === "code,user,chat", "2-l: user preference wins over admin default");
+check(comboCandidates(null, undefined, "mine").join(",") === "mine,chat", "2-l: admin default with no prefs/task");
 check(fallbackCombo("mine", "code") === "mine", "fallback به پیش‌فرض کاربر");
 check(fallbackCombo("mine", "mine") === "chat", "fallback پیش‌فرض == انتخاب → chat");
 check(fallbackCombo("chat", "chat") === null, "fallback همان chat → هیچ");

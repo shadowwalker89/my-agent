@@ -366,6 +366,40 @@ export function parseExpense(text, opts = {}, origText) {
 const EXPENSE_VERBS = /(?<!\p{L})(خرج کردم|پرداخت کردم|خریدم|خرید کردم)(?![\p{L}])/u, INCOME_VERBS = /(?<!\p{L})(دریافت کردم|واریز شد|حقوق گرفتم|پول گرفتم)(?![\p{L}])/u;
 const WEAK_BUY = /(?<!\p{L})(خریدم|خرید کردم)(?![\p{L}])/u; const NEGATED_RE = /(?<!\p{L})(نکردم|نکرد|نخریدم|نگرفتم|نپرداختم|ندریافتم|ندادم|نخواهم|نمی\s+کنم|نمی\s+خواهم|نمی\s+خرم|نمی\s+دهم|نکنم)(?![\p{L}])/u;
 const NOTE_RE = /^\s*(?:(?:لطفا|لطفاً|ببین)\s+)?(?:یادداشت\s+کن(?![\p{L}])|یادداشت\s*[:：])\s*([\s\S]+)/u, REMINDER_RE = /(?<!\p{L})(?:یادم بینداز|یادآوری کن|یادم بنداز|یادت باشه)(?![\p{L}])/u;
+// Phase 2-l: conversational note framing. A greeting/politeness/modal
+// opener before the note phrase, or a trailing "… اینو برام یادداشت کن",
+// is still a note. The note verb accepts only imperative/second-person
+// forms (کن/کنی/کنید/بنویس/...), so the pinned first-person
+// "می‌خواهم یادداشت کنم" stays chat (see the 1b-1b regression test).
+const NOTE_FRAMING = String.raw`(?:(?:سلام|درود|سلام\s+علیکم|وقت\s+بخیر|صبح\s+بخیر|عصر\s+بخیر|شب\s+بخیر|لطفا|لطفاً|بی\s*زحمت|ممنون|مرسی|خواهشا|خواهشاً|می\s*خوام|می\s*خواهم|میخوام|میخواهم|می\s*خواستم|میخواستم|میشه|می\s*شه|می\s*تونی|میتونی|می\s*تونید|میتونید)\s*[،,!.؛;:]?\s*)*`;
+const NOTE_VERB = String.raw`(?:ثبت\s+|ذخیره\s+|ایجاد\s+|نوشتن\s+)?(?:کنی|کنید|کن|بنویسی|بنویس|بذاری|بذار|بگذاری|بگذار|بکنی|بکن)(?!\p{L})`;
+const NOTE_LEAD_RE = new RegExp(String.raw`^${NOTE_FRAMING}(?:(?:یه|یک)\s+)?یادداشت(?:\s+جدید)?(?:\s+(?:برام|واسم|برای\s+من|برایم|برا\s+من))?\s*${NOTE_VERB}(?:\s+که(?!\p{L}))?\s*[:：]?\s*([\s\S]+)$`, "ud");
+const NOTE_TAIL_RE = new RegExp(String.raw`^([\s\S]{2,}?)\s*[،,؛;]?\s*(?:(?:اینو|این\s+رو|این\s+را|اونو|اون\s+رو|اون\s+را)\s+)?(?:برام|واسم|برای\s+من|برایم|برا\s+من)?\s*(?:(?:یه|یک)\s+)?یادداشت(?:\s+جدید)?\s*${NOTE_VERB}(?:\s+که(?!\p{L}))?\s*[.؟?!]?\s*$`, "ud");
+export function stripNoteCommandPrefix(s) {
+  let out = String(s ?? "").trim();
+  out = out.replace(new RegExp(String.raw`^(?:${NOTE_FRAMING})`, "u"), "").trim();
+  out = out.replace(/^(?:که|این\s+که|اینکه)\s+/u, "").trim();
+  out = out.replace(/^[:：،,؛;\s]+/u, "").trim();
+  return out;
+}
+function isMeaningfulNoteBody(s) {
+  const t = String(s ?? "").trim();
+  if (!t || !t.replace(/[؟?!.،,:：؛;\s]+/gu, "")) return false;
+  return !/^(?:تسک|کار|یادآوری|پروژه|یادداشت)$/u.test(t);
+}
+function parseConversationalNote(raw, text) {
+  const lead = NOTE_LEAD_RE.exec(raw);
+  if (lead) {
+    const body = text.slice(lead.indices[1][0], lead.indices[1][1]).trim();
+    if (isMeaningfulNoteBody(body)) return body;
+  }
+  const tail = NOTE_TAIL_RE.exec(raw);
+  if (tail) {
+    const body = stripNoteCommandPrefix(text.slice(tail.indices[1][0], tail.indices[1][1]));
+    if (isMeaningfulNoteBody(body)) return body;
+  }
+  return null;
+}
 // Note-query: the separator between یادداشت and the plural/possessive
 // suffix is optional, so colloquial joined spellings from speech
 // transcription (یادداشتهامو، یادداشتهایم) reach note-query instead of
@@ -531,6 +565,11 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
     if (m && m[1].trim().replace(/[؟?!.،,:：\s]+/gu, "")) return { intent: "note", confidence: 1, text: text.slice(m.indices[1][0], m.indices[1][1]).trim() };
   }
   const note = NOTE_RE.exec(raw); if (note && note[1].trim().replace(/[؟?!.،,:：\s]+/gu, "")) return { intent: "note", confidence: 1, text: text.slice(note.index + note[0].length - note[1].length).trim() };
+  // Phase 2-l: greeting/politeness/modal openers and the trailing
+  // "… اینو برام یادداشت کن" form are notes too, with the framing
+  // stripped from the stored body.
+  const convNote = parseConversationalNote(raw, text);
+  if (convNote) return { intent: "note", confidence: 1, text: convNote };
   // Bare note: only a note trigger, no body. Ask for the text at rule
   // level instead of falling through to chat, where the live model
   // answered chat and hallucinated a stored note (2026-10-30). Anchored

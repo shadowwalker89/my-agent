@@ -2672,6 +2672,25 @@ if (DatabaseSync) {
     const forms = ["یادداشت", "یادداشت کن", "یادداشت کن.", "یادداشت جدید", "لطفا یادداشت کن", "لطفاً یادداشت", "یادداشت:", "می‌خوام یک یادداشت جدید و جداگانه ثبت کنم", "می‌خوام یادداشت بنویسم"];
     check(forms.every((f) => { const c = cl(f); return c.intent === "ask" && c.question === "note-text"; }), "bare-note: classifyDaily bare forms -> ask note-text");
   }
+  // Phase 2-l: conversational note forms with the framing stripped.
+  {
+    const lead = cl("سلام یه یادداشت برام ثبت کن که فردا سیمان میرسه");
+    const modal = cl("میخوام یه یادداشت ثبت کنی فردا جلسه با مهندس ناظر ساعت ۱۰");
+    const tail = cl("فردا باید قرارداد رو امضا کنیم، اینو برام یادداشت کن");
+    check(lead.intent === "note" && lead.text === "فردا سیمان میرسه", "2-l: greeting+polite note strips framing");
+    check(modal.intent === "note" && modal.text === "فردا جلسه با مهندس ناظر ساعت ۱۰", "2-l: modal opener note strips framing");
+    check(tail.intent === "note" && tail.text === "فردا باید قرارداد رو امضا کنیم", "2-l: trailing اینو برام یادداشت کن strips framing");
+    check(cl("می‌خواهم یادداشت کنم که فردا جلسه دارم").intent === "chat", "2-l: first-person note form still chat");
+    check(cl("میتونی اینو برام یادداشت کنی؟").intent !== "note", "2-l: framing-only trailing form is not a note");
+  }
+  // Phase 2-l: the deterministic path stores the stripped body with zero
+  // model calls (no NLU needed for a conversational note).
+  {
+    const env = mkEnv(), s = fakeSend();
+    global.fetch = async () => { fetchCalls++; throw new Error("model must not be called"); };
+    const r = await handleDailyText(env, o(env, 4525, "سلام یه یادداشت برام ثبت کن که فردا سیمان میرسه", { ...s, nowMs: NOW }));
+    check(r === "handled" && lastText(s).includes("یادداشت ذخیره شد") && rows("SELECT text FROM notes WHERE user_id = 4525")[0].text === "فردا سیمان میرسه" && fetchCalls === 0, "2-l: conversational note stored deterministically with framing stripped, zero model calls");
+  }
   // End to end: bare note asks directly with zero model calls and a
   // note-text slot, replacing any stale slot.
   {
@@ -5373,6 +5392,24 @@ if (DatabaseSync) {
     const entry = await call("GET", "/admin/api/models", null, "http://x/admin/api/models?provider=xkiro");
     const row = (entry.data.models ?? []).find((m) => m.id === "qwen3-32b");
     check(entry.status === 200 && row?.status === "ok" && row?.medianLatencyMs === null, "2-d: GET /admin/api/models carries status + cooldownReason + medianLatencyMs fields");
+  }
+  // (a2) Phase 2-l: /admin/api/default-combo sets, validates and clears the
+  // admin manual default; GET config surfaces it.
+  {
+    const env = { STATE: fakeKV() };
+    const call = async (method, pathname, body) => {
+      const req = { method, url: `http://x${pathname}`, json: async () => body };
+      const res = await adminApi(req, env, method, pathname);
+      return { status: res.status, data: await res.json() };
+    };
+    const bad = await call("POST", "/admin/api/default-combo", { combo: "no-such" });
+    check(bad.status === 400 && /unknown combo/.test(bad.data.error ?? ""), "2-l: unknown default combo rejected with 400");
+    const set = await call("POST", "/admin/api/default-combo", { combo: "chat" });
+    const cfg = await call("GET", "/admin/api/config", null);
+    check(set.status === 200 && set.data.defaultCombo === "chat" && cfg.data.defaultCombo === "chat", "2-l: default combo stored and surfaced by GET config");
+    const clr = await call("DELETE", "/admin/api/default-combo", null);
+    const cfg2 = await call("GET", "/admin/api/config", null);
+    check(clr.status === 200 && clr.data.defaultCombo === null && cfg2.data.defaultCombo === null, "2-l: DELETE clears the default combo");
   }
   // (b) KV-cooling pinned models do not block healthy targets; previews
   // do not advance the round-robin pointer.
