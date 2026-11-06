@@ -211,6 +211,7 @@ input::placeholder{color:var(--muted)}
   <button type="button" id="tabBtnProv" data-tab="provTab" data-i18n="tabProviders"></button>
   <button type="button" id="tabBtnModels" data-tab="modelsTab" data-i18n="tabModels"></button>
   <button type="button" id="tabBtnCombos" data-tab="combosTab" data-i18n="tabCombos"></button>
+  <button type="button" id="tabBtnVault" data-tab="vaultTab" data-i18n="tabVault"></button>
 </nav>
 
 <main class="wrap">
@@ -368,6 +369,56 @@ input::placeholder{color:var(--muted)}
           <div id="comboErr" class="err"></div>
         </div>
         <div id="comboList" class="grid combo-grid"></div>
+      </div>
+    </section>
+
+    <section id="vaultTab" class="tab hidden">
+      <div class="card">
+        <div class="sec-head">
+          <div><h2 data-i18n="vaultTitle"></h2><p class="help" data-i18n="vaultHelp"></p></div>
+          <div class="line">
+            <input id="vUserId" type="number" min="1" placeholder="User ID" style="width:120px">
+            <button id="vLoad" class="primary" data-i18n="vaultLoad"></button>
+          </div>
+        </div>
+        <div id="vErr" class="err"></div>
+        <div class="subcard">
+          <div class="line">
+            <span class="lbl" data-i18n="vaultLabel"></span><input id="vLabel" maxlength="120">
+            <span class="lbl" data-i18n="vaultValue"></span><input id="vValue" type="password" autocomplete="new-password">
+          </div>
+          <div class="line">
+            <span class="lbl" data-i18n="vaultFile"></span><input id="vFile" type="file">
+            <button id="vSave" class="primary" data-i18n="vaultSave"></button>
+          </div>
+          <p class="help" data-i18n="vaultEncrypted"></p>
+        </div>
+        <div id="vList" class="grid combo-grid"></div>
+      </div>
+      <div class="card">
+        <div class="sec-head"><div><h2 data-i18n="vaultGoogle"></h2><p class="help" data-i18n="googleHelp"></p></div></div>
+        <div class="line">
+          <span class="lbl" data-i18n="googleSheet"></span><input id="gSheet" class="mono">
+          <span class="lbl" data-i18n="googleDoc"></span><input id="gDoc" class="mono">
+        </div>
+        <div class="line">
+          <span class="lbl" data-i18n="googleDrive"></span><input id="gDrive" class="mono">
+          <span class="lbl" data-i18n="googleWebhook"></span><input id="gWebhook" class="mono">
+        </div>
+        <div class="line">
+          <span class="lbl" data-i18n="googleWebhookSecret"></span><input id="gWebhookSecret" type="password" autocomplete="new-password">
+          <span class="lbl" data-i18n="googleClientId"></span><input id="gClientId" class="mono">
+        </div>
+        <div class="line">
+          <span class="lbl" data-i18n="googleClientSecret"></span><input id="gClientSecret" type="password" autocomplete="new-password">
+          <span class="lbl" data-i18n="googleRefresh"></span><input id="gRefresh" type="password" autocomplete="new-password">
+        </div>
+        <div class="line"><span class="lbl" data-i18n="googleServiceAccount"></span><textarea id="gServiceAccount" rows="3" class="mono grow"></textarea></div>
+        <div class="line">
+          <button id="gSave" class="primary" data-i18n="googleSave"></button>
+          <button id="gClear" class="danger" data-i18n="googleClear"></button>
+        </div>
+        <div id="gStatus" class="state"></div>
       </div>
     </section>
   </div>
@@ -563,6 +614,37 @@ var I18N = {
     copyExists: 'A manual combo with this name already exists.',
     copyEmpty: 'No usable targets right now — refresh the catalog first.',
     manualCombos: 'Manual combos',
+    tabVault: 'Vault',
+    vaultTitle: 'Secure Google vault',
+    vaultHelp: 'Values are encrypted before storage. Google sync is optional; unsynced items stay pending.',
+    vaultUser: 'User ID',
+    vaultLabel: 'Label',
+    vaultValue: 'Secret value',
+    vaultFile: 'File',
+    vaultSave: 'Save to vault',
+    vaultLoad: 'Load',
+    vaultEmpty: 'No vault items for this user.',
+    vaultDelete: 'Delete',
+    vaultSync: 'Sync now',
+    vaultEncrypted: 'AES-256-GCM encryption; the plaintext value is never returned by the admin API.',
+    vaultGoogle: 'Google mirror settings',
+    googleHelp: 'Configure Sheets, Docs, Drive, or an Apps Script webhook. Secrets are write-only.',
+    googleSheet: 'Sheet ID',
+    googleDoc: 'Doc ID',
+    googleDrive: 'Drive folder ID',
+    googleWebhook: 'Webhook URL',
+    googleWebhookSecret: 'Webhook secret',
+    googleClientId: 'OAuth client ID',
+    googleClientSecret: 'OAuth client secret',
+    googleRefresh: 'Refresh token',
+    googleServiceAccount: 'Service account JSON',
+    googleSave: 'Save Google settings',
+    googleClear: 'Clear Google settings',
+    vaultSaved: 'Vault item saved',
+    vaultDeleted: 'Vault item deleted',
+    googleSaved: 'Google settings saved',
+    googleCleared: 'Google settings cleared',
+    vaultNeedUser: 'Enter a user ID first',
     saving: 'Saving...'
   },
   fa: {
@@ -751,6 +833,37 @@ var I18N = {
     copyExists: 'یک combo دستی با همین نام از قبل هست.',
     copyEmpty: 'الان هدفِ سالمی نیست — اول کاتالوگ را به‌روزرسانی کن.',
     manualCombos: 'comboهای دستی',
+    tabVault: 'گاوصندوق',
+    vaultTitle: '🔐 گاوصندوق امن گوگل',
+    vaultHelp: 'مقادیر قبل از ذخیره رمزنگاری می‌شوند. همگام‌سازی گوگل اختیاری است؛ موارد همگام‌نشده در حالت انتظار می‌مانند.',
+    vaultUser: 'شناسه‌ی کاربر',
+    vaultLabel: 'برچسب',
+    vaultValue: 'مقدار محرمانه',
+    vaultFile: 'فایل',
+    vaultSave: 'ذخیره در گاوصندوق',
+    vaultLoad: 'بارگذاری',
+    vaultEmpty: 'برای این کاربر موردی در گاوصندوق نیست.',
+    vaultDelete: 'حذف',
+    vaultSync: 'همگام‌سازی',
+    vaultEncrypted: 'رمزنگاری AES-256-GCM؛ مقدار خام هرگز از API مدیریت برگردانده نمی‌شود.',
+    vaultGoogle: 'تنظیمات آینه‌ی گوگل',
+    googleHelp: 'Sheets، Docs، Drive یا وبهوک Apps Script را تنظیم کن. رازها فقط نوشتنی‌اند.',
+    googleSheet: 'شناسه‌ی Sheet',
+    googleDoc: 'شناسه‌ی Doc',
+    googleDrive: 'شناسه‌ی پوشه‌ی Drive',
+    googleWebhook: 'نشانی وبهوک',
+    googleWebhookSecret: 'راز وبهوک',
+    googleClientId: 'شناسه‌ی OAuth',
+    googleClientSecret: 'راز OAuth',
+    googleRefresh: 'Refresh token',
+    googleServiceAccount: 'JSON حساب سرویس',
+    googleSave: 'ذخیره‌ی تنظیمات گوگل',
+    googleClear: 'پاک کردن تنظیمات گوگل',
+    vaultSaved: 'مورد گاوصندوق ذخیره شد',
+    vaultDeleted: 'مورد گاوصندوق حذف شد',
+    googleSaved: 'تنظیمات گوگل ذخیره شد',
+    googleCleared: 'تنظیمات گوگل پاک شد',
+    vaultNeedUser: 'اول شناسه‌ی کاربر را وارد کن',
     saving: 'در حال ذخیره...'
   }
 };
@@ -785,7 +898,7 @@ function readJson(key) {
 
 var lang;
 try { lang = (localStorage.getItem('admin_lang') === 'fa') ? 'fa' : 'en'; } catch (e) { lang = 'en'; }
-var TABS = ['provTab', 'modelsTab', 'combosTab'];
+var TABS = ['provTab', 'modelsTab', 'combosTab', 'vaultTab'];
 var CFG = null;
 var OVERRIDES = { pins: {}, bans: [], prefer: {} };
 var CUR_MODELS = [];
@@ -1169,7 +1282,7 @@ function showTab(id) {
   }
   activeTab = id;
   lsSet('admin_tab', id);
-  var map = { provTab: 'tabBtnProv', modelsTab: 'tabBtnModels', combosTab: 'tabBtnCombos' };
+  var map = { provTab: 'tabBtnProv', modelsTab: 'tabBtnModels', combosTab: 'tabBtnCombos', vaultTab: 'tabBtnVault' };
   TABS.forEach(function (t) { $(t).classList.toggle('hidden', t !== id); });
   TABS.forEach(function (t) { $(map[t]).classList.toggle('on', t === id); });
   if (id === 'modelsTab') ensureModels().then(function () { restoreTabScroll(id); });

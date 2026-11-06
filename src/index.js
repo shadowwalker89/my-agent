@@ -30,7 +30,8 @@ import { classifyIntent, needsConfirmation } from "./intent.js";
 import { getChatContext } from "./memory.js";
 import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, chatFailureNotice, formatFailureDetail, runReminderTick, quickConvertKeyboard } from "./everyday.js";
 import { handleVoice, handleVoiceRetry } from "./voice.js";
-import { saveMessage } from "./db.js";
+import { saveMessage, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus } from "./db.js";
+import { encryptVaultValue, decryptVaultValue, getGoogleVaultConfig, googleVaultStatus, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
 import {
   dispatchDev,
   approveDevPR,
@@ -1800,6 +1801,149 @@ async function adminApiProbe(request, env) {
   return json({ ok: true, results });
 }
 
+// Phase 3-A: vault admin helpers. Responses expose metadata only —
+// value_enc / plaintext / Google credentials never leave the Worker.
+const VAULT_CONFIG_FIELDS = ["sheetId", "docId", "driveFolderId", "webhookUrl", "webhookSecret", "clientId", "clientSecret", "refreshToken", "serviceAccountJson"];
+function publicGoogleVault(cfg) {
+  return {
+    sheetId: cfg?.sheetId || "",
+    docId: cfg?.docId || "",
+    driveFolderId: cfg?.driveFolderId || "",
+    webhookUrl: cfg?.webhookUrl || "",
+    hasWebhookSecret: Boolean(cfg?.webhookSecret),
+    hasClient: Boolean(cfg?.clientId && cfg?.clientSecret),
+    hasRefreshToken: Boolean(cfg?.refreshToken),
+    hasServiceAccount: Boolean(cfg?.serviceAccountJson),
+    hasAccessToken: Boolean(cfg?.accessToken),
+  };
+}
+function vaultSummary(row) {
+  return {
+    id: row.id,
+    label: row.label,
+    kind: row.kind,
+    fileName: row.file_name ?? null,
+    mimeType: row.file_mime ?? null,
+    googleId: row.google_id ?? null,
+    syncStatus: row.sync_status ?? "local",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+function vaultB64ToBytes(b64) {
+  const s = atob(String(b64));
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+async function syncVaultRow(env, userId, row) {
+  let result;
+  if (row.kind === "file") {
+    const data = row.value_enc ? vaultB64ToBytes(await decryptVaultValue(env, row.value_enc)) : new Uint8Array();
+    result = await syncVaultFileToGoogle(env, {
+      id: row.id,
+      userId,
+      label: row.label,
+      fileName: row.file_name,
+      mimeType: row.file_mime,
+      data,
+      createdAt: row.created_at,
+    });
+  } else {
+    const value = await decryptVaultValue(env, row.value_enc);
+    result = await syncVaultItemToGoogle(env, {
+      id: row.id,
+      userId,
+      label: row.label,
+      value,
+      createdAt: row.created_at,
+    });
+  }
+  const status = result.ok ? "synced" : "pending_google";
+  await setVaultSyncStatus(env, userId, row.id, status, result.googleId ?? null);
+  return { ...result, status };
+}
+async function adminApiVault(request, env, method, id, sub) {
+  const userId = Number(new URL(request.url).searchParams.get("userId"));
+  if (method === "GET" && !id) {
+    if (!Number.isInteger(userId) || userId <= 0) return json({ ok: false, error: "userId is required" }, 400);
+    const r = await listVaultItems(env, userId, { limit: 50 });
+    return json({ ok: r.ok, items: r.items.map(vaultSummary) });
+  }
+  if (method === "POST" && !id) {
+    const body = await readJsonBody(request);
+    if (!body) return json({ ok: false, error: "invalid json body" }, 400);
+    const uid = Number(body.userId);
+    const label = String(body.label ?? "").trim();
+    if (!Number.isInteger(uid) || uid <= 0 || !label) return json({ ok: false, error: "userId and label are required" }, 400);
+    const kind = body.kind === "file" ? "file" : "text";
+    let valueEnc;
+    let fileName = null;
+    let mimeType = null;
+    try {
+      if (kind === "text") {
+        const value = String(body.value ?? "");
+        if (!value) return json({ ok: false, error: "value is required" }, 400);
+        valueEnc = await encryptVaultValue(env, value);
+      } else {
+        const dataB64 = String(body.dataB64 ?? "");
+        if (!dataB64) return json({ ok: false, error: "dataB64 is required" }, 400);
+        valueEnc = await encryptVaultValue(env, dataB64);
+        fileName = String(body.fileName ?? "vault-file").slice(0, 200);
+        mimeType = String(body.mimeType ?? "application/octet-stream").slice(0, 120);
+      }
+    } catch {
+      return json({ ok: false, error: "vault secret is not configured" }, 400);
+    }
+    const saved = await saveVaultItem(env, { userId: uid, label, kind, valueEnc, fileName, mimeType, syncStatus: "local" });
+    if (!saved.ok) return json({ ok: false, error: "could not save vault item" }, 500);
+    const row = await getVaultItem(env, uid, saved.id);
+    const sync = row ? await syncVaultRow(env, uid, row) : { ok: false, mode: "none", status: "pending_google" };
+    const after = await getVaultItem(env, uid, saved.id);
+    return json({ ok: true, item: vaultSummary(after ?? row), sync: { ok: sync.ok, mode: sync.mode, status: sync.status } });
+  }
+  if (method === "DELETE" && id) {
+    if (!Number.isInteger(userId) || userId <= 0) return json({ ok: false, error: "userId is required" }, 400);
+    const r = await deleteVaultItem(env, userId, id);
+    return json({ ok: r.ok, deleted: r.deleted });
+  }
+  if (method === "POST" && id && sub === "sync") {
+    if (!Number.isInteger(userId) || userId <= 0) return json({ ok: false, error: "userId is required" }, 400);
+    const row = await getVaultItem(env, userId, id);
+    if (!row) return json({ ok: false, error: "vault item not found" }, 404);
+    const sync = await syncVaultRow(env, userId, row);
+    const after = await getVaultItem(env, userId, id);
+    return json({ ok: true, item: vaultSummary(after ?? row), sync: { ok: sync.ok, mode: sync.mode, status: sync.status } });
+  }
+  return null;
+}
+async function adminApiGoogleVault(request, env, method) {
+  if (method === "GET") {
+    const cfg = await getGoogleVaultConfig(env);
+    return json({ ok: true, status: googleVaultStatus(cfg), config: publicGoogleVault(cfg) });
+  }
+  if (method === "POST") {
+    const body = await readJsonBody(request);
+    if (!body) return json({ ok: false, error: "invalid json body" }, 400);
+    const cfg = await getConfig(env);
+    const src = cfg.googleVault && typeof cfg.googleVault === "object" ? { ...cfg.googleVault } : {};
+    for (const f of VAULT_CONFIG_FIELDS) {
+      if (body[f] !== undefined) src[f] = String(body[f] ?? "").trim();
+    }
+    cfg.googleVault = src;
+    await setConfig(env, cfg);
+    const resolved = await getGoogleVaultConfig(env);
+    return json({ ok: true, status: googleVaultStatus(resolved), config: publicGoogleVault(resolved) });
+  }
+  if (method === "DELETE") {
+    const cfg = await getConfig(env);
+    cfg.googleVault = {};
+    await setConfig(env, cfg);
+    return json({ ok: true, status: googleVaultStatus({}), config: publicGoogleVault({}) });
+  }
+  return null;
+}
+
 // بدون mutation خطرناک: خطای apiError → 400 با پیام کوتاه؛ بقیه ۵۰۰ با نام خطا
 async function adminApi(request, env, method, pathname) {
   const parts = pathname.split("/").filter(Boolean); // ["admin","api",...]
@@ -1830,6 +1974,15 @@ async function adminApi(request, env, method, pathname) {
       cfg.defaultCombo = name;
       await setConfig(env, cfg);
       return json({ ok: true, defaultCombo: name });
+    }
+
+    if (kind === "vault") {
+      const res = await adminApiVault(request, env, method, id, sub);
+      return res ?? json({ ok: false, error: "not found" }, 404);
+    }
+    if (kind === "google-vault") {
+      const res = await adminApiGoogleVault(request, env, method);
+      return res ?? json({ ok: false, error: "not found" }, 404);
     }
 
     if (kind === "models" && method === "GET") return await adminApiListModels(request, env);
