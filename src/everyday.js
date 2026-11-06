@@ -3,10 +3,11 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, extractFolderTag, matchKnownProjectAt, IRAN_OFFSET_MIN } from "./daily.js";
 import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO, resolveInterpreterModel } from "./intent.js";
-import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks } from "./db.js";
+import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, setVaultSyncStatus } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
-import { tgApi, sendProgressMessage } from "./telegram.js";
+import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadData, escapeHtml, formatTelegramHtml } from "./telegram.js";
+import { encryptVaultValue, decryptVaultValue, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
 const DRAFT_TTL_SEC = 600;
@@ -458,6 +459,93 @@ async function runDailyBranch(env, o, c, ctx) {
     if (ok) await markDaily(env, o);
     return "handled";
   }
+  if (c.intent === "vault_save") {
+    await markDaily(env, o);
+    let valueEnc;
+    try { valueEnc = await encryptVaultValue(env, c.value ?? ""); } catch { await o.send(NOT_SAVED_TEXT); return "handled"; }
+    const saved = await saveVaultItem(env, { userId, label: c.title ?? "موردGaosc", kind: "text", valueEnc, category: c.category ?? null, extra: c.extra ?? null, syncStatus: "local" });
+    let badge = "";
+    if (saved.ok) {
+      const row = await getVaultItem(env, userId, saved.id);
+      if (row) {
+        const sync = await syncVaultItemToGoogle(env, { id: row.id, userId, label: row.label, value: c.value ?? "", kind: "text", createdAt: row.created_at });
+        await setVaultSyncStatus(env, userId, saved.id, sync.ok ? "synced" : "pending_google", sync.googleId ?? null);
+        badge = sync.ok ? "\n✅ گوگل‌شیت: ذخیره شد" : "\n⏳ در انتظار همگام‌سازی گوگل";
+      }
+    }
+    await o.send(`🔒 **در Gaosc امن ذخیره شد**\n📌 عنوان: **${c.title ?? ""}**\n💳 مقدار (ضربه برای کپی): \`${c.value ?? ""}\`${badge}`);
+    return "handled";
+  }
+  if (c.intent === "vault_get") {
+    await markDaily(env, o);
+    const items = (await listVaultItems(env, userId)).items;
+    const keys = (c.keywords ?? []).filter(Boolean);
+    const matches = [];
+    for (const it of items || []) {
+      const hay = `${it.label ?? ""} ${it.category ?? ""} ${it.extra ?? ""}`;
+      if (keys.some((k) => hay.includes(k))) matches.push(it);
+    }
+    if (matches.length === 0) { await o.send("هیچ موردی در Gaosc پیدا نشد."); return "handled"; }
+    const lines = [];
+    for (const it of matches) {
+      const row = await getVaultItem(env, userId, it.id);
+      let value = "";
+      try { if (row) value = await decryptVaultValue(env, row.value_enc); } catch { value = "[رمزنگاری‌شده]"; }
+      lines.push(`📌 **${it.label ?? ""}**\n\`${value}\``);
+    }
+    await o.send(lines.join("\n\n"));
+    return "handled";
+  }
+  if (c.intent === "vault_list") {
+    await markDaily(env, o);
+    if (c.fileList) {
+      const files = (await listVaultFiles(env, userId)).files || [];
+      if (!files.length) { await o.send("هیچ مدرکی در آرشیو پیدا نشد."); return "handled"; }
+      const lines = [];
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        const tp = tehranParts(f.created_at);
+        const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : "";
+        lines.push(`${i + 1}. 📁 **${f.title ?? ""}**${when ? ` — ${when}` : ""}`);
+      }
+      const keyboard = files.map((f, i) => [{ text: `📥 #${i + 1}`, callback_data: `vault:file:${f.id}` }]);
+      await o.send(lines.join("\n"), { replyMarkup: { inline_keyboard: keyboard } });
+      return "handled";
+    }
+    const items = (await listVaultItems(env, userId)).items;
+    if (!(items || []).length) { await o.send("Gaosc خالی است."); return "handled"; }
+    const lines = [];
+    let n = 0;
+    for (const it of items || []) {
+      const row = await getVaultItem(env, userId, it.id);
+      let value = "";
+      try { if (row) value = await decryptVaultValue(env, row.value_enc); } catch { value = ""; }
+      if (!value) continue;
+      n++;
+      lines.push(`${n}. 📌 **${it.label ?? ""}** — \`${value}\``);
+    }
+    let text = n ? lines.join("\n") : "هیچ مقدار ذخیره‌شده‌ای پیدا نشد.";
+    text += `\n\nبرای گرفتن فایل اکسل، روی «📊 خروجی اکسل (CSV)» بزنید.`;
+    await o.send(text, { replyMarkup: { inline_keyboard: [[{ text: "📊 خروجی اکسل (CSV)", callback_data: "vault:csv" }], [{ text: "☁️ همگام‌سازی گوگل", callback_data: "vault:sync" }]] } });
+    return "handled";
+  }
+  if (c.intent === "vault_file_get") {
+    await markDaily(env, o);
+    const keys = (c.keywords ?? []).filter(Boolean);
+    const files = (await listVaultFiles(env, userId)).files || [];
+    const hits = keys.length ? files.filter((f) => keys.some((k) => String(f.title ?? "").includes(k))) : files;
+    hits.sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
+    const f = hits[0];
+    if (!f) { await o.send("مدرکی با این عنوان پیدا نشد."); return "handled"; }
+    const tp = tehranParts(f.created_at);
+    const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : "";
+    const caption = `🔒📁 **${f.title ?? ""}**${when ? `\n🗓 ${when}` : ""}${f.doc_url ? `\n${f.doc_url}` : ""}`;
+    const formatted = formatTelegramHtml(caption);
+    const payload = { chat_id: o.chatId, caption: formatted, ...(formatted !== caption ? { parse_mode: "HTML" } : {}) };
+    if (f.file_type === "photo") await tgApi(env, "sendPhoto", { ...payload, photo: f.tg_file_id });
+    else await tgApi(env, "sendDocument", { ...payload, document: f.tg_file_id });
+    return "handled";
+  }
   if (c.intent === "file-reference") {
     const recent = await recentMessages(env, userId, 10);
     const file = recent.find((r) => r.tg_file_id);
@@ -876,9 +964,11 @@ export async function renderNoteList(env, userId, { projectName = null, projectI
     // is still available through the summary/delete actions.
     return `📖 #${offset + i + 1}${parts ? ` · ${parts}` : ""} — ${deriveNoteTitle(n.text)}`;
   }).join("\n");
-  // Phase 2-d: delete buttons numbered by row and packed 4 per row
-  // (8 vertical rows become 2); project filters chunked to at most 3.
-  const keyboard = chunkButtons(r.notes.map((n, i) => ({ text: `🗑 #${offset + i + 1}`, callback_data: `note:del:${n.id}` })), 4);
+  // Phase 3-A: view buttons (📖 #N -> note:view:<id>) render the full note
+  // on tap; delete buttons follow below, both packed 4 per row.
+  const keyboard = [];
+  keyboard.push(...chunkButtons(r.notes.map((n, i) => ({ text: `📖 #${offset + i + 1}`, callback_data: `note:view:${n.id}` })), 4));
+  keyboard.push(...chunkButtons(r.notes.map((n, i) => ({ text: `🗑 #${offset + i + 1}`, callback_data: `note:del:${n.id}` })), 4));
   if (r.notes.length === 8) keyboard.push([{ text: "بیشتر", callback_data: moreTag(offset + 8) }]);
   keyboard.push([{ text: "📊 خلاصه و جدول", callback_data: `note:sum:${pidTag}` }]);
   if (rp.ok) {
@@ -949,6 +1039,28 @@ export async function resolveNoteCallback(env, o) {
     if (!r.deleted) return true; // foreign/missing: silent
     if (o.editMarkup) await o.editMarkup();
     await o.send("🗑 یادداشت حذف شد.");
+    return true;
+  }
+  const view = /^note:view:(\d+)$/.exec(o.data);
+  if (view) {
+    const id = Number(view[1]);
+    if (!Number.isSafeInteger(id) || id <= 0) return true;
+    const row = await firstDb(env, "SELECT id, text, project_id, created_at FROM notes WHERE id = ? AND user_id = ?", [id, o.fromId]);
+    if (!row.ok || !row.row) { await o.send("یادداشتی پیدا نشد."); return true; }
+    let pname = null;
+    if (row.row.project_id != null) {
+      const rp = await listProjectsResult(env, o.fromId);
+      if (rp.ok) { const hit = rp.projects.find((p) => String(p.id) === String(row.row.project_id)); if (hit) pname = hit.name; }
+    }
+    const tp = tehranParts(row.row.created_at);
+    const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : "";
+    const body = String(row.row.text ?? "");
+    const title = deriveNoteTitle(body);
+    let text = `📌 **${title}**`;
+    if (when) text += `\n🗓 ${when}`;
+    if (pname) text += ` [📁 ${pname}]`;
+    text += `\n\n${body}`;
+    await o.send(text, { replyMarkup: { inline_keyboard: [[{ text: "🗑 حذف یادداشت", callback_data: `note:del:${id}` }]] } });
     return true;
   }
   const proj = /^note:proj:([^:]+)$/.exec(o.data);
@@ -1776,6 +1888,132 @@ export async function resolveInterpCallback(env, o) {
   await o.send("🗑 حذف شد."); return true;
 }
 
+// Phase 3-A: secure file/archive vault helpers.
+
+function stripCaptionPrefix(caption) {
+  return String(caption ?? "").replace(/^(?:ذخیره\s*[-:]\s*|ثبت\s*[-:]\s*|ذخیره‌اش\s*کن\s*|ثبت‌اش\s*کن\s*|بذر\s*)/u, "").trim() || null;
+}
+
+// Strips a conversational naming prefix ("بذار آخرین آزمایش" -> "آخرین آزمایش").
+// Returns null unless an actual naming prefix was present, so a pending
+// upload is never renamed by an unrelated message.
+function stripNamingPrefix(text) {
+  const t = String(text ?? "");
+      const m = /^(?:بذار\s+|اسمش\s+رو\s+بذار\s+|عنوانش\s+رو\s+بذار\s+|ذخیره\s*[-:]\s*کن\s*به\s*اسم\s*|ثبت\s*[-:]\s*کن\s+|ذخیره\s+به\s*اسم\s*|ثبت\s+به\s*اسم\s*)\s*([\s\S]+)$/u.exec(t);
+  return m ? m[1].trim() || null : null;
+}
+
+// Escapes Telegram markdown metacharacters so user content stays literal.
+function mdEscape(s) { return String(s ?? "").replace(/\*\*/g, "* *").replace(/`/g, "\\`"); }
+
+function csvField(v) {
+  const s = String(v ?? "");
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+function csvRow(...fields) { return fields.map(csvField).join(","); }
+
+async function fileBytesFromTelegram(env, tgFileId) {
+  const data = await getFileDownloadData(env, tgFileId);
+  if (!data) return null;
+  return data.data instanceof Uint8Array ? data.data : new Uint8Array(data.data ?? []);
+}
+
+// Case A (caption) / Case B (no caption) for incoming document/photo uploads.
+export async function handleVaultFile(env, o) {
+  const { userId, chatId, tgFileId, fileType, mimeType, fileName, caption, send } = o;
+  if (!dbOf(env)) return false;
+  const title = caption ? stripCaptionPrefix(caption) : null;
+  if (title) {
+    const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title, fileName, syncStatus: "local" });
+    let syncInfo = "";
+    if (saved.ok) {
+      const bytes = await fileBytesFromTelegram(env, tgFileId);
+      const sync = await syncVaultFileToGoogle(env, { id: saved.id, userId, label: title, fileName, mimeType, data: bytes ?? new Uint8Array(0), createdAt: new Date().toISOString() });
+      await setFileSyncStatus(env, userId, saved.id, sync.ok ? "synced" : "pending_google", sync.googleId ?? null, null);
+      syncInfo = sync.ok ? `\n✅ گوگل Docs/Drive${sync.googleId ? ` (${sync.googleId})` : ""}: ذخیره شد` : "\n⏳ در انتظار همگام‌سازی گوگل";
+    }
+    await send(`🔒📁 مدرک «**${mdEscape(title)}**» در آرشیو امن ذخیره شد.${syncInfo}`);
+    return true;
+  }
+  const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title: "__pending__", fileName, syncStatus: "local" });
+  if (!saved.ok) { await send(NOT_SAVED_TEXT); return true; }
+  await send("🔒📁 این مدرک/تصویر حساس با چه عنوانی در آرشیو امن و Google Docs ذخیره شود؟\n(مثلاً بنویسید یا ویس بدهید: «آخرین آزمایش» یا «تصویر کارت ملی»)");
+  return true;
+}
+
+// Next-turn naming for a pending __pending__ vault upload. Returns true when
+// the incoming text/voice named the file.
+async function namePendingVaultFile(env, o) {
+  const { userId, text, send } = o;
+  const title = stripNamingPrefix(text);
+  if (!title) return false;
+  const pend = await resolvePendingVaultFile(env, userId, title);
+  if (!pend.ok || !pend.file) return false;
+  const f = pend.file;
+  const bytes = await fileBytesFromTelegram(env, f.tg_file_id);
+  const sync = await syncVaultFileToGoogle(env, { id: f.id, userId, label: f.title, fileName: f.fileName, mimeType: f.mimeType, data: bytes ?? new Uint8Array(0), createdAt: f.created_at });
+  await setFileSyncStatus(env, userId, f.id, sync.ok ? "synced" : "pending_google", sync.googleId ?? null, null);
+  await send(`🔒📁 مدرک با عنوان «**${mdEscape(f.title)}**» در آرشیو امن و Google Docs ثبت شد.`);
+  return true;
+}
+
+// Vault callbacks: vault:csv, vault:sync, vault:file:<id>.
+export async function resolveVaultCallback(env, o) {
+  const csv = /^vault:csv$/.exec(o.data);
+  if (csv) {
+    const items = (await listVaultItems(env, o.fromId)).items || [];
+    const lines = ["ID,Category,Title,Value,Extra,UpdatedAt"];
+    for (const it of items) {
+      let value = "";
+      try { value = await decryptVaultValue(env, it.value_enc); } catch {}
+      lines.push(csvRow(it.id, it.category ?? "", it.label ?? "", value, it.extra ?? "", it.updated_at ?? ""));
+    }
+    const body = "\uFEFF" + lines.join("\r\n") + "\r\n";
+    await sendDocument(env, o.chatId, "personal-vault.csv", body, { contentType: "text/csv" });
+    return true;
+  }
+  const sync = /^vault:sync$/.exec(o.data);
+  if (sync) {
+    let done = 0, failed = 0;
+    const items = (await listVaultItems(env, o.fromId)).items || [];
+    for (const it of items) {
+      if (it.sync_status === "synced") continue;
+      let value = "";
+      try { value = await decryptVaultValue(env, it.value_enc); } catch {}
+      const r = await syncVaultItemToGoogle(env, { id: it.id, userId: o.fromId, label: it.label, value, kind: "text", createdAt: it.created_at });
+      await setVaultSyncStatus(env, o.fromId, it.id, r.ok ? "synced" : "pending_google", r.googleId ?? null);
+      r.ok ? done++ : failed++;
+    }
+    const files = (await listVaultFiles(env, o.fromId)).files || [];
+    for (const f of files) {
+      if (f.sync_status === "synced") continue;
+      const bytes = await fileBytesFromTelegram(env, f.tg_file_id);
+      const r = await syncVaultFileToGoogle(env, { id: f.id, userId: o.fromId, label: f.title, fileName: f.fileName, mimeType: f.mimeType, data: bytes ?? new Uint8Array(0), createdAt: f.created_at });
+      await setFileSyncStatus(env, o.fromId, f.id, r.ok ? "synced" : "pending_google", r.googleId ?? null, null);
+      r.ok ? done++ : failed++;
+    }
+    await o.send(`✅ همگام‌سازی گوگل تمام شد: ${done} موفق، ${failed} ناموفق.`);
+    return true;
+  }
+  const file = /^vault:file:(\d+)$/.exec(o.data);
+  if (file) {
+    const fid = Number(file[1]);
+    if (!Number.isSafeInteger(fid) || fid <= 0) return true;
+    const f = await getVaultFile(env, o.fromId, fid);
+    if (!f) { await o.send("مدرکی پیدا نشد."); return true; }
+    const tp = tehranParts(f.created_at);
+    const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : "";
+    const caption = `🔒📁 **${f.title ?? ""}**${when ? `\n🗓 ${when}` : ""}${f.doc_url ? `\n${f.doc_url}` : ""}`;
+    const formatted = formatTelegramHtml(caption);
+    const payload = { chat_id: o.chatId, caption: formatted, ...(formatted !== caption ? { parse_mode: "HTML" } : {}) };
+    if (f.file_type === "photo") await tgApi(env, "sendPhoto", { ...payload, photo: f.tg_file_id });
+    else await tgApi(env, "sendDocument", { ...payload, document: f.tg_file_id });
+    return true;
+  }
+  return false;
+}
+
 // Everyday text, Phase 0-b: deterministic gates first (commands, bare-note
 // ask, fast money, open-question answers), then the interpreter for
 // everything else — never directly to chat. Part 2 comment below kept.
@@ -1964,6 +2202,12 @@ export async function handleDailyText(env, o) {
   if (o.chat) { const rawChat = o.chat; o.chat = (t, copts = {}) => rawChat(t, { ...copts, ...(o.voiceHeader && !copts.voiceHeader ? { voiceHeader: o.voiceHeader } : {}), ...(o.entryMessageId && !copts.retryEntryId && !copts.retryData ? { retryEntryId: o.entryMessageId } : {}), ...(o.entryMessageId && !copts.quickConvertId ? { quickConvertId: o.entryMessageId } : {}) }); }
   const finalizeEntry = async (kind) => { if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; await finalizeMessageKind(env, o.entryMessageId, userId, kind); } };
   const viaBranch = async (cc) => { const r = await runDailyBranch(env, o, cc, ctx); await finalizeEntry(r === "chat" ? "chat" : "daily"); return r; };
+  // Phase 3-A: name a pending __pending__ vault upload on the next turn
+  // (text message or voice transcript). Not a command.
+  if (text && !/^\s*\//.test(text)) {
+    const named = await namePendingVaultFile(env, o);
+    if (named) { await finalizeEntry("daily"); return "handled"; }
+  }
   // Bare-note ask bypasses the model step: the model is exactly what
   // failed live for bare notes (chat verdict -> hallucinated storage).
   // runDailyBranch asks for the text and sets the note-text slot itself.
@@ -2202,7 +2446,10 @@ export async function resolveAskCallback(env, o) {
 // Telegram senders for the daily: branches in index.js.
 export function dailySenders(env, chatId, messageId) {
   return {
-    send: (msgText, opts) => tgApi(env, "sendMessage", { chat_id: chatId, text: msgText, ...(opts?.replyMarkup ? { reply_markup: opts.replyMarkup } : {}) }),
+    send: (msgText, opts) => {
+      const formatted = formatTelegramHtml(String(msgText ?? ""));
+      return tgApi(env, "sendMessage", { chat_id: chatId, text: formatted, ...(formatted !== String(msgText ?? "") ? { parse_mode: "HTML" } : {}), ...(opts?.replyMarkup ? { reply_markup: opts.replyMarkup } : {}) });
+    },
     editMarkup: () => tgApi(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
     // Phase 2-d: edit the original message's text in place and drop
     // its buttons (reply_markup: []); null when there is no message

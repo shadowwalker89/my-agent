@@ -310,6 +310,7 @@ export const NLU_MAX_TOKENS = 360;
 export const NLU_VALID_INTENTS = Object.freeze([
   "note", "task", "reminder", "expense", "note_list", "task_list",
   "project_list", "project_create", "summary", "daypart_reply", "chat",
+  "vault_save", "vault_get", "vault_list", "vault_file_get",
 ]);
 
 export function resolveInterpreterModel(env) {
@@ -369,6 +370,7 @@ function buildNluPrompt(text, context = {}) {
     "- A natural conversational task request — even with greetings or modal openers — is task with confidence >= 0.85. body = the clean task title only. Examples: 'سلام یه تسک جدید برام ثبت کن برای پروژه یوتیوب ادیت ویدیو' → task, body='ادیت ویدیو', project='یوتیوب'; 'یه کار جدید برام ثبت کن بررسی قرارداد پیمانکار' → task, body='بررسی قرارداد پیمانکار'.",
     "- A time-based request (e.g. یادم بنداز فردا ساعت ۵ عصر به علی زنگ بزنم, یادت نره فردا به علی زنگ بزنم) is reminder: body = title, date_ref, time_ref, daypart, project.",
     "- Summarize requests (e.g. یه خلاصه از یادداشتهام بده, یادداشتهای گلبهار رو جدول کن) are summary with summary_target notes/tasks and project.",
+    "- Vault requests: saving a card/sheba/account/ID ('شماره کارت رسالت 6037... ثبتش کن') is vault_save; asking for one ('شماره کارتم چنده؟') is vault_get; listing them ('کارت‌هام رو نشون بده') is vault_list; asking for an archived file/photo ('آخرین آزمایشم رو بفرست') is vault_file_get. The caller validates and decrypts values deterministically — never trust NLU-extracted amounts.",
     "- When a pending hour-ambiguous question is active and the message is a time/daypart clarification or cancellation, even with typos or conversational phrasing (صبخ, واسه صبح, عصری, کنسل), it is daypart_reply with daypart صبح/عصر/شب/cancel.",
     "- Never invent a project: project must be one of the listed names or null. Never invent numbers: the caller validates any amount deterministically.",
     "- body must never contain command framing words like 'یادداشت کن', 'ثبت کن', 'بذار', 'تسک', 'یادداشت', 'برام', 'واسم', 'لطفاً', 'سلام', 'میخوام'. Extract only the meaningful content.",

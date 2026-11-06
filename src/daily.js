@@ -691,6 +691,32 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   }
   // No verb: ask only for a short message that carries a currency word.
   if (amount?.anchored) { if (NEGATED_RE.test(raw)) return { intent: "chat", confidence: 1 }; if (amount.bareMultiplier) return { intent: "chat", confidence: 1 }; if (raw.split(/\s+/).some((tok) => /^ن(خریدم|خرید|گرفتم|پرداختم|دریافت|کردم)/u.test(tok))) return { intent: "chat", confidence: 1 }; const tokens = raw.split(/\s+/).filter(Boolean).length; if (tokens <= 4) return { intent: "ask", confidence: 0.5, question: "expense-or-chat" }; return { intent: "chat", confidence: 1 }; }
+  // Phase 3-A: personal vault references — rule-based, zero model calls.
+  // A vault keyword (card/sheba/account/national-id/personal-info) gates
+  // every vault verdict so ordinary chat never misclassifies.
+  const vk = /کارت|شبا|حساب|کد\s*ملی|اطلاعات\s*شخصی|گاوصندوق/u.test(raw);
+  if (vk) {
+    const cat = /شبا/u.test(raw) ? "sheba" : /کد\s*ملی/u.test(raw) ? "national_id" : /حساب/u.test(raw) ? "account" : /اطلاعات\s*شخصی/u.test(raw) ? "personal_info" : /کارت/u.test(raw) ? "bank_card" : null;
+    const vDigits = raw ? normalizeDigits(raw).match(/\d+/g) : null;
+    const value = vDigits ? vDigits.join("") : "";
+    let title = null;
+    if (cat) {
+      if (cat === "bank_card") { const m = /کارت\s+(بانک\s+)?([^\s\d،,؛:؛؟!.]{2,})/u.exec(raw); title = m ? `کارت ${m[1] ?? ""}${m[2]}`.replace(/\s+/g, " ").trim() : "کارت بانکی"; }
+      else if (cat === "sheba") { const m = /شبا\s+([^\s\d]{2,})/u.exec(raw); title = m ? `شبا ${m[1]}` : "شبا"; }
+      else if (cat === "account") { const m = /حساب\s+([^\s\d]{2,})/u.exec(raw); title = m ? `حساب ${m[1]}` : "حساب بانکی"; }
+      else if (cat === "national_id") title = "کد ملی";
+      else if (cat === "personal_info") title = "اطلاعات شخصی";
+    }
+    const kws = (cat ? [cat] : []).concat(title ? [title] : []);
+    // List before get: "نشون بده" also ends in "بده".
+    if (/نشون\s*بده|\bلیست\b/u.test(raw)) return { intent: "vault_list", confidence: 1, category: cat ?? null, title, keywords: kws };
+    if (/ثبت\s*ش?\s*کن|ثبت\s*کن|ذخیره\s*کن|بذار(?!\p{L})|بگذار|ذخیره‌اش\s*کن|ثبت‌اش\s*کن/u.test(raw)) return { intent: "vault_save", confidence: 1, category: cat ?? null, title, value, keywords: kws };
+    if (/چنده(?!\p{L})|چقدر(?!\p{L})|بده(?!\p{L})/u.test(raw)) return { intent: "vault_get", confidence: 1, category: cat ?? null, title, keywords: kws };
+  }
+  // Phase 3-A: archived file listing ("لیست مدارک آرشیو", "فایل‌های ذخیره شده").
+  if (/لیست\s*(?:مادرک|مدیریت)|(?:مادرک|مدیریت)\s*آرشیو|آرشیو\s*(?:مادرک|مدیریت)|فایل\s*های\s*ذخیره\s*شدة|ذخیره\s*شدة\s*فایل/u.test(raw)) return { intent: "vault_list", confidence: 1, category: null, title: null, keywords: [], fileList: true };
+  // Phase 3-A: archived file retrieval ("آخرین آزمایشم رو بفرست", "تصویر کارت ملی رو بده").
+  if (/فایل|مدرک|عکس|تصویر|کارت\s*ملی|آزمایشم/u.test(raw) && /بفرست(?!\p{L})|بده(?!\p{L})|رو\s*فرست/u.test(raw)) return { intent: "vault_file_get", confidence: 1, keywords: raw.split(/\s+/).filter(Boolean).slice(-6) };
   return { intent: "chat", confidence: 1 };
 }
 

@@ -737,6 +737,18 @@ async function ensureVaultTable(db) {
       )
       .bind()
       .run();
+    await db
+      .prepare(
+        "CREATE TABLE IF NOT EXISTS vault_files (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, tg_file_id TEXT NOT NULL, file_type TEXT NOT NULL, mime_type TEXT, title TEXT NOT NULL, file_name TEXT, drive_url TEXT, doc_url TEXT, sync_status TEXT NOT NULL DEFAULT 'local', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+      )
+      .bind()
+      .run();
+    try {
+      await db.prepare("ALTER TABLE vault_items ADD COLUMN category TEXT").bind().run();
+    } catch {}
+    try {
+      await db.prepare("ALTER TABLE vault_items ADD COLUMN extra TEXT").bind().run();
+    } catch {}
     vaultReadyDbs.add(db);
     return true;
   } catch {
@@ -755,22 +767,24 @@ export async function saveVaultItem(envOrDb, item) {
   if (!(await ensureVaultTable(db))) return { ok: false };
   const now = typeof item?.createdAt === "string" && item.createdAt ? item.createdAt : new Date().toISOString();
   const syncStatus = typeof item?.syncStatus === "string" && item.syncStatus ? item.syncStatus : "local";
+  const category = typeof item?.category === "string" ? item.category : null;
+  const extra = typeof item?.extra === "string" ? item.extra : null;
   const id = Number(item?.id);
   try {
     if (Number.isInteger(id) && id > 0) {
       await db
         .prepare(
-          "UPDATE vault_items SET label = ?, kind = ?, value_enc = ?, file_name = ?, file_mime = ?, google_id = ?, sync_status = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+          "UPDATE vault_items SET label = ?, kind = ?, value_enc = ?, file_name = ?, file_mime = ?, google_id = ?, sync_status = ?, updated_at = ?, category = ?, extra = ? WHERE id = ? AND user_id = ?",
         )
-        .bind(label, kind, item?.valueEnc ?? null, item?.fileName ?? null, item?.mimeType ?? null, item?.googleId ?? null, syncStatus, now, id, userId)
+        .bind(label, kind, item?.valueEnc ?? null, item?.fileName ?? null, item?.mimeType ?? null, item?.googleId ?? null, syncStatus, now, category, extra, id, userId)
         .run();
       return { ok: true, id };
     }
     await db
       .prepare(
-        "INSERT INTO vault_items (user_id, label, kind, value_enc, file_name, file_mime, google_id, sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO vault_items (user_id, label, kind, value_enc, file_name, file_mime, google_id, sync_status, created_at, updated_at, category, extra) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .bind(userId, label, kind, item?.valueEnc ?? null, item?.fileName ?? null, item?.mimeType ?? null, item?.googleId ?? null, syncStatus, now, now)
+      .bind(userId, label, kind, item?.valueEnc ?? null, item?.fileName ?? null, item?.mimeType ?? null, item?.googleId ?? null, syncStatus, now, now, category, extra)
       .run();
     const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first();
     return { ok: true, id: row?.id ?? null };
@@ -789,7 +803,7 @@ export async function listVaultItems(envOrDb, userId, { limit = 20, offset = 0 }
   try {
     const res = await db
       .prepare(
-        "SELECT id, label, kind, file_name, file_mime, google_id, sync_status, created_at, updated_at FROM vault_items WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+        "SELECT id, label, kind, file_name, file_mime, google_id, sync_status, created_at, updated_at, category, extra FROM vault_items WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
       )
       .bind(id, n, off)
       .all();
@@ -837,6 +851,105 @@ export async function setVaultSyncStatus(envOrDb, userId, itemId, status, google
     await db
       .prepare("UPDATE vault_items SET sync_status = ?, google_id = COALESCE(?, google_id), updated_at = ? WHERE id = ? AND user_id = ?")
       .bind(syncStatus, googleId, new Date().toISOString(), vaultId, id)
+      .run();
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  }
+}
+
+export async function saveVaultFile(envOrDb, { userId, tgFileId, fileType, mimeType, title, fileName = null, syncStatus = "local" } = {}) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  if (!db || id === null || !tgFileId || !fileType) return { ok: false };
+  if (!(await ensureVaultTable(db))) return { ok: false };
+  const now = new Date().toISOString();
+  try {
+    await db
+      .prepare(
+        "INSERT INTO vault_files (user_id, tg_file_id, file_type, mime_type, title, file_name, sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind(id, tgFileId, fileType, mimeType ?? null, String(title), fileName, syncStatus, now, now)
+      .run();
+    const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first();
+    return { ok: true, id: row?.id ?? null };
+  } catch {
+    return { ok: false };
+  }
+}
+
+export async function listVaultFiles(envOrDb, userId, { limit = 20, offset = 0 } = {}) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  if (!db || id === null) return { ok: false, files: [] };
+  if (!(await ensureVaultTable(db))) return { ok: false, files: [] };
+  const n = Math.max(1, Math.min(50, Number(limit) || 20));
+  const off = Math.max(0, Number(offset) || 0);
+  try {
+    const res = await db
+      .prepare(
+        "SELECT id, tg_file_id, file_type, mime_type, title, file_name, drive_url, doc_url, sync_status, created_at, updated_at FROM vault_files WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+      )
+      .bind(id, n, off)
+      .all();
+    return { ok: true, files: Array.isArray(res?.results) ? res.results : [] };
+  } catch {
+    return { ok: false, files: [] };
+  }
+}
+
+export async function getVaultFile(envOrDb, userId, fileId) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  const fid = Number(fileId);
+  if (!db || id === null || !Number.isInteger(fid) || fid <= 0) return null;
+  if (!(await ensureVaultTable(db))) return null;
+  try {
+    return await db.prepare("SELECT * FROM vault_files WHERE id = ? AND user_id = ? LIMIT 1").bind(fid, id).first();
+  } catch {
+    return null;
+  }
+}
+
+// Finds the most recent "__pending__" upload for the user (created within
+// the last 15 minutes). When `title` is given it renames the pending record
+// and returns the updated file row.
+export async function resolvePendingVaultFile(envOrDb, userId, title = null) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  if (!db || id === null) return { ok: false, file: null };
+  if (!(await ensureVaultTable(db))) return { ok: false, file: null };
+  const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  try {
+    const row = await db
+      .prepare("SELECT * FROM vault_files WHERE user_id = ? AND title = '__pending__' AND datetime(created_at) >= datetime(?) ORDER BY id DESC LIMIT 1")
+      .bind(id, cutoff)
+      .first();
+    if (!row) return { ok: true, file: null };
+    if (title !== null) {
+      await db
+        .prepare("UPDATE vault_files SET title = ?, updated_at = ? WHERE id = ? AND user_id = ? AND title = '__pending__'")
+        .bind(String(title), new Date().toISOString(), row.id, id)
+        .run();
+      return { ok: true, file: { ...row, title: String(title) } };
+    }
+    return { ok: true, file: row };
+  } catch {
+    return { ok: false, file: null };
+  }
+}
+
+export async function setFileSyncStatus(envOrDb, userId, fileId, status, driveUrl = null, docUrl = null) {
+  const db = dbOf(envOrDb);
+  const id = validUserId(userId);
+  const fid = Number(fileId);
+  const syncStatus = typeof status === "string" && status ? status : "local";
+  if (!db || id === null || !Number.isInteger(fid) || fid <= 0) return { ok: false };
+  if (!(await ensureVaultTable(db))) return { ok: false };
+  try {
+    await db
+      .prepare("UPDATE vault_files SET sync_status = ?, drive_url = COALESCE(?, drive_url), doc_url = COALESCE(?, doc_url), updated_at = ? WHERE id = ? AND user_id = ?")
+      .bind(syncStatus, driveUrl, docUrl, new Date().toISOString(), fid, id)
       .run();
     return { ok: true };
   } catch {

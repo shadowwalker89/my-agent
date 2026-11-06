@@ -28,7 +28,7 @@ import { recordVerifiedModel, recordProviderCircuitSuccess } from "./circuit.js"
 import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation } from "./intent.js";
 import { getChatContext } from "./memory.js";
-import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, chatFailureNotice, formatFailureDetail, runReminderTick, quickConvertKeyboard } from "./everyday.js";
+import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, handleVaultFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, resolveVaultCallback, chatFailureNotice, formatFailureDetail, runReminderTick, quickConvertKeyboard } from "./everyday.js";
 import { handleVoice, handleVoiceRetry } from "./voice.js";
 import { saveMessage, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus } from "./db.js";
 import { encryptVaultValue, decryptVaultValue, getGoogleVaultConfig, googleVaultStatus, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
@@ -857,6 +857,11 @@ async function handleCallbackQuery(env, cb) {
   }
   if (!fromId || !chatId || !isAllowed(env.ALLOWED_TG_IDS, fromId)) return;
 
+  if (data.startsWith("vault:")) {
+    await resolveVaultCallback(env, { fromId, chatId, data, ...dailySenders(env, chatId, cb?.message?.message_id),
+      chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
+    return;
+  }
   if (data.startsWith("daily:")) {
     await resolveDailyCallback(env, { fromId, chatId, data, ...dailySenders(env, chatId, cb?.message?.message_id),
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
@@ -1060,14 +1065,15 @@ async function handleUpdate(env, update) {
   }
 
   if (!text) {
-    // Non-text file: photo (largest size) or document. Saved as kind
-    // daily, no R2 in Step 1; summarising comes with the file step.
+    // Non-text file: photo (largest size) or document. Routed to the
+    // secure archive vault: caption -> named record + Google mirror,
+    // no caption -> pending record awaiting a next-turn title.
     const photo = Array.isArray(msg.photo) && msg.photo.length ? msg.photo[msg.photo.length - 1] : null;
     const doc = msg.document && typeof msg.document === "object" ? msg.document : null;
     const fileId = photo?.file_id ?? doc?.file_id;
     if (fileId) {
       await ensureUserRow(env, msg.from.id);
-      const handled = await handleDailyFile(env, { userId: msg.from.id, chatId: msg.chat.id, tgFileId: fileId, fileName: doc?.file_name ?? null, fileMime: doc?.mime_type ?? (photo ? "image/jpeg" : null), caption: typeof msg.caption === "string" ? msg.caption : null, send: (msgText) => tgSend(env, msg.chat.id, msgText) });
+      const handled = await handleVaultFile(env, { userId: msg.from.id, chatId: msg.chat.id, tgFileId: fileId, fileType: photo ? "photo" : "document", mimeType: doc?.mime_type ?? (photo ? "image/jpeg" : null), fileName: doc?.file_name ?? null, caption: typeof msg.caption === "string" ? msg.caption : null, send: (msgText) => tgSend(env, msg.chat.id, msgText) });
       if (handled) return;
     }
     await tgSend(env, msg.chat.id, "فعلاً فقط پیام متنی پشتیبانی می‌شود 🙏");
