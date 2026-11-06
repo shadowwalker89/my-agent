@@ -291,6 +291,21 @@ export function classifyFailure(status, bodySnippet, isTimeout) {
   };
 }
 
+// Phase 2-l: OpenRouter model ids are `subvendor/model` (e.g.
+// openrouter/anthropic/claude-...). A transient failure on one sub-vendor
+// must not skip the other sub-vendors of the same provider, so the
+// intra-call skip key is sub-vendor scoped. Account-level key rejection
+// stays provider-scoped.
+export function failoverScope(provider, model) {
+  const p = String(provider ?? "");
+  const m = String(model ?? "");
+  if (p === "openrouter") {
+    const slash = m.indexOf("/");
+    if (slash > 0) return `${p}/${m.slice(0, slash)}`;
+  }
+  return p;
+}
+
 // ترتیب هدف‌ها بر حسب استراتژی combo دستی (pure؛ برای تست آفلاین هم قابل استفاده)
 // - priority: ترتیب ذخیره‌شده (fallback ترتیبی)
 // - round-robin: چرخش از اندیس ذخیره‌شده‌ی KV
@@ -629,7 +644,7 @@ export async function runCombo(
   // per-provider skip, observed: a 503 on xkiro/a then a timeout on
   // nvidia/b must not spend the budget on xkiro/c). Single-provider combos
   // keep trying every target — there is no alternative to skip to.
-  const multiProvider = new Set(targets.map((t) => t.provider)).size > 1;
+  const multiProvider = new Set(targets.map((t) => failoverScope(t.provider, t.model))).size > 1;
   const skippedProviders = new Set();
 
   for (let ti = 0; ti < targets.length; ti++) {
@@ -641,7 +656,7 @@ export async function runCombo(
       targets.splice(ti, rest.length, ...reordered);
     }
     const t = targets[ti];
-    if (rejectedProviders.has(t.provider) || skippedProviders.has(t.provider)) continue;
+    if (rejectedProviders.has(t.provider) || skippedProviders.has(failoverScope(t.provider, t.model))) continue;
     const usedModel = `${t.provider}/${t.model}`;
     const remaining = deadline - (Date.now() - started);
     if (remaining < 1200) {
@@ -765,7 +780,7 @@ export async function runCombo(
       if (transientProviderFailure) {
         recordProviderFailure(t.provider);
         await recordProviderCircuitFailure(env, t.provider, isTimeout ? "timeout" : cause);
-        if (multiProvider) skippedProviders.add(t.provider);
+        if (multiProvider) skippedProviders.add(failoverScope(t.provider, t.model));
       }
     } else if (stream) {
       const res = attempt.res;
@@ -828,7 +843,7 @@ export async function runCombo(
           recordTargetFailure(usedModel, "timeout");
           recordProviderFailure(t.provider);
           await recordProviderCircuitFailure(env, t.provider, "timeout");
-          if (multiProvider) skippedProviders.add(t.provider);
+          if (multiProvider) skippedProviders.add(failoverScope(t.provider, t.model));
           continue;
         }
         errors.push({ target: usedModel, reason: truncate(`bad json: ${err && err.message}`), timerFired: false });

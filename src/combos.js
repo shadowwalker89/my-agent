@@ -19,6 +19,7 @@ export const RULES = {
     demoteUltra: true,
     demoteUnstable: true,
     boostWorkhorse: true,
+    provenFast: true,
     neutralizeVersion: true,
   },
   code: {
@@ -53,6 +54,7 @@ export const RULES = {
     demoteUltra: true,
     demoteUnstable: true,
     boostWorkhorse: true,
+    provenFast: true,
     neutralizeVersion: true,
   },
 };
@@ -182,6 +184,7 @@ export const WEIGHTS = {
   ultraPenalty: 35,     // مدل‌های فوق‌سنگین ≥400B (550b/405b/1t) — در chat/fast دیر پاسخ می‌دهند
   unstablePenalty: 50,  // مدل‌های ناپایدار/هنگ‌کننده (gemma-4/glm-5/qwen3.5-3.9/deepseek-v4/...) در production
   workhorseBoost: 45,   // مدل‌های instruct سریع و اثبات‌شده (llama-3.3-70b/...) در chat/fast
+  provenFastBonus: 28,  // مدل‌های سریعِ اثبات‌شده در production (Phase 2-l)
 };
 
 const NOVELTY_RE = /preview|beta|alpha|exp|-rc\d/i;
@@ -193,6 +196,9 @@ const VL_OMNI_RE = /vision|\bvl\b|omni/i;
 const UNSTABLE_RE = /qwen3\.[5-9]|deepseek-v4|deepseek-r1|glm-5|gemma-4|nemotron-3|mistral-large-4|mistral-large(?:-2)?(?:-instruct)?\b|kimi-k2|preview|thinking|reasoning|-r1\b|omni/i;
 // instructهای سریع و پایدار که در production جواب داده‌اند — در chat/fast تقویت می‌شوند.
 const WORKHORSE_RE = /llama-3\.3-70b-instruct|llama-3\.1-70b-instruct|llama-3\.1-8b-instruct|llama-3\.[0-9]|qwen2\.5-72b-instruct|qwen-2\.5-72b-instruct|qwen2\.5-32b-instruct|gemma-3-27b-it|gemma-2-27b-it|mistral-small|ministral|phi-4|openrouter\/free|cohere\/north|flint-v1|nemotron-super/i;
+// Phase 2-l: models that stayed fast and stable in production. A flat
+// bonus in chat/fast keeps them ahead of newer-but-unproven siblings.
+const PROVEN_FAST_RE = /minimax-m3\.1-flash|cohere\/north-mini-code|nemotron-3\.5-super-vl/i;
 
 function compileSafe(pattern, flags) {
   try {
@@ -283,7 +289,7 @@ export function applyVersionBonus(scored, { enabled = true } = {}) {
   }
 }
 
-export function scoreModel(m, compiledPrefer, { skipVlPenalty = false, demoteUltra = false, demoteUnstable = false, boostWorkhorse = false } = {}) {
+export function scoreModel(m, compiledPrefer, { skipVlPenalty = false, demoteUltra = false, demoteUnstable = false, boostWorkhorse = false, provenFast = false } = {}) {
   const name = namePartOf(m.id);
   const sizeB = sizeBOf(name);
   const sizeAdj = sizeAdjust(sizeB);
@@ -291,6 +297,7 @@ export function scoreModel(m, compiledPrefer, { skipVlPenalty = false, demoteUlt
   if (demoteUltra && sizeB >= 400) score -= WEIGHTS.ultraPenalty;
   if (demoteUnstable && UNSTABLE_RE.test(m.id)) score -= WEIGHTS.unstablePenalty;
   if (boostWorkhorse && WORKHORSE_RE.test(m.id)) score += WEIGHTS.workhorseBoost;
+  if (provenFast && PROVEN_FAST_RE.test(m.id)) score += WEIGHTS.provenFastBonus;
   compiledPrefer.forEach((entry, i) => {
     if (!entry?.re) return;
     // الگوی «coder» فقط وقتی مدل جریمه‌ی اندازه نخورده اعمال می‌شود —
@@ -334,6 +341,7 @@ export function pickModels(catalog, rule, { prefer = null, bans = [] } = {}) {
       demoteUltra: rule.demoteUltra === true,
       demoteUnstable: rule.demoteUnstable === true,
       boostWorkhorse: rule.boostWorkhorse === true,
+      provenFast: rule.provenFast === true,
     }),
   }));
   applyVersionBonus(scored, { enabled: rule.neutralizeVersion !== true });

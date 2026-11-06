@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { RULES, pickModels, diversify, WEIGHTS, sizeBOf } from "../src/combos.js";
+import { RULES, pickModels, diversify, WEIGHTS, sizeBOf, scoreModel, compilePrefer } from "../src/combos.js";
 import { mapNvidia, mapXkiro, mapOpenRouter } from "../src/providers.js";
 import { classifyFailure, sortForStrategy, normalizeOpenAiChat, runCombo, resetRouterHealthForTests, getEmptyFinalCounts, resetEmptyFinalCountsForTests } from "../src/router.js";
 import {
@@ -218,6 +218,30 @@ check(
   }
   check(WEIGHTS.unstablePenalty === 50 && WEIGHTS.workhorseBoost === 45, "2-j: unstable -50 / workhorse +45 weights");
   check(RULES.chat.neutralizeVersion === true && RULES.fast.neutralizeVersion === true, "2-j: chat/fast neutralize the version bonus");
+}
+
+// ── Phase 2-l: proven-fast models get a flat +28 in chat/fast ───────────────
+{
+  const cp = compilePrefer(RULES.chat.prefer);
+  const base = { provider: "nvidia", context: 128000 };
+  const proven = [
+    "minimaxai/minimax-m3.1-flash",
+    "cohere/north-mini-code",
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+  ];
+  for (const id of proven) {
+    const m = { id, ...base };
+    const withBonus = scoreModel(m, cp, { demoteUnstable: true, boostWorkhorse: true, provenFast: true });
+    const without = scoreModel(m, cp, { demoteUnstable: true, boostWorkhorse: true, provenFast: false });
+    check(
+      Math.abs(withBonus - without - WEIGHTS.provenFastBonus) < 1e-9,
+      `2-l: ${id} gets +${WEIGHTS.provenFastBonus} when provenFast is on (delta=${withBonus - without})`,
+    );
+  }
+  check(
+    WEIGHTS.provenFastBonus === 28 && RULES.chat.provenFast === true && RULES.fast.provenFast === true,
+    "2-l: proven-fast +28 is enabled in chat/fast",
+  );
 }
 
 const asserts = {
@@ -1709,6 +1733,45 @@ for (const [label, status] of [["429", 429], ["5xx", 500]]) {
     r = await runCombo(env, "skipmulti", { messages: [{ role: "user", content: "hi" }] }, { attemptTimeoutMs: 50, totalTimeoutMs: 6000 });
   } finally { global.fetch = prev; resetRouterHealthForTests(); }
   check(r.ok === false && seen.join(",") === "a,b", `2-j: multi-provider strict skip tries a,b and skips xkiro/c (seen=${seen.join(",")})`);
+}
+
+// 15) Phase 2-l: OpenRouter sub-vendor failover. A transient failure on
+// one sub-vendor must not skip the other sub-vendors of the same provider.
+{
+  resetRouterHealthForTests();
+  const env = { STATE: fakeKV(), OPENROUTER_API_KEY: "k", NVIDIA_API_KEY: "k" };
+  await upsertProvider(env, { id: "openrouter", name: "openrouter", baseUrl: "https://openrouter.test/v1", secretName: "OPENROUTER_API_KEY", enabled: true });
+  await upsertProvider(env, { id: "nvidia", name: "nvidia", baseUrl: "https://nvidia.test/v1", secretName: "NVIDIA_API_KEY", enabled: true });
+  await upsertCombo(env, {
+    name: "subvendor", kind: "custom", strategy: "priority", timeoutMs: 8000, retries: 0,
+    targets: [
+      { provider: "openrouter", model: "anthropic/claude-3.5-sonnet" },
+      { provider: "openrouter", model: "meta-llama/llama-3.3-70b" },
+      { provider: "nvidia", model: "meta/llama-3.3-70b-instruct" },
+    ],
+  });
+  const seen = [];
+  const prev = global.fetch;
+  global.fetch = (url, init = {}) => {
+    let model = "";
+    try { model = JSON.parse(String(init.body ?? "{}")).model ?? ""; } catch {}
+    seen.push(model);
+    if (model === "anthropic/claude-3.5-sonnet") {
+      return Promise.resolve(new Response(JSON.stringify({ error: { message: "down" } }), { status: 503 }));
+    }
+    return Promise.resolve(Response.json({ choices: [{ message: { content: "ok" } }] }));
+  };
+  let r;
+  try {
+    r = await runCombo(env, "subvendor", { messages: [{ role: "user", content: "hi" }] }, { attemptTimeoutMs: 200, totalTimeoutMs: 6000 });
+  } finally { global.fetch = prev; resetRouterHealthForTests(); }
+  check(
+    r.ok === true &&
+      r.used === "openrouter/meta-llama/llama-3.3-70b" &&
+      seen.includes("anthropic/claude-3.5-sonnet") &&
+      seen.includes("meta-llama/llama-3.3-70b"),
+    `2-l: openrouter sub-vendor failover tries the second sub-vendor (used=${r.used}, seen=${seen.join(",")})`,
+  );
 }
 
 if (failures.length) {
