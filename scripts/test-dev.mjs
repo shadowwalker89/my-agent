@@ -1407,17 +1407,22 @@ import { transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT,
 {
   const originalFetch = global.fetch, originalLog = console.log, originalWarn = console.warn;
   const env = { GEMINI_API_KEY: "voice-test-secret", GEMINI_VOICE_MODEL: "custom-voice-model" };
-  let mode, calls, logs, deleted;
-  const reset = (next) => { mode = next; calls = []; logs = []; deleted = 0; };
+  let mode, calls, logs, deleted, interactionPolls;
+  const reset = (next) => { mode = next; calls = []; logs = []; deleted = 0; interactionPolls = 0; };
   console.log = console.warn = (...args) => logs.push(JSON.stringify(args));
   global.fetch = async (url, init) => {
     const u = new URL(url);
     check(u.origin === "https://generativelanguage.googleapis.com", "voice contract: only Google is contacted");
     check(!u.search, "voice contract: API key is never in URL");
     check(init.headers["x-goog-api-key"] === env.GEMINI_API_KEY, "voice contract: API key in header");
-    if (init.method === "DELETE") { deleted++; return Response.json({}); }
+    if (init.method === "DELETE") { deleted++; return mode === "cleanup-hang" ? new Promise(() => {}) : Response.json({}); }
     if (u.pathname === "/upload/v1beta/files") return Response.json({ file: { name: "files/contract" } });
     if (u.pathname === "/v1beta/files/contract") return Response.json({ state: "ACTIVE", uri: "https://generativelanguage.googleapis.com/v1beta/files/contract" });
+    if (u.pathname === "/v1beta/interactions/pending-1") {
+      interactionPolls++;
+      if (mode === "async-stuck") return Response.json({ id: "pending-1", status: "in_progress" });
+      return Response.json({ status: "completed", output: [{ type: "text", text: "سلام دنیا" }] });
+    }
     const interactions = u.pathname === "/v1beta/interactions";
     check(interactions || /^\/v1beta\/models\/[^/]+:generateContent$/.test(u.pathname), "voice contract: correct API route");
     const body = JSON.parse(init.body);
@@ -1425,9 +1430,17 @@ import { transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT,
     check(interactions ? body.model === "gemini-3.5-transcribe" && !("contents" in body)
       : !("input" in body) && !("generation_config" in body), "voice contract: API-specific request fields");
     if ((mode === "404" && calls.length === 1) || (mode === "fallback404" && calls.length <= 2)) return Response.json({ error: { message: env.GEMINI_API_KEY } }, { status: 404 });
+    if (mode === "headers-hang") return new Promise(() => {});
+    if (mode === "body-hang") return { ok: true, status: 200, json: () => new Promise(() => {}) };
     if (mode === "throw") throw new Error(env.GEMINI_API_KEY);
     if (mode === "legacy") return Response.json({ output_text: "must not route", error: { text: "must not route either" } });
     if (mode === "503" && calls.length === 1) return Response.json({ error: { status: "UNAVAILABLE", message: env.GEMINI_API_KEY } }, { status: 503 });
+    if (interactions && ["async", "async-stuck"].includes(mode)) return Response.json({ id: "pending-1", status: "in_progress" });
+    if (interactions && mode === "output-array") return Response.json({ status: "completed", output: [{ type: "thought", text: "private" }, { type: "text", text: "سلام دنیا" }] });
+    if (interactions && mode === "blank-top") return Response.json({ output_text: "  ", outputs: [], output: [{ type: "text", text: "سلام دنیا" }] });
+    if (interactions && mode === "nested-content") return Response.json({ output: { content: [{ type: "text", text: { value: "سلام دنیا" } }] } });
+    if (interactions && mode === "segments") return Response.json({ transcription: { segments: [{ text: "سلام " }, { text: "دنیا" }] } });
+    if (interactions && mode === "reasoning-only") return Response.json({ outputs: [{ type: "thought", text: "must not route" }] });
     if (interactions && mode === "success") return Response.json({ status: "completed", outputs: [{ type: "thought", text: "private reasoning" }, { type: "text", text: "سلام دنیا" }] });
     if (interactions && mode === "output-text") return Response.json({ output_text: "سلام دنیا" });
     if (interactions && mode === "output-object") return Response.json({ output: { text: "سلام دنیا" } });
@@ -1474,16 +1487,40 @@ import { transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT,
     const transcriptionBody = calls[0].body;
     check(transcriptionBody.input[0].uri.endsWith("files/contract") && transcriptionBody.input[0].mime_type === "audio/ogg", "voice contract: Interactions references uploaded audio");
     check(transcriptionBody.generation_config.transcription_config.language_codes[0] === "fa-IR" && transcriptionBody.generation_config.transcription_config.custom_vocabulary.includes("Cloudflare Workers"), "voice contract: original transcription language and vocabulary restored");
-    for (const format of ["output-text", "output-object"]) {
+    for (const format of ["output-text", "output-object", "output-array", "blank-top", "nested-content", "segments"]) {
       reset(format);
       const result = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
       check(result.ok && result.text === "سلام دنیا" && calls.length === 1 && deleted === 1, `voice contract: Interactions ${format} parsed and cleaned up`);
     }
-    for (const failure of ["pending", "nested-error"]) {
+    for (const failure of ["pending", "nested-error", "reasoning-only"]) {
       reset(failure);
       await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
       check(calls.length > 1, `voice contract: ${failure} not accepted as a transcript`);
     }
+    reset("async");
+    const completed = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0 });
+    check(completed.ok && completed.text === "سلام دنیا" && calls.length === 1 && interactionPolls === 1 && deleted === 1, "voice regression: pending interaction is polled, not discarded or re-generated");
+
+    reset("async-stuck");
+    const pendingLimit = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0, maxPolls: 2 });
+    check(pendingLimit.ok && interactionPolls === 2 && calls.length === 2 && deleted === 1, "voice regression: polling cap is preserved and releases time to Flash fallback");
+
+    reset("cleanup-hang");
+    const cleanupStart = Date.now();
+    const ready = await transcribeWithGemini(env, new ArrayBuffer(8), "audio/ogg", { cleanupTimeoutMs: 10 });
+    check(ready.ok && ready.text === "سلام دنیا" && deleted === 1 && Date.now() - cleanupStart < 1000, "voice regression: stalled cleanup cannot hold a ready transcript");
+
+    for (const hang of ["headers-hang", "body-hang"]) {
+      reset(hang);
+      const budgetStart = Date.now();
+      const limited = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { totalTimeoutMs: 30, attemptTimeoutMs: 1000, cleanupTimeoutMs: 5 });
+      check(!limited.ok && limited.reason === "timeout" && calls.length === 1 && Date.now() - budgetStart < 1000, `voice regression: shared deadline bounds ${hang}, with no post-deadline fallback`);
+    }
+    reset("headers-hang");
+    const attemptStart = Date.now();
+    const attempts = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { totalTimeoutMs: 200, attemptTimeoutMs: 10, cleanupTimeoutMs: 5 });
+    check(!attempts.ok && calls.length === 3 && deleted === 1 && Date.now() - attemptStart < 1000, "voice regression: hung per-model attempts release time for fallback within shared budget");
+
     reset("503");
     const unavailable = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
     check(unavailable.ok && calls.length === 2 && logs.join("").includes("UNAVAILABLE") && !logs.join("").includes(env.GEMINI_API_KEY), "voice contract: 503 uses fallback and logs only safe API status");

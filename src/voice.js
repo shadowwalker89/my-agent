@@ -11,7 +11,17 @@ export const VOICE_TOO_LONG_TEXT = "صدایت طولانی‌تر از ۱۰ د�
 export const VOICE_FAILED_TEXT = "صدا را نفهمیدم یا رونویسی نشد؛ دوباره بفرست یا تایپ کن 🙏";
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com";
-const GEMINI_TIMEOUT_MS = 20000;
+const GEMINI_TIMEOUT_MS = 20000; // Existing Telegram download timeout, unchanged.
+// Voice-only limits; do not reuse/mutate chat-router settings.
+// One 20s envelope replaces up to three sequential 20s model waits. It is a
+// transcription-phase budget, NOT a guarantee for download + downstream chat.
+const TRANSCRIPTION_TOTAL_MS = 20000;
+// Match the router's established 7.5s attempt policy locally: two stalled
+// requests cannot consume all 20s, leaving a chance for the final fallback.
+const TRANSCRIPTION_ATTEMPT_MS = 7500;
+// Deletion is best-effort privacy cleanup, not part of transcription success.
+// Allow a short 500ms attempt without holding a ready transcript for 20s.
+const TRANSCRIPTION_CLEANUP_MS = 500;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function transcriptText(data) {
@@ -25,16 +35,35 @@ function transcriptText(data) {
 }
 
 
+// Read only known result containers, never arbitrary nested metadata/errors.
+function resultText(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(resultText).join("");
+  if (!value || value.thought || (value.type && !["text", "output_text", "transcript", "transcription"].includes(value.type))) return "";
+  if (typeof value.text === "string") return value.text;
+  if (typeof value.text?.value === "string") return value.text.value;
+  return resultText(value.content ?? value.parts ?? value.segments);
+}
 function interactionTranscript(data) {
   if (data?.error || (data?.status && data.status !== "completed")) return "";
-  if (typeof data?.output_text === "string") return data.output_text.trim();
-  if (Array.isArray(data?.outputs)) {
-    return data.outputs.filter((p) => p.type === "text" && typeof p.text === "string")
-      .map((p) => p.text).join("").trim();
+  for (const value of [data?.output_text, data?.outputs, data?.output, data?.transcription, data?.transcript]) {
+    const text = resultText(value).trim();
+    if (text) return text;
   }
-  const output = data?.output;
-  return output && !Array.isArray(output) && typeof output.text === "string"
-    ? output.text.trim() : "";
+  return "";
+}
+
+// Like the chat router: enforce wall time through body consumption, not just
+// response headers. Promise.race also bounds stalled mocks/abort-insensitive IO.
+async function boundedIO(work, timeoutMs) {
+  if (timeoutMs <= 0) throw new Error("voice-timeout");
+  const controller = new AbortController();
+  let timer;
+  try {
+    return await Promise.race([work(controller.signal), new Promise((_, reject) => {
+      timer = setTimeout(() => { controller.abort(); reject(new Error("voice-timeout")); }, timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
 }
 
 // Only allow fixed API status codes in diagnostics, never raw error bodies.
@@ -64,6 +93,13 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
   const headers = { "x-goog-api-key": key };
   const pollIntervalMs = opts.pollIntervalMs ?? 1500;
   const maxPolls = opts.maxPolls ?? 8;
+  const deadline = Math.min(opts.deadlineAt ?? Infinity, started + (opts.totalTimeoutMs ?? TRANSCRIPTION_TOTAL_MS));
+  const remaining = () => Math.max(0, deadline - Date.now());
+  const request = (url, init = {}, cap = opts.attemptTimeoutMs ?? TRANSCRIPTION_ATTEMPT_MS) => boundedIO(async (signal) => {
+    const res = await fetch(url, { ...init, signal });
+    const data = init.method === "DELETE" ? null : await res.json().catch(() => null);
+    return { res, data };
+  }, Math.min(cap, remaining()));
   let name = null;
   try {
     const boundary = `----voice${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
@@ -71,17 +107,15 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
     const meta = JSON.stringify({ file: { display_name: "voice.ogg" } });
     const head = enc.encode(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n--${boundary}\r\nContent-Type: ${mime}\r\n\r\n`);
     const tail = enc.encode(`\r\n--${boundary}--\r\n`);
-    const up = await fetch(`${GEMINI_BASE}/upload/v1beta/files`, { method: "POST", headers: { ...headers, "Content-Type": `multipart/related; boundary=${boundary}`, "X-Goog-Upload-Protocol": "multipart" }, body: new Blob([head, audioBytes, tail]), signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) });
-    const upJson = await up.json().catch(() => null);
+    const { res: up, data: upJson } = await request(`${GEMINI_BASE}/upload/v1beta/files`, { method: "POST", headers: { ...headers, "Content-Type": `multipart/related; boundary=${boundary}`, "X-Goog-Upload-Protocol": "multipart" }, body: new Blob([head, audioBytes, tail]) });
     name = upJson?.file?.name ?? upJson?.name ?? null;
     if (!up.ok || !name) { log(false, "upload"); return { ok: false, reason: "upload" }; }
     let uri = null;
     for (let i = 0; i < maxPolls; i++) {
-      const poll = await fetch(`${GEMINI_BASE}/v1beta/${name}`, { headers, signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) });
-      const info = await poll.json().catch(() => null);
+      const { res: poll, data: info } = await request(`${GEMINI_BASE}/v1beta/${name}`, { headers });
       if (info?.state === "ACTIVE" && info?.uri) { uri = info.uri; break; }
       if (info?.state === "FAILED" || !poll.ok) { log(false, "processing"); return { ok: false, reason: "processing" }; }
-      if (i < maxPolls - 1) await sleep(pollIntervalMs);
+      if (i < maxPolls - 1) await sleep(Math.min(pollIntervalMs, remaining()));
     }
     if (!uri) { log(false, "not-active"); return { ok: false, reason: "not-active" }; }
     // Restore the original dedicated transcription model and its API contract.
@@ -95,6 +129,7 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
       generationConfig: { temperature: 0, maxOutputTokens: 8192 },
     });
     for (const model of models) {
+      if (remaining() <= 0) break;
       try {
         const interactions = model === "gemini-3.5-transcribe";
         const path = interactions ? "interactions" : `models/${encodeURIComponent(model)}:generateContent`;
@@ -104,25 +139,31 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
             language_codes: [VOICE_LANGUAGE], custom_vocabulary: VOICE_CUSTOM_VOCABULARY,
           } },
         }) : body;
-        const res = await fetch(`${GEMINI_BASE}/v1beta/${path}`, {
-          method: "POST", headers: { ...headers, "Content-Type": "application/json" },
-          body: requestBody, signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
+        let { res, data } = await request(`${GEMINI_BASE}/v1beta/${path}`, {
+          method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: requestBody,
         });
-        const data = await res.json().catch(() => null);
+        // A pending interaction is work in progress, not an empty transcript.
+        for (let i = 0; interactions && res.ok && data?.status === "in_progress" && typeof data.id === "string" && i < maxPolls; i++) {
+          const id = data.id;
+          await sleep(Math.min(pollIntervalMs, remaining()));
+          ({ res, data } = await request(`${GEMINI_BASE}/v1beta/interactions/${encodeURIComponent(id)}`, { headers }));
+        }
         if (!res.ok) { console.warn("voice_transcribe_fail", { model, status: res.status, apiStatus: apiErrorStatus(data), err: null }); continue; }
         const text = interactions ? interactionTranscript(data) : transcriptText(data);
-        if (!text) { console.warn("voice_transcribe_fail", { model, status: res.status, err: "empty" }); continue; }
+        if (!text) { console.warn("voice_transcribe_fail", { model, status: res.status, err: data?.status === "in_progress" ? "pending" : "empty", elapsedMs: Date.now() - started }); continue; }
         log(true, null, model);
         return { ok: true, text };
-      } catch {
-        console.warn("voice_transcribe_fail", { model, status: null, err: "request-failed" });
+      } catch (err) {
+        console.warn("voice_transcribe_fail", { model, status: null, err: err?.message === "voice-timeout" ? "timeout" : "request-failed", elapsedMs: Date.now() - started });
       }
     }
-    log(false, "transcription");
-    return { ok: false, reason: "transcription" };
-  } catch { log(false, "error"); return { ok: false, reason: "error" }; }
+    const reason = remaining() <= 0 ? "timeout" : "transcription";
+    log(false, reason);
+    return { ok: false, reason };
+  } catch { log(false, remaining() <= 0 ? "timeout" : "error"); return { ok: false, reason: remaining() <= 0 ? "timeout" : "error" }; }
   finally {
-    if (name) { try { await fetch(`${GEMINI_BASE}/v1beta/${name}`, { method: "DELETE", headers, signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) }); } catch {} }
+    // Cleanup must never hold a ready transcript for another 20 seconds.
+    if (name && remaining() > 0) { try { await request(`${GEMINI_BASE}/v1beta/${name}`, { method: "DELETE", headers }, opts.cleanupTimeoutMs ?? TRANSCRIPTION_CLEANUP_MS); } catch {} }
   }
 }
 
