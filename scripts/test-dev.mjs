@@ -6562,7 +6562,7 @@ if (DatabaseSync) {
 }
 
 // D) runNluBranch calls env.AI.run
-{
+try {
   const sqlite = new (await import("node:sqlite")).DatabaseSync(":memory:");
   sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
@@ -6591,7 +6591,7 @@ if (DatabaseSync) {
   check(aiCalled && aiCalled.model === "@cf/meta/llama-3.3-70b-instruct-fp8-fast", `model default: ${JSON.stringify(aiCalled?.model)}`);
   check(aiCalled && aiCalled.body?.max_tokens === 240 && aiCalled.body?.temperature === 0.1, `params: ${JSON.stringify(aiCalled?.body)}`);
   check(ret === "handled", `runNluBranch routed: ${ret}`);
-}
+} catch (e) { if (e?.code !== 'ERR_UNKNOWN_BUILTIN_MODULE') throw e; console.warn('node:sqlite skipped on Node 20'); }
 
 // E) voice handleVoice at most one error message
 {
