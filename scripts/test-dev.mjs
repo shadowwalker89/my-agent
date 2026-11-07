@@ -1444,7 +1444,7 @@ import { transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT,
 
     reset("404");
     const fallback = await transcribeWithGemini(env, new ArrayBuffer(8), "audio/ogg");
-    check(fallback.ok && calls.length === 2 && calls[1].path.includes("gemini-2.5-flash:"), "voice contract: unavailable custom model falls back to default");
+    check(fallback.ok && calls.length === 2 && calls[1].path.includes("gemini-3.8-flash:"), "voice contract: unavailable custom model falls back to default");
     check(deleted === 1 && !logs.join("").includes(env.GEMINI_API_KEY), "voice contract: fallback cleans up and does not log error bodies or keys");
 
     for (const failure of ["empty", "legacy", "malformed", "blocked", "truncated", "throw"]) {
@@ -1456,8 +1456,21 @@ import { transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT,
     }
 
     reset("empty");
-    await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-2.5-flash" }, new ArrayBuffer(8), "audio/ogg");
-    check(calls.length === 2 && new Set(calls.map((c) => c.path)).size === 2, "voice contract: default model is not retried twice; no retired 1.5/2.0 fallbacks");
+    await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.8-flash" }, new ArrayBuffer(8), "audio/ogg");
+    check(calls.length === 2 && new Set(calls.map((c) => c.path)).size === 2, "voice contract: default model is not retried twice");
+
+    reset("success");
+    const current = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
+    check(current.ok && calls.length === 1 && calls[0].path === "/v1beta/models/gemini-3.8-flash:generateContent", "voice contract: default uses the replacement recommended by the API");
+
+    reset("404");
+    const alias = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
+    check(alias.ok && calls.length === 2 && calls[1].path === "/v1beta/models/gemini-flash-latest:generateContent", "voice contract: unavailable default falls back to rolling Flash alias");
+    check(!calls.some((c) => /gemini-(1\.5|2\.0|2\.5)-/.test(c.path)) && deleted === 1, "voice contract: no old built-in fallbacks; uploaded file cleaned up");
+
+    reset("404");
+    const retiredOverride = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-2.5-flash" }, new ArrayBuffer(8), "audio/ogg");
+    check(retiredOverride.ok && calls.length === 2 && calls[1].path.includes("gemini-3.8-flash:"), "voice contract: stale custom 2.5 model recovers using recommended replacement");
   } finally {
     global.fetch = originalFetch;
     console.log = originalLog;
