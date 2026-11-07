@@ -6499,7 +6499,7 @@ if (DatabaseSync) {
 
 // B) handleDailyText expense report
 if (DatabaseSync) {
-  const sqlite = (await import('node:sqlite').then(m => new m.DatabaseSync(":memory:")).catch(() => null));
+  const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
   const d1 = {
@@ -6532,7 +6532,7 @@ if (DatabaseSync) {
 
 // C) handleDailyText vault get short lookup
 if (DatabaseSync) {
-  const sqlite = (await import('node:sqlite').then(m => new m.DatabaseSync(":memory:")).catch(() => null));
+  const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
   const d1 = {
@@ -6562,8 +6562,8 @@ if (DatabaseSync) {
 }
 
 // D) runNluBranch calls env.AI.run
-try if (DatabaseSync) {
-  const sqlite = (await import('node:sqlite').then(m => new m.DatabaseSync(":memory:")).catch(() => null));
+if (DatabaseSync) {
+  const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
