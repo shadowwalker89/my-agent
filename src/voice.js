@@ -74,20 +74,28 @@ function apiErrorStatus(data) {
 }
 
 export async function downloadTelegramVoice(env, fileId) {
+  let stage = "telegram-info";
+  const failed = (status, kind) => {
+    const failure = { stage, status, apiStatus: null, kind };
+    console.warn("voice_stage_fail", failure);
+    return { ok: false, failure };
+  };
   try {
     const info = await tgApi(env, "getFile", { file_id: fileId });
     const path = info?.result?.file_path;
-    if (!info?.ok || !path) return { ok: false };
+    if (!info?.ok || !path) return failed(Number.isInteger(info?.error_code) ? info.error_code : null, "telegram");
+    stage = "telegram-download";
     const res = await fetch(`${"https://api.telegram.org"}/file/bot${env.TG_TOKEN}/${path}`, { signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) });
-    if (!res.ok) return { ok: false };
+    if (!res.ok) return failed(res.status, "http");
     return { ok: true, bytes: await res.arrayBuffer() };
-  } catch { return { ok: false }; }
+  } catch { return failed(null, "network"); }
 }
 
 export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {}) {
   const started = Date.now();
   const key = env?.GEMINI_API_KEY;
-  const log = (ok, reason, model = null) => console.log(JSON.stringify({ voiceTranscribe: "gemini-voice", model, ms: Date.now() - started, ok, reason: reason ?? null }));
+  let failure = null;
+  const log = (ok, reason, model = null) => console.log(JSON.stringify({ voiceTranscribe: "gemini-voice", model, ms: Date.now() - started, ok, reason: reason ?? null, failure: ok ? null : failure }));
   if (!key) { log(false, "missing-key"); return { ok: false, reason: "missing-key" }; }
   const mime = String(mimeType || "audio/ogg").split(";")[0].trim();
   const headers = { "x-goog-api-key": key };
@@ -95,11 +103,28 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
   const maxPolls = opts.maxPolls ?? 8;
   const deadline = Math.min(opts.deadlineAt ?? Infinity, started + (opts.totalTimeoutMs ?? TRANSCRIPTION_TOTAL_MS));
   const remaining = () => Math.max(0, deadline - Date.now());
-  const request = (url, init = {}, cap = opts.attemptTimeoutMs ?? TRANSCRIPTION_ATTEMPT_MS) => boundedIO(async (signal) => {
-    const res = await fetch(url, { ...init, signal });
-    const data = init.method === "DELETE" ? null : await res.json().catch(() => null);
-    return { res, data };
-  }, Math.min(cap, remaining()));
+  const request = async (url, init = {}, cap = opts.attemptTimeoutMs ?? TRANSCRIPTION_ATTEMPT_MS) => {
+    const stage = init.method === "DELETE" ? "cleanup" : url.includes("/upload/") ? "upload"
+      : url.includes("/interactions") ? "interaction" : url.includes(":generateContent") ? "generation" : "file-poll";
+    try {
+      const response = await boundedIO(async (signal) => {
+        const res = await fetch(url, { ...init, signal });
+        const data = init.method === "DELETE" ? null : await res.json().catch(() => null);
+        return { res, data };
+      }, Math.min(cap, remaining()));
+      if (!response.res.ok && stage !== "cleanup") {
+        failure = { stage, status: response.res.status, apiStatus: apiErrorStatus(response.data), kind: "http" };
+        console.warn("voice_stage_fail", { ...failure, elapsedMs: Date.now() - started });
+      }
+      return response;
+    } catch (err) {
+      if (stage !== "cleanup") {
+        failure = { stage, status: null, apiStatus: null, kind: err?.message === "voice-timeout" ? "timeout" : "network" };
+        console.warn("voice_stage_fail", { ...failure, elapsedMs: Date.now() - started });
+      }
+      throw err;
+    }
+  };
   let name = null;
   try {
     const boundary = `----voice${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
@@ -109,12 +134,12 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
     const tail = enc.encode(`\r\n--${boundary}--\r\n`);
     const { res: up, data: upJson } = await request(`${GEMINI_BASE}/upload/v1beta/files`, { method: "POST", headers: { ...headers, "Content-Type": `multipart/related; boundary=${boundary}`, "X-Goog-Upload-Protocol": "multipart" }, body: new Blob([head, audioBytes, tail]) });
     name = upJson?.file?.name ?? upJson?.name ?? null;
-    if (!up.ok || !name) { log(false, "upload"); return { ok: false, reason: "upload" }; }
+    if (!up.ok || !name) { log(false, "upload"); return { ok: false, reason: "upload", failure }; }
     let uri = null;
     for (let i = 0; i < maxPolls; i++) {
       const { res: poll, data: info } = await request(`${GEMINI_BASE}/v1beta/${name}`, { headers });
       if (info?.state === "ACTIVE" && info?.uri) { uri = info.uri; break; }
-      if (info?.state === "FAILED" || !poll.ok) { log(false, "processing"); return { ok: false, reason: "processing" }; }
+      if (info?.state === "FAILED" || !poll.ok) { log(false, "processing"); return { ok: false, reason: "processing", failure }; }
       if (i < maxPolls - 1) await sleep(Math.min(pollIntervalMs, remaining()));
     }
     if (!uri) { log(false, "not-active"); return { ok: false, reason: "not-active" }; }
@@ -149,6 +174,7 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
           ({ res, data } = await request(`${GEMINI_BASE}/v1beta/interactions/${encodeURIComponent(id)}`, { headers }));
         }
         if (!res.ok) { console.warn("voice_transcribe_fail", { model, status: res.status, apiStatus: apiErrorStatus(data), err: null }); continue; }
+        failure = null;
         const text = interactions ? interactionTranscript(data) : transcriptText(data);
         if (!text) { console.warn("voice_transcribe_fail", { model, status: res.status, err: data?.status === "in_progress" ? "pending" : "empty", elapsedMs: Date.now() - started }); continue; }
         log(true, null, model);
@@ -159,8 +185,8 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
     }
     const reason = remaining() <= 0 ? "timeout" : "transcription";
     log(false, reason);
-    return { ok: false, reason };
-  } catch { log(false, remaining() <= 0 ? "timeout" : "error"); return { ok: false, reason: remaining() <= 0 ? "timeout" : "error" }; }
+    return { ok: false, reason, failure };
+  } catch { log(false, remaining() <= 0 ? "timeout" : "error"); return { ok: false, reason: remaining() <= 0 ? "timeout" : "error", failure }; }
   finally {
     // Cleanup must never hold a ready transcript for another 20 seconds.
     if (name && remaining() > 0) { try { await request(`${GEMINI_BASE}/v1beta/${name}`, { method: "DELETE", headers }, opts.cleanupTimeoutMs ?? TRANSCRIPTION_CLEANUP_MS); } catch {} }
@@ -175,9 +201,17 @@ async function stashVoice(env, userId, fileId, mimeType) {
   const mime = String(mimeType || "audio/ogg").split(";")[0].trim();
   try { await env.STATE.put(voiceStashKey(id), JSON.stringify({ owner: userId, file_id: fileId, mime_type: mime }), { expirationTtl: VOICE_STASH_TTL_SEC }); return id; } catch { return null; }
 }
-async function sendVoiceFailure(o, stashId) {
-  if (stashId) await o.send(VOICE_FAILED_TEXT, { replyMarkup: { inline_keyboard: [[{ text: "🔄 ارسال مجدد", callback_data: `voice:retry:${stashId}` }]] } });
-  else await o.send(VOICE_FAILED_TEXT);
+async function sendVoiceFailure(o, stashId, result) {
+  // Fixed messages/codes only: a phone user can report the failure without logs.
+  const status = result?.failure?.status;
+  let text = VOICE_FAILED_TEXT;
+  if (["telegram-info", "telegram-download"].includes(result?.failure?.stage)) text = "دریافت فایل صدا از تلگرام ناموفق بود؛ رونویسی هنوز شروع نشده است. دوباره تلاش کن. [VOICE-DOWNLOAD]";
+  else if (status === 429) text = "محدودیت درخواست یا سهمیهٔ سرویس رونویسی رسیده؛ لطفاً کمی بعد دوباره تلاش کن. [VOICE-429]";
+  else if ([500, 502, 503, 504].includes(status)) text = "سرویس رونویسی پاسخ موفق نداد؛ مشکل از نامفهوم بودن صدایت نیست. کمی بعد دوباره تلاش کن. [VOICE-SERVICE]";
+  else if ([401, 403].includes(status)) text = "سرویس رونویسی اجازهٔ دسترسی نداد؛ تنظیمات اتصال باید بررسی شود. [VOICE-AUTH]";
+  else if (result?.reason === "timeout" || result?.failure?.kind === "timeout") text = "مهلت پردازش صدا تمام شد؛ این به معنی نامفهوم بودن صدایت نیست. دوباره تلاش کن. [VOICE-TIMEOUT]";
+  if (stashId) await o.send(text, { replyMarkup: { inline_keyboard: [[{ text: "🔄 ارسال مجدد", callback_data: `voice:retry:${stashId}` }]] } });
+  else await o.send(text);
 }
 export async function handleVoiceRetry(env, o) {
   let rec = null;
@@ -186,9 +220,9 @@ export async function handleVoiceRetry(env, o) {
   if (Number(rec.owner) !== Number(o.userId)) return "forbidden";
   if (o.editMarkup) await o.editMarkup();
   const dl = await downloadTelegramVoice(env, rec.file_id);
-  if (!dl.ok) { await sendVoiceFailure(o, o.stashId); return "failed"; }
+  if (!dl.ok) { await sendVoiceFailure(o, o.stashId, dl); return "failed"; }
   const tr = await transcribeWithGemini(env, dl.bytes, rec.mime_type, o.transcribeOpts ?? {});
-  if (!tr.ok) { await sendVoiceFailure(o, o.stashId); return "failed"; }
+  if (!tr.ok) { await sendVoiceFailure(o, o.stashId, tr); return "failed"; }
   try { if (env.STATE) await env.STATE.delete(voiceStashKey(o.stashId)); } catch {}
   await o.route(tr.text);
   return "routed";
@@ -199,9 +233,9 @@ export async function handleVoice(env, o) {
   if (Number.isFinite(duration) && duration > VOICE_MAX_DURATION_SEC) { await o.send(VOICE_TOO_LONG_TEXT); return "too-long"; }
   const stashId = await stashVoice(env, o.userId, voice.file_id, voice.mime_type);
   const dl = await downloadTelegramVoice(env, voice.file_id);
-  if (!dl.ok) { await sendVoiceFailure(o, stashId); return "failed"; }
+  if (!dl.ok) { await sendVoiceFailure(o, stashId, dl); return "failed"; }
   const tr = await transcribeWithGemini(env, dl.bytes, voice.mime_type || "audio/ogg", o.transcribeOpts ?? {});
-  if (!tr.ok) { await sendVoiceFailure(o, stashId); return "failed"; }
+  if (!tr.ok) { await sendVoiceFailure(o, stashId, tr); return "failed"; }
   try { if (env.STATE && stashId) await env.STATE.delete(voiceStashKey(stashId)); } catch {}
   await o.route(tr.text);
   return "routed";
