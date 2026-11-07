@@ -911,7 +911,7 @@ for (const [st, expected] of [["success", "success"], ["failure", "failure"], ["
 // real SQL (kind filter, LIMIT, ON CONFLICT) — the only simulation is the
 // adapter itself, not the queries. Live D1 verification is still a 1b job.
 let DatabaseSync = null;
-try { DatabaseSync = (await import("node:sqlite")).DatabaseSync; } catch { console.warn("\u26a0 node:sqlite در دسترس نیست \u2014 تست‌های ۱الف رد شد."); }
+try { DatabaseSync = (await import('node:sqlite').catch(() => ({}))).DatabaseSync; } catch { console.warn("\u26a0 node:sqlite در دسترس نیست \u2014 تست‌های ۱الف رد شد."); }
 if (DatabaseSync) {
     const sqlite = new DatabaseSync(":memory:");
     sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
@@ -6498,8 +6498,8 @@ if (DatabaseSync) {
 }
 
 // B) handleDailyText expense report
-{
-  const sqlite = new (await import("node:sqlite")).DatabaseSync(":memory:");
+if (DatabaseSync) {
+  const sqlite = (await import('node:sqlite').then(m => new m.DatabaseSync(":memory:")).catch(() => null));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
   const d1 = {
@@ -6531,8 +6531,8 @@ if (DatabaseSync) {
 }
 
 // C) handleDailyText vault get short lookup
-{
-  const sqlite = new (await import("node:sqlite")).DatabaseSync(":memory:");
+if (DatabaseSync) {
+  const sqlite = (await import('node:sqlite').then(m => new m.DatabaseSync(":memory:")).catch(() => null));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
   const d1 = {
@@ -6562,8 +6562,8 @@ if (DatabaseSync) {
 }
 
 // D) runNluBranch calls env.AI.run
-try {
-  const sqlite = new (await import("node:sqlite")).DatabaseSync(":memory:");
+try if (DatabaseSync) {
+  const sqlite = (await import('node:sqlite').then(m => new m.DatabaseSync(":memory:")).catch(() => null));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
@@ -6591,7 +6591,7 @@ try {
   check(aiCalled && aiCalled.model === "@cf/meta/llama-3.3-70b-instruct-fp8-fast", `model default: ${JSON.stringify(aiCalled?.model)}`);
   check(aiCalled && aiCalled.body?.max_tokens === 240 && aiCalled.body?.temperature === 0.1, `params: ${JSON.stringify(aiCalled?.body)}`);
   check(ret === "handled", `runNluBranch routed: ${ret}`);
-} catch (e) { if (e?.code !== 'ERR_UNKNOWN_BUILTIN_MODULE') throw e; console.warn('node:sqlite skipped on Node 20'); }
+}
 
 // E) voice handleVoice at most one error message
 {
