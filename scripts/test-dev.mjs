@@ -1418,13 +1418,21 @@ import { transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT,
     if (init.method === "DELETE") { deleted++; return Response.json({}); }
     if (u.pathname === "/upload/v1beta/files") return Response.json({ file: { name: "files/contract" } });
     if (u.pathname === "/v1beta/files/contract") return Response.json({ state: "ACTIVE", uri: "https://generativelanguage.googleapis.com/v1beta/files/contract" });
-    check(/^\/v1beta\/models\/[^/]+:generateContent$/.test(u.pathname), "voice contract: model-specific generateContent, not interactions");
+    const interactions = u.pathname === "/v1beta/interactions";
+    check(interactions || /^\/v1beta\/models\/[^/]+:generateContent$/.test(u.pathname), "voice contract: correct API route");
     const body = JSON.parse(init.body);
     calls.push({ path: u.pathname, body });
-    check(!("input" in body) && !("generation_config" in body), "voice contract: no Interactions-only fields");
-    if (mode === "404" && calls.length === 1) return Response.json({ error: { message: env.GEMINI_API_KEY } }, { status: 404 });
+    check(interactions ? body.model === "gemini-3.5-transcribe" && !("contents" in body)
+      : !("input" in body) && !("generation_config" in body), "voice contract: API-specific request fields");
+    if ((mode === "404" && calls.length === 1) || (mode === "fallback404" && calls.length <= 2)) return Response.json({ error: { message: env.GEMINI_API_KEY } }, { status: 404 });
     if (mode === "throw") throw new Error(env.GEMINI_API_KEY);
     if (mode === "legacy") return Response.json({ output_text: "must not route", error: { text: "must not route either" } });
+    if (mode === "503" && calls.length === 1) return Response.json({ error: { status: "UNAVAILABLE", message: env.GEMINI_API_KEY } }, { status: 503 });
+    if (interactions && mode === "success") return Response.json({ status: "completed", outputs: [{ type: "thought", text: "private reasoning" }, { type: "text", text: "سلام دنیا" }] });
+    if (interactions && mode === "output-text") return Response.json({ output_text: "سلام دنیا" });
+    if (interactions && mode === "output-object") return Response.json({ output: { text: "سلام دنیا" } });
+    if (interactions && mode === "pending") return Response.json({ status: "in_progress", output_text: "must not route" });
+    if (interactions && mode === "nested-error") return Response.json({ metadata: { text: "must not route" } });
     if (mode === "malformed") return new Response("not JSON");
     if (mode === "blocked") return Response.json({ promptFeedback: { blockReason: "SAFETY" } });
     if (mode === "empty") return Response.json({ candidates: [{ content: { parts: [{ text: "  " }] } }] });
@@ -1450,7 +1458,7 @@ import { transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT,
     for (const failure of ["empty", "legacy", "malformed", "blocked", "truncated", "throw"]) {
       reset(failure);
       const result = await transcribeWithGemini(env, new ArrayBuffer(8), "audio/ogg");
-      check(!result.ok && result.reason === "generate-content", `voice contract: ${failure} is a transcription failure`);
+      check(!result.ok && result.reason === "transcription", `voice contract: ${failure} is a transcription failure`);
       check(deleted === 1, `voice contract: ${failure} cleans up uploaded file`);
       check(!logs.join("").includes(env.GEMINI_API_KEY), `voice contract: ${failure} never logs secrets`);
     }
@@ -1461,12 +1469,33 @@ import { transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT,
 
     reset("success");
     const current = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
-    check(current.ok && calls.length === 1 && calls[0].path === "/v1beta/models/gemini-3.8-flash:generateContent", "voice contract: default uses the replacement recommended by the API");
+    check(current.ok && calls.length === 1 && calls[0].path === "/v1beta/interactions" && calls[0].body.model === "gemini-3.5-transcribe", "voice contract: default restores dedicated 3.5 transcription through Interactions");
+
+    const transcriptionBody = calls[0].body;
+    check(transcriptionBody.input[0].uri.endsWith("files/contract") && transcriptionBody.input[0].mime_type === "audio/ogg", "voice contract: Interactions references uploaded audio");
+    check(transcriptionBody.generation_config.transcription_config.language_codes[0] === "fa-IR" && transcriptionBody.generation_config.transcription_config.custom_vocabulary.includes("Cloudflare Workers"), "voice contract: original transcription language and vocabulary restored");
+    for (const format of ["output-text", "output-object"]) {
+      reset(format);
+      const result = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
+      check(result.ok && result.text === "سلام دنیا" && calls.length === 1 && deleted === 1, `voice contract: Interactions ${format} parsed and cleaned up`);
+    }
+    for (const failure of ["pending", "nested-error"]) {
+      reset(failure);
+      await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
+      check(calls.length > 1, `voice contract: ${failure} not accepted as a transcript`);
+    }
+    reset("503");
+    const unavailable = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
+    check(unavailable.ok && calls.length === 2 && logs.join("").includes("UNAVAILABLE") && !logs.join("").includes(env.GEMINI_API_KEY), "voice contract: 503 uses fallback and logs only safe API status");
 
     reset("404");
     const alias = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
-    check(alias.ok && calls.length === 2 && calls[1].path === "/v1beta/models/gemini-flash-latest:generateContent", "voice contract: unavailable default falls back to rolling Flash alias");
+    check(alias.ok && calls.length === 2 && calls[1].path === "/v1beta/models/gemini-3.8-flash:generateContent", "voice contract: unavailable transcription model uses Flash generateContent fallback");
     check(!calls.some((c) => /gemini-(1\.5|2\.0|2\.5)-/.test(c.path)) && deleted === 1, "voice contract: no old built-in fallbacks; uploaded file cleaned up");
+
+    reset("fallback404");
+    const rolling = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
+    check(rolling.ok && calls.length === 3 && calls[2].path.includes("gemini-flash-latest:"), "voice contract: rolling alias remains final fallback");
 
     reset("404");
     const retiredOverride = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-2.5-flash" }, new ArrayBuffer(8), "audio/ogg");
@@ -1501,10 +1530,12 @@ if (DatabaseSync) {
         if (init?.method === "DELETE") { deleted = true; return { ok: true, json: async () => ({}) }; }
         if (u.includes("/upload/v1beta/files")) return { ok: true, json: async () => ({ file: { name: "files/abc" } }) };
         if (u.includes("/v1beta/files/abc")) return { ok: true, json: async () => ({ state: opts.pollState ?? "ACTIVE", uri: "https://example/audio" }) };
-        if (u.includes(":generateContent")) {
+        if (u.includes(":generateContent") || u.includes("/v1beta/interactions")) {
           if (opts.failGeneration) throw new Error("boom");
           generationBody = JSON.parse(init.body);
-          return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: transcript }] }, finishReason: "STOP" }] }) };
+          return { ok: true, json: async () => u.includes("/v1beta/interactions")
+            ? { output_text: transcript }
+            : { candidates: [{ content: { parts: [{ text: transcript }] }, finishReason: "STOP" }] } };
         }
         return { ok: true, json: async () => ({}) };
       }
@@ -1519,7 +1550,7 @@ if (DatabaseSync) {
     const m = mockVoiceFetch("سلام دنیا");
     const r = await transcribeWithGemini(mkEnv(), new ArrayBuffer(8), "audio/ogg");
     const body = m.generationBody();
-    check(r.ok === true && r.text === "سلام دنیا" && body?.contents?.[0]?.parts?.[0]?.text.includes("fa-IR") && body?.contents?.[0]?.parts?.[0]?.text.includes("Cloudflare Workers") && body?.contents?.[0]?.parts?.[1]?.file_data?.mime_type === "audio/ogg" && m.deleted() === true, "voice: generateContent returns text, Persian + vocab prompt, uploaded file deleted");
+    check(r.ok === true && r.text === "سلام دنیا" && body?.model === "gemini-3.5-transcribe" && body?.generation_config?.transcription_config?.language_codes?.[0] === "fa-IR" && body?.generation_config?.transcription_config?.custom_vocabulary?.includes("Cloudflare Workers") && body?.input?.[0]?.mime_type === "audio/ogg" && m.deleted() === true, "voice: dedicated transcribe returns text, Persian + vocab, uploaded file deleted");
   }
   {
     const env = mkEnv(), s = fakeSend(); const m = mockVoiceFetch("یادداشت کن فردا جلسه دارم");
@@ -6679,7 +6710,7 @@ if (DatabaseSync) {
       if (init?.method === "DELETE") return { ok: true, json: async () => ({}) };
       if (u.includes("/upload/v1beta/files")) return { ok: true, json: async () => ({ file: { name: "files/abc" } }) };
       if (u.includes("/v1beta/files/abc")) return { ok: true, json: async () => ({ state: "ACTIVE", uri: "https://example/audio" }) };
-      if (u.includes(":generateContent")) throw new Error("boom");
+      if (u.includes(":generateContent") || u.includes("/v1beta/interactions")) throw new Error("boom");
       return { ok: true, json: async () => ({}) };
     }
     throw new Error(`unexpected fetch: ${u}`);
