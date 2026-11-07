@@ -1544,6 +1544,79 @@ import { transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT,
   }
 }
 
+// Repeated/simultaneous identical audio must not share file lifecycle or state.
+{
+  const originalFetch = global.fetch, originalLog = console.log, originalWarn = console.warn;
+  const env = { GEMINI_API_KEY: "private-repeat-key", TG_TOKEN: "private-repeat-token", STATE: fakeKV() };
+  const active = new Set(), removed = new Set(), logs = [];
+  let mode = "success", uploaded = 0;
+  console.log = console.warn = (...args) => logs.push(JSON.stringify(args));
+  global.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes("/file/bot")) return new Response(new Uint8Array([1, 2, 3]));
+    if (u.includes("api.telegram.org")) return Response.json(mode === "download" ? { ok: false, error_code: 403 } : { ok: true, result: { file_path: "voice/same.ogg" } });
+    const path = new URL(u).pathname;
+    if (init.method === "DELETE") {
+      check(active.has(path), "voice repeat: cleanup deletes only this request's uploaded file");
+      active.delete(path); removed.add(path);
+      return Response.json({});
+    }
+    if (path.includes("/upload/")) {
+      if (mode === "upload429") return Response.json({ error: { status: "RESOURCE_EXHAUSTED", message: env.GEMINI_API_KEY } }, { status: 429 });
+      const name = `files/repeat-${++uploaded}`;
+      active.add(`/v1beta/${name}`);
+      return Response.json({ file: { name } });
+    }
+    if (path.startsWith("/v1beta/files/")) {
+      if (mode === "poll503") return Response.json({ error: { status: "UNAVAILABLE", message: env.GEMINI_API_KEY } }, { status: 503 });
+      return Response.json({ state: "ACTIVE", uri: `https://example/audio/${path.split("/").at(-1)}` });
+    }
+    if (mode === "auth403") return Response.json({ error: { status: "PERMISSION_DENIED", message: env.GEMINI_API_KEY } }, { status: 403 });
+    if (mode === "timeout") return new Promise(() => {});
+    if (path === "/v1beta/interactions") {
+      const { input } = JSON.parse(init.body);
+      const file = input[0].uri.split("/").at(-1);
+      check(active.has(`/v1beta/files/${file}`), "voice repeat: audio still exists while transcribing");
+      return Response.json({ status: "completed", output_text: "same transcript" });
+    }
+    throw new Error("Unexpected voice test request");
+  };
+  const run = (transcribeOpts) => {
+    const sent = [], routed = [];
+    return handleVoice(env, { userId: 42, chatId: 42, transcribeOpts,
+      voice: { file_id: "same-file-id", duration: 2, mime_type: "audio/ogg" },
+      send: async (text, opts) => sent.push({ text, opts }), route: async (text) => routed.push(text),
+    }).then((result) => ({ result, sent, routed }));
+  };
+  try {
+    for (let i = 0; i < 5; i++) {
+      const r = await run();
+      check(r.result === "routed" && r.routed[0] === "same transcript" && r.sent.length === 0, `voice repeat: identical recording succeeds on turn ${i + 1}`);
+    }
+    const concurrent = await Promise.all([run(), run(), run(), run()]);
+    check(concurrent.every((r) => r.result === "routed") && active.size === 0 && removed.size === 9, "voice repeat: concurrent requests have independent upload/delete lifecycles");
+    for (const [failure, code, stage] of [["download", "VOICE-DOWNLOAD", "telegram-info"], ["upload429", "VOICE-429", "upload"], ["poll503", "VOICE-SERVICE", "file-poll"], ["auth403", "VOICE-AUTH", "interaction"]]) {
+      mode = failure;
+      const r = await run();
+      check(r.result === "failed" && r.routed.length === 0 && r.sent.length === 1 && r.sent[0].text.includes(code), `voice diagnostic: ${failure} has an actionable phone-readable message`);
+      check(logs.some((l) => l.includes('"stage":"' + stage + '"')), `voice diagnostic: ${failure} reports the exact failing stage`);
+      check(r.sent[0].opts?.replyMarkup?.inline_keyboard?.[0]?.[0]?.callback_data?.startsWith("voice:retry:"), "voice diagnostic: failure keeps the existing retry action");
+      mode = "success";
+      check((await run()).result === "routed", `voice repeat: ${failure} does not poison the next request`);
+    }
+    check(active.size === 0, "voice repeat: recoverable failures clean up their own files");
+    mode = "timeout";
+    const timeout = await run({ totalTimeoutMs: 30, attemptTimeoutMs: 1000 });
+    check(timeout.result === "failed" && timeout.sent.length === 1 && timeout.sent[0].text.includes("VOICE-TIMEOUT"), "voice diagnostic: local timeout is not mislabeled as unintelligible audio");
+    // Deadline-exhausted cleanup is best effort, so this timed-out file may remain.
+
+    const report = logs.join("");
+    check(!report.includes(env.GEMINI_API_KEY) && !report.includes(env.TG_TOKEN) && !report.includes("same transcript") && !report.includes("same-file-id"), "voice diagnostic: no keys, bot tokens, transcript, or Telegram file IDs logged");
+  } finally {
+    global.fetch = originalFetch; console.log = originalLog; console.warn = originalWarn;
+  }
+}
+
 // ── Voice input v1: Telegram voice -> Gemini generateContent -> plain-text path ──
 if (DatabaseSync) {
   const sqlite = new DatabaseSync(":memory:");
