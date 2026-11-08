@@ -26,12 +26,24 @@ export function askText(q) {
 // hallucinated "stored" message can never be quoted back as fact by a
 // later chat turn (the live 2026-11-03 case: an old fake ✅ note header
 // was repeated to the user as if it had been stored).
-export function buildChatContext(rows) {
-  const msgs = (rows || []).filter((r) => r && typeof r.content === "string" && r.content).slice(-50);
+// A04: `excludeMessageId` drops the in-flight user row (already appended by
+// the caller) so it is sent to the model exactly once. An oversized single
+// turn is truncated instead of clearing all older history.
+export function buildChatContext(rows, opts = {}) {
+  const excludeId = opts && opts.excludeMessageId != null ? Number(opts.excludeMessageId) : null;
+  const msgs = (rows || []).filter((r) => r && typeof r.content === "string" && r.content && (excludeId === null || Number(r.id) !== excludeId)).slice(-50);
   const kept = []; let total = 0;
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i].role === "assistant" && (/^✅\s*\*\*یادداشت جدید/.test(msgs[i].content) || /^✅\s*(?:یادداشت|تسک|هزینه)/.test(msgs[i].content) || /^⏰\s*یادآوری/.test(msgs[i].content))) continue;
-    if (total + msgs[i].content.length > CHAT_CONTEXT_CHAR_LIMIT) break; kept.push({ role: msgs[i].role === "assistant" ? "assistant" : "user", content: msgs[i].content }); total += msgs[i].content.length;
+    const remaining = CHAT_CONTEXT_CHAR_LIMIT - total;
+    if (remaining <= 0) break;
+    let content = msgs[i].content;
+    if (content.length > remaining) {
+      const cap = Math.min(2000, remaining);
+      if (cap <= 3) break;
+      content = content.slice(0, cap - 3) + "...";
+    }
+    kept.push({ role: msgs[i].role === "assistant" ? "assistant" : "user", content }); total += content.length;
   }
   return kept.reverse();
 }
@@ -1271,7 +1283,8 @@ export async function runReminderTick(env, opts = {}) {
     const text = `${delayed ? "⏰ یادآوری (با تاخیر):" : "⏰ یادآوری:"} ${r.title}`;
     const replyMarkup = { inline_keyboard: [[{ text: "✅", callback_data: `task:done:${r.id}` }, { text: "💤 ۱۰ دقیقه‌ی دیگر", callback_data: `task:snooze:${r.id}` }]] };
     try {
-      await send(r.telegram_id, text, replyMarkup);
+      const res = await send(r.telegram_id, text, replyMarkup);
+      if (res && res.ok === false) throw new Error(`telegram_send_failed: ${res.error_code ?? ""} ${res.description ?? ""}`);
       sent++;
     } catch (err) {
       failed++;
@@ -1953,6 +1966,7 @@ export async function handleVaultFile(env, o) {
   if (cap && VAULT_CAPTION_RE.test(cap)) {
     const title = stripCaptionPrefix(cap) || stripNamingPrefix(cap) || cap;
     const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title, fileName, caption: cap, syncStatus: "local" });
+    if (!saved || !saved.ok) { await send(NOT_SAVED_TEXT); return true; }
     let syncInfo = "";
     if (saved.ok) {
       const bytes = await fileBytesFromTelegram(env, tgFileId);
@@ -1986,8 +2000,14 @@ export async function handleVaultFile(env, o) {
 async function namePendingVaultFile(env, o) {
   const { userId, text, send } = o;
   if (!text || /^\s*\//.test(text)) return false;
-  if (/لغو|انصراف/.test(String(text).trim())) return false;
-  const cleanTitle = stripNamingPrefix(text) || String(text).trim();
+  // A07 escape hatch: never consume the user's next turn as a pending-file
+  // name when the turn is actually an actionable message or a command.
+  const trimmed = String(text).trim();
+  const cg = classifyDaily(trimmed, { nowMs: o.nowMs ?? Date.now() });
+  if (["note", "task", "task-create", "task-delete", "reminder", "expense", "vault_save", "vault_get", "vault_list", "vault_file_get", "command"].includes(cg.intent)) return false;
+  if (/(?:یادداشت|تسک|یادآوری)\s*کن/u.test(trimmed) || /یادداشت[^\n]{0,24}(?:ثبت|ذخیره)\s*کن/u.test(trimmed) || /^ثبت\s*کن(?:\s|$)/u.test(trimmed)) return false;
+  if (/لغو|انصراف/.test(trimmed)) return false;
+  const cleanTitle = stripNamingPrefix(text) || trimmed;
   if (!cleanTitle) return false;
   let pend = await resolvePendingVaultFile(env, Number(userId), cleanTitle);
   if (!pend.ok || !pend.file) {
@@ -1998,7 +2018,12 @@ async function namePendingVaultFile(env, o) {
   const bytes = await fileBytesFromTelegram(env, f.tg_file_id);
   const sync = await syncVaultFileToGoogle(env, { id: f.id, userId, label: f.title, fileName: f.fileName, mimeType: f.mimeType, data: bytes ?? new Uint8Array(0), createdAt: f.created_at });
   await setFileSyncStatus(env, userId, f.id, sync.ok ? "synced" : "pending_google", sync.googleId ?? null, null);
-  await send(`🔒📁 مدرک «<b>${cleanTitle}</b>» در آرشیو امن و Google Docs ثبت شد.`);
+  // A15 honesty: claim Google Docs only when Google actually synced with an id.
+  if (sync.ok && sync.googleId) {
+    await send(`🔒📁 مدرک «<b>${cleanTitle}</b>» در آرشیو امن و Google Docs ثبت شد.`);
+  } else {
+    await send(`✅ نام فایل ثبت شد: **${cleanTitle}**${sync.ok ? "" : "\n⏳ در انتظار همگام‌سازی گوگل"}`);
+  }
   return true;
 }
 
@@ -2286,7 +2311,7 @@ export async function handleDailyText(env, o) {
   // re-tap) suppresses the chat retry, so a failed summary offers exactly
   // one retry — the summary itself — plus quick-convert for the entry.
   if (o.voiceHeader && o.send) { const rawSend = o.send; let headerSent = false; o.send = async (t, sopts) => { if (!headerSent) { headerSent = true; return rawSend(o.voiceHeader + t, sopts); } return rawSend(t, sopts); }; }
-  if (o.chat) { const rawChat = o.chat; o.chat = (t, copts = {}) => rawChat(t, { ...copts, ...(o.voiceHeader && !copts.voiceHeader ? { voiceHeader: o.voiceHeader } : {}), ...(o.entryMessageId && !copts.retryEntryId && !copts.retryData ? { retryEntryId: o.entryMessageId } : {}), ...(o.entryMessageId && !copts.quickConvertId ? { quickConvertId: o.entryMessageId } : {}) }); }
+  if (o.chat) { const rawChat = o.chat; o.chat = (t, copts = {}) => rawChat(t, { ...copts, ...(o.voiceHeader && !copts.voiceHeader ? { voiceHeader: o.voiceHeader } : {}), ...(o.entryMessageId && copts.excludeMessageId == null ? { excludeMessageId: o.entryMessageId } : {}), ...(o.entryMessageId && !copts.retryEntryId && !copts.retryData ? { retryEntryId: o.entryMessageId } : {}), ...(o.entryMessageId && !copts.quickConvertId ? { quickConvertId: o.entryMessageId } : {}) }); }
   const finalizeEntry = async (kind) => { if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; await finalizeMessageKind(env, o.entryMessageId, userId, kind); } };
   const viaBranch = async (cc) => { const r = await runDailyBranch(env, o, cc, ctx); await finalizeEntry(r === "chat" ? "chat" : "daily"); return r; };
   // Bare-note ask bypasses the model step: the model is exactly what

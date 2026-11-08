@@ -911,7 +911,11 @@ for (const [st, expected] of [["success", "success"], ["failure", "failure"], ["
 // real SQL (kind filter, LIMIT, ON CONFLICT) — the only simulation is the
 // adapter itself, not the queries. Live D1 verification is still a 1b job.
 let DatabaseSync = null;
-try { DatabaseSync = (await import('node:sqlite').catch(() => ({}))).DatabaseSync; } catch { console.warn("\u26a0 node:sqlite در دسترس نیست \u2014 تست‌های ۱الف رد شد."); }
+try { DatabaseSync = (await import('node:sqlite').catch(() => ({}))).DatabaseSync; } catch {}
+if (!DatabaseSync) {
+  if (process.env.REQUIRE_SQLITE === "1") throw new Error("DatabaseSync (node:sqlite) is required when REQUIRE_SQLITE=1");
+  console.warn("\u26a0 node:sqlite در دسترس نیست \u2014 تست‌های ۱الف رد شد.");
+}
 if (DatabaseSync) {
     const sqlite = new DatabaseSync(":memory:");
     sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
@@ -6346,7 +6350,7 @@ if (DatabaseSync) {
           return Response.json({ ok: true, result: { message_id: 1 } });
         }
         if (u.includes("/getFile")) return Response.json({ ok: true, result: { file_path: "docs/f1" } });
-        if (u.includes("/file/bot")) return { ok: true, arrayBuffer: async () => new ArrayBuffer(8) };
+    if (u.includes("/file/bot")) return new Response(new ArrayBuffer(8), { headers: { "content-type": "application/octet-stream" } });
         if (u.includes("googleapis.com/upload/drive")) { driveCalls++; return Response.json({ id: "drive-file-1" }); }
         if (u.includes("googleapis.com") || u.includes("oauth2.googleapis.com")) return Response.json({ ok: true });
         return Response.json({ ok: true });
@@ -6679,6 +6683,154 @@ console.log("\n✓ assertهای pipeline 3i برقرار شد.");
     check(!merge, "A11: 100-file response must fail closed");
   } finally {
     world.restore();
+  }
+}
+
+// ── A09: reminder tick must treat Telegram { ok: false } as a send failure ──
+if (DatabaseSync) {
+  const freshA09 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at, remind_at, remind_attempts) VALUES (1, '\u0622\u0632\u0645\u0648\u0646 \u062a\u0644\u06af\u0631\u0627\u0645', 'open', 'text', '2026-10-30T00:00:00.000Z', '2026-10-31T11:00:00.000Z', 0)").run();
+    const db = { prepare(sql) { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { st.run(...p); return { success: true }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; } };
+    return { sq, env: { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "1", DB: db } };
+  };
+  {
+    const { sq, env } = freshA09();
+    const nowIso = "2026-10-31T12:00:00.000Z";
+    const r = await runReminderTick(env, { nowIso, scheduledTime: Date.UTC(2026, 9, 31, 12, 0, 0), sendMessage: async () => ({ ok: false, error_code: 403, description: "bot was blocked by the user" }) });
+    check(r.ok === true && r.sent === 0 && r.failed === 1, `A09: ok:false send counts as failed, not sent: ${JSON.stringify(r)}`);
+    const row = sq.prepare("SELECT id, reminded_at FROM tasks WHERE title = '\u0622\u0632\u0645\u0648\u0646 \u062a\u0644\u06af\u0631\u0627\u0645'").get();
+    check(row.reminded_at === null, `A09: failed delivery releases the claim: ${JSON.stringify(row)}`);
+    const rGood = await runReminderTick(env, { nowIso, scheduledTime: Date.UTC(2026, 9, 31, 12, 0, 0), sendMessage: async () => ({ ok: true }) });
+    check(rGood.ok === true && rGood.sent === 1 && rGood.failed === 0, `A09: released reminder is claimable again and honest retry succeeds: ${JSON.stringify(rGood)}`);
+    check(sq.prepare("SELECT reminded_at FROM tasks WHERE id = ?").get(row.id).reminded_at === nowIso, "A09: successful delivery keeps the claim");;
+  }
+}
+
+// ── A07/A15: pending vault file must not hijack an explicit note command, ──
+// ── and the naming reply must not claim Google Docs when Google is unconfigured ──
+{
+  const mkS2 = () => { const s = { sent: [] }; s.send = async (text, sopts = {}) => { s.sent.push({ ...sopts, text: String(text) }); return { ok: true }; }; return s; };
+  const freshA07 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    const db = { prepare(sql) { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { st.run(...p); return { success: true }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; } };
+    return { sq, env: { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "999", DB: db } };
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    void init;
+    const u = String(url ?? "");
+    if (u.includes("/getFile")) return Response.json({ ok: true, result: { file_path: "docs/f9" } });
+    if (u.includes("/file/bot")) return { ok: true, arrayBuffer: async () => new ArrayBuffer(8) };
+    return Response.json({ ok: true });
+  };
+  try {
+    const NOWA07 = Date.UTC(2026, 9, 31, 12, 0, 0);
+    const mkPending = () => {
+      const { sq, env } = freshA07();
+      // Case B: photo without caption -> choice buttons (__choice__ row)
+      const s0 = mkS2();
+      sq.prepare("INSERT INTO users (id, telegram_id) VALUES (999, '999')").run();
+      return { sq, env, s0 };
+    };
+    // (1) an explicit note command is NOT consumed as a pending file name
+    {
+      const { sq, env, s0 } = mkPending();
+      await handleVaultFile(env, { userId: 999, chatId: 999, tgFileId: "file-9", fileType: "photo", mimeType: "image/jpeg", fileName: null, caption: null, send: s0.send });
+      await resolveVaultCallback(env, { fromId: 999, chatId: 999, data: "vault:askname:1", send: s0.send });
+      const titleAfterAsk = sq.prepare("SELECT title FROM vault_files WHERE id = 1").get().title;
+      check(titleAfterAsk === "__pending__", `A07: askname sets __pending__: ${JSON.stringify(titleAfterAsk)}`);
+      const s = mkS2();
+      await handleDailyText(env, { chatId: 999, userId: 999, text: "\u0627\u06cc\u0646 \u06cc\u0627\u062f\u062f\u0627\u0634\u062a \u0631\u0648 \u062b\u0628\u062a \u06a9\u0646: \u062a\u0633\u062a", send: s.send, chat: async () => {}, nowMs: NOWA07 });
+      const texts = s.sent.map((m) => m.text).join(" | ");
+      const row = sq.prepare("SELECT title FROM vault_files WHERE id = 1").get();
+      check(row.title === "__pending__", `A07: note command is not consumed as a pending file name: ${JSON.stringify(row)}`);
+      check(!texts.includes("\u0646\u0627\u0645 \u0641\u0627\u06cc\u0644 \u062b\u0628\u062a \u0634\u062f"), `A07: note command did not take the naming path: ${JSON.stringify(texts)}`);
+    }
+    // (2) plain naming names the file, but never claims Google Docs when Google is unconfigured
+    {
+      const { sq, env } = mkPending();
+      const s0 = mkS2();
+      await handleVaultFile(env, { userId: 999, chatId: 999, tgFileId: "file-9", fileType: "photo", mimeType: "image/jpeg", fileName: null, caption: null, send: s0.send });
+      await resolveVaultCallback(env, { fromId: 999, chatId: 999, data: "vault:askname:1", send: s0.send });
+      const s = mkS2();
+      await handleDailyText(env, { chatId: 999, userId: 999, text: "\u0628\u06cc\u0645\u0647 \u0646\u0627\u0645\u0647 \u06f2\u06f0\u06f6", send: s.send, chat: async () => {}, nowMs: NOWA07 });
+      const reply = String(s.sent.at(-1)?.text ?? "");
+      check(reply.includes("\u0646\u0627\u0645 \u0641\u0627\u06cc\u0644 \u062b\u0628\u062a \u0634\u062f") && reply.includes("\u0628\u06cc\u0645\u0647 \u0646\u0627\u0645\u0647 \u06f2\u06f0\u06f6"), `A07: honest local naming reply: ${JSON.stringify(s.sent.at(-1))}`);
+      check(!reply.includes("Google Docs"), `A07: no Google Docs claim without sync: ${JSON.stringify(reply)}`);
+      const f = sq.prepare("SELECT title FROM vault_files WHERE id = 1").get();
+      check(f.title === "\u0628\u06cc\u0645\u0647 \u0646\u0627\u0645\u0647 \u06f2\u06f0\u06f6", `A07: pending file renamed by plain title: ${JSON.stringify(f)}`);
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ── A04: chat input dedupe + oversized-history retention ────────────────────
+if (DatabaseSync) {
+  const freshA04 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    return { sq, db: { prepare(sql) { return base(sql); } } };
+  };
+  const captureFetch = (captured) => async (url, init = {}) => {
+    const u = String(url);
+    if (u.startsWith("https://api.telegram.org/")) return Response.json({ ok: true, result: { message_id: 91 } });
+    try { captured.push(JSON.parse(String(init.body ?? "{}"))); } catch {}
+    return Response.json({ choices: [{ message: { content: "پاسخ آزمایشی" } }] });
+  };
+  const chatEnv = async (db) => {
+    const kv = fakeKV();
+    await kv.put("catalog:xkiro", JSON.stringify({ models: [{ id: "qwen3-32b", provider: "xkiro", context: 131072 }] }));
+    return { STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" };
+  };
+  // A04-1: handleDailyText finalises the entry row to kind='chat' before the
+  // chat call, so without dedupe the same message is both history and current.
+  {
+    const { db } = freshA04();
+    const env = await chatEnv(db);
+    const text = "explain how Workers KV caching works";
+    const o = { chatId: 1, userId: 1, text, send: async () => {}, chat: async () => {}, nowMs: Date.UTC(2026, 10, 2, 12, 0, 0) };
+    const daily = await handleDailyText(env, o);
+    const captured = [];
+    const prev = globalThis.fetch;
+    globalThis.fetch = captureFetch(captured);
+    try {
+      await answerChatText(env, 1, 1, text, false, { saveText: "", excludeMessageId: o.entryMessageId });
+    } finally { globalThis.fetch = prev; }
+    const body = captured.find((b) => Array.isArray(b.messages));
+    const hits = (body?.messages ?? []).filter((m) => m.role === "user" && m.content === text).length;
+    check(daily === "chat" && hits === 1, `A04: current chat message appears once in LLM input (got ${hits})`);
+  }
+  // A04-2: a single 8001-char historical turn must be truncated, not wipe
+  // all older context on the next turn.
+  {
+    const { db } = freshA04();
+    const env = await chatEnv(db);
+    await saveMessage(db, { userId: 1, role: "user", content: "پیام قدیمی", kind: "chat" });
+    await saveMessage(db, { userId: 1, role: "user", content: "x".repeat(8001), kind: "chat" });
+    const captured = [];
+    const prev = globalThis.fetch;
+    globalThis.fetch = captureFetch(captured);
+    try {
+      await answerChatText(env, 1, 1, "سوال بعدی", false, { saveText: "" });
+    } finally { globalThis.fetch = prev; }
+    const body = captured.find((b) => Array.isArray(b.messages));
+    const history = (body?.messages ?? []).slice(1, -1);
+    const histChars = history.reduce((a, m) => a + String(m.content ?? "").length, 0);
+    check(history.length > 0 && histChars > 0 && histChars <= 8000, `A04: oversized history keeps earlier turns (${history.length} msgs, ${histChars} chars)`);
+    check(history.some((m) => String(m.content).endsWith("...")), "A04: oversized historical message is truncated with ...");
   }
 }
 
