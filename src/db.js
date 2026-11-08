@@ -61,6 +61,19 @@ export async function finalizeMessageKind(envOrDb, id, userId, kind) {
   try { await db.prepare("UPDATE messages SET kind = ? WHERE id = ? AND user_id = ?").bind(kind, Number(id), Number(userId)).run(); return { ok: true }; } catch { return { ok: false }; }
 }
 
+// A08: vault credentials must never remain in messages.content. Replaces
+// the stored text in place, scoped by owner so a stray id cannot edit
+// another user's row. Safe when D1 is missing or the update fails.
+export async function redactMessageContent(envOrDb, userId, messageId, redactedText = "[🔒 محتوای حساس گاوصندوق]") {
+  const db = dbOf(envOrDb);
+  const id = Number(messageId);
+  if (!db || !Number.isFinite(id) || validUserId(userId) === null) return { ok: false };
+  try {
+    await db.prepare("UPDATE messages SET content = ?1 WHERE id = ?2 AND user_id = ?3").bind(String(redactedText ?? ""), id, Number(userId)).run();
+    return { ok: true };
+  } catch { return { ok: false }; }
+}
+
 // Chat context only: kind = 'chat', newest-first from D1, returned oldest-first.
 // Daily messages are excluded by the SQL itself, never by post-filtering.
 // Returns [] when the DB is missing or the query fails.
@@ -72,7 +85,7 @@ export async function getChatMessages(envOrDb, userId, limit = 50) {
   try {
     const res = await db
       .prepare(
-        "SELECT role, content FROM messages WHERE user_id = ? AND kind = 'chat' ORDER BY id DESC LIMIT ?",
+        "SELECT id, role, content FROM messages WHERE user_id = ? AND kind = 'chat' ORDER BY id DESC LIMIT ?",
       )
       .bind(id, n)
       .all();

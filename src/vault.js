@@ -1,12 +1,14 @@
 // Phase 3-A: encrypted personal vault + best-effort Google mirror.
 // Values are AES-256-GCM ciphertext before they touch D1/KV; the key is
-// derived from VAULT_SECRET (falling back to ADMIN_SECRET / the bot token
-// so existing deployments keep working). Google sync is optional and
-// never blocks local storage: callers save locally first and mark the
-// row pending_google when no backend is configured.
+// derived from VAULT_MASTER_KEY / VAULT_SECRET (falling back to
+// ADMIN_SECRET / the bot token so existing deployments keep working).
+// Google sync is optional and never blocks local storage: callers save
+// locally first and mark the row pending_google when no backend is
+// configured.
 import { getConfig } from "./config.js";
 
-const ENC_PREFIX = "enc:v1:";
+const ENC_PREFIX = "v1:";
+const LEGACY_ENC_PREFIX = "enc:v1:";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/drive",
@@ -15,7 +17,7 @@ const GOOGLE_SCOPES = [
 ].join(" ");
 
 function vaultSecret(env) {
-  const s = env?.VAULT_SECRET || env?.ADMIN_SECRET || env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN;
+  const s = env?.VAULT_MASTER_KEY || env?.VAULT_SECRET || env?.ADMIN_SECRET || env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN;
   return typeof s === "string" && s ? s : null;
 }
 
@@ -55,8 +57,21 @@ function pemToBytes(pem) {
   return b64ToBytes(body);
 }
 
+// A19: new rows are "v1:<iv_b64>:<cipher_b64>". Existing rows use the old
+// "enc:v1:<iv_b64>:<cipher_b64>" prefix, and pre-release rows may be bare
+// "<iv_b64>:<cipher_b64>" (12-byte IV = 16 base64 chars, then ciphertext).
+const BARE_LEGACY_RE = /^[A-Za-z0-9+/]{16}:[A-Za-z0-9+/]{16,}={0,2}$/;
+
+function vaultCipherBody(value) {
+  if (typeof value !== "string") return null;
+  if (value.startsWith(ENC_PREFIX)) return value.slice(ENC_PREFIX.length);
+  if (value.startsWith(LEGACY_ENC_PREFIX)) return value.slice(LEGACY_ENC_PREFIX.length);
+  if (BARE_LEGACY_RE.test(value)) return value;
+  return null;
+}
+
 export function isEncryptedVaultValue(value) {
-  return typeof value === "string" && value.startsWith(ENC_PREFIX);
+  return vaultCipherBody(value) !== null;
 }
 
 export async function encryptVaultValue(env, plaintext) {
@@ -68,8 +83,9 @@ export async function encryptVaultValue(env, plaintext) {
 
 export async function decryptVaultValue(env, value) {
   const s = String(value ?? "");
-  if (!isEncryptedVaultValue(s)) return s;
-  const [ivB64, cipherB64] = s.slice(ENC_PREFIX.length).split(":");
+  const body = vaultCipherBody(s);
+  if (body === null) return s;
+  const [ivB64, cipherB64] = body.split(":");
   if (!ivB64 || !cipherB64) throw new Error("invalid vault ciphertext");
   const key = await vaultKey(env);
   const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64ToBytes(ivB64) }, key, b64ToBytes(cipherB64));

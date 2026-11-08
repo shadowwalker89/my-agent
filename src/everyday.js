@@ -3,7 +3,7 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, extractFolderTag, matchKnownProjectAt, IRAN_OFFSET_MIN } from "./daily.js";
 import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO, resolveInterpreterModel } from "./intent.js";
-import { saveMessage, finalizeMessageKind, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, setVaultSyncStatus } from "./db.js";
+import { saveMessage, finalizeMessageKind, redactMessageContent, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, setVaultSyncStatus } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadData, escapeHtml, formatTelegramHtml } from "./telegram.js";
@@ -14,6 +14,8 @@ export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی م
 const DRAFT_TTL_SEC = 600;
 const EXPIRED_TEXT = "قبلاً ثبت شد یا مهلتش گذشته";
 const NOT_SAVED_TEXT = "ذخیره نشد، دوباره تلاش کن";
+const VAULT_PRIVATE_ONLY_TEXT = "🔒 عملیات گاوصندوق فقط در چت خصوصی مجاز است.";
+const VAULT_REDACTED_TEXT = "[🔒 محتوای حساس گاوصندوق]";
 
 export function mapQuestion(q) { return q === "ambiguous" ? "amount" : q; } // TODO from 1b-1, resolved here
 export function askText(q) {
@@ -473,7 +475,17 @@ async function runDailyBranch(env, o, c, ctx) {
     return "handled";
   }
   if (c.intent === "vault_save") {
+    const rowId = o.messageRowId ?? o.msgId ?? o.entryMessageId ?? null;
+    // A19: never accept vault credentials from a group/supergroup chat.
+    if (o.chatType && o.chatType !== "private") {
+      if (rowId) await redactMessageContent(env, userId, rowId, VAULT_REDACTED_TEXT);
+      await o.send(VAULT_PRIVATE_ONLY_TEXT);
+      return "handled";
+    }
     await markDaily(env, o);
+    // A08: even slot/NLU-routed saves must not leave plaintext credentials
+    // in messages.content (the entry row may already exist).
+    if (rowId) await redactMessageContent(env, userId, rowId, VAULT_REDACTED_TEXT);
     let valueEnc;
     try { valueEnc = await encryptVaultValue(env, c.value ?? ""); } catch { await o.send(NOT_SAVED_TEXT); return "handled"; }
     const saved = await saveVaultItem(env, { userId, label: c.title ?? "مورد گاوصندوق", kind: "text", valueEnc, category: c.category ?? null, extra: c.extra ?? null, syncStatus: "local" });
@@ -490,6 +502,8 @@ async function runDailyBranch(env, o, c, ctx) {
     return "handled";
   }
   if (c.intent === "vault_get") {
+    // A19: decrypting or echoing vault values is private-chat only.
+    if (o.chatType && o.chatType !== "private") { await o.send(VAULT_PRIVATE_ONLY_TEXT); return "handled"; }
     await markDaily(env, o);
     const items = (await listVaultItems(env, userId)).items;
     const keys = (c.keywords ?? []).filter(Boolean);
@@ -2299,7 +2313,7 @@ export async function handleDailyText(env, o) {
   // interpreter). The expense row is untouched by this: it is still
   // inserted only when the user taps Confirm. o.entryMessageId is visible
   // to the caller so downstream chat answers do not save a second user row.
-  const entry = await saveMessage(env, { userId, role: "user", content: text, kind: "pending" });
+  const entry = await saveMessage(env, { userId, role: "user", content: c.intent === "vault_save" ? VAULT_REDACTED_TEXT : text, kind: "pending" });
   if (entry.ok) o.entryMessageId = entry.id; else o._entrySaveFailed = true;
   // 1-d-5 voice echo + chat wrap (placed AFTER the entry save so the
   // entry id is known, BEFORE any branch sends):

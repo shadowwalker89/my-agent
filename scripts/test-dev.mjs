@@ -6199,7 +6199,7 @@ if (DatabaseSync) {
   const env = { VAULT_SECRET: "s1" };
   const c1 = await encryptVaultValue(env, "secret value");
   const c2 = await encryptVaultValue(env, "secret value");
-  check(c1.startsWith("enc:v1:") && c1 !== c2 && !c1.includes("secret value") && isEncryptedVaultValue(c1), "3-a: vault encrypts with a random IV and hides the plaintext");
+  check(c1.startsWith("v1:") && c1 !== c2 && !c1.includes("secret value") && isEncryptedVaultValue(c1), "3-a: vault encrypts with a random IV and hides the plaintext");
   check((await decryptVaultValue(env, c1)) === "secret value" && (await decryptVaultValue(env, "plain")) === "plain", "3-a: vault round-trips ciphertext and passes plaintext through");
   let wrongKey = false;
   try { await decryptVaultValue({ VAULT_SECRET: "s2" }, c1); } catch { wrongKey = true; }
@@ -6831,6 +6831,55 @@ if (DatabaseSync) {
     const histChars = history.reduce((a, m) => a + String(m.content ?? "").length, 0);
     check(history.length > 0 && histChars > 0 && histChars <= 8000, `A04: oversized history keeps earlier turns (${history.length} msgs, ${histChars} chars)`);
     check(history.some((m) => String(m.content).endsWith("...")), "A04: oversized historical message is truncated with ...");
+  }
+}
+
+// ── A08/A19: vault privacy (no plaintext credentials in messages) + versioned ciphertext ──
+if (DatabaseSync) {
+  const freshA08 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    const db = { prepare(sql) { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; } };
+    return { sq, env: { STATE: fakeKV(), VAULT_MASTER_KEY: "master-a08", DB: db } };
+  };
+  const runVaultText = async (env, text, chatType) => {
+    const sent = [];
+    const r = await handleDailyText(env, { chatId: 1, userId: 1, text, chatType, send: async (t) => { sent.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 10, 8, 12, 0, 0) });
+    return { r, sent, joined: sent.join("\n") };
+  };
+  // A08: a successful private save stores the redaction placeholder, never the card.
+  {
+    const { sq, env } = freshA08();
+    const card = "6037123412341234";
+    const { r } = await runVaultText(env, `شماره کارت رسالت ${card} رو ثبتش کن`, "private");
+    const rows = sq.prepare("SELECT content FROM messages WHERE user_id = ?").all(1);
+    check(r === "handled" && rows.length > 0, `A08: vault save handled and a message row exists: ${JSON.stringify({ r, rows })}`);
+    check(rows.every((row) => !String(row.content).includes(card)), `A08: raw card number never persists in messages.content: ${JSON.stringify(rows)}`);
+    check(rows.some((row) => row.content === "[🔒 محتوای حساس گاوصندوق]"), `A08: vault save stores the redaction placeholder: ${JSON.stringify(rows)}`);
+  }
+  // A19: group vault_get refuses to decrypt/leak.
+  {
+    const { env } = freshA08();
+    const secret = "6037999988887777";
+    const valueEnc = await encryptVaultValue(env, secret);
+    await saveVaultItem(env, { userId: 1, label: "کارت بانکی", kind: "text", valueEnc, category: "bank_card", syncStatus: "local" });
+    const { r, joined } = await runVaultText(env, "شماره کارتم چنده؟", "group");
+    check(r === "handled" && joined.includes("عملیات گاوصندوق فقط در چت خصوصی مجاز است"), `A19: group vault_get is refused: ${JSON.stringify(joined)}`);
+    check(!joined.includes(secret), `A19: group vault_get never leaks the decrypted secret: ${JSON.stringify(joined)}`);
+  }
+  // A19: versioned ciphertext + legacy rows stay readable.
+  {
+    const env = { VAULT_MASTER_KEY: "master-a08", VAULT_SECRET: "older-secret" };
+    const current = await encryptVaultValue(env, "legacy-secret");
+    check(current.startsWith("v1:"), `A19: new ciphertext is v1-prefixed: ${JSON.stringify(current.slice(0, 3))}`);
+    const body = current.slice("v1:".length);
+    check((await decryptVaultValue(env, current)) === "legacy-secret", "A19: v1 ciphertext round-trips");
+    check((await decryptVaultValue(env, body)) === "legacy-secret", "A19: bare iv:cipher legacy ciphertext decrypts");
+    check((await decryptVaultValue(env, `enc:v1:${body}`)) === "legacy-secret", "A19: existing enc:v1 rows remain readable");
+    check((await decryptVaultValue({ VAULT_SECRET: "master-a08" }, current)) === "legacy-secret", "A19: VAULT_SECRET remains a valid fallback key");
   }
 }
 
