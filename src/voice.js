@@ -46,11 +46,34 @@ function resultText(value) {
 }
 function interactionTranscript(data) {
   if (data?.error || (data?.status && data.status !== "completed")) return "";
+  // Current Google SDK contract: Interaction.steps -> ModelOutputStep.content
+  // -> TextContent.text (googleapis/python-genai/_gaos/types/interactions).
+  if (Array.isArray(data?.steps)) {
+    const text = data.steps.filter((step) => step?.type === "model_output" && !step.error && !step.thought)
+      .map((step) => Array.isArray(step.content) ? step.content
+        .filter((part) => part?.type === "text" && !part.thought && typeof part.text === "string")
+        .map((part) => part.text).join("") : "").filter((text) => text.trim()).join("\n").trim();
+    if (text) return text;
+  }
   for (const value of [data?.output_text, data?.outputs, data?.output, data?.transcription, data?.transcript]) {
     const text = resultText(value).trim();
     if (text) return text;
   }
   return "";
+}
+
+function interactionShape(data) {
+  // Fixed booleans, counters, and allowlisted states only; no payload/key names,
+  // transcript fragments, IDs, error messages, or unknown enum strings.
+  const steps = Array.isArray(data?.steps) ? data.steps : [];
+  const outputs = steps.filter((step) => step?.type === "model_output");
+  return {
+    status: ["completed", "in_progress", "queued", "failed", "cancelled", "incomplete", "requires_action", "budget_exceeded", "requires_continuation"].includes(data?.status) ? data.status : "unknown",
+    hasSteps: Array.isArray(data?.steps), stepCount: steps.length,
+    modelOutputSteps: outputs.length, stepErrors: outputs.filter((step) => Boolean(step.error)).length,
+    textParts: outputs.reduce((n, step) => n + (Array.isArray(step.content) ? step.content.filter((part) => part?.type === "text" && !part.thought && typeof part.text === "string").length : 0), 0),
+    hasLegacyOutput: typeof data?.output_text === "string" || data?.outputs != null || data?.output != null,
+  };
 }
 
 // Like the chat router: enforce wall time through body consumption, not just
@@ -213,7 +236,7 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
           method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: requestBody,
         });
         // A pending interaction is work in progress, not an empty transcript.
-        for (let i = 0; interactions && res.ok && data?.status === "in_progress" && typeof data.id === "string" && i < maxPolls; i++) {
+        for (let i = 0; interactions && res.ok && ["in_progress", "queued"].includes(data?.status) && typeof data.id === "string" && i < maxPolls; i++) {
           const id = data.id;
           await sleep(Math.min(pollIntervalMs, remaining()));
           ({ res, data } = await request(`${GEMINI_BASE}/v1beta/interactions/${encodeURIComponent(id)}`, { headers }));
@@ -230,7 +253,8 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
         }
         failure = null;
         const text = interactions ? interactionTranscript(data) : transcriptText(data);
-        if (!text) { console.warn("voice_transcribe_fail", { model, status: res.status, err: data?.status === "in_progress" ? "pending" : "empty", elapsedMs: Date.now() - started }); continue; }
+        if (!text) { console.warn("voice_transcribe_fail", { model, status: res.status, err: ["in_progress", "queued"].includes(data?.status) ? "pending" : "empty", elapsedMs: Date.now() - started,
+          ...(interactions ? { responseShape: interactionShape(data) } : {}) }); continue; }
         log(true, null, model);
         return { ok: true, text };
       } catch (err) {
