@@ -156,6 +156,7 @@ export function parseReminder(text, nowMs, origText) {
   for (const [a, b] of ranges) { if (a < pos) continue; body += src.slice(pos, a); pos = b; }
   body += src.slice(pos);
   body = body.replace(/\s+/g, " ").trim();
+  if (/^برای\s+(?:فردا|امروز|پس[\s\u200c]+فردا)/u.test(text)) body = body.replace(/^برای\s+/u, "").trim();
   if (!body) return { ask: "empty" }; // "for what?" — never store an empty reminder
   return { due: `${date}T${pad(hour.hour)}:${pad(hour.minute)}:00+03:30`, text: body };
 }
@@ -555,6 +556,28 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
     if (!body) return { intent: "translate", confidence: 0.5, ask: "text" };
     return { intent: "translate", confidence: 1, target, text: body };
   }
+  // Phase 2.3: four distinct operational contracts. Unsupported external
+  // sends (email/connector) are never chat and never a silent note/task:
+  // they return unsupported_action so the caller replies honestly.
+  if (!isNegatedCommand(raw) && /(?:ایمیل|پیامک|واتساپ|واتس\s*اپ|email)/iu.test(raw) && /(بفرست|ارسال)/u.test(raw)) return { intent: "unsupported_action", confidence: 1, action: "email", text: String(text ?? "").trim() };
+  // Memory-save: "این را به خاطر بسپار: ..." / "یادت بمونه اسم من ... است"
+  // (and the bare "به خاطر بسپار ..." form). Distinct from note (یادداشت کن)
+  // and from remember-settings (یادت باشد ...): the caller saves a user fact
+  // (and a setting when the fact is name/currency/language) and confirms
+  // "🧠 به خاطر سپرده شد" — never a note or a task.
+  const mem = /(?:این\s+را|اینو|این)?\s*(?:به\s+خاطر\s+بسپار|یادت\s+بمونه|یادت\s+بماند|یادم\s+بمونه)\s*[:：]?\s*(?:که\s+)?([\s\S]+)/u.exec(raw);
+  if (mem) {
+    const bodyRaw = mem[1].trim().replace(/[؟?!.،,؛;:\s]+$/u, "").trim();
+    if (bodyRaw) {
+      const nameM = /^(?:اسمم|نامم|اسم\s+من|نام\s+من)\s+([\s\S]+?)(?:\s+(?:است|هست))?$/u.exec(bodyRaw);
+      if (nameM) { const v = nameM[1].trim(); if (v && v.length <= 50) return { intent: "memory_save", confidence: 1, text: bodyRaw, factKey: "name", factValue: v, setting: { key: "name", value: v } }; }
+      const curM = /^(?:ارزم|ارز[\s\u200c]+پیش[\s\u200c]*فرضم)\s+(\S+)/u.exec(bodyRaw);
+      if (curM) { const tok = curM[1].replace(/[؟?!.،,]+$/, ""); const code = has(CUR, tok) ? CUR[tok] : (tok.endsWith("ه") && has(CUR, tok.slice(0, -1)) ? CUR[tok.slice(0, -1)] : (["TOMAN", "IRR", "USD", "EUR"].includes(tok) ? tok : null)); if (code) return { intent: "memory_save", confidence: 1, text: bodyRaw, factKey: "currency", factValue: code, setting: { key: "currency", value: code } }; }
+      const langM = /^(?:زبانم|زبان)\s+(\S+)/u.exec(bodyRaw);
+      if (langM) { const v = langM[1] === "انگلیسی" ? "en" : langM[1] === "فارسی" ? "fa" : (langM[1] === "en" || langM[1] === "fa" ? langM[1] : null); if (v) return { intent: "memory_save", confidence: 1, text: bodyRaw, factKey: "language", factValue: v, setting: { key: "language", value: v } }; }
+      return { intent: "memory_save", confidence: 1, text: bodyRaw, factKey: "general", factValue: bodyRaw };
+    }
+  }
   // Remember/note/reminder are UNANCHORED now that strict translate runs
   // first, so a reminder at the end of a message is still caught.
   const rem = /(?<!\p{L})(?:یادت باشد|یادت باشه|به خاطر بسپار)(?![\p{L}])\s+([\s\S]+)/u.exec(raw);
@@ -589,7 +612,7 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   // colon after کن is dropped; the (?!\p{L}) guard keeps words like
   // کهکشان intact. A trigger with no body still falls through to the
   // bare-note ask below.
-  for (const re of [/^(?:اینو\s+)?یادداشت\s+کن(?:\s+که(?!\p{L}))?\s*:?\s*([\s\S]+)$/ud, /^بنویس(?:\s+توی\s+یادداشت\s*های?م)?\s+([\s\S]+)$/ud]) {
+  for (const re of [/^(?:اینو\s+)?یادداشت\s+کن(?:\s+که(?!\p{L}))?\s*:?\s*([\s\S]+)$/ud, /^بنویس(?:\s+توی\s+یادداشت\s*های?م)?\s+([\s\S]+)$/ud, /^این\s+را\s+یادداشت\s+کن\s*[:：]?\s*([\s\S]+)$/ud]) {
     const m = re.exec(raw);
     if (m && m[1].trim().replace(/[؟?!.،,:：\s]+/gu, "")) return { intent: "note", confidence: 1, text: text.slice(m.indices[1][0], m.indices[1][1]).trim() };
   }

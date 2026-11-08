@@ -308,9 +308,10 @@ export const DEFAULT_INTERPRETER_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fa
 export const NLU_TIMEOUT_MS = 4500;
 export const NLU_MAX_TOKENS = 512;
 export const NLU_VALID_INTENTS = Object.freeze([
-  "note", "task", "reminder", "expense", "note_list", "task_list",
+  "note", "task", "reminder", "expense", "income", "note_list", "task_list",
   "project_list", "project_create", "summary", "daypart_reply", "chat",
   "vault_save", "vault_get", "vault_list", "vault_file_get",
+  "memory_save", "unsupported_action",
 ]);
 
 export function resolveInterpreterModel(env) {
@@ -405,13 +406,29 @@ function buildNluPrompt(text, context = {}) {
   const pending = context.pendingAsk
     ? JSON.stringify(context.pendingAsk)
     : "none";
+  const source = context.source === "voice" ? "voice" : "text";
+  const nowIso = typeof context.nowIso === "string" && context.nowIso ? context.nowIso : "unknown";
+  const openTasks = Array.isArray(context.openTasks) && context.openTasks.length
+    ? context.openTasks.map((t) => (typeof t === "string" ? t : t?.title ?? "")).filter(Boolean).join("، ")
+    : "none";
+  const recentNotes = Array.isArray(context.recentNotes) && context.recentNotes.length
+    ? context.recentNotes.map((t) => (typeof t === "string" ? t : t?.text ?? "")).filter(Boolean).join("، ")
+    : "none";
+  const lastAction = context.lastAction
+    ? (typeof context.lastAction === "string" ? context.lastAction : JSON.stringify(context.lastAction))
+    : "none";
   const system = [
     "You are a Persian intent classifier for a single-user personal assistant bot.",
     "Output ONLY one JSON object, no other text, no markdown fences:",
     '{"intent": "...", "confidence": 0.0-1.0, "project": "name or null", "body": "text or null", "date_ref": "امروز|فردا|پسفردا|null", "time_ref": "HH:MM or hour text or null", "daypart": "صبح|عصر|شب|cancel|null", "summary_target": "notes|tasks|null", "leading_framing": "exact text or null", "trailing_framing": "exact text or null"}',
-    "Intents: note, task, reminder, expense, note_list, task_list, project_list, project_create, summary, daypart_reply, chat.",
+    "Intents: note, task, reminder, expense, income, note_list, task_list, project_list, project_create, summary, daypart_reply, vault_save, vault_get, vault_list, vault_file_get, memory_save, unsupported_action, chat.",
     "Rules:",
     "- Information/explanation questions (e.g. تفاوت Cloudflare D1 و KV چیه؟, چطور توی پایتون...) are ALWAYS chat.",
+    "- 'این را به خاطر بسپار: ...' and 'یادت بمونه اسم من ... است' are memory_save (save a user fact / setting, NOT a note or task), body = the fact content only.",
+    "- 'این را یادداشت کن: ...' is note, NOT memory_save.",
+    "- Sending an email or any external connector message ('الان ایمیل بفرست به ...') is unsupported_action — never chat and never a note/task; the caller replies honestly that the connector is not connected.",
+    "- Money received (حقوق گرفتم، واریز شد، درآمد) is income, money spent is expense. The caller validates amounts deterministically.",
+    "- Reference phrases ('همونو برای فردا بذار', 'اونو ...'): resolve against the single recent open task/note listed below when exactly one exists; if multiple open targets exist, return chat with low confidence so the caller asks a clarification question instead of guessing.",
     "- A natural conversational note request — even if it starts with a greeting (سلام, درود), a politeness word (لطفاً, بیزحمت, ممنون), or a modal opener (میخوام, میخواستم, میشه) — is note with confidence >= 0.85. Strip ALL framing words from body; body must be ONLY the clean content to store. Examples: 'سلام یه یادداشت برام ثبت کن که فردا سیمان میرسه' → note, body='فردا سیمان میرسه'; 'میخوام یه یادداشت ثبت کنی فردا جلسه با مهندس ناظر ساعت ۱۰' → note, body='فردا جلسه با مهندس ناظر ساعت ۱۰'; 'فردا باید قرارداد رو امضا کنیم، اینو برام یادداشت کن' → note, body='فردا باید قرارداد رو امضا کنیم'.",
     "- A natural conversational task request — even with greetings or modal openers — is task with confidence >= 0.85. body = the clean task title only. Examples: 'سلام یه تسک جدید برام ثبت کن برای پروژه یوتیوب ادیت ویدیو' → task, body='ادیت ویدیو', project='یوتیوب'; 'یه کار جدید برام ثبت کن بررسی قرارداد پیمانکار' → task, body='بررسی قرارداد پیمانکار'.",
     "- A time-based request (e.g. یادم بنداز فردا ساعت ۵ عصر به علی زنگ بزنم, یادت نره فردا به علی زنگ بزنم) is reminder: body = title, date_ref, time_ref, daypart, project.",
@@ -424,6 +441,11 @@ function buildNluPrompt(text, context = {}) {
     "- If unsure, return chat with low confidence.",
     `Projects: ${projects}`,
     `Pending question: ${pending}`,
+    `Message source: ${source}`,
+    `Now (Iran time, +03:30): ${nowIso}`,
+    `Last action: ${lastAction}`,
+    `Open tasks: ${openTasks}`,
+    `Recent notes: ${recentNotes}`,
   ].join("\n");
   return { system, user: String(text ?? "") };
 }

@@ -6990,6 +6990,107 @@ if (DatabaseSync) {
   }
 }
 
+// Phase 2.3: four contracts + NLU branches (A02/A05/A12/A13/A14)
+if (DatabaseSync) {
+  const MORNING23 = Date.UTC(2026, 9, 28, 5, 0, 0); // 08:30 Tehran
+  const fresh23 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    sq.prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (1, 'عمومی', '[]', 'active', 1, '2026-10-01T00:00:00.000Z')").run();
+    const db = { prepare(sql) { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; } };
+    return { sq, db };
+  };
+  const convo23 = (sc, extraEnv = {}) => {
+    const sent = []; const chats = [];
+    const send = async (t, opts) => { sent.push({ text: t, opts }); };
+    const chat = async (t, copts) => { chats.push({ text: t, opts: copts }); };
+    const env = { STATE: fakeKV(), DB: sc.db, ...extraEnv };
+    const say = async (text, nowMs = MORNING23) => handleDailyText(env, { chatId: 1, userId: 1, text, send, chat, nowMs });
+    return { env, sent, chats, say };
+  };
+  const ai23 = (obj, capture) => ({ run: async (model, body) => { if (capture) capture.body = body; return { response: JSON.stringify(obj) }; } });
+  // Contract 1: memory_save
+  {
+    check(classifyDaily("این را به خاطر بسپار که اسمم سینا است", { nowMs: MORNING23 }).intent === "memory_save", "2.3: classify memory_save for به خاطر بسپار");
+    check(classifyDaily("یادت بمونه اسم من مریم است", { nowMs: MORNING23 }).intent === "memory_save", "2.3: classify memory_save for یادت بمونه");
+    const sc = fresh23(); const c = convo23(sc);
+    const r = await c.say("این را به خاطر بسپار که اسمم سینا است");
+    let facts = []; try { facts = sc.sq.prepare("SELECT fact_key, fact_value FROM user_facts WHERE user_id = 1 AND status = 'active'").all(); } catch {}
+    check(r === "handled" && c.sent.at(-1)?.text === "🧠 به خاطر سپرده شد", `2.3: memory_save confirms به خاطر سپرده شد: ${JSON.stringify(c.sent.at(-1))}`);
+    check(facts.length === 1 && facts[0].fact_key === "name" && facts[0].fact_value === "سینا", `2.3: memory_save stores user_fact name=سینا: ${JSON.stringify(facts)}`);
+    check((await getSetting({ DB: sc.db, STATE: c.env.STATE }, 1, "name")) === "سینا", "2.3: memory_save syncs name setting");
+    check(sc.sq.prepare("SELECT id FROM notes WHERE user_id = 1").all().length === 0 && sc.sq.prepare("SELECT id FROM tasks WHERE user_id = 1").all().length === 0, "2.3: memory_save creates no note/task");
+  }
+  // Contract 2: note
+  {
+    check(classifyDaily("این را یادداشت کن: خرید نان", { nowMs: MORNING23 }).intent === "note", `2.3: classify note for این را یادداشت کن: ${JSON.stringify(classifyDaily("این را یادداشت کن: خرید نان", { nowMs: MORNING23 }))}`);
+    const sc = fresh23(); const c = convo23(sc);
+    const r = await c.say("این را یادداشت کن: خرید نان");
+    const note = sc.sq.prepare("SELECT text FROM notes WHERE user_id = 1").all()[0];
+    check(r === "handled" && note?.text === "خرید نان" && String(c.sent.at(-1)?.text ?? "").includes("یادداشت ذخیره شد"), `2.3: note contract saves note خرید نان: ${JSON.stringify(note)}`);
+    check(sc.sq.prepare("SELECT id FROM tasks WHERE user_id = 1").all().length === 0, "2.3: note contract creates no task");
+  }
+  // Contract 3: reminder
+  {
+    check(classifyDaily("برای فردا ساعت ۹ یادآوری کن جلسه", { nowMs: MORNING23 }).intent === "reminder", "2.3: classify reminder for برای فردا یادآوری کن");
+    const sc = fresh23(); const c = convo23(sc);
+    const r = await c.say("برای فردا ساعت ۹ یادآوری کن جلسه");
+    const task = sc.sq.prepare("SELECT title, remind_at, due_at FROM tasks WHERE user_id = 1").all()[0];
+    check(r === "handled" && task && String(task.title ?? "").includes("جلسه") && (task.remind_at === "2026-10-29T09:00:00+03:30" || task.due_at === "2026-10-29T09:00:00+03:30"), `2.3: reminder contract saves task with due/remind tomorrow 09:00: ${JSON.stringify(task)}`);
+    check(sc.sq.prepare("SELECT id FROM notes WHERE user_id = 1").all().length === 0, "2.3: reminder contract creates no note");
+  }
+  // Contract 4: unsupported email
+  {
+    check(classifyDaily("الان ایمیل بفرست به علی", { nowMs: MORNING23 }).intent === "unsupported_action", "2.3: classify unsupported_action for ایمیل بفرست");
+    const sc = fresh23(); const c = convo23(sc);
+    const r = await c.say("الان ایمیل بفرست به علی");
+    let facts = []; try { facts = sc.sq.prepare("SELECT id FROM user_facts WHERE user_id = 1").all(); } catch {}
+    check(r === "handled" && c.sent.at(-1)?.text === "در حال حاضر ابزار اتصال و ارسال مستقیم ایمیل فعال نیست؛ چیزی ارسال نشد. اگر بخواهی می‌توانم متنش را به‌عنوان یادداشت یا کار ذخیره کنم.", `2.3: email honestly states not connected: ${JSON.stringify(c.sent.at(-1))}`);
+    check(c.chats.length === 0 && sc.sq.prepare("SELECT id FROM notes WHERE user_id = 1").all().length === 0 && sc.sq.prepare("SELECT id FROM tasks WHERE user_id = 1").all().length === 0 && facts.length === 0, "2.3: email creates no false items and no chat fallback");
+  }
+  // NLU vault_list (direct, so deterministic vault routing cannot mask it) + rich context
+  {
+    const sc = fresh23();
+    sc.sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'خرید نان', 'open', 'text', '2026-10-28T00:00:00.000Z')").run();
+    const capture = {}; const sent = [];
+    const env = { STATE: fakeKV(), DB: sc.db, VAULT_SECRET: "s1", AI: ai23({ intent: "vault_list", confidence: 0.9 }, capture) };
+    const o = { chatId: 1, userId: 1, text: "کارت‌هام رو نشون بده", send: async (t) => { sent.push(t); }, chat: async () => {}, nowMs: MORNING23 };
+    const r = await runNluBranch(env, o, { now: MORNING23, remembered: "TOMAN" });
+    const promptText = String(capture.body?.messages?.[0]?.content ?? "");
+    check(r === "handled" && sent.some((t) => String(t).includes("گاوصندوق خالی")), `2.3: NLU vault_list executes instead of chat: ${JSON.stringify(sent)}`);
+    check(promptText.includes("+03:30") && promptText.includes("خرید نان") && /Message source: text/.test(promptText), "2.3: NLU receives source, +03:30 nowIso and open-task context");
+  }
+  // NLU income
+  {
+    const sc = fresh23(); const sent = [];
+    const env = { STATE: fakeKV(), DB: sc.db, AI: ai23({ intent: "income", confidence: 0.9 }) };
+    const o = { chatId: 1, userId: 1, text: "حقوق گرفتم ۵۰۰ تومان", send: async (t) => { sent.push(t); }, chat: async () => {}, nowMs: MORNING23 };
+    const r = await runNluBranch(env, o, { now: MORNING23, remembered: "TOMAN" });
+    const drafts = [...env.STATE.store.keys()].filter((k) => k.startsWith("daily:draft:"));
+    check(r === "handled" && drafts.length === 1 && sent.some((t) => String(t).includes("💰 درآمد: 500")) && sc.sq.prepare("SELECT id FROM expenses WHERE user_id = 1").all().length === 0, `2.3: NLU income creates confirm draft, no direct insert: ${JSON.stringify(sent)}`);
+  }
+  // NLU memory_save
+  {
+    const sc = fresh23(); const sent = [];
+    const env = { STATE: fakeKV(), DB: sc.db, AI: ai23({ intent: "memory_save", confidence: 0.92, body: "اسمم پارسا است" }) };
+    const o = { chatId: 1, userId: 1, text: "این را به خاطر بسپار که اسمم پارسا است", send: async (t) => { sent.push(t); }, chat: async () => {}, nowMs: MORNING23 };
+    const r = await runNluBranch(env, o, { now: MORNING23, remembered: "TOMAN" });
+    let facts = []; try { facts = sc.sq.prepare("SELECT fact_value FROM user_facts WHERE user_id = 1 AND status = 'active'").all(); } catch {}
+    check(r === "handled" && sent.includes("🧠 به خاطر سپرده شد") && facts[0]?.fact_value === "پارسا", `2.3: NLU memory_save executes: ${JSON.stringify({ sent, facts })}`);
+  }
+  // NLU unsupported_action
+  {
+    const sc = fresh23(); const sent = [];
+    const env = { STATE: fakeKV(), DB: sc.db, AI: ai23({ intent: "unsupported_action", confidence: 0.9 }) };
+    const o = { chatId: 1, userId: 1, text: "الان ایمیل بفرست به علی", send: async (t) => { sent.push(t); }, chat: async () => {}, nowMs: MORNING23 };
+    const r = await runNluBranch(env, o, { now: MORNING23, remembered: "TOMAN" });
+    check(r === "handled" && sent.includes("در حال حاضر ابزار اتصال و ارسال مستقیم ایمیل فعال نیست؛ چیزی ارسال نشد. اگر بخواهی می‌توانم متنش را به‌عنوان یادداشت یا کار ذخیره کنم."), `2.3: NLU unsupported_action replies honestly: ${JSON.stringify(sent)}`);
+  }
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);

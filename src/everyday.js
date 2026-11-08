@@ -3,7 +3,7 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, extractFolderTag, matchKnownProjectAt, IRAN_OFFSET_MIN } from "./daily.js";
 import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO, resolveInterpreterModel, recoverFullNoteBody } from "./intent.js";
-import { saveMessage, finalizeMessageKind, redactMessageContent, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, setVaultSyncStatus } from "./db.js";
+import { saveMessage, finalizeMessageKind, redactMessageContent, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, setVaultSyncStatus, upsertUserFact } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadData, escapeHtml, formatTelegramHtml } from "./telegram.js";
@@ -16,6 +16,9 @@ const EXPIRED_TEXT = "قبلاً ثبت شد یا مهلتش گذشته";
 const NOT_SAVED_TEXT = "ذخیره نشد، دوباره تلاش کن";
 const VAULT_PRIVATE_ONLY_TEXT = "🔒 عملیات گاوصندوق فقط در چت خصوصی مجاز است.";
 const VAULT_REDACTED_TEXT = "[🔒 محتوای حساس گاوصندوق]";
+const MEMORY_SAVED_TEXT = "🧠 به خاطر سپرده شد";
+const UNSUPPORTED_ACTION_TEXT = "در حال حاضر ابزار اتصال و ارسال مستقیم ایمیل فعال نیست؛ چیزی ارسال نشد. اگر بخواهی می‌توانم متنش را به‌عنوان یادداشت یا کار ذخیره کنم.";
+const iranIso = (ms) => new Date((ms ?? Date.now()) + IRAN_OFFSET_MIN * 60000).toISOString().replace(/Z$/, "+03:30");
 
 export function mapQuestion(q) { return q === "ambiguous" ? "amount" : q; } // TODO from 1b-1, resolved here
 export function askText(q) {
@@ -347,6 +350,26 @@ async function runDailyBranch(env, o, c, ctx) {
     if (c.refused) { await o.send("در این قدم فقط تنظیم‌ها نگه داشته می‌شوند؛ خاطره‌های آزاد در قدم حافظه می‌آیند"); return "handled"; }
     const r = await setSetting(env, userId, c.setting.key, c.setting.value);
     await o.send(r.ok ? `✅ ذخیره شد: ${c.setting.key} = ${c.setting.value}` : NOT_SAVED_TEXT);
+    return "handled";
+  }
+  if (c.intent === "memory_save") {
+    const factKey = c.factKey ?? c.setting?.key ?? "general";
+    const factValue = String(c.factValue ?? c.setting?.value ?? c.text ?? "").trim();
+    if (!factValue) { await o.send(NOT_SAVED_TEXT); return "handled"; }
+    let ok = false;
+    if (c.setting?.key && c.setting?.value) {
+      const sr = await setSetting(env, userId, c.setting.key, c.setting.value);
+      ok = !!sr?.ok;
+      try { const fr = await upsertUserFact(env, { userId, factKey: c.setting.key, factValue: c.setting.value, sourceMsgId: o.entryMessageId ?? o.messageRowId ?? null, nowMs: ctx.now }); ok = ok || !!fr?.ok; } catch {}
+    } else {
+      try { const fr = await upsertUserFact(env, { userId, factKey, factValue, sourceMsgId: o.entryMessageId ?? o.messageRowId ?? null, nowMs: ctx.now }); ok = !!fr?.ok; } catch {}
+    }
+    await o.send(ok ? MEMORY_SAVED_TEXT : NOT_SAVED_TEXT);
+    if (ok) await markDaily(env, o);
+    return "handled";
+  }
+  if (c.intent === "unsupported_action") {
+    await o.send(UNSUPPORTED_ACTION_TEXT);
     return "handled";
   }
   if (c.intent === "note") {
@@ -1511,7 +1534,7 @@ async function interpretAndExecute(env, o, ctx, text, rowId, finalize) {
   // the failure path runs instead (no seed names shown).
   const rp = await resolveProjects(env, o.userId);
   if (!rp.ok) { await sendInterpUnavailable(env, o, text, rowId); return "handled"; }
-  const prompt = buildInterpreterPrompt({ text, source: o.source === "voice" ? "voice" : "text", recentTurns: recent, openQuestion: null, projects: rp.projects, nowIso: new Date(ctx.now + 210 * 60000).toISOString(), defaultCurrency: ctx.remembered });
+  const prompt = buildInterpreterPrompt({ text, source: o.source === "voice" ? "voice" : "text", recentTurns: recent, openQuestion: null, projects: rp.projects, nowIso: iranIso(ctx.now), defaultCurrency: ctx.remembered });
   const res = await interpretText(env, o.interpreterModel ?? env.INTERPRETER_MODEL ?? null, prompt, o.interpreterCallFn ?? null);
   if (!res.ok) { await recordInterpError(env, res.reason); await sendInterpUnavailable(env, o, text, rowId); return "handled"; }
   return runInterpPolicy(env, o, ctx, res.actions, finalize);
@@ -2022,7 +2045,7 @@ async function namePendingVaultFile(env, o) {
   // name when the turn is actually an actionable message or a command.
   const trimmed = String(text).trim();
   const cg = classifyDaily(trimmed, { nowMs: o.nowMs ?? Date.now() });
-  if (["note", "task", "task-create", "task-delete", "reminder", "expense", "vault_save", "vault_get", "vault_list", "vault_file_get", "command"].includes(cg.intent)) return false;
+  if (["note", "task", "task-create", "task-delete", "reminder", "expense", "income", "memory_save", "unsupported_action", "vault_save", "vault_get", "vault_list", "vault_file_get", "command"].includes(cg.intent)) return false;
   if (/(?:یادداشت|تسک|یادآوری)\s*کن/u.test(trimmed) || /یادداشت[^\n]{0,24}(?:ثبت|ذخیره)\s*کن/u.test(trimmed) || /^ثبت\s*کن(?:\s|$)/u.test(trimmed)) return false;
   if (/لغو|انصراف/.test(trimmed)) return false;
   const cleanTitle = stripNamingPrefix(text) || trimmed;
@@ -2195,7 +2218,13 @@ export async function runNluBranch(env, o, ctx) {
   // elapsedMs, fallbackReason (null on a routed turn).
   const nluModel = resolveInterpreterModel(env);
   const nluT0 = Date.now();
-  const nlu = await classifyIntent(env, text, { projects: (pres.projects || []).map((p) => p.name), pendingAsk: null });
+  const nowIso = iranIso(now);
+  const source = o.source || "text";
+  let openTasks = [], recentNotes = [], lastAction = ctx.lastAction ?? null;
+  try { const tr = await listOpenTasksResult(env, userId, null, 5, 0); if (tr?.ok) openTasks = (tr.tasks || []).map((t) => t.title).filter(Boolean); } catch {}
+  try { const nr = await listNotesResult(env, userId, { limit: 5, offset: 0 }); if (nr?.ok) recentNotes = (nr.notes || []).map((n) => n.text).filter(Boolean); } catch {}
+  if (!lastAction) lastAction = openTasks[0] ? { kind: "task", title: openTasks[0] } : recentNotes[0] ? { kind: "note", title: recentNotes[0] } : null;
+  const nlu = await classifyIntent(env, text, { projects: (pres.projects || []).map((p) => p.name), pendingAsk: null, source, nowIso, lastAction, openTasks, recentNotes });
   let nluRoutedTo = "chat";
   const emitNluDiag = (fallbackReason) => {
     if (!nluModel) return;
@@ -2203,6 +2232,20 @@ export async function runNluBranch(env, o, ctx) {
     console.log(JSON.stringify({ event: "intent_nlu_diag", models: [nluModel], perModel: [{ model: nluModel, status: nlu.ok ? "ok" : nlu.reason }], parseOk: nlu.ok || nlu.reason === "bad-intent", finalDomain: nlu.ok ? parts[0] : null, finalAction: nlu.ok ? (parts.slice(1).join("_") || null) : null, confidence: nlu.ok ? nlu.confidence : null, routedTo: nluRoutedTo, elapsedMs: Date.now() - nluT0, fallbackReason }));
   };
   if (!nlu.ok || nlu.confidence < 0.75 || nlu.intent === "chat") { emitNluDiag(!nlu.ok ? nlu.reason : nlu.confidence < 0.75 ? "low-confidence" : "chat-intent"); return null; }
+  // A05/A13 reference resolution: "همونو برای فردا بذار" etc. resolve
+  // against the single recent task/note; with multiple open targets ask
+  // a clarification question instead of guessing.
+  const isRef = /همونو|همون|اونو|اینو/.test(text);
+  const refTargets = [...openTasks.map((t) => ({ kind: "task", title: t })), ...recentNotes.map((t) => ({ kind: "note", title: t }))];
+  if (isRef && ["note", "task", "reminder"].includes(nlu.intent) && (!nlu.body || /همونو|همون|اونو|اینو/.test(nlu.body))) {
+    if (refTargets.length > 1) {
+      nluRoutedTo = nlu.intent;
+      await o.send(`کدام مورد را منظورت است؟\n${refTargets.map((t, i) => `${i + 1}. ${t.title}`).join("\n")}`);
+      emitNluDiag(null);
+      return "handled";
+    }
+    if (refTargets.length === 1) nlu.body = refTargets[0].title;
+  }
   const trace = async (projectName) => { try { await insertIntentFeedback(env, { userId, text, predictedType: nlu.intent, correctType: nlu.intent, project: projectName ?? null }); } catch {} };
   const tag = await resolveFolderTag(env, userId, text);
   const resolveProject = () => {
@@ -2274,6 +2317,52 @@ export async function runNluBranch(env, o, ctx) {
       const ex = parseExpense(text, { nowMs: now }, text);
       if (!ex || ex.error || !Number.isInteger(ex.amount)) return null;
       await startConfirm(env, o, "expense", ex);
+      return "handled";
+    }
+    case "income": {
+      const ex = parseExpense(text, { nowMs: now, rememberedCurrency: ctx.remembered }, text);
+      if (!ex || ex.error || !Number.isInteger(ex.amount)) return null;
+      await startConfirm(env, o, "income", ex);
+      await trace(null);
+      return "handled";
+    }
+    case "vault_save": {
+      const det = classifyDaily(text, { nowMs: now, rememberedCurrency: ctx.remembered });
+      if (det.intent === "vault_save" && det.value) { await trace(null); return viaBranch(det); }
+      const digits = String(text).replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d))).match(/\d+/g);
+      const value = digits ? digits.join("") : (nlu.body && /\d/.test(nlu.body) ? nlu.body.replace(/\D/g, "") : "");
+      if (!value) return null;
+      await trace(null);
+      return viaBranch({ intent: "vault_save", value, title: nlu.body && !/\d/.test(nlu.body) ? nlu.body.trim() : (det.title ?? null), category: det.category ?? null, keywords: det.keywords ?? [], extra: det.extra ?? null });
+    }
+    case "vault_get": {
+      const det = classifyDaily(text, { nowMs: now, rememberedCurrency: ctx.remembered });
+      await trace(null);
+      return viaBranch(det.intent === "vault_get" ? det : { intent: "vault_get", keywords: det.keywords ?? (nlu.body ? [nlu.body.trim()] : []), category: det.category ?? null, title: det.title ?? nlu.body ?? null });
+    }
+    case "vault_list": {
+      const det = classifyDaily(text, { nowMs: now, rememberedCurrency: ctx.remembered });
+      await trace(null);
+      return viaBranch(det.intent === "vault_list" ? det : { intent: "vault_list", category: det.category ?? null, title: det.title ?? null, keywords: det.keywords ?? [], fileList: det.fileList ?? false });
+    }
+    case "vault_file_get": {
+      const det = classifyDaily(text, { nowMs: now, rememberedCurrency: ctx.remembered });
+      await trace(null);
+      return viaBranch(det.intent === "vault_file_get" ? det : { intent: "vault_file_get", keywords: det.keywords ?? (nlu.body ? String(nlu.body).split(/\s+/).filter(Boolean) : []) });
+    }
+    case "memory_save": {
+      const det = classifyDaily(text, { nowMs: now, rememberedCurrency: ctx.remembered });
+      if (det.intent === "memory_save") { await trace(null); return viaBranch(det); }
+      const body = (nlu.body || "").trim() || text.trim();
+      if (!body) return null;
+      const nameM = /^(?:اسمم|نامم|اسم\s+من|نام\s+من)\s+([\s\S]+?)(?:\s+(?:است|هست))?$/u.exec(body);
+      if (nameM) { const v = nameM[1].trim(); if (!v) return null; await trace(null); return viaBranch({ intent: "memory_save", text: body, factKey: "name", factValue: v, setting: { key: "name", value: v } }); }
+      await trace(null);
+      return viaBranch({ intent: "memory_save", text: body, factKey: "general", factValue: body });
+    }
+    case "unsupported_action": {
+      await o.send(UNSUPPORTED_ACTION_TEXT);
+      await trace(null);
       return "handled";
     }
     case "note_list":
@@ -2383,7 +2472,7 @@ export async function handleDailyText(env, o) {
     let answerText = text;
     if (shortUnknown && !o.interpreterCallFn && !o.interpreterModel && !env.INTERPRETER_MODEL && env?.AI && typeof env.AI.run === "function") {
       const pres = await resolveProjects(env, userId);
-      const nlu = await classifyIntent(env, text, { projects: (pres.projects || []).map((p) => p.name), pendingAsk: { kind: "reminder", reason: "hour-ambiguous", pendingBody: slot.pendingBody ?? null } });
+      const nlu = await classifyIntent(env, text, { projects: (pres.projects || []).map((p) => p.name), pendingAsk: { kind: "reminder", reason: "hour-ambiguous", pendingBody: slot.pendingBody ?? null }, source: o.source || "text", nowIso: iranIso(now), lastAction: null, openTasks: [], recentNotes: [] });
       if (nlu.ok && nlu.confidence >= 0.75 && nlu.intent === "daypart_reply") {
         if (nlu.daypart === "cancel") {
           await clearPendingAsk(env, userId);
