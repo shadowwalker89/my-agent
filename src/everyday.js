@@ -8,7 +8,7 @@ import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validate
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadData, escapeHtml, formatTelegramHtml } from "./telegram.js";
 import { encryptVaultValue, decryptVaultValue, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
-import { parseImageGenCommand, generateFreeImage } from "./media.js";
+import { parseImageGenCommand, generateFreeImage, editImage, analyzeImage, isVisionQuestionCaption, isImageEditCaption } from "./media.js";
 import { CONNECTORS, getConnectorStatuses, setConnectorSecret, getConnectorSecret, renderSetupStatusText } from "./connectors.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
@@ -2001,11 +2001,40 @@ async function analyzeVaultImage(env, file, prompt) {
   return null;
 }
 
+export async function handleIncomingFile(env, o) {
+  return handleVaultFile(env, o);
+}
+
 // Case A (caption) / Case B (no caption) for incoming document/photo uploads.
 export async function handleVaultFile(env, o) {
   const { userId, chatId, tgFileId, fileType, mimeType, fileName, caption, send } = o;
   if (!dbOf(env)) return false;
   const cap = typeof caption === "string" ? caption.trim() : "";
+  const kind = o.kind || fileType;
+  const isPhoto = kind === "photo" || fileType === "photo" || (typeof mimeType === "string" && mimeType.startsWith("image/"));
+  if (isPhoto && cap && isImageEditCaption(cap)) {
+    const bytes = await fileBytesFromTelegram(env, tgFileId);
+    if (!bytes || !bytes.length) { await send("ویرایش تصویر ممکن نشد."); return true; }
+    const edited = await editImage(env, { imageBytes: bytes, mimeType: mimeType || "image/jpeg", instruction: cap, userId, fetchFn: o.fetchFn });
+    if (edited && edited.ok) {
+      let photoSent = false;
+      if (typeof o.sendPhoto === "function") { await o.sendPhoto(edited.bytes, { caption: "🖼️ تصویر ویرایش‌شده", mimeType: edited.mimeType }); photoSent = true; }
+      else if (env?.TELEGRAM_BOT_TOKEN && chatId) { await sendPhoto(env, chatId, "edited.jpg", edited.bytes, { caption: "🖼️ تصویر ویرایش‌شده", contentType: edited.mimeType }); photoSent = true; }
+      else if (env?.TG_TOKEN && chatId) { await sendPhoto({ ...env, TELEGRAM_BOT_TOKEN: env.TG_TOKEN }, chatId, "edited.jpg", edited.bytes, { caption: "🖼️ تصویر ویرایش‌شده", contentType: edited.mimeType }); photoSent = true; }
+      if (!photoSent && typeof send === "function") await send("🖼️ تصویر ویرایش‌شده آماده شد.");
+    } else {
+      if (typeof send === "function") await send(edited?.reason || "ویرایش تصویر ممکن نشد.");
+    }
+    return true;
+  }
+  if (isPhoto && cap && isVisionQuestionCaption(cap) && !/در گاوصندوق ذخیره کن|آرشیو کن/.test(cap)) {
+    const bytes = await fileBytesFromTelegram(env, tgFileId);
+    if (!bytes || !bytes.length) { await send("تحلیل ممکن نشد."); return true; }
+    const result = await analyzeImage(env, { imageBytes: bytes, mimeType: mimeType || "image/jpeg", prompt: cap, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
+    if (result && result.ok && result.text) await send(result.text);
+    else await send(result?.text || "تحلیل ممکن نشد.");
+    return true;
+  }
   // Case 1: explicit vault caption
   if (cap && VAULT_CAPTION_RE.test(cap)) {
     const title = stripCaptionPrefix(cap) || stripNamingPrefix(cap) || cap;
@@ -2023,6 +2052,12 @@ export async function handleVaultFile(env, o) {
   }
   // Case 2: explicit vision/analysis caption
   if (cap && VISION_CAPTION_RE.test(cap)) {
+    const bytes2 = await fileBytesFromTelegram(env, tgFileId);
+    if (bytes2 && bytes2.length) {
+      const r2 = await analyzeImage(env, { imageBytes: bytes2, mimeType: mimeType || "image/jpeg", prompt: cap, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
+      if (r2 && r2.ok && r2.text) { await send(r2.text); return true; }
+      if (r2 && r2.text) { await send(r2.text); return true; }
+    }
     const f = { tg_file_id: tgFileId, mime_type: mimeType, file_type: fileType };
     const text = await analyzeVaultImage(env, f, cap);
     await send(text || "تحلیل ممکن نشد.");
@@ -2445,7 +2480,7 @@ export async function handleDailyText(env, o) {
   }
   const parsedImage = parseImageGenCommand(text);
   if (parsedImage.isImageGen) {
-    const res = await generateFreeImage(env, parsedImage.prompt);
+    const res = await generateFreeImage(env, parsedImage.prompt, { userId, fetchFn: o.fetchFn });
     if (res.ok) {
       let photoSent = false;
       if (typeof o.sendPhoto === "function") { await o.sendPhoto(res.bytes, { caption: `🎨 تصویر ساخته شد: ${parsedImage.prompt}`, mimeType: res.mimeType }); photoSent = true; }

@@ -7507,12 +7507,27 @@ if (DatabaseSync) {
   check(p1.isImageGen === true && p1.prompt === "کوه دماوند در شب", `3.2: parse Persian image gen: ${JSON.stringify(p1)}`);
   const p2 = parseImageGenCommand("عکس کارت ملی را در گاوصندوق ذخیره کن");
   check(p2.isImageGen === false, `3.2: vault command must not match image gen: ${JSON.stringify(p2)}`);
+  let cfCalls = 0;
+  const pollFn = async () => ({ ok: true, arrayBuffer: async () => new Uint8Array([9, 9, 9]).buffer });
+  const r1 = await generateFreeImage({ AI: { run: async () => { cfCalls++; return new Uint8Array([1,2,3]); } } }, "kand", { fetchFn: pollFn });
+  check(cfCalls === 0, `3.2: generateFreeImage never calls env.AI.run: cfCalls=${cfCalls}`);
+  check(r1.ok === true && r1.provider === "pollinations" && r1.bytes.length === 3, `3.2: pollinations fallback without AI: ${JSON.stringify(r1).slice(0, 200)}`);
   const b64 = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString("base64");
-  const r1 = await generateFreeImage({ AI: { run: async () => ({ image: b64 }) } }, "kand");
-  check(r1.ok === true && r1.bytes instanceof Uint8Array && r1.bytes.length === 8 && r1.provider === "cf-flux", `3.2: generate from base64: ${JSON.stringify(r1).slice(0, 200)}`);
-  const r2 = await generateFreeImage({ AI: { run: async () => new Uint8Array([1, 2, 3, 4]) } }, "kand");
-  check(r2.ok === true && r2.bytes.length === 4 && r2.provider === "cf-flux", `3.2: generate from Uint8Array: ${JSON.stringify(r2).slice(0, 200)}`);
-  const r3 = await generateFreeImage({ AI: { run: async () => { throw new Error("boom"); } } }, "hi", { fetchFn: async () => ({ ok: true, arrayBuffer: async () => new Uint8Array([9, 9, 9]).buffer }) });
+  let togetherUrl = "";
+  let togetherCalled = false;
+  const togetherFn = async (url, init = {}) => { togetherCalled = true; togetherUrl = String(url); return { ok: true, json: async () => ({ data: [{ b64_json: b64 }] }) }; };
+  const rT = await generateFreeImage({ TOGETHER_API_KEY: "tkey", AI: { run: async () => { throw new Error("should not be called"); } } }, "kand", { fetchFn: togetherFn });
+  check(togetherCalled && togetherUrl.includes("api.together.xyz") && rT.ok === true && rT.provider === "together" && rT.bytes.length === 8, `3.2: together provider used: ok=${rT.ok} provider=${rT.provider} url=${togetherUrl}`);
+  const nvidiaB64 = Buffer.from([5,5,5]).toString("base64");
+  let nvidiaUrl = "";
+  const nvidiaFn = async (url) => { nvidiaUrl = String(url); return { ok: true, json: async () => ({ artifacts: [{ base64: nvidiaB64 }] }) }; };
+  const rN = await generateFreeImage({ NVIDIA_API_KEY: "nkey" }, "kand", { fetchFn: nvidiaFn });
+  check(nvidiaUrl.includes("ai.api.nvidia.com") && rN.ok === true && rN.provider === "nvidia" && rN.bytes.length === 3, `3.2: nvidia provider used: ${JSON.stringify(rN).slice(0, 200)} url=${nvidiaUrl}`);
+  let geminiUrl = "";
+  const geminiFn = async (url) => { geminiUrl = String(url); return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ inlineData: { data: b64 } }] } }] }) }; };
+  const rG = await generateFreeImage({ GEMINI_API_KEY: "gkey" }, "hi", { fetchFn: geminiFn });
+  check(geminiUrl.includes("generativelanguage.googleapis.com") && rG.ok === true && rG.provider === "gemini" && rG.bytes.length === 8, `3.2: gemini provider used: ${JSON.stringify(rG).slice(0, 200)} url=${geminiUrl}`);
+  const r3 = await generateFreeImage({ AI: { run: async () => { throw new Error("boom"); } } }, "hi", { fetchFn: pollFn });
   check(r3.ok === true && r3.provider === "pollinations" && r3.bytes.length === 3, `3.2: fallback to pollinations: ${JSON.stringify(r3).slice(0, 200)}`);
 }
 if (DatabaseSync) {
@@ -7524,11 +7539,17 @@ if (DatabaseSync) {
   const base32 = (sql) => { const st = sq32.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
   const db32 = { prepare(sql) { return base32(sql); } };
   const rows32 = (sql, params = []) => sq32.prepare(sql).all(...params);
-  const env32 = { STATE: fakeKV(), DB: db32, AI: { run: async () => new Uint8Array([137, 80, 78, 71, 13]) } };
+  let cfCalls32 = 0;
+  const env32 = { STATE: fakeKV(), DB: db32, AI: { run: async () => { cfCalls32++; return new Uint8Array([137, 80, 78, 71, 13]); } } };
   const sent32 = [];
   const photos32 = [];
-  const r32 = await handleDailyText(env32, { chatId: 1, userId: 1, text: "یک تصویر از غروب شیراز بساز", send: async (t) => { sent32.push(t); }, sendPhoto: async (bytes, opts) => { photos32.push({ bytes, opts }); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+  const r32 = await handleDailyText(env32, { chatId: 1, userId: 1, text: "یک تصویر از غروب شیراز بساز", send: async (t) => { sent32.push(t); }, sendPhoto: async (bytes, opts) => { photos32.push({ bytes, opts }); }, chat: async () => {}, fetchFn: async (url) => {
+    const u = String(url);
+    if (u.includes("pollinations.ai")) return { ok: true, arrayBuffer: async () => new Uint8Array([10,20,30]).buffer };
+    return { ok: false, json: async () => ({}) };
+  }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
   check(r32 === "handled", `3.2: handleDailyText image gen handled: ${r32}`);
+  check(cfCalls32 === 0, `3.2: handleDailyText never calls env.AI.run`);
   check(photos32.length === 1 || sent32.some((t) => String(t).includes("تصویر ساخته شد")), `3.2: image confirmation sent: photos=${photos32.length} sent=${JSON.stringify(sent32)}`);
   check(rows32("SELECT COUNT(*) AS n FROM notes")[0].n === 0, "3.2: image gen creates no note");
   check(rows32("SELECT COUNT(*) AS n FROM tasks")[0].n === 0, "3.2: image gen creates no task");
@@ -7601,6 +7622,83 @@ if (DatabaseSync) {
     check(snap.vault_items?.[0]?.value_enc === enc && !JSON.stringify(snap).includes("vault-plaintext-33"), "3.3: backup keeps vault items encrypted, never decrypted");
     const direct = await exportUserBackupSnapshot(env33, 1, { nowMs: 0 });
     check(direct.ok === true && direct.counts.notes === 1 && direct.vault_items[0].value_enc === enc, "3.3: exportUserBackupSnapshot direct works");
+  }
+}
+
+// Phase 3.4: Remove Cloudflare env.AI, multi-provider gen + edit + vision
+{
+  const { generateFreeImage: genImg, analyzeImage, editImage, isVisionQuestionCaption, isImageEditCaption } = await import("../src/media.js");
+  const { handleIncomingFile, handleVaultFile: hvf34 } = await import("../src/everyday.js");
+  let cf34 = 0;
+  const poll34 = async () => ({ ok: true, arrayBuffer: async () => new Uint8Array([1,2,3]).buffer });
+  const g0 = await genImg({ AI: { run: async () => { cf34++; return new Uint8Array([9]); } } }, "test", { fetchFn: poll34 });
+  check(cf34 === 0 && g0.ok === true && g0.provider === "pollinations", `3.4: generateFreeImage never uses env.AI.run: cf=${cf34} provider=${g0.provider}`);
+  const b64edited = Buffer.from([10,20,30]).toString("base64");
+  const geminiEditFn = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes("gemini-2.0-flash-preview-image-generation")) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ inlineData: { data: b64edited } }] } }] }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+  const edited = await editImage({ GEMINI_API_KEY: "gkey" }, { imageBytes: new Uint8Array([1,2,3]), mimeType: "image/jpeg", instruction: "این عکس رو کارتونی کن", fetchFn: geminiEditFn });
+  check(edited.ok === true && edited.provider === "gemini-edit" && edited.bytes.length === 3, `3.4: editImage gemini-edit returns edited bytes: ${JSON.stringify(edited).slice(0,200)}`);
+  const noKeyEdit = await editImage({ STATE: fakeKV() }, { imageBytes: new Uint8Array([1,2,3]), mimeType: "image/jpeg", instruction: "ویرایش: نور بهتر کن", fetchFn: poll34 });
+  check(noKeyEdit.ok === false && String(noKeyEdit.reason).includes("GEMINI_API_KEY") && String(noKeyEdit.reason).includes("/setup"), `3.4: editImage no-key Persian reason: ${JSON.stringify(noKeyEdit)}`);
+  const geminiVisionFn = async (url) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: "این عکس یک فاکتور برق است و مبلغ آن ۱۲۳۴۵ تومان است." }] } }] }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+  const ana = await analyzeImage({ GEMINI_API_KEY: "gkey" }, { imageBytes: new Uint8Array([1,2,3]), mimeType: "image/jpeg", prompt: "این عکس رو تحلیل کن", fetchFn: geminiVisionFn });
+  check(ana.ok === true && String(ana.text).includes("فاکتور"), `3.4: analyzeImage gemini Persian analysis: ${JSON.stringify(ana)}`);
+  let routerSeen = null;
+  const anaRouter = await analyzeImage({ STATE: fakeKV() }, { imageBytes: new Uint8Array([1,2,3]), mimeType: "image/jpeg", prompt: "متن داخل عکس رو بخون", fetchFn: poll34, routerCallFn: async (body) => { routerSeen = body; return { text: "متن داخل عکس: سلام" }; } });
+  check(anaRouter.ok === true && String(anaRouter.text).includes("سلام") && routerSeen && String(routerSeen.messages?.[0]?.content?.[0]?.image_url?.url || "").startsWith("data:image/jpeg;base64,"), `3.4: analyzeImage router fallback with data URI: ok=${anaRouter.ok} seen=${JSON.stringify(routerSeen).slice(0,200)}`);
+  check(isVisionQuestionCaption("این عکس رو تحلیل کن و بگو چیه؟") === true, "3.4: isVisionQuestionCaption detects تحلیل + چیه؟");
+  check(isImageEditCaption("ویرایش: پس‌زمینه عکس رو حذف کن") === true, "3.4: isImageEditCaption detects ویرایش:");
+  if (DatabaseSync) {
+    const sq34 = new DatabaseSync(":memory:");
+    sq34.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq34.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq34.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq34.exec("INSERT INTO users (id, telegram_id) VALUES (4242, '4242')");
+    const base34 = (sql) => { const st = sq34.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    const db34 = { prepare(sql) { return base34(sql); } };
+    const origFetch34 = global.fetch;
+    global.fetch = async (url, init = {}) => {
+      const u = String(url);
+      if (u.startsWith("https://api.telegram.org/")) {
+        const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+        const method = m ? m[1] : "";
+        if (method === "getFile") return Response.json({ ok: true, result: { file_path: "photos/f34.jpg" } });
+        return Response.json({ ok: true, result: { message_id: 1 } });
+      }
+      if (u.includes("/file/bot")) return new Response(new ArrayBuffer(8), { headers: { "content-type": "image/jpeg" } });
+      if (u.includes("generativelanguage.googleapis.com")) {
+        return Response.json({ candidates: [{ content: { parts: [{ text: "این عکس یک فاکتور است." }] } }] });
+      }
+      return Response.json({ ok: true });
+    };
+    try {
+      const env34 = { STATE: fakeKV(), DB: db34, TG_TOKEN: "fake-token", VAULT_SECRET: "s34", GEMINI_API_KEY: "gkey34" };
+      const sent34 = [];
+      const send34 = async (text) => { sent34.push(String(text)); };
+      const geminiFetch34 = async (url) => {
+        if (String(url).includes("generativelanguage.googleapis.com")) return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: "این عکس یک فاکتور برق است." }] } }] }) };
+        return { ok: true, json: async () => ({}) };
+      };
+      const handled34 = await handleIncomingFile(env34, { userId: 4242, chatId: 4242, tgFileId: "photo-34", fileType: "photo", kind: "photo", mimeType: "image/jpeg", fileName: null, caption: "این عکس رو تحلیل کن و بگو چیه؟", send: send34, fetchFn: geminiFetch34, routerCallFn: null });
+      check(handled34 === true, "3.4: handleIncomingFile vision photo handled");
+      check(sent34.some((t) => String(t).includes("فاکتور برق")), `3.4: vision caption triggers Persian interpretation: ${JSON.stringify(sent34)}`);
+      check((await (async () => { try { const r = await listVaultFiles(env34, 4242); return r?.files?.length ?? -1; } catch { return -1; } })()) === 0, "3.4: vision photo not blindly vault-archived");
+      const sentVault = [];
+      const handledVault = await handleVaultFile(env34, { userId: 4242, chatId: 4242, tgFileId: "file-34v", fileType: "document", mimeType: "application/pdf", fileName: "scan.pdf", caption: "در گاوصندوق ذخیره کن", send: async (t) => { sentVault.push(String(t)); } });
+      check(handledVault === true && sentVault.some((t) => t.includes("آرشیو امن")), `3.4: explicit vault caption still archives: ${JSON.stringify(sentVault)}`);
+    } finally {
+      global.fetch = origFetch34;
+    }
   }
 }
 

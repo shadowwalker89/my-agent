@@ -1,3 +1,5 @@
+import { getConnectorSecret } from "./connectors.js";
+
 function cleanPrompt(s) {
   return String(s ?? "").trim().replace(/\s+/g, " ").replace(/[.!؟?۔]+$/u, "").trim();
 }
@@ -31,6 +33,20 @@ function b64ToBytes(b64) {
     } catch {}
   }
   return null;
+}
+
+function bytesToB64(bytes) {
+  if (!bytes) return "";
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (typeof Buffer !== "undefined") {
+    try {
+      return Buffer.from(arr).toString("base64");
+    } catch {}
+  }
+  let bin = "";
+  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+  if (typeof btoa === "function") return btoa(bin);
+  return bin;
 }
 
 async function toBytes(out) {
@@ -88,19 +104,155 @@ export function parseImageGenCommand(text) {
   return { isImageGen: false, prompt: "" };
 }
 
+async function resolveKey(env, userId, connectorId, fallbackEnvName) {
+  try {
+    const v = await getConnectorSecret(env, userId, connectorId);
+    if (typeof v === "string" && v) return v;
+  } catch {}
+  const fromEnv = env?.[fallbackEnvName];
+  return typeof fromEnv === "string" && fromEnv ? fromEnv : null;
+}
+
+function resolveFetch(opts) {
+  return opts?.fetchFn || (typeof fetch === "function" ? fetch : null);
+}
+
+async function safeJson(res) {
+  try {
+    if (typeof res?.json === "function") return await res.json();
+  } catch {}
+  try {
+    if (typeof res?.text === "function") {
+      const t = await res.text();
+      return t ? JSON.parse(t) : null;
+    }
+  } catch {}
+  return null;
+}
+
+function extractGeminiImage(json) {
+  const c = json?.candidates?.[0]?.content?.parts || [];
+  for (const p of c) {
+    const d = p?.inlineData?.data || p?.inline_data?.data || p?.inlineData || p?.inline_data;
+    if (typeof d === "string" && d) return d;
+  }
+  const cand = json?.candidates?.[0];
+  if (cand) {
+    const direct = cand?.content?.parts?.[0]?.inlineData?.data || cand?.content?.parts?.[0]?.inline_data?.data;
+    if (direct) return direct;
+  }
+  return null;
+}
+
+function extractTogetherImage(json) {
+  const arr = json?.data || json?.images || null;
+  if (Array.isArray(arr) && arr[0]) {
+    const first = arr[0];
+    const b = first?.b64_json || first?.base64 || first?.image || first?.data;
+    if (typeof b === "string" && b) return b;
+  }
+  if (typeof json?.b64_json === "string") return json.b64_json;
+  if (typeof json?.base64 === "string") return json.base64;
+  return null;
+}
+
+function extractNvidiaImage(json) {
+  if (typeof json?.image === "string" && json.image) return json.image;
+  if (typeof json?.base64 === "string" && json.base64) return json.base64;
+  if (Array.isArray(json?.artifacts) && json.artifacts[0]) {
+    const b = json.artifacts[0]?.base64 || json.artifacts[0]?.image || json.artifacts[0]?.data;
+    if (typeof b === "string" && b) return b;
+  }
+  return null;
+}
+
 export async function generateFreeImage(env, prompt, opts = {}) {
   const clean = String(prompt ?? "").trim();
   if (!clean) return { ok: false, error: "image_gen_failed" };
-  if (env?.AI && typeof env.AI.run === "function") {
-    try {
-      const out = await env.AI.run(opts.cfModel || "@cf/black-forest-labs/flux-1-schnell", { prompt: clean });
-      const bytes = await toBytes(out);
-      if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "cf-flux" };
-    } catch {}
-  }
+  const fn = resolveFetch(opts);
+  const userId = opts.userId ?? null;
+  if (typeof fn !== "function") return { ok: false, error: "image_gen_failed" };
+
   try {
-    const fn = opts.fetchFn || fetch;
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(clean)}?width=1024&height=1024&nologo=true`;
+    const togetherKey = await resolveKey(env, userId, "together", "TOGETHER_API_KEY");
+    if (togetherKey) {
+      try {
+        const res = await fn("https://api.together.xyz/v1/images/generations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${togetherKey}` },
+          body: JSON.stringify({ model: "black-forest-labs/FLUX.1-schnell-Free", prompt: clean, width: 1024, height: 1024, n: 1, response_format: "b64_json" }),
+        });
+        if (res?.ok) {
+          const json = await safeJson(res);
+          const b64 = extractTogetherImage(json);
+          const bytes = b64 ? b64ToBytes(b64) : null;
+          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "together" };
+        }
+      } catch {}
+    }
+  } catch {}
+
+  try {
+    const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
+    if (nvidiaKey) {
+      try {
+        const res = await fn("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}`, Accept: "application/json" },
+          body: JSON.stringify({ prompt: clean, width: 1024, height: 1024, steps: 4 }),
+        });
+        if (res?.ok) {
+          const json = await safeJson(res);
+          const b64 = extractNvidiaImage(json);
+          const bytes = b64 ? b64ToBytes(b64) : null;
+          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "nvidia" };
+        }
+      } catch {}
+    }
+  } catch {}
+
+  try {
+    const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
+    if (geminiKey) {
+      try {
+        const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=${geminiKey}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: clean }] }],
+            generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+          }),
+        });
+        if (res?.ok) {
+          const json = await safeJson(res);
+          const b64 = extractGeminiImage(json);
+          const bytes = b64 ? b64ToBytes(b64) : null;
+          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "gemini" };
+        }
+      } catch {}
+    }
+  } catch {}
+
+  try {
+    const hfKey = await resolveKey(env, userId, "huggingface", "HF_TOKEN");
+    if (hfKey) {
+      try {
+        const res = await fn("https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${hfKey}`, Accept: "image/png" },
+          body: JSON.stringify({ inputs: clean }),
+        });
+        if (res?.ok && typeof res.arrayBuffer === "function") {
+          const buf = await res.arrayBuffer();
+          const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "huggingface" };
+        }
+      } catch {}
+    }
+  } catch {}
+
+  try {
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(clean)}?model=flux&width=1024&height=1024&nologo=true`;
     const res = await fn(url);
     if (res?.ok) {
       const buf = await res.arrayBuffer();
@@ -111,10 +263,130 @@ export async function generateFreeImage(env, prompt, opts = {}) {
   return { ok: false, error: "image_gen_failed" };
 }
 
+export function isImageEditCaption(caption) {
+  const s = String(caption ?? "").trim();
+  if (!s) return false;
+  if (/^\s*(ویرایش\s*عکس|ویرایش|ادیت)\s*[:：-]/u.test(s)) return true;
+  if (/^(ویرایش|ادیت)\s+/.test(s)) return true;
+  const markers = ["ویرایش عکس", "ادیت", "ویرایش کن", "ادیت کن", "پس‌زمینه", "پسزمینه", "کارتونی کن", "کارتونی", "تغییر بده", "نور عکس", "بهتر کن", "حذف کن", "تغییر بده", "اصلاح کن"];
+  return markers.some((m) => s.includes(m));
+}
+
+export async function editImage(env, opts = {}) {
+  const imageBytes = opts.imageBytes ?? opts.bytes ?? null;
+  const mimeType = opts.mimeType || "image/jpeg";
+  const instruction = String(opts.instruction ?? "").trim();
+  const userId = opts.userId ?? null;
+  const fn = resolveFetch(opts);
+  if (!imageBytes || !instruction || typeof fn !== "function") return { ok: false, reason: "نیاز به تنظیم کلید GEMINI_API_KEY یا HF_TOKEN در /setup برای ویرایش تصویر است." };
+
+  try {
+    const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
+    if (geminiKey) {
+      try {
+        const b64 = bytesToB64(imageBytes);
+        const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=${geminiKey}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: instruction }, { inlineData: { mimeType, data: b64 } }] }],
+            generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+          }),
+        });
+        if (res?.ok) {
+          const json = await safeJson(res);
+          const outB64 = extractGeminiImage(json);
+          const bytes = outB64 ? b64ToBytes(outB64) : null;
+          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "gemini-edit" };
+        }
+      } catch {}
+    }
+  } catch {}
+
+  try {
+    const hfKey = await resolveKey(env, userId, "huggingface", "HF_TOKEN");
+    if (hfKey) {
+      try {
+        const res = await fn("https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${hfKey}`, Accept: "image/png" },
+          body: JSON.stringify({ inputs: instruction, image: bytesToB64(imageBytes) }),
+        });
+        if (res?.ok && typeof res.arrayBuffer === "function") {
+          const buf = await res.arrayBuffer();
+          const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "huggingface-edit" };
+        }
+      } catch {}
+    }
+  } catch {}
+
+  return { ok: false, reason: "نیاز به تنظیم کلید GEMINI_API_KEY یا HF_TOKEN در /setup برای ویرایش تصویر است." };
+}
+
+export async function analyzeImage(env, opts = {}) {
+  const imageBytes = opts.imageBytes ?? opts.bytes ?? null;
+  const mimeType = opts.mimeType || "image/jpeg";
+  const prompt = String(opts.prompt ?? "این تصویر را به فارسی تحلیل کن.").trim() || "این تصویر را به فارسی تحلیل کن.";
+  const userId = opts.userId ?? null;
+  const fn = resolveFetch(opts);
+  const routerCallFn = opts.routerCallFn ?? null;
+  if (!imageBytes) return { ok: false, error: "image_gen_failed", text: "تحلیل تصویر ممکن نشد؛ هیچ تصویری دریافت نشد." };
+
+  try {
+    const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
+    if (geminiKey && typeof fn === "function") {
+      const b64 = bytesToB64(imageBytes);
+      for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) {
+        try {
+          const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ role: "user", parts: [{ text: prompt }, { inlineData: { mimeType, data: b64 } }] }],
+            }),
+          });
+          if (res?.ok) {
+            const json = await safeJson(res);
+            const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+            if (text) return { ok: true, text };
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  if (typeof routerCallFn === "function") {
+    try {
+      const b64 = bytesToB64(imageBytes);
+      const dataUri = `data:${mimeType};base64,${b64}`;
+      const models = ["vision", "nvidia/nemotron-3.5-super-vl-120b-a12b", "qwen/qwen3.8-omni-flash:free", "meta/llama-3.2-90b-vision-instruct"];
+      for (const model of models) {
+        try {
+          const body = {
+            model,
+            messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUri } }, { type: "text", text: prompt }] }],
+          };
+          const out = await routerCallFn(body);
+          let text = "";
+          if (typeof out === "string") text = out.trim();
+          else if (out && typeof out === "object") {
+            text = out.text || out.finalText || out.answer || out?.data?.choices?.[0]?.message?.content || out?.data?.message?.content || "";
+            if (typeof text !== "string") text = String(text ?? "").trim();
+          }
+          if (text && String(text).trim()) return { ok: true, text: String(text).trim() };
+        } catch {}
+      }
+    } catch {}
+  }
+
+  return { ok: false, text: "تحلیل تصویر ممکن نشد؛ کلید GEMINI_API_KEY تنظیم نشده و مدل vision هم در دسترس نیست.", error: "vision_unavailable" };
+}
+
 export function isVisionQuestionCaption(caption) {
   const s = String(caption ?? "").trim();
   if (!s) return false;
   if (s.endsWith("?") || s.endsWith("؟")) return true;
-  const markers = ["این چیه", "چی نوشته", "ترجمه", "توضیح بده", "تحلیل کن", "فیش", "فاکتور", "کیلومتر", "چنده"];
+  const markers = ["این چیه", "چی نوشته", "ترجمه", "توضیح بده", "تحلیل کن", "تفسیر کن", "تفسیر", "فیش", "فاکتور", "کیلومتر", "متن داخل عکس", "متن عکس", "چنده", "چیست", "بخون", "بخوان", "توضیح", "خلاصه", "بررسی", "OCR", "بگو چیه", "تحلیل"];
   return markers.some((m) => s.includes(m));
 }
