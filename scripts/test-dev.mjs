@@ -7484,6 +7484,22 @@ if (DatabaseSync) {
   }
 }
 
+// Phase 3.1: multi-provider interpreter fallback — callFn (nvidia) first, env.AI on throw
+{
+  let callFnTried = false;
+  const aiModels = [];
+  const env31 = {
+    INTERPRETER_MODEL: "nvidia/llama-3.1-nemotron-70b-instruct",
+    AI: { run: async (model) => { aiModels.push(model); return { response: JSON.stringify({ intent: "note", confidence: 0.9, body: "fallback ok" }) }; } },
+  };
+  const callFn = async () => { callFnTried = true; throw new Error("provider boom"); };
+  check(resolveInterpreterModel(env31, { callFn }) === "nvidia/llama-3.1-nemotron-70b-instruct", "3.1: resolveInterpreterModel keeps non-@cf model when callFn provided");
+  const res = await classifyIntent(env31, "hello", {}, { callFn });
+  check(callFnTried === true, "3.1: classifyIntent tried callFn first");
+  check(aiModels.length === 1 && aiModels[0] === DEFAULT_INTERPRETER_MODEL, `3.1: fell back to env.AI default model: ${JSON.stringify(aiModels)}`);
+  check(res.ok === true && res.intent === "note" && res.body === "fallback ok", `3.1: fallback result returned: ${JSON.stringify(res)}`);
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);

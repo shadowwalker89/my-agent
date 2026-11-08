@@ -16,12 +16,21 @@ import { getConfig } from "./config.js";
 // TTL estimate (expiry = failedAt + ttlSec). Old readers only check
 // key existence (isModelHealthy) or parse label/reason, so the extra
 // fields are backward-compatible.
-export async function markFailure(env, target, classification, reasonText) {
+const _healthWriteState = new Map();
+export function resetHealthWriteState() {
+  _healthWriteState.clear();
+}
+export async function markFailure(env, target, classification, reasonText, opts = {}) {
   if (!env.STATE || !classification) return;
   const key =
     classification.scope === "provider"
       ? `health:provider:${String(target).split("/")[0]}`
       : `health:${target}`;
+  const tier = `${classification.scope ?? "model"}:${classification.label ?? ""}:${classification.cooldownSec ?? ""}`;
+  if (!opts?.forceFlush) {
+    const prev = _healthWriteState.get(key);
+    if (prev && prev.tier === tier && Date.now() - prev.lastWriteAt < 300_000) return;
+  }
   const value = JSON.stringify({
     cls: classification.scope,
     label: classification.label ?? null,
@@ -30,6 +39,7 @@ export async function markFailure(env, target, classification, reasonText) {
     ttlSec: Math.max(60, classification.cooldownSec),
   });
   await env.STATE.put(key, value, { expirationTtl: Math.max(60, classification.cooldownSec) });
+  _healthWriteState.set(key, { tier, lastWriteAt: Date.now() });
 }
 
 // Phase 2-d: parsed cooldown entry for one model, or null when healthy

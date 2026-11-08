@@ -263,9 +263,13 @@ async function callFastCombo(env, text) {
 // Phase 1-e Pillar 2 overload: classifyIntent(env, text, context) —
 // first arg an object, second a string — routes to the NLU interpreter
 // (classifyIntentNlu). The legacy (message, ctx) form is untouched.
-export async function classifyIntent(message, ctx = {}, nluContext = {}) {
+export async function classifyIntent(message, ctx = {}, nluContext = {}, opts = {}) {
   if (message && typeof message === "object" && typeof ctx === "string") {
-    return classifyIntentNlu(message, ctx, nluContext);
+    const mergedOpts = { ...opts };
+    if (typeof nluContext?.callFn === "function" && typeof mergedOpts.callFn !== "function") mergedOpts.callFn = nluContext.callFn;
+    if (typeof nluContext?.model === "string" && typeof mergedOpts.model !== "string") mergedOpts.model = nluContext.model;
+    if (typeof nluContext?.timeoutMs === "number" && typeof mergedOpts.timeoutMs !== "number") mergedOpts.timeoutMs = nluContext.timeoutMs;
+    return classifyIntentNlu(message, ctx, nluContext, mergedOpts);
   }
   const sync = classifyIntentSync(message);
 
@@ -314,12 +318,13 @@ export const NLU_VALID_INTENTS = Object.freeze([
   "memory_save", "unsupported_action",
 ]);
 
-export function resolveInterpreterModel(env) {
-  const v = env?.INTERPRETER_MODEL;
+export function resolveInterpreterModel(env, opts = {}) {
+  const v = opts?.model ?? env?.INTERPRETER_MODEL;
   if (v === "off" || v === "none") return null;
   if (typeof v === "string" && v.trim()) {
     const t = v.trim();
     if (t.startsWith("@cf/") || !env?.AI || typeof env.AI.run !== "function") return t;
+    if (typeof opts?.callFn === "function") return t;
     return DEFAULT_INTERPRETER_MODEL;
   }
   if (env?.AI && typeof env.AI.run === "function") return DEFAULT_INTERPRETER_MODEL;
@@ -459,49 +464,79 @@ function buildNluPrompt(text, context = {}) {
 // unknown intent all return { ok: false } so the caller falls through
 // to chat — never a drop, never a guessed write.
 export async function classifyIntentNlu(env, text, context = {}, opts = {}) {
-  const model = resolveInterpreterModel(env);
+  const model = resolveInterpreterModel(env, opts);
   if (!model) return { ok: false, reason: "no-model" };
   const timeoutMs = opts.timeoutMs || NLU_TIMEOUT_MS;
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error("nlu timeout")), timeoutMs);
-  });
-  try {
-    const prompt = buildNluPrompt(text, context);
-    const res = await Promise.race([
-       env.AI.run(model, {
-         messages: [
-           { role: "system", content: prompt.system },
-           { role: "user", content: prompt.user },
-         ],
-         temperature: 0.1,
-         max_tokens: NLU_MAX_TOKENS,
-       }),
-      timeout,
-    ]);
+  const prompt = buildNluPrompt(text, context);
+  const aiPayload = {
+    messages: [
+      { role: "system", content: prompt.system },
+      { role: "user", content: prompt.user },
+    ],
+    temperature: 0.1,
+    max_tokens: NLU_MAX_TOKENS,
+  };
+  const runWithTimeout = async (fn) => {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("nlu timeout")), timeoutMs);
+    });
+    try {
+      return await Promise.race([Promise.resolve().then(fn), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const parse = (res) => {
     const raw = typeof res === "string" ? res : (res?.response ?? res?.text ?? "");
     const obj = extractJsonObject(raw);
-    if (!obj) return { ok: false, reason: "bad-json" };
-    if (!NLU_VALID_INTENTS.includes(obj.intent)) return { ok: false, reason: "bad-intent" };
+    if (!obj) return { error: "bad-json" };
+    if (!NLU_VALID_INTENTS.includes(obj.intent)) return { error: "bad-intent" };
     const conf = typeof obj.confidence === "number" ? obj.confidence : Number(obj.confidence);
     const str = (v) => (typeof v === "string" ? v : null);
     return {
-      ok: true,
-      intent: obj.intent,
-      confidence: Number.isFinite(conf) ? Math.min(1, Math.max(0, conf)) : 0,
-      project: str(obj.project),
-      title: str(obj.title),
-      body: str(obj.body),
-      date_ref: str(obj.date_ref),
-      time_ref: str(obj.time_ref),
-      daypart: str(obj.daypart),
-      summary_target: str(obj.summary_target),
-      leading_framing: str(obj.leading_framing),
-      trailing_framing: str(obj.trailing_framing),
+      result: {
+        ok: true,
+        intent: obj.intent,
+        confidence: Number.isFinite(conf) ? Math.min(1, Math.max(0, conf)) : 0,
+        project: str(obj.project),
+        title: str(obj.title),
+        body: str(obj.body),
+        date_ref: str(obj.date_ref),
+        time_ref: str(obj.time_ref),
+        daypart: str(obj.daypart),
+        summary_target: str(obj.summary_target),
+        leading_framing: str(obj.leading_framing),
+        trailing_framing: str(obj.trailing_framing),
+      },
     };
+  };
+  const hasAi = env?.AI && typeof env.AI.run === "function";
+  if (typeof opts.callFn === "function") {
+    try {
+      const promptArg = { ...prompt, model, text: String(text ?? ""), messages: aiPayload.messages, prompt: `${prompt.system}\n${prompt.user}` };
+      const raw = await runWithTimeout(() => (opts.callFn.length >= 2 ? opts.callFn(model, promptArg) : opts.callFn(promptArg)));
+      const parsed = parse(raw);
+      if (parsed.result) return parsed.result;
+      if (!hasAi) return { ok: false, reason: parsed.error };
+    } catch (err) {
+      if (!hasAi) return { ok: false, reason: err?.message === "nlu timeout" ? "timeout" : "error" };
+    }
+    try {
+      const res = await runWithTimeout(() => env.AI.run(DEFAULT_INTERPRETER_MODEL, aiPayload));
+      const parsed = parse(res);
+      if (parsed.result) return parsed.result;
+      return { ok: false, reason: parsed.error };
+    } catch (err) {
+      return { ok: false, reason: err?.message === "nlu timeout" ? "timeout" : "error" };
+    }
+  }
+  try {
+    const res = await runWithTimeout(() => env.AI.run(model, aiPayload));
+    const parsed = parse(res);
+    if (parsed.result) return parsed.result;
+    return { ok: false, reason: parsed.error };
   } catch (err) {
     return { ok: false, reason: err?.message === "nlu timeout" ? "timeout" : "error" };
-  } finally {
-    if (timer) clearTimeout(timer);
   }
 }
