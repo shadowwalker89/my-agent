@@ -15,7 +15,7 @@ export async function getChatContext(envOrDb, userId) {
   const rows = await getChatMessages(envOrDb, userId, CHAT_CONTEXT_LIMIT);
   return rows
     .filter((r) => r && typeof r.content === "string" && r.content)
-    .map((r) => ({ role: r.role === "assistant" ? "assistant" : "user", content: r.content }))
+    .map((r) => ({ id: r.id, role: r.role === "assistant" ? "assistant" : "user", content: r.content }))
     .slice(-CHAT_CONTEXT_LIMIT);
 }
 
