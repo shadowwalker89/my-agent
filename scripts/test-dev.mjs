@@ -34,7 +34,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, ensureVaultFilesTable, ensureVaultTable } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, ensureVaultFilesTable, ensureVaultTable, ensureUserFactsTable, upsertUserFact, listActiveUserFactsResult, forgetUserFact } from "../src/db.js";
 import { encryptVaultValue, decryptVaultValue, isEncryptedVaultValue, getGoogleVaultConfig, googleVaultStatus, syncVaultItemToGoogle, syncVaultFileToGoogle, fetchVaultFromGoogle } from "../src/vault.js";
 import {
   getChatContext,
@@ -43,6 +43,8 @@ import {
   getDefaultCurrency,
   CHAT_CONTEXT_LIMIT,
   DEFAULT_CURRENCY,
+  searchPersonalMemoryResult,
+  buildUserMemoryHeader,
 } from "../src/memory.js";
 import { iranDate, weekRange, monthRange, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, parseHour, parseReminder, extractFolderTag, resolveProjectName, matchKnownProjectAt, parseNoteQuery, parseSummaryQuery, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, stripMiddleFolderTag, normalizeDaypartToken } from "../src/daily.js";
 import { callRouter, runCombo, resetRouterHealthForTests, getRouterHealthSnapshotForTests, extractAssistantText, extractFinalText, getComboTargets, classifyFailure, getEmptyFinalCounts, resetEmptyFinalCountsForTests } from "../src/router.js";
@@ -6910,6 +6912,81 @@ if (DatabaseSync) {
       const c = classifyDaily(text);
       check(!["note", "task-create", "reminder", "expense", "vault_save"].includes(c.intent), `A01: negated command is not actionable (${text}): ${JSON.stringify(c)}`);
     }
+  }
+}
+
+// Phase 2.2: personal memory graph, message dependencies & grounded retrieval (A03/A05/A13/A17)
+if (DatabaseSync) {
+  const fresh22 = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    const db = { prepare(sql) { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; } };
+    return { sq, env: { STATE: fakeKV(), DB: db } };
+  };
+  {
+    const { sq, env } = fresh22();
+    check(await ensureUserFactsTable(env) === true, "A03/A05: ensureUserFactsTable creates user_facts");
+    const r1 = await upsertUserFact(env, { userId: 1, factKey: "name", factValue: "علی", category: "general", sourceMsgId: 11, nowMs: 1700000000000 });
+    check(r1.ok && r1.id != null, `A03/A05: upsert stores علی: ${JSON.stringify(r1)}`);
+    const r2 = await upsertUserFact(env, { userId: 1, factKey: "name", factValue: "رضا", category: "general", sourceMsgId: 22, nowMs: 1700000001000 });
+    check(r2.ok && r2.id != null && r2.id !== r1.id, `A03/A05: upsert stores رضا as new row: ${JSON.stringify(r2)}`);
+    const rows = sq.prepare("SELECT fact_value, status, superseded_by, source_msg_id FROM user_facts WHERE user_id = ? ORDER BY id ASC").all(1);
+    check(rows.length === 2 && rows[0].fact_value === "علی" && rows[0].status === "superseded" && rows[0].superseded_by === r2.id, `A03/A05: علی is superseded_by رضا row: ${JSON.stringify(rows)}`);
+    check(rows[1].fact_value === "رضا" && rows[1].status === "active" && rows[1].source_msg_id === 22, `A03/A05: رضا is active with source_msg_id provenance: ${JSON.stringify(rows)}`);
+    const list = await listActiveUserFactsResult(env, 1);
+    check(list.ok === true && Array.isArray(list.rows) && list.rows.length === 1 && list.rows[0].fact_value === "رضا" && list.rows[0].source_msg_id === 22, `A03/A05/A17: listActiveUserFactsResult returns رضا with provenance: ${JSON.stringify(list)}`);
+    check((await getSetting(env, 1, "name")) === "رضا", "A03: name fact syncs to setting");
+    const s = await searchPersonalMemoryResult(env, 1, "رضا");
+    check(s.ok === true && s.facts.length === 1 && s.facts[0].fact_value === "رضا" && s.facts[0].source_msg_id === 22 && s.facts[0].id === r2.id, `A03/A13: search returns رضا with provenance: ${JSON.stringify(s)}`);
+    const sOld = await searchPersonalMemoryResult(env, 1, "علی");
+    check(sOld.ok === true && sOld.facts.length === 0, `A03/A13: superseded علی never returned by search: ${JSON.stringify(sOld)}`);
+    const header = await buildUserMemoryHeader(env, 1, {});
+    check(typeof header === "string" && header.includes("رضا") && header.length < 300, `A03/A05: buildUserMemoryHeader is compact and contains رضا: ${JSON.stringify(header)}`);
+    const ctx = buildChatContext([{ id: 1, role: "user", content: "سلام" }], { memoryHeader: header });
+    check(ctx.length === 2 && ctx[0].content === header, `A03/A05: buildChatContext injects memory header when non-empty: ${JSON.stringify(ctx)}`);
+    const ctxNo = buildChatContext([{ id: 1, role: "user", content: "سلام" }], {});
+    check(ctxNo.length === 1 && ctxNo[0].content === "سلام", `A03/A05: buildChatContext unchanged without header: ${JSON.stringify(ctxNo)}`);
+    await saveMessage(env, { userId: 1, role: "user", content: "پیام مورد نظر", kind: "chat" });
+    const msgRow = sq.prepare("SELECT id FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT 1").get(1);
+    const header2 = await buildUserMemoryHeader(env, 1, { replyToMessageId: msgRow.id });
+    check(header2.includes("پیام مورد نظر") && header2.length < 300, `A05: buildUserMemoryHeader includes replied message via getMessageRow: ${JSON.stringify(header2)}`);
+  }
+  {
+    const { sq, env } = fresh22();
+    await upsertUserFact(env, { userId: 1, factKey: "city", factValue: "تهران", sourceMsgId: 5, nowMs: 1700000000000 });
+    sq.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)").run(1, "جلسه بودجه فردا", "text", new Date().toISOString());
+    const noteId = sq.prepare("SELECT id FROM notes WHERE user_id = ?").get(1).id;
+    sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (?, ?, ?, ?, ?)").run(1, "خرید نان", "open", "text", new Date().toISOString());
+    let s = await searchPersonalMemoryResult(env, 1, "جلسه");
+    check(s.ok === true && s.notes.length === 1 && s.notes[0].id === noteId, `A13: search finds note by keyword: ${JSON.stringify(s)}`);
+    await deleteNote(env, 1, noteId);
+    s = await searchPersonalMemoryResult(env, 1, "جلسه");
+    check(s.ok === true && s.notes.length === 0, `A13: deleted note removed from search: ${JSON.stringify(s)}`);
+    s = await searchPersonalMemoryResult(env, 1, "تهران");
+    check(s.ok === true && s.facts.length === 1, `A13: search finds active fact تهران: ${JSON.stringify(s)}`);
+    const f = await forgetUserFact(env, 1, "city");
+    check(f.ok === true, `A13: forgetUserFact ok: ${JSON.stringify(f)}`);
+    s = await searchPersonalMemoryResult(env, 1, "تهران");
+    check(s.ok === true && s.facts.length === 0, `A13: forgotten fact removed from search: ${JSON.stringify(s)}`);
+    const list = await listActiveUserFactsResult(env, 1);
+    check(list.ok === true && list.rows.length === 0, `A13: listActive empty after forget (ok:true, not an error): ${JSON.stringify(list)}`);
+    s = await searchPersonalMemoryResult(env, 1, "نان");
+    check(s.ok === true && s.tasks.length === 1 && s.tasks[0].title === "خرید نان", `A13: search finds task by keyword: ${JSON.stringify(s)}`);
+  }
+  {
+    const badDb = { prepare() { throw new Error("db boom"); } };
+    const badEnv = { DB: badDb, STATE: fakeKV() };
+    const l = await listActiveUserFactsResult(badEnv, 1);
+    check(l.ok === false && !!l.error, `A17: listActiveUserFactsResult returns ok:false on DB throw, not []: ${JSON.stringify(l)}`);
+    const s = await searchPersonalMemoryResult(badEnv, 1, "رضا");
+    check(s.ok === false && !!s.error, `A17: searchPersonalMemoryResult returns ok:false on DB throw, not []: ${JSON.stringify(s)}`);
+    const l2 = await listActiveUserFactsResult({}, 1);
+    check(l2.ok === false, `A17: listActiveUserFactsResult returns ok:false on missing DB: ${JSON.stringify(l2)}`);
+    const s2 = await searchPersonalMemoryResult({}, 1, "x");
+    check(s2.ok === false, `A17: searchPersonalMemoryResult returns ok:false on missing DB: ${JSON.stringify(s2)}`);
   }
 }
 

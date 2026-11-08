@@ -32,6 +32,8 @@ export function askText(q) {
 // the caller) so it is sent to the model exactly once. An oversized single
 // turn is truncated instead of clearing all older history.
 export function buildChatContext(rows, opts = {}) {
+  const headerRaw = typeof opts === "string" ? opts : opts && typeof opts === "object" ? (opts.memoryHeader ?? opts.userMemoryHeader ?? opts.header ?? opts.memory ?? null) : null;
+  const memoryHeader = typeof headerRaw === "string" && headerRaw.trim() ? headerRaw.trim() : "";
   const excludeId = opts && opts.excludeMessageId != null ? Number(opts.excludeMessageId) : null;
   const msgs = (rows || []).filter((r) => r && typeof r.content === "string" && r.content && (excludeId === null || Number(r.id) !== excludeId)).slice(-50);
   const kept = []; let total = 0;
@@ -47,7 +49,9 @@ export function buildChatContext(rows, opts = {}) {
     }
     kept.push({ role: msgs[i].role === "assistant" ? "assistant" : "user", content }); total += content.length;
   }
-  return kept.reverse();
+  const result = kept.reverse();
+  if (memoryHeader) result.unshift({ role: "system", content: memoryHeader });
+  return result;
 }
 
 function dbOf(env) { const db = env && env.DB; return db && typeof db.prepare === "function" ? db : null; }

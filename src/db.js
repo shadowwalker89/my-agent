@@ -990,3 +990,113 @@ export async function setFileSyncStatus(envOrDb, userId, fileId, status, driveUr
     return { ok: false };
   }
 }
+
+// Phase 2.2: structured personal facts with provenance + superseding.
+// Lazy table (like vault) so no migration is required. updated_at is
+// integer ms (nowMs) per spec, not an ISO string.
+export async function ensureUserFactsTable(envOrDb) {
+  const db = resolveDb(envOrDb);
+  if (!db) return false;
+  try {
+    await db
+      .prepare(
+        "CREATE TABLE IF NOT EXISTS user_facts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, fact_key TEXT NOT NULL, fact_value TEXT NOT NULL, category TEXT DEFAULT 'general', source_msg_id INTEGER, status TEXT NOT NULL DEFAULT 'active', superseded_by INTEGER, updated_at INTEGER NOT NULL)",
+      )
+      .bind()
+      .run();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeFactKey(key) {
+  const raw = typeof key === "string" ? key.trim() : "";
+  if (!raw) return "";
+  return raw.startsWith("user.") ? raw.slice(5).trim() : raw;
+}
+
+const FACT_SETTING_KEYS = ["name", "language", "currency", "timezone"];
+
+export async function upsertUserFact(envOrDb, input = {}) {
+  const db = resolveDb(envOrDb);
+  const id = validUserId(input?.userId);
+  const factKey = normalizeFactKey(input?.factKey ?? input?.key ?? input?.fact_key);
+  const factValue = typeof (input?.factValue ?? input?.value ?? input?.fact_value) === "string" ? String(input.factValue ?? input.value ?? input.fact_value).trim() : "";
+  if (!db || id === null || !factKey || !factValue) return { ok: false };
+  if (!(await ensureUserFactsTable(db))) return { ok: false };
+  const category = typeof input?.category === "string" && input.category.trim() ? input.category.trim() : "general";
+  const srcRaw = input?.sourceMsgId ?? input?.source_msg_id ?? null;
+  const srcNum = Number(srcRaw);
+  const sourceMsgId = srcRaw != null && Number.isInteger(srcNum) && srcNum > 0 ? srcNum : null;
+  const nowRaw = Number(input?.nowMs ?? input?.now_ms);
+  const nowMs = Number.isFinite(nowRaw) && nowRaw > 0 ? Math.floor(nowRaw) : Date.now();
+  try {
+    await db
+      .prepare(
+        "INSERT INTO user_facts (user_id, fact_key, fact_value, category, source_msg_id, status, superseded_by, updated_at) VALUES (?, ?, ?, ?, ?, 'active', NULL, ?)",
+      )
+      .bind(id, factKey, factValue, category, sourceMsgId, nowMs)
+      .run();
+    const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first();
+    const newId = row?.id != null ? Number(row.id) : null;
+    if (newId != null && Number.isInteger(newId)) {
+      await db
+        .prepare(
+          "UPDATE user_facts SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE user_id = ? AND fact_key = ? AND status = 'active' AND id != ?",
+        )
+        .bind(newId, nowMs, id, factKey, newId)
+        .run();
+    }
+    if (FACT_SETTING_KEYS.includes(factKey)) {
+      try { await setMemory(envOrDb, id, "setting", factKey, factValue); } catch {}
+    }
+    const fact = { id: newId, user_id: id, userId: id, fact_key: factKey, factKey, fact_value: factValue, factValue, category, source_msg_id: sourceMsgId, sourceMsgId, status: "active", superseded_by: null, updated_at: nowMs };
+    return { ok: true, id: newId, row: fact, fact };
+  } catch {
+    return { ok: false };
+  }
+}
+
+export async function listActiveUserFactsResult(envOrDb, userId) {
+  const db = resolveDb(envOrDb);
+  const id = validUserId(userId);
+  if (!db || id === null) return { ok: false, error: !db ? "db unavailable" : "invalid user" };
+  try {
+    if (!(await ensureUserFactsTable(db))) return { ok: false, error: "db unavailable" };
+    const res = await db
+      .prepare(
+        "SELECT id, user_id, fact_key, fact_value, category, source_msg_id, status, superseded_by, updated_at FROM user_facts WHERE user_id = ? AND status = 'active' ORDER BY id ASC",
+      )
+      .bind(id)
+      .all();
+    const rows = Array.isArray(res?.results) ? res.results : [];
+    return { ok: true, rows };
+  } catch (e) {
+    return { ok: false, error: e && e.message ? String(e.message) : "db error" };
+  }
+}
+
+export async function forgetUserFact(envOrDb, userId, keyOrQuery) {
+  const db = resolveDb(envOrDb);
+  const id = validUserId(userId);
+  let q = "";
+  if (typeof keyOrQuery === "string") q = keyOrQuery.trim();
+  else if (keyOrQuery && typeof keyOrQuery === "object") q = String(keyOrQuery.factKey ?? keyOrQuery.key ?? keyOrQuery.query ?? keyOrQuery.q ?? keyOrQuery.fact_key ?? "").trim();
+  if (!db || id === null || !q) return { ok: false, deleted: false, count: 0, error: !db ? "db unavailable" : "invalid input" };
+  if (!(await ensureUserFactsTable(db))) return { ok: false, deleted: false, count: 0, error: "db unavailable" };
+  const normalized = normalizeFactKey(q);
+  const nowMs = Date.now();
+  try {
+    const res = await db
+      .prepare(
+        "UPDATE user_facts SET status = 'deleted', updated_at = ? WHERE user_id = ? AND status = 'active' AND (fact_key = ? OR fact_key = ? OR fact_value LIKE ? OR fact_key LIKE ?)",
+      )
+      .bind(nowMs, id, q, normalized, `%${q}%`, `%${q}%`)
+      .run();
+    const changes = Number(res?.meta?.changes ?? 0) || 0;
+    return { ok: true, deleted: changes > 0, count: changes, changes };
+  } catch (e) {
+    return { ok: false, deleted: false, count: 0, error: e && e.message ? String(e.message) : "db error" };
+  }
+}
