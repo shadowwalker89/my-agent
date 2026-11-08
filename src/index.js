@@ -198,7 +198,7 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
   // Chat context: last 50 chat-kind rows, capped at 8,000 characters.
   // Translate skips history entirely: a weak model let note-themed history
   // override the translate system prompt (observed in Telegram tests).
-  const history = opts.noHistory ? [] : buildChatContext(await getChatContext(env, userId));
+  const history = opts.noHistory ? [] : buildChatContext(await getChatContext(env, userId), { excludeMessageId: opts.excludeMessageId });
   const body = {
     messages: [
       { role: "system", content: opts.systemPrompt || CHAT_SYSTEM_PROMPT },
@@ -782,7 +782,7 @@ async function handlePlainText(env, msg, text, opts = {}) {
   // Allow-list already checked in handleUpdate; only then create the row.
   await ensureUserRow(env, userId);
   // Order: explicit /dev (tgCommand) -> everyday -> chat/task/dev.
-  const dailyO = { chatId, userId, text, source: opts.source, hasImage: updateHasImage(msg), ...dailySenders(env, chatId),
+  const dailyO = { chatId, userId, text, chatType: msg.chat?.type, source: opts.source, hasImage: updateHasImage(msg), ...dailySenders(env, chatId),
     chat: (modelText, copts) => answerChatText(env, chatId, userId, modelText, updateHasImage(msg), copts) };
   const daily = await handleDailyText(env, dailyO);
   // Save-first entry row already owns the user message: downstream chat
@@ -796,7 +796,7 @@ async function handlePlainText(env, msg, text, opts = {}) {
   // offers retry + quick-convert instead of dropping silently.
   const voiceHeader = opts.source === "voice" ? `🎙 «${text}»\n\n` : undefined;
   if (voiceHeader) dailyO.voiceHeader = voiceHeader;
-  const chatOpts = dailyO.entryMessageId ? { ...skipUserSave, ...(voiceHeader ? { voiceHeader } : {}), retryEntryId: dailyO.entryMessageId, quickConvertId: dailyO.entryMessageId, replyMarkup: { inline_keyboard: quickConvertKeyboard(dailyO.entryMessageId) } } : skipUserSave;
+  const chatOpts = dailyO.entryMessageId ? { ...skipUserSave, excludeMessageId: dailyO.entryMessageId, ...(voiceHeader ? { voiceHeader } : {}), retryEntryId: dailyO.entryMessageId, quickConvertId: dailyO.entryMessageId, replyMarkup: { inline_keyboard: quickConvertKeyboard(dailyO.entryMessageId) } } : skipUserSave;
   // Model already said chat for a text message: answer directly, skip
   // classifyIntent (dev was in the model allow-list and was rejected).
   // Image messages keep today's path (they return "chat", not "chat-direct").
@@ -919,7 +919,7 @@ async function handleCallbackQuery(env, cb) {
   if (data.startsWith("voice:retry:")) {
     await handleVoiceRetry(env, { userId: fromId, stashId: data.slice("voice:retry:".length),
       send: (t, opts) => tgSend(env, chatId, t, opts),
-      route: (transcript) => handlePlainText(env, { chat: { id: chatId }, from: { id: fromId } }, transcript, { source: "voice" }),
+      route: (transcript) => handlePlainText(env, { chat: { id: chatId, type: cb?.message?.chat?.type }, from: { id: fromId } }, transcript, { source: "voice" }),
       editMarkup: dailySenders(env, chatId, cb?.message?.message_id).editMarkup });
     return;
   }
