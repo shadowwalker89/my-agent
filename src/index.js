@@ -27,7 +27,7 @@ import { healthCounts, getMedianLatency, getHealthEntry, markFailure, recordLate
 import { recordVerifiedModel, recordProviderCircuitSuccess } from "./circuit.js";
 import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation } from "./intent.js";
-import { getChatContext } from "./memory.js";
+import { getChatContext, buildUserMemoryHeader } from "./memory.js";
 import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, handleVaultFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, resolveVaultCallback, chatFailureNotice, formatFailureDetail, runReminderTick, quickConvertKeyboard } from "./everyday.js";
 import { handleVoice, handleVoiceRetry } from "./voice.js";
 import { saveMessage, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus } from "./db.js";
@@ -52,7 +52,7 @@ import { runTask } from "./executor.js";
 const TG_ERROR_LIMIT = 120;
 
 export const CHAT_SYSTEM_PROMPT =
-  "You are a concise, helpful personal assistant. Reply in the user's language (Persian if they write Persian). Never claim to have saved or registered a note, task, reminder, or expense in the database; only the system stores records. (هرگز به دروغ ادعا نکن که یادداشت، تسک، یادآوری یا هزینه‌ای را ثبت یا ذخیره کرده‌ای؛ ثبت در دیتابیس فقط توسط سیستم انجام می‌شود.) You have no access to the user's notes, tasks, reminders, or expenses database, so never assert whether any such records exist, how many there are, or that none exist; instead point the user to the list commands (for example: «برای دیدن تسک‌ها بنویس: تسک‌هام رو نشون بده»). (تو به دیتابیس یادداشت‌ها، تسک‌ها، یادآوری‌ها و هزینه‌های کاربر دسترسی نداری؛ پس هرگز درباره‌ی وجود، تعداد یا نبودِ آن‌ها اظهار نظر نکن و کاربر را به دستورهای فهرست راهنمایی کن، مثلاً: «برای دیدن تسک‌ها بنویس: تسک‌هام رو نشون بده».) Never invent or suggest slash commands such as /اضافه کردن هزینه, /یادداشت, or /تسکم; users just write naturally or send a voice message. (هرگز دستورهای اسلش جعلی مثل /اضافه کردن هزینه، /یادداشت، یا /تسکم را پیشنهاد یا اختراع نکن؛ کاربر کافی است با زبان طبیعی بنویسد یا ویس بدهد.)";
+  "You are a concise, helpful personal assistant. Reply in the user's language (Persian if they write Persian). Never claim to have saved or registered a note, task, reminder, or expense in the database; only the system stores records. (هرگز به دروغ ادعا نکن که یادداشت، تسک، یادآوری یا هزینه‌ای را ثبت یا ذخیره کرده‌ای؛ ثبت در دیتابیس فقط توسط سیستم انجام می‌شود.) در ابتدای زمینه گفتگو، بخش [حافظه و اطلاعات شخصی کاربر] شامل نام، ویژگی‌ها و حقایق ثبت‌شده کاربر قرار دارد. هر زمان کاربر درباره اطلاعات شخصی خودش (مانند نام، محل زندگی، خودرو و موارد سپرده‌شده به حافظه) سوال پرسید، مستقیماً و با اطمینان از روی اطلاعات [حافظه و اطلاعات شخصی کاربر] پاسخ بده. Never invent or suggest slash commands such as /اضافه کردن هزینه, /یادداشت, or /تسکم; users just write naturally or send a voice message. (هرگز دستورهای اسلش جعلی مثل /اضافه کردن هزینه، /یادداشت، یا /تسکم را پیشنهاد یا اختراع نکن؛ کاربر کافی است با زبان طبیعی بنویسد یا ویس بدهد.)";
 
 // kind هر combo داخلی برای «ساخت نسخه‌ی دستی» در پنل
 const AUTO_KINDS = { chat: "text", code: "code", vision: "vision", fast: "fast" };
@@ -199,9 +199,12 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
   // Translate skips history entirely: a weak model let note-themed history
   // override the translate system prompt (observed in Telegram tests).
   const history = opts.noHistory ? [] : buildChatContext(await getChatContext(env, userId), { excludeMessageId: opts.excludeMessageId });
+  const memoryHeader = await buildUserMemoryHeader(env, userId);
+  const basePrompt = opts.systemPrompt || CHAT_SYSTEM_PROMPT;
+  const systemContent = memoryHeader ? `[حافظه و اطلاعات شخصی کاربر] ${memoryHeader}\n\n${basePrompt}` : basePrompt;
   const body = {
     messages: [
-      { role: "system", content: opts.systemPrompt || CHAT_SYSTEM_PROMPT },
+      { role: "system", content: systemContent },
       ...history,
       { role: "user", content: text },
     ],

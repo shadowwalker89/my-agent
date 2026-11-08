@@ -135,8 +135,55 @@ export function parseHour(text) {
   return { ask: "hour-ambiguous" };
 }
 const REMINDER_TRIGGERS = /(?:یادم بینداز|یادآوری کن|یادم بنداز|یادت باشه|یادآوری)(?![\p{L}])/u;
+const REL_WORD_VAL = { "یک": 1, "دو": 2, "سه": 3, "چهار": 4, "پنج": 5, "شش": 6, "هفت": 7, "هشت": 8, "نه": 9, "ده": 10, "پانزده": 15, "بیست": 20, "سی": 30, "چهل": 40, "پنجاه": 50, "شصت": 60, "هفتاد": 70, "هشتاد": 80, "نود": 90, "نیم": 0.5 };
+const REL_RE = /(?<!\p{L})(?:(\d+)|(چهل\s+و\s+پنج)|(یک|دو|سه|چهار|پنج|شش|هفت|هشت|نه|ده|پانزده|بیست|سی|چهل|پنجاه|شصت|هفتاد|هشتاد|نود|نیم))\s*(دقیقه|ساعت|روز|ربع)\s*(?:دیگه|دیگر|بعد)(?!\p{L})/u;
+function parseRelativeDurationMs(tNorm) {
+  const m = REL_RE.exec(String(tNorm ?? ""));
+  if (!m) return null;
+  let num;
+  if (m[1] !== undefined) num = Number(m[1]);
+  else if (m[2] !== undefined) num = 45;
+  else {
+    const w = String(m[3] ?? "").replace(/\s+/g, " ").trim();
+    if (w === "چهل و پنج") num = 45;
+    else if (w === "نیم") num = 0.5;
+    else if (Object.hasOwn(REL_WORD_VAL, w)) num = REL_WORD_VAL[w];
+    else return null;
+  }
+  if (!Number.isFinite(num) || num <= 0) return null;
+  const unit = m[4];
+  let ms;
+  if (unit === "دقیقه") ms = num * 60000;
+  else if (unit === "ساعت") ms = num * 3600000;
+  else if (unit === "روز") ms = num * 86400000;
+  else if (unit === "ربع") ms = num * 900000;
+  else return null;
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  return { ms, index: m.index, length: m[0].length };
+}
 export function parseReminder(text, nowMs, origText) {
-  const now = nowMs ?? Date.now(), hour = parseHour(text);
+  const now = nowMs ?? Date.now();
+  const tNorm = normalizeDigits(String(text ?? ""));
+  const rel = parseRelativeDurationMs(tNorm);
+  if (rel) {
+    const src0 = origText ?? text;
+    const ranges0 = [];
+    const collect0 = (re) => { let mm; while ((mm = re.exec(text)) !== null) ranges0.push([mm.index, mm.index + mm[0].length]); };
+    collect0(new RegExp(REMINDER_TRIGGERS.source, "gu"));
+    ranges0.push([rel.index, rel.index + rel.length]);
+    ranges0.sort((a, b) => a[0] - b[0]);
+    let body0 = "", pos0 = 0;
+    for (const [a, b] of ranges0) { if (a < pos0) continue; body0 += src0.slice(pos0, a); pos0 = b; }
+    body0 += src0.slice(pos0);
+    body0 = body0.replace(/\s+/g, " ").trim().replace(/^برای\s+/u, "").trim();
+    if (!body0) return { ask: "empty" };
+    const target = now + rel.ms;
+    const t = new Date(target + IRAN_OFFSET_MIN * 60000);
+    const dateStr = iso(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate());
+    const due = `${dateStr}T${pad(t.getUTCHours())}:${pad(t.getUTCMinutes())}:00+03:30`;
+    return { due, text: body0 };
+  }
+  const hour = parseHour(text);
   if (!hour) return { ask: "no-time" }; if (hour.ask) return { ask: hour.ask };
   const date = parseRelativeDate(text, now); if (date === null) return { ask: "date" };
   const [y, mo, d] = date.split("-").map(Number);
@@ -375,7 +422,7 @@ const NOTE_RE = /^\s*(?:(?:لطفا|لطفاً|ببین)\s+)?(?:یادداشت\s
 const NOTE_FRAMING = String.raw`(?:(?:سلام|درود|سلام\s+علیکم|وقت\s+بخیر|صبح\s+بخیر|عصر\s+بخیر|شب\s+بخیر|لطفا|لطفاً|بی\s*زحمت|ممنون|مرسی|خواهشا|خواهشاً|می\s*خوام|می\s*خواهم|میخوام|میخواهم|می\s*خواستم|میخواستم|میشه|می\s*شه|می\s*تونی|میتونی|می\s*تونید|میتونید)\s*[،,!.؛;:]?\s*)*`;
 const NOTE_VERB = String.raw`(?:ثبت\s+|ذخیره\s+|ایجاد\s+|نوشتن\s+)?(?:کنی|کنید|کن|بنویسی|بنویس|بذاری|بذار|بگذاری|بگذار|بکنی|بکن)(?!\p{L})`;
 const NOTE_LEAD_RE = new RegExp(String.raw`^${NOTE_FRAMING}(?:(?:یه|یک)\s+)?یادداشت(?:\s+جدید)?(?:\s+(?:برام|واسم|برای\s+من|برایم|برا\s+من))?\s*${NOTE_VERB}(?:\s+که(?!\p{L}))?\s*[:：]?\s*([\s\S]+)$`, "ud");
-const NOTE_TAIL_RE = new RegExp(String.raw`^([\s\S]{2,}?)\s*[،,؛;]?\s*(?:(?:اینو|این\s+رو|این\s+را|اونو|اون\s+رو|اون\s+را)\s+)?(?:برام|واسم|برای\s+من|برایم|برا\s+من)?\s*(?:(?:یه|یک)\s+)?یادداشت(?:\s+جدید)?\s*${NOTE_VERB}(?:\s+که(?!\p{L}))?\s*[.؟?!]?\s*$`, "ud");
+const NOTE_TAIL_RE = new RegExp(String.raw`^([\s\S]{2,}?)\s*[،,؛;]?\s*(?:(?:اینو|این\s+رو|این\s+را|این|اونو|اون\s+رو|اون\s+را|اون)\s+)?(?:برام|واسم|برای\s+من|برایم|برا\s+من)?\s*(?:(?:یه|یک)\s+)?یادداشت(?:\s+جدید)?(?:\s*(?:رو|را))?\s*${NOTE_VERB}(?:\s+که(?!\p{L}))?\s*[.؟?!]?\s*$`, "ud");
 const CONV_NOTE_TRIGGER_A = String.raw`(?:یه|یک)?\s*(?:نوت|یادداشت|نوتی|یادداشتی)\s+(?:جدید\s+)?(?:برام\s+)?(?:ثبت\s*کن(?:م|ی|ید)?|بنویس(?:م|ی|ید)?|ذخیره\s*کن(?:م|ی|ید)?|بذار(?:م|ی|ید)?|اضافه\s*کن(?:م|ی|ید)?)`;
 const CONV_NOTE_TRIGGER_B = String.raw`(?:این(?:و|\s+رو|\s+را)?\s+(?:برام\s+)?(?:یادداشت|نوت|ثبت|ذخیره)\s*کن(?:م|ی|ید)?)`;
 const CONV_NOTE_RE = new RegExp(String.raw`^(?:(?:سلام|درود|وقت\s+بخیر|خسته\s+نباشی|بی\s*زحمت|لطفا|لطفاً|ببین)\s*[\s،,.:!-]*)*(?:(?:من|می\s*خوام|میخوام|می\s*خواستم|میشه|می\s*شه|میتونی|می\s*تونی)\s*[\s،,.:!-]*)*(?:${CONV_NOTE_TRIGGER_A}|${CONV_NOTE_TRIGGER_B})\\s*(?:\\s+که\\s+|[\\s:：.،,؛\\-]+)\\s*(.+)$`, "ud");
@@ -565,13 +612,24 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   // and from remember-settings (یادت باشد ...): the caller saves a user fact
   // (and a setting when the fact is name/currency/language) and confirms
   // "🧠 به خاطر سپرده شد" — never a note or a task.
-  const mem = /(?:این\s+را|اینو|این)?\s*(?:به\s+خاطر\s+بسپار|یادت\s+بمونه|یادت\s+بماند|یادم\s+بمونه)\s*[:：]?\s*(?:که\s+)?([\s\S]+)/u.exec(raw);
+  const mem = /(?:این\s+را|اینو|این)?\s*(?:به\s+خاطر\s+بسپار|یادت\s+بمونه|یادت\s+بماند|یادم\s+بمونه|یادت\s+باشه|یادت\s+باشد|یادم\s+باشه|فراموش\s+نکن|تو\s+ذهنت\s+باشه|ذهنت\s+باشه)\s*[:：]?\s*(?:که\s+)?([\s\S]+)/u.exec(raw);
   if (mem) {
     const bodyRaw = mem[1].trim().replace(/[؟?!.،,؛;:\s]+$/u, "").trim();
-    if (bodyRaw) {
+    const memTrig = mem[0] ?? "";
+    const isBashaTrig = /یادت\s+باشه|یادت\s+باشد|یادم\s+باشه|فراموش\s+نکن|ذهنت\s+باشه/.test(memTrig);
+    let memFact = true;
+    if (isBashaTrig && bodyRaw) {
+      const FACT_RE = /(?:اسم\s*من|اسمم|نام\s*من|نامم|شهر\s*من|شهرم|زندگی\s*می\s*کنم|می\s*شینم|می\s*نشینم|ماشین\s*من|ماشینم|شغلم|شغل\s*من|سنم|سن\s*من|تولدم|تولد\s*من|علاقه\s*م|حساسیت|آلرژی)/u;
+      const HAS_TIME_RE = /(فردا|امروز|پس\s*فردا|دیروز|ساعت)/u;
+      const FUTURE_RE = /(زنگ\s*بزن|تماس\s*بگیر|انجام\s*بده|بررسی\s*کن|خرید\s*کن|پرداخت\s*کن|بفرست|ارسال\s*کن|یادآوری\s*کن|یادم\s*بنداز|بزنم|بگیرم|کنم|بدم|بخر)/u;
+      const isSettingAttempt = /^(?:ارزم|ارز\s|زبانم|زبان\s|نامم|اسمم)/.test(bodyRaw);
+      if (isSettingAttempt) memFact = false;
+      else if (!FACT_RE.test(bodyRaw) && (HAS_TIME_RE.test(bodyRaw) || HAS_TIME_RE.test(raw) || FUTURE_RE.test(bodyRaw))) memFact = false;
+    }
+    if (bodyRaw && (!isBashaTrig || memFact)) {
       const nameM = /^(?:اسمم|نامم|اسم\s+من|نام\s+من)\s+([\s\S]+?)(?:\s+(?:است|هست))?$/u.exec(bodyRaw);
-      if (nameM) { const v = nameM[1].trim(); if (v && v.length <= 50) return { intent: "memory_save", confidence: 1, text: bodyRaw, factKey: "name", factValue: v, setting: { key: "name", value: v } }; }
-      const curM = /^(?:ارزم|ارز[\s\u200c]+پیش[\s\u200c]*فرضم)\s+(\S+)/u.exec(bodyRaw);
+      if (nameM) { let v = nameM[1].trim(); if (isBashaTrig && v.endsWith("ه") && v.length > 1) v = v.slice(0, -1); if (v && v.length <= 50) return { intent: "memory_save", confidence: 1, text: bodyRaw, factKey: "name", factValue: v, setting: { key: "name", value: v } }; }
+      const curM = /^(?:ارزم|ارز[\s ]+پیش[\s ]*فرضم)\s+(\S+)/u.exec(bodyRaw);
       if (curM) { const tok = curM[1].replace(/[؟?!.،,]+$/, ""); const code = has(CUR, tok) ? CUR[tok] : (tok.endsWith("ه") && has(CUR, tok.slice(0, -1)) ? CUR[tok.slice(0, -1)] : (["TOMAN", "IRR", "USD", "EUR"].includes(tok) ? tok : null)); if (code) return { intent: "memory_save", confidence: 1, text: bodyRaw, factKey: "currency", factValue: code, setting: { key: "currency", value: code } }; }
       const langM = /^(?:زبانم|زبان)\s+(\S+)/u.exec(bodyRaw);
       if (langM) { const v = langM[1] === "انگلیسی" ? "en" : langM[1] === "فارسی" ? "fa" : (langM[1] === "en" || langM[1] === "fa" ? langM[1] : null); if (v) return { intent: "memory_save", confidence: 1, text: bodyRaw, factKey: "language", factValue: v, setting: { key: "language", value: v } }; }
@@ -754,10 +812,11 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   // A vault keyword (card/sheba/account/national-id/personal-info) gates
   // every vault verdict so ordinary chat never misclassifies.
   const vk = /کارت|شبا|حساب|کد\s*ملی|اطلاعات\s*شخصی|گاوصندوق/u.test(raw);
-  if (vk && !keywordInLongDiscussion) {
+  if (vk && !keywordInLongDiscussion && !raw.includes("یادداشت") && raw.length <= 160) {
     const cat = /شبا/u.test(raw) ? "sheba" : /کد\s*ملی/u.test(raw) ? "national_id" : /حساب/u.test(raw) ? "account" : /اطلاعات\s*شخصی/u.test(raw) ? "personal_info" : /کارت/u.test(raw) ? "bank_card" : null;
     const vDigits = raw ? normalizeDigits(raw).match(/\d+/g) : null;
-    const value = vDigits ? vDigits.join("") : "";
+    const longDigits = vDigits ? vDigits.filter((d) => d.length >= 8) : [];
+    const value = longDigits.length ? longDigits.join("") : "";
     let title = null;
     if (cat) {
       if (cat === "bank_card") { const m = /کارت\s+(بانک\s+)?([^\s\d،,؛:؛؟!.]{2,})/u.exec(raw); title = m ? `کارت ${m[1] ?? ""}${m[2]}`.replace(/\s+/g, " ").trim() : "کارت بانکی"; }

@@ -6232,7 +6232,7 @@ if (DatabaseSync) {
   check(cl2g("تسک هام شیر بخرم").intent !== "task-list" && cl2g("تسک هام را ببینم").intent !== "task-list" && cl2g("تسک‌هام رو ببینم").intent !== "task-list" && cl2g("کارهام انجام شد").intent !== "task-list" && cl2g("تسک‌هام رو جدول کن").intent !== "summary", "2-g: body/junk/verb forms never route to .list");
 
   // (g) prompt checks need no sqlite, so they run on every Node.
-  check(CHAT_SYSTEM_PROMPT.includes("no access to the user's notes") && CHAT_SYSTEM_PROMPT.includes("برای دیدن تسک‌ها بنویس: تسک‌هام رو نشون بده"), "2-g: free-chat system prompt carries the memory-claim guard");
+  check(CHAT_SYSTEM_PROMPT.includes("[حافظه و اطلاعات شخصی کاربر]") && !CHAT_SYSTEM_PROMPT.includes("no access to the user's notes"), "2-g: free-chat system prompt carries the memory header instruction");
   check(!SUMMARY_SYSTEM.includes("no access to the user's notes") && SUMMARY_SYSTEM.includes("فهرست شماره‌دار"), "2-g: summary system prompt has no guard and keeps its numbered-list instruction");
 
   // Everything below needs node:sqlite (Node 22+); on CI's Node 20 it
@@ -6393,7 +6393,7 @@ if (DatabaseSync) {
       };
       try { await answerChatText({ STATE: kv, DB: db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k" }, 1, 1, "سلام", false, { saveText: "" }); } finally { global.fetch = prev; }
       const sysMsg = (providerBody?.messages ?? []).find((m) => m.role === "system");
-      check(typeof sysMsg?.content === "string" && sysMsg.content.includes("no access to the user's notes"), "2-g: chat provider request carries the memory-claim guard in its system prompt");
+      check(typeof sysMsg?.content === "string" && sysMsg.content.includes("[حافظه و اطلاعات شخصی کاربر]") && !sysMsg.content.includes("no access to the user's notes"), "2-g: chat provider request carries the memory header instruction in its system prompt");
       }
     // (h) Phase 2-k: POST /admin/api/probe sends max_tokens>=200, reports
     // ok/failed rows, and cools only real HTTP failures (not HTTP 200).
@@ -6601,7 +6601,7 @@ if (DatabaseSync) {
         check(save.category === "bank_card" && save.title === "کارت بانک رسالت" && save.value === "6037997512345678", `vault_save fields: ${JSON.stringify({ category: save.category, title: save.title, value: save.value })}`);
         check(cl("\u0634\u0645\u0627ره\u0020\u06a9ارت\u0020رسالتم\u0020چنده؟").intent === "vault_get", "vault_get detected");
         check(cl("شماره کارت‌هام رو نشون بده").intent === "vault_list", "vault_list detected");
-        check(cl("شبا رسالت IR123 ذخیره کن").intent === "vault_save" && cl("شبا رسالت IR123 ذخیره کن").category === "sheba" && cl("شبا رسالت IR123 ذخیره کن").value === "123", "sheba save");
+        check(cl("شبا رسالت IR12345678 ذخیره کن").intent === "vault_save" && cl("شبا رسالت IR12345678 ذخیره کن").category === "sheba" && cl("شبا رسالت IR12345678 ذخیره کن").value === "12345678", "sheba save");
         check(cl("کد ملی من 0012345678 را ذخیره کن").intent === "vault_save" && cl("کد ملی من 0012345678 را ذخیره کن").category === "national_id", "national id save");
         check(cl("\u0622\u062e\u0631\u06cc\u0646\u0020\u0622\u0632\u0645\u0627\u06cc\u0634\u0645\u0020\u0631\u0648\u0020\u0628\u0641\u0631\u0633\u062a").intent === "vault_file_get", "vault_file_get detected");
         check(cl("\u0644\u06cc\u0633\u062a\u0020\u0645\u062f\u06cc\u0631\u06cc\u062a\u0020\u0622\u0631\u0634\u06cc\u0648").intent === "vault_list" && cl("\u0644\u06cc\u0633\u062a\u0020\u0645\u062f\u06cc\u0631\u06cc\u062a\u0020\u0622\u0631\u0634\u06cc\u0648").fileList === true, "vault file list detected");
@@ -7395,6 +7395,92 @@ if (DatabaseSync) {
     const o = { chatId: 1, userId: 1, text: "الان ایمیل بفرست به علی", send: async (t) => { sent.push(t); }, chat: async () => {}, nowMs: MORNING23 };
     const r = await runNluBranch(env, o, { now: MORNING23, remembered: "TOMAN" });
     check(r === "handled" && sent.includes("در حال حاضر ابزار اتصال و ارسال مستقیم ایمیل فعال نیست؛ چیزی ارسال نشد. اگر بخواهی می‌توانم متنش را به‌عنوان یادداشت یا کار ذخیره کنم."), `2.3: NLU unsupported_action replies honestly: ${JSON.stringify(sent)}`);
+  }
+}
+
+// ── Live Telegram 5 fixes: AI-first semantic, memory, vault, relative, header ──
+if (DatabaseSync) {
+  const NOW_LIVE = Date.UTC(2026, 9, 28, 5, 0, 0);
+  const freshLive = () => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    sq.prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (1, 'عمومی', '[]', 'active', 1, '2026-10-01T00:00:00.000Z')").run();
+    const db = { prepare(sql) { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; } };
+    return { sq, db };
+  };
+  const convoLive = (sc, extraEnv = {}) => {
+    const sent = []; const chats = [];
+    const send = async (t, opts) => { sent.push({ text: t, opts }); };
+    const chat = async (t, copts) => { chats.push({ text: t, opts: copts }); };
+    const env = { STATE: fakeKV(), DB: sc.db, VAULT_SECRET: "s1", ...extraEnv };
+    const say = async (text, nowMs = NOW_LIVE) => handleDailyText(env, { chatId: 1, userId: 1, text, send, chat, nowMs });
+    return { env, sent, chats, say };
+  };
+  {
+    const sc = freshLive(); const c = convoLive(sc);
+    const r = await c.say("یادت باشه اسم من محمده.", NOW_LIVE);
+    const facts = sc.sq.prepare("SELECT fact_key, fact_value FROM user_facts WHERE user_id = 1 AND status = 'active'").all();
+    check(r === "handled" && c.sent.some((x) => x.text === "🧠 به خاطر سپرده شد"), `live1: memory reply: ${JSON.stringify(c.sent)}`);
+    check(facts.some((f) => f.fact_value === "محمد"), `live1: fact محمد: ${JSON.stringify(facts)}`);
+    check((await getSetting(c.env, 1, "name")) === "محمد", "live1: settings.name = محمد");
+    check(!c.sent.some((x) => String(x.text).includes("ساعت یادآوری را بگو.")), "live1: no time ask");
+  }
+  {
+    const sc = freshLive(); const c = convoLive(sc);
+    const longText = "خب می‌خوام برنامه فاز بعدی رو بررسی کنیم. باید کیف پول و گاوصندوق و API رو تست کنیم و اتصال ایمیل هم لازم است. فردا ساعت ۸ باید این کارها رو بررسی کنیم نه اینکه الان اجرا بشن. شماره کارت و شبا هم در مستندات هست. خیلی خب، این وویس رو برام، این یادداشت رو ثبت کن.";
+    const r = await c.say(longText, NOW_LIVE);
+    const notes = sc.sq.prepare("SELECT id, text FROM notes WHERE user_id = 1").all();
+    const vault = await listVaultItems(c.env, 1);
+    const reminders = sc.sq.prepare("SELECT id FROM tasks WHERE user_id = 1 AND remind_at IS NOT NULL").all();
+    check(r === "handled" && notes.length === 1, `live2: 1 note: ${JSON.stringify(notes)}`);
+    check((vault.items || []).length === 0, `live2: 0 vault: ${JSON.stringify(vault)}`);
+    check(reminders.length === 0, `live2: 0 reminders: ${JSON.stringify(reminders)}`);
+  }
+  {
+    const sc = freshLive(); const c = convoLive(sc);
+    const r = await c.say("شماره کارت را ذخیره کن", NOW_LIVE);
+    const vault = await listVaultItems(c.env, 1);
+    check(r === "handled" && c.sent.some((x) => x.text === "برای ثبت در گاوصندوق، عنوان و مقدار را مشخص کن؛ هنوز چیزی ذخیره نشده است."), `live3: guard reply: ${JSON.stringify(c.sent)}`);
+    check((vault.items || []).length === 0, "live3: 0 vault");
+  }
+  {
+    const sc = freshLive(); const c = convoLive(sc);
+    const r = await c.say("برای ۲ دقیقه دیگه یادآوری کن تست زنده فاز دو", NOW_LIVE);
+    const tasks = sc.sq.prepare("SELECT title, remind_at FROM tasks WHERE user_id = 1").all();
+    check(r === "handled" && tasks.length === 1 && tasks[0].title === "تست زنده فاز دو", `live4: task title: ${JSON.stringify(tasks)}`);
+    const dueMs = tasks[0] && tasks[0].remind_at ? Date.parse(tasks[0].remind_at) : NaN;
+    check(dueMs === NOW_LIVE + 120000, `live4: due +120s: ${tasks[0]?.remind_at} ms=${dueMs} want=${NOW_LIVE + 120000}`);
+    check(!c.sent.some((x) => String(x.text).includes("ساعت یادآوری را بگو.")), "live4: no time ask");
+  }
+  {
+    const sc = freshLive();
+    const kv = fakeKV();
+    await kv.put("catalog:xkiro", JSON.stringify({ models: [{ id: "qwen3-32b", provider: "xkiro", context: 131072 }] }));
+    const env = { STATE: kv, DB: sc.db, TG_TOKEN: "x", ALLOWED_TG_IDS: "1", XKIRO_API_KEY: "k", VAULT_SECRET: "s1" };
+    const sent = [];
+    const send = async (t, o) => { sent.push({ text: t, opts: o }); };
+    const chatNoop = async () => {};
+    await handleDailyText(env, { chatId: 1, userId: 1, text: "یادت باشه اسم من محمده.", send, chat: chatNoop, nowMs: NOW_LIVE });
+    await handleDailyText(env, { chatId: 1, userId: 1, text: "این را به خاطر بسپار: شهر من تهران است و ماشینم پژو ۲۰۷ است", send, chat: chatNoop, nowMs: NOW_LIVE });
+    const captured = [];
+    const prev = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      if (u.startsWith("https://api.telegram.org/")) return Response.json({ ok: true, result: { message_id: 99 } });
+      try { captured.push(JSON.parse(String(init.body ?? "{}"))); } catch {}
+      return Response.json({ choices: [{ message: { content: "پاسخ" } }] });
+    };
+    try {
+      await answerChatText(env, 1, 1, "اسم من چیه؟", false, { saveText: "" });
+    } finally { globalThis.fetch = prev; }
+    const body = captured.find((b) => Array.isArray(b.messages));
+    const promptText = String(body?.messages?.[0]?.content ?? "");
+    check(promptText.includes("محمد") && promptText.includes("تهران") && promptText.includes("پژو ۲۰۷"), `live5: header injected: ${promptText.slice(0, 500)}`);
+    check(!promptText.includes("دسترسی نداری") && !promptText.includes("You have no access") && !promptText.includes("دسترسی ندارم"), `live5: no deny: ${promptText.slice(0, 500)}`);
+    check(!CHAT_SYSTEM_PROMPT.includes("دسترسی نداری") && !CHAT_SYSTEM_PROMPT.includes("You have no access"), "live5: CHAT_SYSTEM_PROMPT no deny");
   }
 }
 

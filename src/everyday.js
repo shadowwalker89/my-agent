@@ -509,6 +509,7 @@ async function runDailyBranch(env, o, c, ctx) {
       await o.send(VAULT_PRIVATE_ONLY_TEXT);
       return "handled";
     }
+    if (!c.title || !String(c.title).trim() || !c.value || !String(c.value).trim() || String(c.value).trim().length < 4) { await o.send("برای ثبت در گاوصندوق، عنوان و مقدار را مشخص کن؛ هنوز چیزی ذخیره نشده است."); return "handled"; }
     await markDaily(env, o);
     // A08: even slot/NLU-routed saves must not leave plaintext credentials
     // in messages.content (the entry row may already exist).
@@ -2328,12 +2329,16 @@ export async function runNluBranch(env, o, ctx) {
     }
     case "vault_save": {
       const det = classifyDaily(text, { nowMs: now, rememberedCurrency: ctx.remembered });
-      if (det.intent === "vault_save" && det.value) { await trace(null); return viaBranch(det); }
+      if (det.intent === "vault_save" && det.value) {
+        if (!det.title || !String(det.title).trim() || !det.value || !String(det.value).trim() || String(det.value).trim().length < 4) { await trace(null); await o.send("برای ثبت در گاوصندوق، عنوان و مقدار را مشخص کن؛ هنوز چیزی ذخیره نشده است."); return "handled"; }
+        await trace(null); return viaBranch(det);
+      }
       const digits = String(text).replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d))).match(/\d+/g);
-      const value = digits ? digits.join("") : (nlu.body && /\d/.test(nlu.body) ? nlu.body.replace(/\D/g, "") : "");
-      if (!value) return null;
+      const candValue = digits ? digits.join("") : (nlu.body && /\d/.test(nlu.body) ? nlu.body.replace(/\D/g, "") : "");
+      const candTitle = nlu.body && !/\d/.test(nlu.body) ? nlu.body.trim() : (det.title ?? null);
+      if (!candTitle || !String(candTitle).trim() || !candValue || !String(candValue).trim() || String(candValue).trim().length < 4) { await trace(null); await o.send("برای ثبت در گاوصندوق، عنوان و مقدار را مشخص کن؛ هنوز چیزی ذخیره نشده است."); return "handled"; }
       await trace(null);
-      return viaBranch({ intent: "vault_save", value, title: nlu.body && !/\d/.test(nlu.body) ? nlu.body.trim() : (det.title ?? null), category: det.category ?? null, keywords: det.keywords ?? [], extra: det.extra ?? null });
+      return viaBranch({ intent: "vault_save", value: candValue, title: candTitle, category: det.category ?? null, keywords: det.keywords ?? [], extra: det.extra ?? null });
     }
     case "vault_get": {
       const det = classifyDaily(text, { nowMs: now, rememberedCurrency: ctx.remembered });
@@ -2433,7 +2438,15 @@ export async function handleDailyText(env, o) {
   // Rule task list (1-b-1): direct to the list render, never to the model
   // step or the interpreter gate; clears any stale slot first.
   if (c.intent === "task-list") { await clearPendingAsk(env, userId); return viaBranch(c); }
-  if (c.intent !== "chat" && c.intent !== "ask") { await clearPendingAsk(env, userId); return viaBranch(c); }
+  const aiAvailableForNlu = (env?.AI && typeof env.AI.run === "function") || o.interpreterCallFn || o.interpreterModel;
+  const isMultiClause = String(text ?? "").length > 160 || ((String(text ?? "").match(/[.،؛;!?؟\n]/g) || []).length >= 3);
+  const hasFactMarker = /(اسم\s*من|اسمم|نام\s*من|نامم|شهر\s*من|شهرم|ماشین\s*من|ماشینم|تولدم|تولد\s*من|سنم|شغلم)/u.test(String(text ?? ""));
+  const greedyShouldDeferToAi = Boolean(aiAvailableForNlu) && (
+    (c.intent === "reminder" && c.ask && c.ask !== "hour-ambiguous" && hasFactMarker) ||
+    ((c.intent === "reminder" || c.intent === "vault_save") && isMultiClause) ||
+    (c.confidence < 1 && c.intent === "reminder" && hasFactMarker)
+  );
+  if (!greedyShouldDeferToAi && c.intent !== "chat" && c.intent !== "ask") { await clearPendingAsk(env, userId); return viaBranch(c); }
   // Answers to an open bot question keep the existing slot path.
   let slot = await getPendingAsk(env, userId);
   // 1-d-6: an hour-ambiguous slot must be fully discharged HERE, before
