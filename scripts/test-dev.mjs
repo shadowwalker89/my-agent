@@ -7534,6 +7534,76 @@ if (DatabaseSync) {
   check(rows32("SELECT COUNT(*) AS n FROM tasks")[0].n === 0, "3.2: image gen creates no task");
 }
 
+// Phase 3.3: Unified Connector Setup Hub /setup, upload.am & backup
+if (DatabaseSync) {
+  const { CONNECTORS, getConnectorStatuses, getConnectorSecret, setConnectorSecret, uploadToUploadAm } = await import("../src/connectors.js");
+  const { exportUserBackupSnapshot } = await import("../src/db.js");
+  const sq33 = new DatabaseSync(":memory:");
+  sq33.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sq33.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sq33.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  sq33.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+  const base33 = (sql) => { const st = sq33.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+  const db33 = { prepare(sql) { return base33(sql); } };
+  const rows33 = (sql, params = []) => sq33.prepare(sql).all(...params);
+  const env33 = { STATE: fakeKV(), DB: db33, VAULT_SECRET: "s33", TG_TOKEN: "fake", TELEGRAM_BOT_TOKEN: "fake" };
+  check(CONNECTORS.length === 8 && CONNECTORS.some((c) => c.id === "gemini" && c.keyName === "GEMINI_API_KEY") && CONNECTORS.some((c) => c.id === "upload_am" && c.optionalKey), "3.3: connector registry has 8 connectors");
+  sq33.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, 'note one', 'text', '2026-10-30T00:00:00.000Z')").run();
+  sq33.prepare("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'task one', 'open', 'text', '2026-10-30T00:00:00.000Z')").run();
+  sq33.prepare("INSERT INTO expenses (user_id, type, amount, currency_code, item, date, created_at) VALUES (1, 'expense', 500, 'TOMAN', 'bread', '2026-10-30', '2026-10-30T00:00:00.000Z')").run();
+  sq33.prepare("INSERT INTO projects (user_id, name, aliases, status, is_default, created_at) VALUES (1, 'عمومی', '[]', 'active', 1, '2026-10-30T00:00:00.000Z')").run();
+  await upsertUserFact(env33, { userId: 1, factKey: "favorite_color", factValue: "blue" });
+  // /setup displays statuses
+  {
+    const sent = [];
+    const r = await handleDailyText({ ...env33 }, { chatId: 1, userId: 1, text: "/setup", send: async (t) => { sent.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    const txt = sent.join("\n");
+    check(r === "handled" && txt.includes("وضعیت کانکتورها") && txt.includes("gemini") && txt.includes("together") && txt.includes("⚙️ تنظیم‌نشده") && txt.includes("/setup gemini"), `3.3: /setup displays connector statuses: ${txt.slice(0, 200)}`);
+  }
+  // /setup together test-key-123 stores, redacts, marks configured
+  {
+    const sent = [];
+    const r = await handleDailyText({ ...env33 }, { chatId: 1, userId: 1, text: "/setup together test-key-123", send: async (t) => { sent.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    check(r === "handled" && sent.join(" ").includes("✅ کانکتور **together** با موفقیت تنظیم و فعال شد."), "3.3: /setup together confirms");
+    check(rows33("SELECT value FROM memories WHERE user_id = 1 AND kind = 'setting' AND key = 'conn_together'")[0]?.value === "test-key-123", "3.3: connector key stored in memories settings");
+    check(rows33("SELECT COUNT(*) AS n FROM messages WHERE content LIKE '%test-key-123%'")[0].n === 0, "3.3: raw API key redacted from messages");
+    check(rows33("SELECT COUNT(*) AS n FROM messages WHERE content LIKE '%کلید کانکتور%'")[0].n >= 1, "3.3: redacted message row exists");
+    check((await getConnectorSecret(env33, 1, "together")) === "test-key-123", "3.3: getConnectorSecret reads user key");
+    const st = (await getConnectorStatuses({ ...env33 }, { conn_together: "test-key-123" })).find((x) => x.id === "together");
+    check(st?.configured === true && st?.masked === "test...23", `3.3: together marked configured with masked preview: ${JSON.stringify(st)}`);
+    const sent2 = [];
+    await handleDailyText({ ...env33 }, { chatId: 1, userId: 1, text: "تنظیمات کانکتورها", send: async (t) => { sent2.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    check(sent2.join(" ").includes("✅ متصل") && sent2.join(" ").includes("together"), "3.3: /setup after set shows together متصل");
+  }
+  // Persian set form + upload mock
+  {
+    const sent = [];
+    const r = await handleDailyText({ ...env33 }, { chatId: 1, userId: 1, text: "تنظیم کانکتور gemini AIzaSyTestKey9f", send: async (t) => { sent.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    check(r === "handled" && (await getConnectorSecret(env33, 1, "gemini")) === "AIzaSyTestKey9f", "3.3: Persian تنظیم کانکتور stores gemini key");
+    check(rows33("SELECT COUNT(*) AS n FROM messages WHERE content LIKE '%AIzaSyTestKey9f%'")[0].n === 0, "3.3: gemini key redacted from messages");
+    const up = await uploadToUploadAm(new TextEncoder().encode("hello"), "a.txt", { apiKey: "k", fetchFn: async () => ({ ok: true, json: async () => ({ url: "https://upload.am/f/abc" }) }) });
+    check(up.ok === true && up.url === "https://upload.am/f/abc", `3.3: uploadToUploadAm returns url: ${JSON.stringify(up)}`);
+  }
+  // Backup exports counts, excludes conn_* secrets, keeps vault encrypted
+  {
+    const enc = await encryptVaultValue(env33, "vault-plaintext-33");
+    const saved = await saveVaultItem(env33, { userId: 1, label: "bank33", valueEnc: enc, kind: "text" });
+    check(saved.ok === true, "3.3: vault item saved for backup");
+    const docs = [];
+    const sent = [];
+    const r = await handleDailyText({ ...env33 }, { chatId: 1, userId: 1, text: "بکاپ اطلاعات", send: async (t) => { sent.push(String(t)); }, sendDocument: async (data, opts) => { docs.push({ data, opts }); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    const txt = sent.join("\n");
+    check(r === "handled" && docs.length === 1, "3.3: backup sends one document");
+    check(txt.includes("یادداشت‌ها: 1") && txt.includes("تسک‌ها: 1") && txt.includes("هزینه‌ها: 1") && txt.includes("حقایق حافظه: 1") && txt.includes("گاوصندوق رمزنگاری‌شده: 1"), `3.3: backup summary counts: ${txt}`);
+    const snap = JSON.parse(String(docs[0]?.data ?? "{}"));
+    check(snap.counts?.notes === 1 && snap.counts?.tasks === 1 && snap.counts?.expenses === 1 && snap.counts?.user_facts === 1 && snap.counts?.vault_items === 1, `3.3: backup counts accurate: ${JSON.stringify(snap.counts)}`);
+    check(!JSON.stringify(snap.settings ?? []).includes("test-key-123") && !JSON.stringify(snap.settings ?? []).includes("conn_together"), "3.3: backup settings exclude conn_* secrets");
+    check(snap.vault_items?.[0]?.value_enc === enc && !JSON.stringify(snap).includes("vault-plaintext-33"), "3.3: backup keeps vault items encrypted, never decrypted");
+    const direct = await exportUserBackupSnapshot(env33, 1, { nowMs: 0 });
+    check(direct.ok === true && direct.counts.notes === 1 && direct.vault_items[0].value_enc === enc, "3.3: exportUserBackupSnapshot direct works");
+  }
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);

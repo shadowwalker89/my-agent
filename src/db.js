@@ -1100,3 +1100,37 @@ export async function forgetUserFact(envOrDb, userId, keyOrQuery) {
     return { ok: false, deleted: false, count: 0, error: e && e.message ? String(e.message) : "db error" };
   }
 }
+
+export async function exportUserBackupSnapshot(env, userId, { nowMs } = {}) {
+  const empty = { notes: [], tasks: [], expenses: [], projects: [], settings: [], user_facts: [], vault_items: [] };
+  const counts = { notes: 0, tasks: 0, expenses: 0, projects: 0, settings: 0, user_facts: 0, vault_items: 0 };
+  const db = dbOf(env);
+  const id = validUserId(userId);
+  const now = nowMs ?? Date.now();
+  if (!db || id === null) return { ok: false, error: !db ? "db unavailable" : "invalid user", exportedAt: new Date(now).toISOString(), userId: id, counts, ...empty };
+  const all = async (sql, params = []) => {
+    try {
+      const res = await db.prepare(sql).bind(...params).all();
+      return Array.isArray(res?.results) ? res.results : [];
+    } catch { return []; }
+  };
+  const notes = await all("SELECT * FROM notes WHERE user_id = ? ORDER BY id ASC", [id]);
+  const tasks = await all("SELECT * FROM tasks WHERE user_id = ? ORDER BY id ASC", [id]);
+  const expenses = await all("SELECT * FROM expenses WHERE user_id = ? ORDER BY id ASC", [id]);
+  const projects = await all("SELECT * FROM projects WHERE user_id = ? ORDER BY id ASC", [id]);
+  const settings = await all("SELECT kind, key, value, updated_at FROM memories WHERE user_id = ? AND kind = 'setting' AND key NOT LIKE 'conn_%' ORDER BY key ASC", [id]);
+  const user_facts = await all("SELECT * FROM user_facts WHERE user_id = ? ORDER BY id ASC", [id]);
+  let vault_items = [];
+  try {
+    await ensureVaultTable(db);
+    const raw = await all("SELECT * FROM vault_items WHERE user_id = ? ORDER BY id ASC", [id]);
+    vault_items = raw.map((r) => {
+      const c = { ...r };
+      delete c.value; delete c.plaintext; delete c.decrypted;
+      return c;
+    });
+  } catch { vault_items = []; }
+  counts.notes = notes.length; counts.tasks = tasks.length; counts.expenses = expenses.length;
+  counts.projects = projects.length; counts.settings = settings.length; counts.user_facts = user_facts.length; counts.vault_items = vault_items.length;
+  return { ok: true, exportedAt: new Date(now).toISOString(), userId: id, counts, notes, tasks, expenses, projects, settings, user_facts, vault_items };
+}

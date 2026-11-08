@@ -3,12 +3,13 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, extractFolderTag, matchKnownProjectAt, IRAN_OFFSET_MIN } from "./daily.js";
 import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO, resolveInterpreterModel, recoverFullNoteBody } from "./intent.js";
-import { saveMessage, finalizeMessageKind, redactMessageContent, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, setVaultSyncStatus, upsertUserFact } from "./db.js";
+import { saveMessage, finalizeMessageKind, redactMessageContent, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, setVaultSyncStatus, upsertUserFact, exportUserBackupSnapshot } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadData, escapeHtml, formatTelegramHtml } from "./telegram.js";
 import { encryptVaultValue, decryptVaultValue, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
 import { parseImageGenCommand, generateFreeImage } from "./media.js";
+import { CONNECTORS, getConnectorStatuses, setConnectorSecret, getConnectorSecret, renderSetupStatusText } from "./connectors.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
 export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی مثل /یادداشت، /تسکم، یا /اضافه کردن هزینه به کاربر پیشنهاد نده. کاربر برای ثبت موارد فقط کافی است با زبان طبیعی بنویسد یا ویس بدهد (مثلاً: «یادداشت کن فردا جلسه دارم» یا «امروز ۲۰۰ تومن نون خریدم» یا «خرجای امروز»).";
@@ -2398,6 +2399,50 @@ export async function handleDailyText(env, o) {
   const { userId, text } = o;
   const now = o.nowMs ?? Date.now();
   if (!dbOf(env)) { await clearPendingAsk(env, userId); return "chat"; } // D1 unavailable: everyday off, chat keeps working
+  {
+    const raw = String(text ?? "").trim();
+    const isSetupList = raw === "/setup" || raw === "تنظیمات کانکتورها" || raw === "وضعیت کانکتورها";
+    const setupSet = raw.match(/^\/(?:setup)\s+([A-Za-z0-9_]+)\s+(.+)$/) || raw.match(/^تنظیم کانکتور\s+([A-Za-z0-9_]+)\s+(.+)$/);
+    const isBackup = raw === "/backup" || raw === "بکاپ اطلاعات" || raw === "پشتیبان‌گیری";
+    if (isSetupList) {
+      const userSettings = {};
+      for (const c of CONNECTORS) { try { const s = await getConnectorSecret(env, userId, c.id); if (s) userSettings[`conn_${c.id}`] = s; } catch {} }
+      const statuses = await getConnectorStatuses(env, userSettings);
+      if (typeof o.send === "function") await o.send(renderSetupStatusText(statuses));
+      return "handled";
+    }
+    if (setupSet) {
+      const cid = setupSet[1].trim().toLowerCase();
+      const value = setupSet[2].trim().split(/\s+/)[0];
+      if (!CONNECTORS.some((c) => c.id === cid) || !value) {
+        if (typeof o.send === "function") await o.send(`⚙️ کانکتور نامعتبر است. کانکتورهای مجاز: ${CONNECTORS.map((c) => c.id).join("، ")}`);
+        return "handled";
+      }
+      const r = await setConnectorSecret(env, userId, cid, value);
+      try {
+        const saved = await saveMessage(env, { userId, role: "user", content: "[🔒 کلید کانکتور]", kind: "daily" });
+        if (saved.ok && saved.id) { o.entryMessageId = saved.id; await redactMessageContent(env, userId, saved.id, "[🔒 کلید کانکتور]"); }
+        const existing = o.messageRowId ?? o.msgId ?? null;
+        if (existing && Number(existing) !== Number(saved.id)) await redactMessageContent(env, userId, existing, "[🔒 کلید کانکتور]");
+      } catch {}
+      if (r && r.ok === false) { if (typeof o.send === "function") await o.send("❌ ذخیره کلید کانکتور ناموفق بود."); return "handled"; }
+      if (typeof o.send === "function") await o.send(`✅ کانکتور **${cid}** با موفقیت تنظیم و فعال شد.`);
+      return "handled";
+    }
+    if (isBackup) {
+      const snap = await exportUserBackupSnapshot(env, userId, { nowMs: now });
+      const json = JSON.stringify(snap, null, 2);
+      const c = snap.counts ?? {};
+      try {
+        if (typeof o.sendDocument === "function") { await o.sendDocument(json, { filename: `backup-${userId}.json`, contentType: "application/json" }); }
+        else if ((env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN) && o.chatId) {
+          await sendDocument({ ...env, TG_TOKEN: env.TG_TOKEN || env.TELEGRAM_BOT_TOKEN }, o.chatId, `backup-${userId}.json`, json, { contentType: "application/json" });
+        }
+      } catch {}
+      if (typeof o.send === "function") await o.send(`📦 بکاپ اطلاعات آماده شد:\nیادداشت‌ها: ${c.notes ?? 0}\nتسک‌ها: ${c.tasks ?? 0}\nهزینه‌ها: ${c.expenses ?? 0}\nپروژه‌ها: ${c.projects ?? 0}\nتنظیمات: ${c.settings ?? 0}\nحقایق حافظه: ${c.user_facts ?? 0}\nگاوصندوق رمزنگاری‌شده: ${c.vault_items ?? 0}`);
+      return "handled";
+    }
+  }
   const parsedImage = parseImageGenCommand(text);
   if (parsedImage.isImageGen) {
     const res = await generateFreeImage(env, parsedImage.prompt);
