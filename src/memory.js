@@ -21,14 +21,37 @@ export async function getChatContext(envOrDb, userId) {
 
 // Explicit settings only. Unknown keys and empty values are refused;
 // there is no automatic writer in Step 1a.
+function isSettingKey(key) {
+  return SETTING_KEYS.includes(key) || (typeof key === "string" && /^conn_[a-z0-9_]+$/i.test(key));
+}
 export async function getSetting(envOrDb, userId, key) {
-  if (!SETTING_KEYS.includes(key)) return null;
-  return getMemory(envOrDb, userId, "setting", key);
+  if (!isSettingKey(key)) return null;
+  const v = await getMemory(envOrDb, userId, "setting", key);
+  return typeof v === "string" ? v : null;
 }
 
 export async function setSetting(envOrDb, userId, key, value) {
-  if (!SETTING_KEYS.includes(key)) return { ok: false };
+  if (!isSettingKey(key)) return { ok: false };
+  if (typeof value !== "string" || !value) return { ok: false };
   return setMemory(envOrDb, userId, "setting", key, value);
+}
+
+export async function getAllSettings(envOrDb, userId) {
+  const db = resolveMemoryDb(envOrDb);
+  if (!db) return {};
+  const id = Number(userId);
+  if (!Number.isFinite(id)) return {};
+  try {
+    const res = await db.prepare("SELECT key, value FROM memories WHERE user_id = ? AND kind = 'setting' ORDER BY key ASC").bind(id).all();
+    const rows = Array.isArray(res?.results) ? res.results : [];
+    const out = {};
+    for (const r of rows) {
+      const k = typeof r?.key === "string" ? r.key : "";
+      if (!isSettingKey(k)) continue;
+      out[k] = typeof r?.value === "string" ? r.value : String(r?.value ?? "");
+    }
+    return out;
+  } catch { return {}; }
 }
 
 export async function getDefaultCurrency(envOrDb, userId) {
