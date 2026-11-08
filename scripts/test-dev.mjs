@@ -7500,6 +7500,40 @@ if (DatabaseSync) {
   check(res.ok === true && res.intent === "note" && res.body === "fallback ok", `3.1: fallback result returned: ${JSON.stringify(res)}`);
 }
 
+// Phase 3.2: media module — parse, generate, handleDailyText wiring
+{
+  const { parseImageGenCommand, generateFreeImage } = await import("../src/media.js");
+  const p1 = parseImageGenCommand("یه عکس از کوه دماوند در شب بساز");
+  check(p1.isImageGen === true && p1.prompt === "کوه دماوند در شب", `3.2: parse Persian image gen: ${JSON.stringify(p1)}`);
+  const p2 = parseImageGenCommand("عکس کارت ملی را در گاوصندوق ذخیره کن");
+  check(p2.isImageGen === false, `3.2: vault command must not match image gen: ${JSON.stringify(p2)}`);
+  const b64 = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString("base64");
+  const r1 = await generateFreeImage({ AI: { run: async () => ({ image: b64 }) } }, "kand");
+  check(r1.ok === true && r1.bytes instanceof Uint8Array && r1.bytes.length === 8 && r1.provider === "cf-flux", `3.2: generate from base64: ${JSON.stringify(r1).slice(0, 200)}`);
+  const r2 = await generateFreeImage({ AI: { run: async () => new Uint8Array([1, 2, 3, 4]) } }, "kand");
+  check(r2.ok === true && r2.bytes.length === 4 && r2.provider === "cf-flux", `3.2: generate from Uint8Array: ${JSON.stringify(r2).slice(0, 200)}`);
+  const r3 = await generateFreeImage({ AI: { run: async () => { throw new Error("boom"); } } }, "hi", { fetchFn: async () => ({ ok: true, arrayBuffer: async () => new Uint8Array([9, 9, 9]).buffer }) });
+  check(r3.ok === true && r3.provider === "pollinations" && r3.bytes.length === 3, `3.2: fallback to pollinations: ${JSON.stringify(r3).slice(0, 200)}`);
+}
+if (DatabaseSync) {
+  const sq32 = new DatabaseSync(":memory:");
+  sq32.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sq32.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sq32.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  sq32.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+  const base32 = (sql) => { const st = sq32.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+  const db32 = { prepare(sql) { return base32(sql); } };
+  const rows32 = (sql, params = []) => sq32.prepare(sql).all(...params);
+  const env32 = { STATE: fakeKV(), DB: db32, AI: { run: async () => new Uint8Array([137, 80, 78, 71, 13]) } };
+  const sent32 = [];
+  const photos32 = [];
+  const r32 = await handleDailyText(env32, { chatId: 1, userId: 1, text: "یک تصویر از غروب شیراز بساز", send: async (t) => { sent32.push(t); }, sendPhoto: async (bytes, opts) => { photos32.push({ bytes, opts }); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+  check(r32 === "handled", `3.2: handleDailyText image gen handled: ${r32}`);
+  check(photos32.length === 1 || sent32.some((t) => String(t).includes("تصویر ساخته شد")), `3.2: image confirmation sent: photos=${photos32.length} sent=${JSON.stringify(sent32)}`);
+  check(rows32("SELECT COUNT(*) AS n FROM notes")[0].n === 0, "3.2: image gen creates no note");
+  check(rows32("SELECT COUNT(*) AS n FROM tasks")[0].n === 0, "3.2: image gen creates no task");
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);

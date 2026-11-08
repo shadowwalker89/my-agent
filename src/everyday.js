@@ -8,6 +8,7 @@ import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validate
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadData, escapeHtml, formatTelegramHtml } from "./telegram.js";
 import { encryptVaultValue, decryptVaultValue, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
+import { parseImageGenCommand, generateFreeImage } from "./media.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
 export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی مثل /یادداشت، /تسکم، یا /اضافه کردن هزینه به کاربر پیشنهاد نده. کاربر برای ثبت موارد فقط کافی است با زبان طبیعی بنویسد یا ویس بدهد (مثلاً: «یادداشت کن فردا جلسه دارم» یا «امروز ۲۰۰ تومن نون خریدم» یا «خرجای امروز»).";
@@ -2397,6 +2398,19 @@ export async function handleDailyText(env, o) {
   const { userId, text } = o;
   const now = o.nowMs ?? Date.now();
   if (!dbOf(env)) { await clearPendingAsk(env, userId); return "chat"; } // D1 unavailable: everyday off, chat keeps working
+  const parsedImage = parseImageGenCommand(text);
+  if (parsedImage.isImageGen) {
+    const res = await generateFreeImage(env, parsedImage.prompt);
+    if (res.ok) {
+      let photoSent = false;
+      if (typeof o.sendPhoto === "function") { await o.sendPhoto(res.bytes, { caption: `🎨 تصویر ساخته شد: ${parsedImage.prompt}`, mimeType: res.mimeType }); photoSent = true; }
+      else if (env?.TELEGRAM_BOT_TOKEN && o.chatId) { await sendPhoto(env, o.chatId, "generated.png", res.bytes, { caption: `🎨 تصویر ساخته شد: ${parsedImage.prompt}`, contentType: res.mimeType }); photoSent = true; }
+      if (!photoSent && typeof o.send === "function") await o.send(`🎨 تصویر ساخته شد: ${parsedImage.prompt}`);
+    } else {
+      if (typeof o.send === "function") await o.send("❌ تولید تصویر در حال حاضر ناموفق بود؛ دوباره تلاش کن.");
+    }
+    return "handled";
+  }
   // Phase 3-A: name a pending __pending__ vault upload on the next turn
   // (text message or voice transcript). At the very top, before classifyDaily.
   if (text && !/^\s*\//.test(text)) {
