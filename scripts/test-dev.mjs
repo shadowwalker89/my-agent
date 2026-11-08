@@ -1494,7 +1494,7 @@ import { classifyVoiceQuota, transcribeWithGemini, handleVoice, handleVoiceRetry
     if (u.pathname === "/v1beta/interactions/pending-1") {
       interactionPolls++;
       if (mode === "async-stuck") return Response.json({ id: "pending-1", status: "in_progress" });
-      return Response.json({ status: "completed", output: [{ type: "text", text: "سلام دنیا" }] });
+      return Response.json({ status: "completed", steps: [{ type: "model_output", content: [{ type: "text", text: "سلام دنیا" }] }] });
     }
     const interactions = u.pathname === "/v1beta/interactions";
     check(interactions || /^\/v1beta\/models\/[^/]+:generateContent$/.test(u.pathname), "voice contract: correct API route");
@@ -1508,7 +1508,17 @@ import { classifyVoiceQuota, transcribeWithGemini, handleVoice, handleVoiceRetry
     if (mode === "throw") throw new Error(env.GEMINI_API_KEY);
     if (mode === "legacy") return Response.json({ output_text: "must not route", error: { text: "must not route either" } });
     if (mode === "503" && calls.length === 1) return Response.json({ error: { status: "UNAVAILABLE", message: env.GEMINI_API_KEY } }, { status: 503 });
-    if (interactions && ["async", "async-stuck"].includes(mode)) return Response.json({ id: "pending-1", status: "in_progress" });
+    if (interactions && ["async", "async-stuck", "queued"].includes(mode)) return Response.json({ id: "pending-1", status: mode === "queued" ? "queued" : "in_progress" });
+    if (interactions && ["steps", "steps-blank-legacy", "steps-incomplete"].includes(mode)) return Response.json({
+      status: mode === "steps-incomplete" ? "incomplete" : "completed", output_text: " ", outputs: [],
+      steps: [null, { type: "user_input", content: [{ type: "text", text: "private user input" }] },
+        { type: "thought", content: [{ type: "text", text: "private reasoning" }] },
+        { type: "function_result", content: [{ type: "text", text: "private tool result" }] },
+        { type: "model_output", content: [null, { type: "audio", text: "private audio field" }, { type: "text", thought: true, text: "private thought" }, { type: "text", text: "سلام " }, { type: "text", text: "دنیا" }] }],
+    });
+    if (interactions && mode === "steps-error") return Response.json({ status: "completed", steps: [{ type: "model_output", error: { code: 13, message: "private error" }, content: [{ type: "text", text: "must not route" }] }] });
+    if (interactions && mode === "steps-thought") return Response.json({ status: "completed", steps: [{ type: "thought", content: [{ type: "text", text: "must not route" }] }] });
+    if (interactions && mode === "steps-malformed") return Response.json({ status: "completed", steps: [null, { type: "model_output", content: {} }, { type: "model_output", content: [null, { type: "text", text: 123 }] }] });
     if (interactions && mode === "output-array") return Response.json({ status: "completed", output: [{ type: "thought", text: "private" }, { type: "text", text: "سلام دنیا" }] });
     if (interactions && mode === "blank-top") return Response.json({ output_text: "  ", outputs: [], output: [{ type: "text", text: "سلام دنیا" }] });
     if (interactions && mode === "nested-content") return Response.json({ output: { content: [{ type: "text", text: { value: "سلام دنیا" } }] } });
@@ -1560,19 +1570,27 @@ import { classifyVoiceQuota, transcribeWithGemini, handleVoice, handleVoiceRetry
     const transcriptionBody = calls[0].body;
     check(transcriptionBody.input[0].uri.endsWith("files/contract") && transcriptionBody.input[0].mime_type === "audio/ogg", "voice contract: Interactions references uploaded audio");
     check(transcriptionBody.generation_config.transcription_config.language_codes[0] === "fa-IR" && transcriptionBody.generation_config.transcription_config.custom_vocabulary.includes("Cloudflare Workers"), "voice contract: original transcription language and vocabulary restored");
-    for (const format of ["output-text", "output-object", "output-array", "blank-top", "nested-content", "segments"]) {
+    for (const format of ["output-text", "output-object", "output-array", "blank-top", "nested-content", "segments", "steps", "steps-blank-legacy"]) {
       reset(format);
       const result = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
       check(result.ok && result.text === "سلام دنیا" && calls.length === 1 && deleted === 1, `voice contract: Interactions ${format} parsed and cleaned up`);
     }
-    for (const failure of ["pending", "nested-error", "reasoning-only"]) {
+    for (const failure of ["pending", "nested-error", "reasoning-only", "steps-incomplete", "steps-error", "steps-thought", "steps-malformed"]) {
       reset(failure);
       await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
       check(calls.length > 1, `voice contract: ${failure} not accepted as a transcript`);
+      if (failure.startsWith("steps-")) {
+        check(logs.some((line) => line.includes('"responseShape"') && line.includes('"hasSteps":true')), "voice schema: unparsed/unsafe steps get content-free response-shape diagnostics");
+        check(!logs.join("").includes("must not route") && !logs.join("").includes("private error"), "voice schema: shape diagnostics do not log rejected text or error messages");
+      }
     }
     reset("async");
     const completed = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0 });
     check(completed.ok && completed.text === "سلام دنیا" && calls.length === 1 && interactionPolls === 1 && deleted === 1, "voice regression: pending interaction is polled, not discarded or re-generated");
+
+    reset("queued");
+    const queued = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0 });
+    check(queued.ok && queued.text === "سلام دنیا" && calls.length === 1 && interactionPolls === 1, "voice schema: queued interaction is retrieved by GET and completed steps are parsed without another generation");
 
     reset("async-stuck");
     const pendingLimit = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0, maxPolls: 2 });
@@ -1717,7 +1735,7 @@ if (DatabaseSync) {
           if (opts.failGeneration) throw new Error("boom");
           generationBody = JSON.parse(init.body);
           return { ok: true, json: async () => u.includes("/v1beta/interactions")
-            ? { output_text: transcript }
+            ? { status: "completed", steps: [{ type: "model_output", content: [{ type: "text", text: transcript }] }] }
             : { candidates: [{ content: { parts: [{ text: transcript }] }, finishReason: "STOP" }] } };
         }
         return { ok: true, json: async () => ({}) };
