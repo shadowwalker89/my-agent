@@ -505,6 +505,24 @@ export function parseListRequest(raw) {
 const FILE_RE = /(?<!\p{L})(خلاصه\s+اش\s+کن(?![\p{L}])|خلاصه\s+کن(?![\p{L}])|خلاصه\s+اش|این فایل را خلاصه\s+کن(?![\p{L}]))/u;
 const TRANSLATE_VERB = /(?<!\p{L})(?:ترجمه\s+(?:کن|کنید|بکن))(?![\p{L}])/u;
 function countAnchoredAmounts(text) { const toks = stripThousands(normalizeDigits(normalizeText(text))).replace(/[؟?!.،,]/g, " ").split(/\s+/).filter(Boolean); let n = 0; for (let ci = 0; ci < toks.length; ci++) if (CUR_WORDS.includes(toks[ci])) for (let s = Math.max(0, ci - 7); s < ci; s++) { const ph = parseNumberPhrase(toks.slice(s, ci), 0); if (ph && !ph.error && ph.consumed === ci - s) { n++; break; } } return n; }
+const CLAUSE_SEP_RE = /[.،؛;!?؟\n]+/gu;
+function isLongDiscussion(text) {
+  const s = String(text ?? "");
+  if (s.length > 160) return true;
+  const seps = s.match(CLAUSE_SEP_RE);
+  return Boolean(seps && seps.length >= 3);
+}
+function isExplicitStandaloneCommand(text) {
+  const s = String(text ?? "").trim();
+  if (!s) return false;
+  const head = s.slice(0, 48), tail = s.slice(-64);
+  return /^(?:لطفا\s+|لطفاً\s+|ببین\s+)?(?:یادداشت\s*کن|یادداشت\s*:|بنویس|تسک\s*:|تسک\s+جدید\s*:|یه\s+تسک\s+|پروژه\s+جدید|یادم\s+بنداز|یادت\s+باشه|یادآوری\s+کن)/u.test(head)
+    || /(?:یادداشت\s*کن|ثبت\s*(?:اش|ش)?\s*کن|ذخیره\s*(?:اش|ش)?\s*کن|بذار|نگه\s*دار|یادم\s+بنداز|یادت\s+باشه|تسک\s*:)\s*[.،؛;!?؟\s]*$/u.test(tail);
+}
+const NEGATED_COMMAND_RE = /(?<!\p{L})(?:ثبت(?:[‌\s]*(?:اش|ش))?\s*نکن|ذخیره(?:[‌\s]*(?:اش|ش))?\s*نکن|نساز|نذار|نفرست|نگه\s*ندار|اضافه\s*نکن)(?![\p{L}])/u;
+function isNegatedCommand(text) {
+  return NEGATED_COMMAND_RE.test(String(text ?? ""));
+}
 // Rule-only classifier. Confident = 1; ambiguous = { intent: "ask" }.
 // Never a guess, never a model call. Strict translate is checked FIRST:
 // a bare word "translate" anywhere is not a translate, only the verb is.
@@ -517,6 +535,9 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   const now = opts.nowMs ?? Date.now(), raw = normalizeText(text);
   if (!raw.trim()) return { intent: "chat", confidence: 1 };
   if (raw.trimStart().startsWith("/")) return { intent: "command", confidence: 1 };
+  if (isNegatedCommand(raw)) return { intent: "chat", confidence: 1 };
+  const longDiscussion = isLongDiscussion(raw);
+  const keywordInLongDiscussion = longDiscussion && !isExplicitStandaloneCommand(raw);
   const trVerb = TRANSLATE_VERB.exec(raw);
   if (trVerb) {
     // Destination: a known language maps to its code; any other word after
@@ -589,7 +610,7 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   const bareNote = raw.trim().replace(/[؟?!.،,:：\s]+$/u, "");
   if (/^(?:(?:لطفا|لطفاً|ببین)\s+)?(?:یادداشت\s+کن|یادداشت\s+جدید|یادداشت)$/u.test(bareNote)
     || /^(?:می\s*خوام|می\s*خواهم|میخوام|میخواهم)\s+(?:یک\s+)?یادداشت(?:\s+جدید)?(?:\s+و\s+جداگانه)?\s+(?:ثبت\s+کنم|بنویسم|ایجاد\s+کنم|بکنم)$/u.test(bareNote)) return { intent: "ask", confidence: 0.5, question: "note-text" };
-  if (REMINDER_RE.test(raw)) { const r = parseReminder(raw, now, text); return r.ask ? { intent: "reminder", confidence: 0.5, ask: r.ask } : { intent: "reminder", confidence: 1, due: r.due, text: r.text }; }
+  if (!keywordInLongDiscussion && REMINDER_RE.test(raw)) { const r = parseReminder(raw, now, text); return r.ask ? { intent: "reminder", confidence: 0.5, ask: r.ask } : { intent: "reminder", confidence: 1, due: r.due, text: r.text }; }
   // 1-d-2: natural project creation, project listing, deterministic
   // task creation. Placed before expense inference so an explicit
   // "task:" / "project" prefix wins over a verb/amount reading. Bodies
@@ -604,11 +625,11 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   // Phase 1-e Pillar 2: deterministic natural task forms without a
   // colon ("یه تسک بذار ...", "تسک ثبت کن که ..."). Placed before the
   // colon-prefix loop; colon forms still match through the :? tail.
-  {
-    const m = /^(?:یه\s+)?تسک\s+(?:جدید\s+)?(?:ثبت\s+کن|بذار|اضافه\s+کن)(?:\s+که(?!\p{L})|\s+برای(?!\p{L}))?\s*:?\s*([\s\S]+)$/ud.exec(raw);
+  if (!keywordInLongDiscussion) {
+    const m = /^(?:یه\s+)?تسک\s+(?:جدید\s+)?(?:ثبت\s*کن|بذار|اضافه\s*کن)(?:\s+که(?!\p{L})|\s+برای(?!\p{L}))?\s*:?\s*([\s\S]+)$/ud.exec(raw);
     if (m && m[1].trim().replace(/[؟?!.،,:：\s]+/gu, "")) return { intent: "task-create", confidence: 1, text: text.slice(m.indices[1][0], m.indices[1][1]).trim() };
   }
-  for (const re of [/^تسک\s*[:：]\s*(.+)$/ud, /^تسک جدید\s*[:：]\s*(.+)$/ud, /^تسک ثبت کن\s*[:：]\s*(.+)$/ud, /^به تسک\s*هامو?\s+اضافه کن\s*[:：]\s*(.+)$/ud]) {
+  if (!keywordInLongDiscussion) for (const re of [/^تسک\s*[:：]\s*(.+)$/ud, /^تسک جدید\s*[:：]\s*(.+)$/ud, /^تسک ثبت کن\s*[:：]\s*(.+)$/ud, /^به تسک\s*هامو?\s+اضافه کن\s*[:：]\s*(.+)$/ud]) {
     const m = re.exec(raw);
     if (m) { const body = text.slice(m.indices[1][0], m.indices[1][1]).trim(); if (body) return { intent: "task-create", confidence: 1, text: body }; }
   }
@@ -696,7 +717,7 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   if (/(?:خلاصه|جدول)/.test(raw) && raw.search(/یادداشت/) >= 0) {
     return { intent: "summary", confidence: 1, kind: "note", projectName: null };
   }
-  const nq = parseNoteQuery(raw, now); if (nq) return nq;
+  if (!longDiscussion) { const nq = parseNoteQuery(raw, now); if (nq) return nq; }
   if (FILE_RE.test(raw)) {
     // File reference only for a short message with no accompanying text:
     // a colon followed by text means the user is asking about that text.
@@ -710,7 +731,7 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   // A vault keyword (card/sheba/account/national-id/personal-info) gates
   // every vault verdict so ordinary chat never misclassifies.
   const vk = /کارت|شبا|حساب|کد\s*ملی|اطلاعات\s*شخصی|گاوصندوق/u.test(raw);
-  if (vk) {
+  if (vk && !keywordInLongDiscussion) {
     const cat = /شبا/u.test(raw) ? "sheba" : /کد\s*ملی/u.test(raw) ? "national_id" : /حساب/u.test(raw) ? "account" : /اطلاعات\s*شخصی/u.test(raw) ? "personal_info" : /کارت/u.test(raw) ? "bank_card" : null;
     const vDigits = raw ? normalizeDigits(raw).match(/\d+/g) : null;
     const value = vDigits ? vDigits.join("") : "";

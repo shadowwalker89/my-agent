@@ -306,7 +306,7 @@ export function freeTextDevSuggestion() {
 // and the caller re-validates everything deterministically.
 export const DEFAULT_INTERPRETER_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 export const NLU_TIMEOUT_MS = 4500;
-export const NLU_MAX_TOKENS = 360;
+export const NLU_MAX_TOKENS = 512;
 export const NLU_VALID_INTENTS = Object.freeze([
   "note", "task", "reminder", "expense", "note_list", "task_list",
   "project_list", "project_create", "summary", "daypart_reply", "chat",
@@ -356,6 +356,48 @@ export function extractJsonObject(raw) {
   return null;
 }
 
+const NOTE_LEAD_FRAMING_RE = /^\s*(?:(?:سلام|درود|وقت\s*بخیر|خسته\s*نباشی|لطفا|لطفاً|بی[‌\s]*زحمت|ممنون|مرسی|ببین|می[‌\s]*(?:خوام|خواهم|خواستم)|میخوام|میخواهم|میخواستم|میشه|می[‌\s]*شه|میتونی|می[‌\s]*تونی)\s*[،,.:!؛;?؟\-]*\s*)+/u;
+const NOTE_COMMAND_LEAD_RE = /^(?:یه\s+|یک\s+)?(?:یادداشت|نوت)(?:\s+جدید)?\s*(?:ثبت\s*کن|بذار|بنویس|ایجاد\s*کن|بکن)\s*(?:که(?!\p{L})|[:：.،,؛;\-]+\s*)?/u;
+const NOTE_TRAIL_FRAMING_RE = /[\s،,؛;:：.!?؟\-]*(?:(?:این|اون|هم)\s+)*(?:(?:رو|را)\s+)?(?:(?:برام|واسم|برای\s*من|توی|در|داخل|به)\s+)?(?:(?:یادداشت(?:[‌\s]*ها(?:م|یم|ی)?|هام|هایم)?|نوت(?:[‌\s]*هام)?)\s*)?(?:(?:برام|واسم)\s+)?(?:نگه\s*دار|نگهدار|ثبت(?:[‌\s]*(?:اش|ش))?\s*کن|ذخیره(?:[‌\s]*(?:اش|ش))?\s*کن|بذار|بنویس|یادداشت\s*کن|نوت\s*کن|اضافه\s*کن)\s*$/u;
+
+function stripNoteFramingPrefix(s) {
+  let out = String(s ?? "").trim();
+  for (let i = 0; i < 8; i++) {
+    const before = out;
+    out = out.replace(NOTE_LEAD_FRAMING_RE, "").replace(NOTE_COMMAND_LEAD_RE, "").trim();
+    if (out === before) break;
+  }
+  return out;
+}
+
+function stripNoteFramingSuffix(s) {
+  let out = String(s ?? "").trim();
+  for (let i = 0; i < 8; i++) {
+    const before = out;
+    out = out.replace(NOTE_TRAIL_FRAMING_RE, "").trim();
+    if (out === before) break;
+  }
+  return out;
+}
+
+export function recoverFullNoteBody(rawText, modelBody, leadingFraming, trailingFraming) {
+  const raw = typeof rawText === "string" ? rawText : "";
+  const model = typeof modelBody === "string" ? modelBody.trim() : "";
+  if (!raw.trim()) return model;
+  let stripped = raw.trim();
+  const lf = typeof leadingFraming === "string" ? leadingFraming.trim() : "";
+  const tf = typeof trailingFraming === "string" ? trailingFraming.trim() : "";
+  if (lf && lf.length < raw.length * 0.3 && stripped.startsWith(lf)) stripped = stripped.slice(lf.length);
+  if (tf && tf.length < raw.length * 0.3 && stripped.endsWith(tf)) stripped = stripped.slice(0, stripped.length - tf.length);
+  stripped = stripNoteFramingPrefix(stripped);
+  stripped = stripNoteFramingSuffix(stripped);
+  stripped = stripped.replace(/^[\s،,؛;:：.!?؟\-]+/u, "").replace(/[\s،,؛;:：.!?؟\-]+$/u, "").trim();
+  if (!stripped) return model || raw.trim();
+  if (!model) return stripped;
+  if (raw.length > 100 && model.length < stripped.length * 0.85) return stripped;
+  return model;
+}
+
 function buildNluPrompt(text, context = {}) {
   const projects = Array.isArray(context.projects) && context.projects.length
     ? context.projects.join("، ")
@@ -366,7 +408,7 @@ function buildNluPrompt(text, context = {}) {
   const system = [
     "You are a Persian intent classifier for a single-user personal assistant bot.",
     "Output ONLY one JSON object, no other text, no markdown fences:",
-    '{"intent": "...", "confidence": 0.0-1.0, "project": "name or null", "body": "text or null", "date_ref": "امروز|فردا|پسفردا|null", "time_ref": "HH:MM or hour text or null", "daypart": "صبح|عصر|شب|cancel|null", "summary_target": "notes|tasks|null"}',
+    '{"intent": "...", "confidence": 0.0-1.0, "project": "name or null", "body": "text or null", "date_ref": "امروز|فردا|پسفردا|null", "time_ref": "HH:MM or hour text or null", "daypart": "صبح|عصر|شب|cancel|null", "summary_target": "notes|tasks|null", "leading_framing": "exact text or null", "trailing_framing": "exact text or null"}',
     "Intents: note, task, reminder, expense, note_list, task_list, project_list, project_create, summary, daypart_reply, chat.",
     "Rules:",
     "- Information/explanation questions (e.g. تفاوت Cloudflare D1 و KV چیه؟, چطور توی پایتون...) are ALWAYS chat.",
@@ -378,6 +420,7 @@ function buildNluPrompt(text, context = {}) {
     "- When a pending hour-ambiguous question is active and the message is a time/daypart clarification or cancellation, even with typos or conversational phrasing (صبخ, واسه صبح, عصری, کنسل), it is daypart_reply with daypart صبح/عصر/شب/cancel.",
     "- Never invent a project: project must be one of the listed names or null. Never invent numbers: the caller validates any amount deterministically.",
     "- body must never contain command framing words like 'یادداشت کن', 'ثبت کن', 'بذار', 'تسک', 'یادداشت', 'برام', 'واسم', 'لطفاً', 'سلام', 'میخوام'. Extract only the meaningful content.",
+    "- For a note, copy framing words verbatim into leading_framing/trailing_framing when they sit at the very start/end of the user text; never summarize, rewrite, or truncate a long body.",
     "- If unsure, return chat with low confidence.",
     `Projects: ${projects}`,
     `Pending question: ${pending}`,
@@ -408,7 +451,7 @@ export async function classifyIntentNlu(env, text, context = {}, opts = {}) {
            { role: "user", content: prompt.user },
          ],
          temperature: 0.1,
-         max_tokens: 240,
+         max_tokens: NLU_MAX_TOKENS,
        }),
       timeout,
     ]);
@@ -428,6 +471,8 @@ export async function classifyIntentNlu(env, text, context = {}, opts = {}) {
       time_ref: str(obj.time_ref),
       daypart: str(obj.daypart),
       summary_target: str(obj.summary_target),
+      leading_framing: str(obj.leading_framing),
+      trailing_framing: str(obj.trailing_framing),
     };
   } catch (err) {
     return { ok: false, reason: err?.message === "nlu timeout" ? "timeout" : "error" };

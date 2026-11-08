@@ -16,6 +16,7 @@ import {
   resolveInterpreterModel,
   extractJsonObject,
   classifyIntentNlu,
+  recoverFullNoteBody,
 } from "../src/intent.js";
 import { runTask, EXECUTOR_NOT_CONFIGURED } from "../src/executor.js";
 import {
@@ -6593,7 +6594,7 @@ if (DatabaseSync) {
   const ret = await runNluBranch(env, o, { now: Date.UTC(2026, 9, 28, 12, 0, 0), remembered: "TOMAN" });
   check(!!aiCalled, "runNluBranch calls env.AI.run");
   check(aiCalled && aiCalled.model === "@cf/meta/llama-3.3-70b-instruct-fp8-fast", `model default: ${JSON.stringify(aiCalled?.model)}`);
-  check(aiCalled && aiCalled.body?.max_tokens === 240 && aiCalled.body?.temperature === 0.1, `params: ${JSON.stringify(aiCalled?.body)}`);
+  check(aiCalled && aiCalled.body?.max_tokens === 512 && aiCalled.body?.temperature === 0.1, `params: ${JSON.stringify(aiCalled?.body)}`);
   check(ret === "handled", `runNluBranch routed: ${ret}`);
 }
 
@@ -6880,6 +6881,35 @@ if (DatabaseSync) {
     check((await decryptVaultValue(env, body)) === "legacy-secret", "A19: bare iv:cipher legacy ciphertext decrypts");
     check((await decryptVaultValue(env, `enc:v1:${body}`)) === "legacy-secret", "A19: existing enc:v1 rows remain readable");
     check((await decryptVaultValue({ VAULT_SECRET: "master-a08" }, current)) === "legacy-secret", "A19: VAULT_SECRET remains a valid fallback key");
+  }
+  // A06: a long voice note survives a truncated NLU body — raw text is canonical.
+  {
+    const { sq, env: baseEnv } = freshA08();
+    const phrase = "امروز جلسه مهمی داشتیم و درباره بودجه و برنامه فردا صحبت کردیم ";
+    const core = phrase.repeat(20).slice(0, 500).trim();
+    const raw = `${core} این رو توی یادداشت‌هام نگه دار`;
+    const truncated = "این خلاصه کوتاه مدل است که باید نادیده گرفته شود";
+    const env = { ...baseEnv, AI: { run: async () => ({ response: JSON.stringify({ intent: "note", confidence: 0.95, body: truncated, leading_framing: null, trailing_framing: "این رو توی یادداشت‌هام نگه دار" }) }) } };
+    const direct = recoverFullNoteBody(raw, truncated, null, "این رو توی یادداشت‌هام نگه دار");
+    check(direct === core, `A06: recoverFullNoteBody keeps the full dictation, not the 50-char model body: ${JSON.stringify({ got: direct.length, want: core.length })}`);
+    const r = await handleDailyText(env, { chatId: 1, userId: 1, text: raw, source: "voice", send: async () => {}, chat: async () => {}, nowMs: Date.UTC(2026, 10, 8, 12, 0, 0) });
+    const saved = sq.prepare("SELECT text, source FROM notes WHERE user_id = ?").all(1);
+    check(r === "handled" && saved.length === 1, `A06: long voice note is handled and stored: ${JSON.stringify({ r, saved })}`);
+    check(saved[0]?.text === core && saved[0]?.source === "voice", `A06: stored body is the complete dictation with source voice: ${JSON.stringify({ len: saved[0]?.text?.length, want: core.length, source: saved[0]?.source })}`);
+  }
+  // A01: keyword mentions inside a long discussion never fire a deterministic write.
+  {
+    const phrase = "امروز درباره گاوصندوق و شماره کارت و ایمیل و جلسه فردا ساعت ۸ صحبت کردیم. ";
+    const para = phrase.repeat(4).slice(0, 200).trim();
+    const c = classifyDaily(para);
+    check(c.intent !== "vault_save" && c.intent !== "reminder" && c.intent !== "task-create", `A01: long discussion is not a keyword write: ${JSON.stringify(c)}`);
+  }
+  // A01: negated commands never create tasks/notes/vault items.
+  {
+    for (const text of ["این کار رو برای فردا ثبت نکن", "این شماره کارت رو ذخیره نکن", "برام تسک نساز", "این یادداشت رو نذار", "این ایمیل رو نفرست"]) {
+      const c = classifyDaily(text);
+      check(!["note", "task-create", "reminder", "expense", "vault_save"].includes(c.intent), `A01: negated command is not actionable (${text}): ${JSON.stringify(c)}`);
+    }
   }
 }
 
