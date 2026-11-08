@@ -73,6 +73,49 @@ function apiErrorStatus(data) {
     "PERMISSION_DENIED", "UNAUTHENTICATED", "INTERNAL", "DEADLINE_EXCEEDED"].includes(status) ? status : null;
 }
 
+// Google RPC error_details.proto: inspect structured quota fields only.
+// Never retain subjects, descriptions, metric IDs, dimensions, or raw messages.
+export function classifyVoiceQuota(data, headers, nowMs = Date.now()) {
+  let daily = false, rate = false, project = false, model = false;
+  let retryAfterSeconds = null;
+  const delay = (seconds) => {
+    if (Number.isFinite(seconds) && seconds >= 0 && seconds <= 604800) {
+      retryAfterSeconds = Math.max(retryAfterSeconds ?? 0, Math.ceil(seconds));
+    }
+  };
+  const header = headers?.get?.("retry-after");
+  if (typeof header === "string") {
+    if (/^\d+$/.test(header.trim())) delay(Number(header));
+    else if (/^[A-Za-z]{3},/.test(header)) {
+      const date = Date.parse(header);
+      if (Number.isFinite(date)) delay(Math.max(0, (date - nowMs) / 1000));
+    }
+  }
+  const details = Array.isArray(data?.error?.details) ? data.error.details : [];
+  for (const item of details.slice(0, 32)) {
+    if (item?.["@type"] === "type.googleapis.com/google.rpc.RetryInfo") {
+      const value = item.retryDelay;
+      if (typeof value === "string" && /^\d+(?:\.\d{1,9})?s$/.test(value)) delay(Number(value.slice(0, -1)));
+    }
+    if (item?.["@type"] !== "type.googleapis.com/google.rpc.QuotaFailure") continue;
+    const violations = Array.isArray(item.violations) ? item.violations : [];
+    for (const v of violations.slice(0, 64)) {
+      const id = [v?.quotaId, v?.quotaMetric].filter((x) => typeof x === "string")
+        .join(" ").toLowerCase().replace(/[_ -]/g, "");
+      daily ||= /perday|daily/.test(id);
+      rate ||= /persecond|perminute|perhour/.test(id);
+      const dimensions = v?.quotaDimensions;
+      const perModel = /permodel/.test(id) || Boolean(dimensions && typeof dimensions === "object"
+        && Object.keys(dimensions).some((k) => /^model(?:_?id)?$/i.test(k)));
+      model ||= perModel;
+      project ||= !perModel && /perproject/.test(id);
+    }
+  }
+  // RetryInfo says when to retry, not which quota was exhausted.
+  return { kind: daily ? "daily" : rate ? "rate" : "unknown",
+    scope: project ? "project" : model ? "model" : "unknown", retryAfterSeconds };
+}
+
 export async function downloadTelegramVoice(env, fileId) {
   let stage = "telegram-info";
   const failed = (status, kind) => {
@@ -94,7 +137,7 @@ export async function downloadTelegramVoice(env, fileId) {
 export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {}) {
   const started = Date.now();
   const key = env?.GEMINI_API_KEY;
-  let failure = null;
+  let failure = null, quotaFailure = null;
   const log = (ok, reason, model = null) => console.log(JSON.stringify({ voiceTranscribe: "gemini-voice", model, ms: Date.now() - started, ok, reason: reason ?? null, failure: ok ? null : failure }));
   if (!key) { log(false, "missing-key"); return { ok: false, reason: "missing-key" }; }
   const mime = String(mimeType || "audio/ogg").split(";")[0].trim();
@@ -113,7 +156,9 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
         return { res, data };
       }, Math.min(cap, remaining()));
       if (!response.res.ok && stage !== "cleanup") {
-        failure = { stage, status: response.res.status, apiStatus: apiErrorStatus(response.data), kind: "http" };
+        failure = { stage, status: response.res.status, apiStatus: apiErrorStatus(response.data), kind: "http",
+          ...(response.res.status === 429 ? { quota: classifyVoiceQuota(response.data, response.res.headers) } : {}) };
+        if (response.res.status === 429 && !quotaFailure) quotaFailure = failure;
         console.warn("voice_stage_fail", { ...failure, elapsedMs: Date.now() - started });
       }
       return response;
@@ -173,7 +218,16 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
           await sleep(Math.min(pollIntervalMs, remaining()));
           ({ res, data } = await request(`${GEMINI_BASE}/v1beta/interactions/${encodeURIComponent(id)}`, { headers }));
         }
-        if (!res.ok) { console.warn("voice_transcribe_fail", { model, status: res.status, apiStatus: apiErrorStatus(data), err: null }); continue; }
+        if (!res.ok) {
+          console.warn("voice_transcribe_fail", { model, status: res.status, apiStatus: apiErrorStatus(data), err: null });
+          // Only explicit project-wide quota evidence suppresses other models.
+          // Model-scoped and unknown limits retain the existing fallback policy.
+          if (res.status === 429 && failure?.quota?.scope === "project") {
+            log(false, "quota", model);
+            return { ok: false, reason: "quota", failure };
+          }
+          continue;
+        }
         failure = null;
         const text = interactions ? interactionTranscript(data) : transcriptText(data);
         if (!text) { console.warn("voice_transcribe_fail", { model, status: res.status, err: data?.status === "in_progress" ? "pending" : "empty", elapsedMs: Date.now() - started }); continue; }
@@ -183,6 +237,8 @@ export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {})
         console.warn("voice_transcribe_fail", { model, status: null, err: err?.message === "voice-timeout" ? "timeout" : "request-failed", elapsedMs: Date.now() - started });
       }
     }
+    // A failed fallback must not hide the original actionable quota response.
+    failure = quotaFailure ?? failure;
     const reason = remaining() <= 0 ? "timeout" : "transcription";
     log(false, reason);
     return { ok: false, reason, failure };
@@ -206,7 +262,18 @@ async function sendVoiceFailure(o, stashId, result) {
   const status = result?.failure?.status;
   let text = VOICE_FAILED_TEXT;
   if (["telegram-info", "telegram-download"].includes(result?.failure?.stage)) text = "دریافت فایل صدا از تلگرام ناموفق بود؛ رونویسی هنوز شروع نشده است. دوباره تلاش کن. [VOICE-DOWNLOAD]";
-  else if (status === 429) text = "محدودیت درخواست یا سهمیهٔ سرویس رونویسی رسیده؛ لطفاً کمی بعد دوباره تلاش کن. [VOICE-429]";
+  else if (status === 429) {
+    const quota = result.failure.quota;
+    const type = quota?.kind === "daily" ? "DAILY" : quota?.kind === "rate" ? "RATE" : "UNKNOWN";
+    const stage = { upload: "UPLOAD", "file-poll": "FILE", interaction: "INTERACTION", generation: "GENERATION" }[result.failure.stage] ?? "GOOGLE";
+    text = type === "DAILY" ? "گوگل اتمام سهمیهٔ روزانهٔ رونویسی را گزارش کرده؛ تلاش پیاپی کمکی نمی‌کند."
+      : type === "RATE" ? "گوگل محدودیت نرخ درخواست رونویسی را گزارش کرده؛ کمی بعد دوباره تلاش کن."
+      : "گوگل خطای محدودیت درخواست یا سهمیه داده؛ نوع محدودیت هنوز مشخص نیست.";
+    if (quota?.scope === "project") text += " دامنهٔ محدودیت: پروژه.";
+    else if (quota?.scope === "model") text += " دامنهٔ محدودیت: مدل.";
+    if (quota?.retryAfterSeconds != null) text += ` زمان پیشنهادی سرویس برای تلاش مجدد: ${quota.retryAfterSeconds} ثانیه.`;
+    text += ` [VOICE-429-${type}/${stage}]`;
+  }
   else if ([500, 502, 503, 504].includes(status)) text = "سرویس رونویسی پاسخ موفق نداد؛ مشکل از نامفهوم بودن صدایت نیست. کمی بعد دوباره تلاش کن. [VOICE-SERVICE]";
   else if ([401, 403].includes(status)) text = "سرویس رونویسی اجازهٔ دسترسی نداد؛ تنظیمات اتصال باید بررسی شود. [VOICE-AUTH]";
   else if (result?.reason === "timeout" || result?.failure?.kind === "timeout") text = "مهلت پردازش صدا تمام شد؛ این به معنی نامفهوم بودن صدایت نیست. دوباره تلاش کن. [VOICE-TIMEOUT]";

@@ -1401,7 +1401,80 @@ if (DatabaseSync) {
   }
 }
 
-import { transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT, VOICE_TOO_LONG_TEXT } from "../src/voice.js";
+import { classifyVoiceQuota, transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT, VOICE_TOO_LONG_TEXT } from "../src/voice.js";
+
+// Structured Google quota diagnostics: no assumptions from free-form messages.
+{
+  const quota = (violations, extra = []) => ({ error: { message: "private", details: [
+    { "@type": "type.googleapis.com/google.rpc.QuotaFailure", violations }, ...extra,
+  ] } });
+  const retry = (retryDelay) => ({ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay });
+  const now = Date.UTC(2026, 10, 7, 12);
+  let q = classifyVoiceQuota(quota([{ quotaId: "GenerateRequestsPerDayPerProjectPerModel", quotaDimensions: { model: "private-model" } }]), null, now);
+  check(q.kind === "daily" && q.scope === "model" && q.retryAfterSeconds === null, "voice quota: real error.details envelope, daily model scope");
+  q = classifyVoiceQuota(quota([{ quotaId: "GenerateRequestsPerMinutePerProject" }], [retry("2.25s")]), new Headers({ "retry-after": "5" }), now);
+  check(q.kind === "rate" && q.scope === "project" && q.retryAfterSeconds === 5, "voice quota: project scope and longest server-supplied wait rounded up");
+  q = classifyVoiceQuota(quota([{ quotaId: "GenerateRequestsPerMinutePerProject", quotaDimensions: { model: "private-model" } }]), null, now);
+  check(q.scope === "model", "voice quota: explicit model dimension prevents false project-wide stop");
+  q = classifyVoiceQuota(quota([{ quotaMetric: "api/requests_per_hour_per_project" }]), new Headers({ "retry-after": new Date(now + 9000).toUTCString() }), now);
+  check(q.kind === "rate" && q.scope === "project" && q.retryAfterSeconds === 9, "voice quota: metric identifiers and HTTP-date Retry-After");
+  q = classifyVoiceQuota({ error: { details: [retry("0.2s")] } }, null, now);
+  check(q.kind === "unknown" && q.scope === "unknown" && q.retryAfterSeconds === 1, "voice quota: RetryInfo alone does not prove minute/daily quota");
+  for (const header of ["12junk", "-5", "Infinity", "99999999999"]) {
+    check(classifyVoiceQuota(null, new Headers({ "retry-after": header }), now).retryAfterSeconds === null, "voice quota: invalid/unbounded wait rejected: " + header);
+  }
+  q = classifyVoiceQuota(quota([{ quotaId: "PerDayPerProject" }, { quotaId: "PerMinutePerProjectPerModel" }]), null, now);
+  check(q.kind === "daily" && q.scope === "project", "voice quota: a proven project violation still blocks model fallback in mixed details");
+  q = classifyVoiceQuota({ error: { message: "daily quota exceeded", details: [{ "@type": "unknown", quotaId: "PerDayPerProject" }] } }, null, now);
+  check(q.kind === "unknown" && q.scope === "unknown", "voice quota: free-form messages and unknown detail types never establish quota scope");
+  check(!JSON.stringify(classifyVoiceQuota(quota([{ subject: "private", description: "private", quotaId: "PerDayPerProject", quotaDimensions: { project: "private" } }]), null)).includes("private"), "voice quota: raw identifiers and descriptions never retained");
+}
+
+// Quota response handling across upload, file readiness, create, and result GET.
+{
+  const originalFetch = global.fetch, originalLog = console.log, originalWarn = console.warn;
+  const env = { GEMINI_API_KEY: "quota-secret", TG_TOKEN: "bot-secret", STATE: fakeKV() };
+  let target, scope, generations, deletes, logs;
+  console.log = console.warn = (...args) => logs.push(JSON.stringify(args));
+  const limited = () => Response.json({ error: { status: "RESOURCE_EXHAUSTED", message: env.GEMINI_API_KEY, details: [
+    { "@type": "type.googleapis.com/google.rpc.QuotaFailure", violations: scope === "unknown" ? [] : [{
+      quotaId: scope === "project" ? "RequestsPerDayPerProject" : "RequestsPerMinutePerProjectPerModel",
+      subject: "private-subject", quotaDimensions: scope === "model" ? { model: "private-model" } : {},
+    }] }, { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "8.5s" },
+  ] } }, { status: 429 });
+  global.fetch = async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path.includes("/file/bot")) return new Response(new Uint8Array([1]));
+    if (String(url).includes("api.telegram.org")) return Response.json({ ok: true, result: { file_path: "voice/test.ogg" } });
+    if (init.method === "DELETE") { deletes++; return Response.json({}); }
+    if (path.includes("/upload/")) return target === "upload" ? limited() : Response.json({ file: { name: "files/quota-test" } });
+    if (path === "/v1beta/files/quota-test") return target === "file" ? limited() : Response.json({ state: "ACTIVE", uri: "https://example/audio" });
+    if (path === "/v1beta/interactions/result-1") return limited();
+    generations++;
+    if (path === "/v1beta/interactions") return target === "result" ? Response.json({ id: "result-1", status: "in_progress" }) : limited();
+    if (target === "allfail") return Response.json({ error: { status: "UNAVAILABLE" } }, { status: 503 });
+    return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: "successful fallback" }] } }] });
+  };
+  try {
+    for (const scenario of [["upload", "project", 0, "UPLOAD"], ["file", "project", 0, "FILE"], ["create", "project", 1, "INTERACTION"], ["result", "project", 1, "INTERACTION"], ["create", "model", 2], ["create", "unknown", 2], ["allfail", "model", 3, "INTERACTION"]]) {
+      [target, scope] = scenario; generations = 0; deletes = 0; logs = [];
+      const sent = [], routed = [];
+      const result = await handleVoice(env, { userId: 42, chatId: 42,
+        voice: { file_id: "private-file", duration: 2 }, transcribeOpts: { pollIntervalMs: 0 },
+        send: async (text, opts) => sent.push({ text, opts }), route: async (text) => routed.push(text),
+      });
+      check(generations === scenario[2], `voice quota: ${target}/${scope} generation count respects proven scope`);
+      check(deletes === (target === "upload" ? 0 : 1), "voice quota: owned uploaded files still cleaned up");
+      if (scenario[3]) {
+        const code = scope === "project" ? "DAILY" : "RATE";
+        check(result === "failed" && routed.length === 0 && sent[0].text.includes(`VOICE-429-${code}/${scenario[3]}`) && sent[0].text.includes("9"), "voice quota: phone-readable type, stage and rounded server wait; fallback errors do not hide first quota");
+        check(sent[0].opts.replyMarkup.inline_keyboard[0][0].callback_data.startsWith("voice:retry:"), "voice quota: retry ownership flow preserved");
+      } else check(result === "routed" && routed.length === 1 && sent.length === 0, "voice quota: model/unknown scope preserves successful fallback");
+      const report = logs.join("") + JSON.stringify(sent);
+      check(![env.GEMINI_API_KEY, env.TG_TOKEN, "private-subject", "private-model", "private-file"].some((x) => report.includes(x)), "voice quota: no secrets or raw quota fields in logs/messages");
+    }
+  } finally { global.fetch = originalFetch; console.log = originalLog; console.warn = originalWarn; }
+}
 
 // Voice API contract regressions run on Node 20 too (no SQLite required).
 {
