@@ -7702,6 +7702,73 @@ if (DatabaseSync) {
   }
 }
 
+// Phase 3.5: Bidirectional PDF engine — isPdfAnalysisRequest, analyze, image->pdf, text->pdf
+{
+  const { isPdfAnalysisRequest, analyzePdfDocument, buildImageToPdfBytes, buildTextPdfOrHtmlReport, parsePdfCreateCommand } = await import("../src/pdf.js");
+  const { handleIncomingFile: hif35, handleVaultFile: hvf35, handleDailyText: hdt35 } = await import("../src/everyday.js");
+  const fakeJpeg35 = new Uint8Array([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x64, 0x00, 0x80, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xff, 0xd9]);
+  const imgPdf35 = buildImageToPdfBytes(fakeJpeg35);
+  const imgPdfStr35 = Buffer.from(imgPdf35).toString("latin1");
+  check(imgPdfStr35.startsWith("%PDF-1.4") && imgPdfStr35.includes("%%EOF"), `3.5: buildImageToPdfBytes valid %PDF-1.4 binary: head=${imgPdfStr35.slice(0, 20)}`);
+  check(isPdfAnalysisRequest("این پی‌دی‌اف رو خلاصه کن", "application/pdf", "scan.pdf") === true, "3.5: isPdfAnalysisRequest detects خلاصه");
+  check(isPdfAnalysisRequest("این پی‌دی‌اف درباره چیه", "application/pdf", "scan.pdf") === true && isPdfAnalysisRequest("متن این فایل رو دربیار", null, "doc.pdf") === true, "3.5: isPdfAnalysisRequest detects درباره/دربیار");
+  check(isPdfAnalysisRequest("در گاوصندوق ذخیره کن", "application/pdf", "scan.pdf") === false && isPdfAnalysisRequest("سلام", "application/pdf", "scan.pdf") === false, "3.5: vault/plain caption is not analysis");
+  check(isPdfAnalysisRequest("خلاصه کن", "image/jpeg", "a.jpg") === false, "3.5: non-PDF is not analysis");
+  const rep35 = buildTextPdfOrHtmlReport("یادداشت", "سلام دنیا");
+  const repStr35 = Buffer.from(rep35.pdfBytes).toString("latin1");
+  check(repStr35.startsWith("%PDF-1.4") && repStr35.includes("%%EOF") && rep35.html.includes('dir="rtl"') && rep35.html.includes('lang="fa"') && rep35.html.includes("@media print"), `3.5: buildTextPdfOrHtmlReport pdf+rtl html: html=${String(rep35.html).slice(0,120)}`);
+  check(parsePdfCreateCommand("این متن رو PDF کن: سلام").isPdfCreate === true && parsePdfCreateCommand("تبدیل به PDF: سلام").isPdfCreate === true && parsePdfCreateCommand("/pdf سلام").text === "سلام" && parsePdfCreateCommand("سلام").isPdfCreate === false, "3.5: parsePdfCreateCommand matches 3 forms");
+  const fakePdf35 = new TextEncoder().encode("%PDF-1.4\n1 0 obj\n<<>>\nstream\nBT /F1 12 Tf (Hello World) Tj ET\nendstream\n%%EOF");
+  const ana35 = await analyzePdfDocument({ STATE: fakeKV() }, { pdfBytes: fakePdf35, prompt: "این پی‌دی‌اف درباره چیه؟", userId: 1, fetchFn: async () => ({ ok: false, json: async () => ({}) }), chatFn: async (t) => { check(String(t).includes("Hello World"), "3.5: extractor passes Hello World to chatFn"); return "خلاصه فارسی: سلام دنیا"; } });
+  check(ana35.ok === true && String(ana35.text).includes("خلاصه فارسی"), `3.5: analyzePdfDocument extractor fallback: ${JSON.stringify(ana35).slice(0,200)}`);
+  if (DatabaseSync) {
+    const sq35 = new DatabaseSync(":memory:");
+    sq35.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq35.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq35.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq35.exec("INSERT INTO users (id, telegram_id) VALUES (4242, '4242')");
+    const base35 = (sql) => { const st = sq35.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    const db35 = { prepare(sql) { return base35(sql); } };
+    const origFetch35 = global.fetch;
+    const fakePdfBuf35 = new TextEncoder().encode("%PDF-1.4\nBT (Hello World) Tj ET\n%%EOF");
+    global.fetch = async (url) => {
+      const u = String(url);
+      if (u.startsWith("https://api.telegram.org/")) {
+        const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+        const method = m ? m[1] : "";
+        if (method === "getFile") return Response.json({ ok: true, result: { file_path: "doc/s35.pdf" } });
+        return Response.json({ ok: true, result: { message_id: 1 } });
+      }
+      if (u.includes("/file/bot")) return new Response(fakePdfBuf35.slice().buffer, { headers: { "content-type": "application/pdf" } });
+      return Response.json({ ok: true });
+    };
+    try {
+      const env35 = { STATE: fakeKV(), DB: db35, TG_TOKEN: "fake-token", VAULT_SECRET: "s35", GEMINI_API_KEY: "gkey35" };
+      const geminiFn35 = async (url) => {
+        if (String(url).includes("generativelanguage.googleapis.com")) return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: "خلاصه فارسی PDF: این کتاب درباره زندگی است." }] } }] }) };
+        return { ok: true, json: async () => ({}) };
+      };
+      const sent35 = [];
+      const handled35 = await hif35(env35, { userId: 4242, chatId: 4242, tgFileId: "pdf-35", fileType: "document", mimeType: "application/pdf", fileName: "scan.pdf", caption: "این پی‌دی‌اف رو خلاصه کن", send: async (t) => { sent35.push(String(t)); }, fetchFn: geminiFn35, chat: async () => { return "fallback"; }, routerCallFn: null });
+      check(handled35 === true && sent35.some((t) => String(t).includes("خلاصه فارسی")), `3.5: PDF summary caption invokes analyzePdfDocument: ${JSON.stringify(sent35)}`);
+      check((await (async () => { try { const r = await listVaultFiles(env35, 4242); return r?.files?.length ?? -1; } catch { return -1; } })()) === 0, "3.5: analysis PDF not blindly vault-archived");
+      const sentV35 = [];
+      const handledV35 = await hvf35(env35, { userId: 4242, chatId: 4242, tgFileId: "pdf-35v", fileType: "document", mimeType: "application/pdf", fileName: "scan.pdf", caption: "در گاوصندوق ذخیره کن", send: async (t) => { sentV35.push(String(t)); } });
+      check(handledV35 === true && sentV35.some((t) => String(t).includes("آرشیو امن")), `3.5: PDF without analysis caption still archives: ${JSON.stringify(sentV35)}`);
+      const docs35 = [];
+      const sentP35 = [];
+      await hif35(env35, { userId: 4242, chatId: 4242, tgFileId: "photo-35", fileType: "photo", kind: "photo", mimeType: "image/jpeg", fileName: null, caption: "تبدیل به PDF", send: async (t) => { sentP35.push(String(t)); }, sendDocument: async (data, opts) => { docs35.push({ data, opts }); } });
+      check(docs35.length === 1 && Buffer.from(docs35[0].data).toString("latin1").startsWith("%PDF-1.4") && Buffer.from(docs35[0].data).toString("latin1").includes("%%EOF"), "3.5: photo -> pdf via sendDocument");
+      const docsD35 = [];
+      const msgsD35 = [];
+      const rD35 = await hdt35(env35, { userId: 4242, chatId: 4242, text: "این متن رو PDF کن: سلام دنیا", send: async (t) => { msgsD35.push(String(t)); }, sendDocument: async (data, opts) => { docsD35.push({ data, opts }); }, chat: async () => {} });
+      check(rD35 === "handled" && docsD35.length === 1 && Buffer.from(docsD35[0].data).toString("latin1").includes("%PDF-1.4"), `3.5: handleDailyText pdf create via sendDocument: r=${rD35} docs=${docsD35.length}`);
+    } finally {
+      global.fetch = origFetch35;
+    }
+  }
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);

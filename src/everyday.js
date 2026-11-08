@@ -10,6 +10,7 @@ import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadDat
 import { encryptVaultValue, decryptVaultValue, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
 import { parseImageGenCommand, generateFreeImage, editImage, analyzeImage, isVisionQuestionCaption, isImageEditCaption } from "./media.js";
 import { CONNECTORS, getConnectorStatuses, setConnectorSecret, getConnectorSecret, renderSetupStatusText } from "./connectors.js";
+import { isPdfAnalysisRequest, analyzePdfDocument, buildImageToPdfBytes, buildTextPdfOrHtmlReport, parsePdfCreateCommand } from "./pdf.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
 export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی مثل /یادداشت، /تسکم، یا /اضافه کردن هزینه به کاربر پیشنهاد نده. کاربر برای ثبت موارد فقط کافی است با زبان طبیعی بنویسد یا ویس بدهد (مثلاً: «یادداشت کن فردا جلسه دارم» یا «امروز ۲۰۰ تومن نون خریدم» یا «خرجای امروز»).";
@@ -2012,6 +2013,24 @@ export async function handleVaultFile(env, o) {
   const cap = typeof caption === "string" ? caption.trim() : "";
   const kind = o.kind || fileType;
   const isPhoto = kind === "photo" || fileType === "photo" || (typeof mimeType === "string" && mimeType.startsWith("image/"));
+  if (cap && isPdfAnalysisRequest(cap, mimeType, fileName)) {
+    const pdfBytesPdf = await fileBytesFromTelegram(env, tgFileId);
+    if (!pdfBytesPdf || !pdfBytesPdf.length) { await send("تحلیل ممکن نشد."); return true; }
+    const resultPdf = await analyzePdfDocument(env, { pdfBytes: pdfBytesPdf, prompt: cap, userId, fetchFn: o.fetchFn, chatFn: typeof o.chat === "function" ? o.chat : o.chatFn, routerCallFn: o.routerCallFn });
+    if (resultPdf && resultPdf.ok && resultPdf.text) await send(resultPdf.text);
+    else await send(resultPdf?.text || resultPdf?.error || "تحلیل ممکن نشد.");
+    return true;
+  }
+  if (isPhoto && cap && /(تبدیل\s+به\s*(?:PDF|پی‌دی‌اف)|پی‌دی‌اف\s+کن|PDF\s+کن|^pdf$)/i.test(cap)) {
+    const photoBytesPdf = await fileBytesFromTelegram(env, tgFileId);
+    if (!photoBytesPdf || !photoBytesPdf.length) { await send("تبدیل به PDF ممکن نشد."); return true; }
+    const pdfBytesOut = buildImageToPdfBytes(photoBytesPdf);
+    let pdfSent = false;
+    if (typeof o.sendDocument === "function") { await o.sendDocument(pdfBytesOut, { filename: "photo.pdf", contentType: "application/pdf" }); pdfSent = true; }
+    else if ((env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN) && chatId) { await sendDocument({ ...env, TG_TOKEN: env.TG_TOKEN || env.TELEGRAM_BOT_TOKEN }, chatId, "photo.pdf", pdfBytesOut, { contentType: "application/pdf" }); pdfSent = true; }
+    if (!pdfSent && typeof send === "function") await send("📄 PDF آماده شد.");
+    return true;
+  }
   if (isPhoto && cap && isImageEditCaption(cap)) {
     const bytes = await fileBytesFromTelegram(env, tgFileId);
     if (!bytes || !bytes.length) { await send("ویرایش تصویر ممکن نشد."); return true; }
@@ -2489,6 +2508,15 @@ export async function handleDailyText(env, o) {
     } else {
       if (typeof o.send === "function") await o.send("❌ تولید تصویر در حال حاضر ناموفق بود؛ دوباره تلاش کن.");
     }
+    return "handled";
+  }
+  const parsedPdf = parsePdfCreateCommand(text);
+  if (parsedPdf && parsedPdf.isPdfCreate && parsedPdf.text) {
+    const reportPdf = buildTextPdfOrHtmlReport(parsedPdf.title || "سند", parsedPdf.bodyText || parsedPdf.text);
+    let pdfSent = false;
+    if (typeof o.sendDocument === "function") { await o.sendDocument(reportPdf.pdfBytes, { filename: "report.pdf", contentType: "application/pdf" }); pdfSent = true; }
+    else if ((env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN) && o.chatId) { await sendDocument({ ...env, TG_TOKEN: env.TG_TOKEN || env.TELEGRAM_BOT_TOKEN }, o.chatId, "report.pdf", reportPdf.pdfBytes, { contentType: "application/pdf" }); pdfSent = true; }
+    if (typeof o.send === "function") await o.send("📄 PDF آماده شد.");
     return "handled";
   }
   // Phase 3-A: name a pending __pending__ vault upload on the next turn
