@@ -6562,7 +6562,7 @@ if (DatabaseSync) {
 }
 
 // D) runNluBranch calls env.AI.run
-try if (DatabaseSync) {
+if (DatabaseSync) {
   const sqlite = (await import('node:sqlite').then(m => new m.DatabaseSync(":memory:")).catch(() => null));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
   sqlite.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
@@ -6636,4 +6636,54 @@ console.log("\n✓ assertهای pipeline 3i برقرار شد.");
   check(cl("امروز ۵۰۰ تومان خرج نکردم").intent === "chat", "negation gate: خرج نکردم is chat, not an expense");
   check(cl("دلار ۶۰۰۰۰ تومان و یورو ۷۰۰۰۰ تومان شده").intent === "chat", "price list without a verb reaches chat");
   check(cl("خرج کردم ۵۰۰ تومان نان و ۲۰۰ تومان آب").intent === "ask" && cl("خرج کردم ۵۰۰ تومان نان و ۲۰۰ تومان آب").question === "amount", "two amounts with a verb ask");
+}
+
+// ── A11: merge hardening — rename guard, file cap, pinned sha ────────────────
+{
+  const world = mockWorld({ prFiles: [{ filename: "src/a.js", previous_filename: ".github/workflows/ci.yml" }] });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "A11: renamed protected file must block merge");
+    const msg = world.calls.telegram.filter((c) => c.method === "sendMessage").at(-1);
+    check(String(msg?.payload?.text ?? "").includes("Blocked"), "A11: rename block reports Blocked");
+    check(world.calls.unexpected === 0, "A11: no unexpected fetch on rename guard");
+  } finally {
+    world.restore();
+  }
+}
+
+{
+  const world = mockWorld();
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await env.STATE.put("dev:active:4242", "1");
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(Boolean(merge), "A11: clean approve merges");
+    check(merge?.body?.sha === "headsha123", `A11: merge pinned to verified head sha: ${JSON.stringify(merge?.body)}`);
+    check(world.calls.unexpected === 0, "A11: no unexpected fetch on pinned merge");
+  } finally {
+    world.restore();
+  }
+}
+
+{
+  const prFiles = Array.from({ length: 100 }, (_, i) => ({ filename: `src/f${i}.js` }));
+  const world = mockWorld({ prFiles });
+  try {
+    const env = newEnv({ GITHUB_DISPATCH_TOKEN: "gh-fake" });
+    await sendTg(env, cbUpdate("dev:approve:7"));
+    const merge = world.calls.github.find((c) => c.method === "PUT" && c.url.endsWith("/merge"));
+    check(!merge, "A11: 100-file response must fail closed");
+  } finally {
+    world.restore();
+  }
+}
+
+if (failures.length) {
+  console.error("\nFailures found:");
+  for (const f of failures) console.error(`  - ${f}`);
+  process.exit(1);
 }

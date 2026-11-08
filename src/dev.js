@@ -160,10 +160,20 @@ export function isForbiddenPath(path) {
 
 export function pathGuardViolations(files) {
   const list = Array.isArray(files) ? files : [];
-  return list
-    .map((f) => (typeof f === "string" ? f : f?.filename ?? f?.path ?? ""))
-    .filter(Boolean)
-    .filter(isForbiddenPath);
+  const paths = [];
+  for (const f of list) {
+    if (typeof f === "string") {
+      paths.push(f);
+      continue;
+    }
+    if (!f || typeof f !== "object") continue;
+    if (typeof f.filename === "string") paths.push(f.filename);
+    if (typeof f.path === "string") paths.push(f.path);
+    if (typeof f.previous_filename === "string" && f.previous_filename) {
+      paths.push(f.previous_filename);
+    }
+  }
+  return paths.filter(Boolean).filter(isForbiddenPath);
 }
 
 // The official action creates `opencode/dispatch-*`; we also accept an explicit
@@ -647,6 +657,15 @@ export async function approveDevPR(env, prNumber) {
       };
     }
     const files = await filesRes.json();
+    if (!Array.isArray(files) || files.length >= 100) {
+      return {
+        ok: false,
+        code: "too_many_files",
+        text:
+          `⛔ تعداد فایل‌های PR به سقف صفحه رسیده است (${Array.isArray(files) ? files.length : "?"} ≥ 100).\n` +
+          `Blocked: PR file list hit the fetch cap; refusing to merge without inspecting every file.`,
+      };
+    }
     const violations = pathGuardViolations(files);
     if (violations.length) {
       return {
@@ -723,7 +742,7 @@ export async function approveDevPR(env, prNumber) {
     const mergeRes = await githubFetch(env, `/repos/${repo}/pulls/${Number(prNumber)}/merge`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ merge_method: "squash" }),
+      body: JSON.stringify({ merge_method: "squash", sha: ci.sha }),
     });
     if (!mergeRes.ok) {
       return {
