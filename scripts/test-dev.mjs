@@ -7023,7 +7023,7 @@ if (DatabaseSync) {
 
 // ── A07/A15: pending vault file must not hijack an explicit note command, ──
 // ── and the naming reply must not claim Google Docs when Google is unconfigured ──
-{
+if (DatabaseSync) {
   const mkS2 = () => { const s = { sent: [] }; s.send = async (text, sopts = {}) => { s.sent.push({ ...sopts, text: String(text) }); return { ok: true }; }; return s; };
   const freshA07 = () => {
     const sq = new DatabaseSync(":memory:");
