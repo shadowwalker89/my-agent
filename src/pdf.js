@@ -1,6 +1,7 @@
 // Phase 3.5: Bidirectional PDF engine — read/translate PDFs + generate PDFs. Zero external deps.
 import { getConnectorSecret } from "./connectors.js";
-function bytesToB64(b) { const a = b instanceof Uint8Array ? b : new Uint8Array(b || []); if (typeof Buffer !== "undefined") { try { return Buffer.from(a).toString("base64"); } catch {} } let s = ""; for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]); return typeof btoa === "function" ? btoa(s) : s; }
+export function bytesToBase64(b) { const a = b instanceof Uint8Array ? b : new Uint8Array(b || []); if (typeof Buffer !== "undefined") { try { return Buffer.from(a).toString("base64"); } catch {} } let s = ""; for (let i = 0; i < a.length; i += 8192) s += String.fromCharCode.apply(null, a.subarray(i, i + 8192)); return typeof btoa === "function" ? btoa(s) : s; }
+function bytesToB64(b) { return bytesToBase64(b); }
 function enc(s) { return new TextEncoder().encode(s); }
 async function resolveKey(env, uid, cid, fb) { try { const v = await getConnectorSecret(env, uid, cid); if (typeof v === "string" && v) return v; } catch {} const e = env?.[fb]; return typeof e === "string" && e ? e : null; }
 async function safeJson(r) { try { if (typeof r?.json === "function") return await r.json(); } catch {} try { if (typeof r?.text === "function") { const t = await r.text(); return t ? JSON.parse(t) : null; } } catch {} return null; }
@@ -9,22 +10,115 @@ function pdfEsc(s) { return String(s ?? "").replace(/\\/g, "\\\\").replace(/\(/g
 function chatText(out) { if (!out) return ""; if (typeof out === "string") return out.trim(); if (typeof out === "object") { const t = out.text || out.finalText || out.answer || out?.data?.choices?.[0]?.message?.content || out?.data?.message?.content || ""; if (typeof t === "string" && t.trim()) return t.trim(); if (t && typeof t === "object") { try { return String(t).trim(); } catch {} } } try { return String(out).trim(); } catch { return ""; } }
 function latin1FromBytes(bytes) {
   const a = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
-  let raw = ""; for (let i = 0; i < a.length; i += 4096) raw += String.fromCharCode.apply(null, a.subarray(i, i + 4096));
+  let raw = "";
+  for (let i = 0; i < a.length; i += 8192) raw += String.fromCharCode.apply(null, a.subarray(i, i + 8192));
   return raw;
 }
-function tokensFromRawText(raw) {
-  const toks = [];
-  for (const m of raw.matchAll(/\(((?:[^()\\]|\\.)*)\)/g)) { let t = m[1].replace(/\\n/g, " ").replace(/\\r/g, " ").replace(/\\t/g, " ").replace(/\\\(/g, "(").replace(/\\\)/g, ")").replace(/\\\\/g, "\\").trim(); if (t.length >= 2 && /[A-Za-z0-9\u0600-\u06FF]/.test(t) && !/^(BT|ET|Tf|Td|stream|endstream)$/.test(t)) toks.push(t); }
-  for (const m of raw.matchAll(/<([0-9A-Fa-f\s]{4,})>/g)) { let hx = m[1].replace(/\s+/g, ""); if (hx.length % 2) hx = hx.slice(0, -1); if (hx.length < 4) continue; const bb = new Uint8Array(hx.length / 2); for (let j = 0; j < bb.length; j++) bb[j] = parseInt(hx.slice(j * 2, j * 2 + 2), 16); let s = ""; if (/^FEFF/i.test(hx)) { for (let k = 2; k < bb.length; k += 2) s += String.fromCharCode((bb[k] << 8) | bb[k + 1]); } else { let u = ""; for (let k = 0; k + 1 < bb.length; k += 2) u += String.fromCharCode((bb[k] << 8) | bb[k + 1]); const plausible = u.length >= 2 && /[A-Za-z0-9\u0600-\u06FF]/.test(u) && (u.charCodeAt(0) > 255 || bb[0] === 0 || /[\u0600-\u06FF]/.test(u)); if (plausible) s = u; else { for (let k = 0; k < bb.length; k++) s += String.fromCharCode(bb[k]); if (!/[A-Za-z0-9\u0600-\u06FF]/.test(s)) s = ""; } } s = s.replace(/\0/g, "").trim(); if (s.length >= 2 && /[A-Za-z0-9\u0600-\u06FF]/.test(s)) toks.push(s); }
-  return toks;
+export const SCANNED_PDF_MESSAGE = "این PDF از تصاویر اسکن‌شده تشکیل شده و لایهٔ متن قابل استخراج ندارد؛ لطفاً نسخهٔ متنی یا OCR‌شده را بفرست.";
+function hexToUnicode(hex) {
+  let h = String(hex || "").replace(/\s+/g, "");
+  if (!h) return "";
+  if (h.length % 2) h = "0" + h;
+  let out = "";
+  if (h.length >= 4) {
+    for (let i = 0; i + 3 < h.length; i += 4) out += String.fromCharCode(parseInt(h.slice(i, i + 4), 16));
+    if (h.length % 4 === 2) out += String.fromCharCode(parseInt(h.slice(-2), 16));
+  } else {
+    out = String.fromCharCode(parseInt(h, 16));
+  }
+  return out.replace(/\0/g, "");
 }
+function normGlyphKey(hex) { return String(hex || "").replace(/\s+/g, "").toUpperCase(); }
+function parseCMapInto(map, text) {
+  const src = String(text || "");
+  for (const block of src.matchAll(/beginbfchar([\s\S]*?)endbfchar/g)) {
+    for (const m of block[1].matchAll(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g)) {
+      const k = normGlyphKey(m[1]); const v = hexToUnicode(m[2]);
+      if (k && v) map.set(k, v);
+    }
+  }
+  for (const block of src.matchAll(/beginbfrange([\s\S]*?)endbfrange/g)) {
+    for (const m of block[1].matchAll(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:<([0-9A-Fa-f]+)>|\[([\s\S]*?)\])/g)) {
+      const start = parseInt(m[1], 16); const end = parseInt(m[2], 16);
+      const width = Math.max(2, normGlyphKey(m[1]).length);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end < start || end - start > 65535) continue;
+      if (m[4] != null) {
+        const vals = [...m[4].matchAll(/<([0-9A-Fa-f]+)>/g)].map((x) => hexToUnicode(x[1]));
+        for (let c = start; c <= end && c - start < vals.length; c++) map.set(c.toString(16).toUpperCase().padStart(width, "0"), vals[c - start]);
+      } else {
+        const base = m[3];
+        const baseVal = parseInt(base.slice(-4), 16);
+        for (let c = start; c <= end; c++) {
+          const dst = (baseVal + (c - start)).toString(16).toUpperCase().padStart(base.length, "0");
+          const v = hexToUnicode(dst); if (v) map.set(c.toString(16).toUpperCase().padStart(width, "0"), v);
+        }
+      }
+    }
+  }
+  return map;
+}
+function decodePdfLiteral(raw) {
+  return String(raw || "").replace(/\\(\r\n|\n|\r)/g, "").replace(/\\([0-7]{1,3}|.)/g, (all, g) => {
+    if (/^[0-7]+$/.test(g)) return String.fromCharCode(parseInt(g, 8) & 0xff);
+    switch (g) { case "n": return "\n"; case "r": return "\r"; case "t": return "\t"; case "b": return "\b"; case "f": return "\f"; default: return g; }
+  });
+}
+function chooseGlyphWidth(hexLen, map) {
+  if (!map || !map.size) return hexLen % 4 === 0 ? 4 : 2;
+  let has4 = false; let has2 = false;
+  for (const k of map.keys()) { if (k.length === 4) has4 = true; else if (k.length === 2) has2 = true; }
+  if (hexLen % 4 === 0 && has4) return 4;
+  if (hexLen % 2 === 0 && has2) return 2;
+  return hexLen % 4 === 0 ? 4 : 2;
+}
+function decodeHexGlyphs(hex, map) {
+  const clean = String(hex || "").replace(/\s+/g, "");
+  if (!clean || clean.length % 2) return "";
+  const width = chooseGlyphWidth(clean.length, map);
+  let out = "";
+  for (let i = 0; i < clean.length; i += width) {
+    const chunk = clean.slice(i, i + width); if (chunk.length < width) break;
+    const key = chunk.toUpperCase();
+    if (map && map.has(key)) { out += map.get(key); continue; }
+    if (width >= 4) {
+      const u = parseInt(chunk.slice(0, 2), 16) * 256 + parseInt(chunk.slice(2, 4), 16);
+      if (u >= 0x20 && u !== 0xfffd && u !== 0x0000) out += String.fromCharCode(u);
+    } else {
+      const c = parseInt(chunk, 16);
+      if (c >= 0x20 && c !== 0x7f) out += String.fromCharCode(c);
+    }
+  }
+  return out;
+}
+const PDF_JUNK_TOKEN = /^(?:obj|endobj|stream|endstream|FlateDecode|BitsPerComponent|xref|trailer|startxref|BT|ET|Tj|TJ|Tf|Td|TD|Tm|T\*|cm|rg|RG|q|Q)$/;
+function extractContentText(content, glyphMap) {
+  const src = String(content || "");
+  const segments = [];
+  for (const seg of src.matchAll(/\bBT\b([\s\S]*?)\bET\b/g)) segments.push(seg[1]);
+  if (!segments.length) return "";
+  const parts = [];
+  const push = (t, kind) => {
+    const s = String(t || "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ").trim();
+    if (s && !PDF_JUNK_TOKEN.test(s)) parts.push({ text: s, kind });
+  };
+  for (const seg of segments) {
+    for (const m of seg.matchAll(/\(((?:[^()\\]|\\.)*)\)/g)) push(decodePdfLiteral(m[1]), "lit");
+    for (const m of seg.matchAll(/<(?!<)([0-9A-Fa-f\s]+)>/g)) push(decodeHexGlyphs(m[1], glyphMap), "hex");
+  }
+  let out = "";
+  let lastKind = "";
+  for (const p of parts) {
+    if (!out) out = p.text;
+    else out += p.kind === "hex" && lastKind === "hex" ? p.text : " " + p.text;
+    lastKind = p.kind;
+  }
+  return out.replace(/[ \t]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
+}
+function readableCount(s) { return (String(s || "").match(/[A-Za-z0-9\u0600-\u06FF]/g) || []).length; }
 function uniqText(toks) {
-  const seen = new Set(); const uniq = toks.filter((t) => { const k = t.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
-  return uniq.join("\n").replace(/\s+\n/g, "\n").trim().slice(0, 12000);
-}
-function extractPdfText(bytes) {
-  const a = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []); if (!a.length) return "";
-  return uniqText(tokensFromRawText(latin1FromBytes(a)));
+  const seen = new Set();
+  const uniq = toks.filter((t) => { const k = String(t).toLowerCase(); if (!k || seen.has(k)) return false; seen.add(k); return true; });
+  return uniq.join("\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim().slice(0, 12000);
 }
 async function inflateBytes(bytes, format, timeoutMs = 3000) {
   if (typeof DecompressionStream !== "function" || typeof Response !== "function") return null;
@@ -44,28 +138,54 @@ async function inflateBytes(bytes, format, timeoutMs = 3000) {
 export async function extractTextFromPdfBytes(pdfBytes) {
   const a = pdfBytes instanceof Uint8Array ? pdfBytes : new Uint8Array(pdfBytes || []);
   if (!a.length) return "";
-  const raw = latin1FromBytes(a);
-  const toks = tokensFromRawText(raw);
+  // latin1 is 1:1 with byte indices, so it is only used to LOCATE offsets.
+  // The bytes handed to the decompressor are always the raw subarray.
+  const latin = latin1FromBytes(a);
   const re = /\bstream\r?\n/g;
+  const decoded = [];
   let m; let count = 0;
-  while ((m = re.exec(raw)) && count < 80) {
+  while ((m = re.exec(latin)) && count < 150) {
     count++;
     const start = m.index + m[0].length;
-    const end = raw.indexOf("endstream", start);
+    const end = latin.indexOf("endstream", start);
     if (end < 0) continue;
-    const data = raw.slice(start, end).replace(/\r?\n$/, "");
+    const objIdx = latin.lastIndexOf(" obj", m.index);
+    const header = latin.slice(objIdx >= 0 ? objIdx : Math.max(0, m.index - 300), m.index);
     re.lastIndex = end + 9;
-    if (!data.length || data.length > 3000000) continue;
-    const sb = new Uint8Array(data.length);
-    for (let i = 0; i < data.length; i++) sb[i] = data.charCodeAt(i) & 0xff;
+    if (end - start < 1 || end - start > 4000000) continue;
+    // Never extract text from font, image or xref binary streams.
+    if (/\/(?:Subtype\s*\/Image|FontFile|Subtype\s*\/Type1C|Subtype\s*\/CIDFontType|Type\s*\/XRef)/.test(header)) continue;
+    let e = end;
+    while (e > start && (a[e - 1] === 0x0a || a[e - 1] === 0x0d)) e--;
+    const rawBytes = a.subarray(start, e);
+    if (!rawBytes.length) continue;
     let out = null;
-    for (const fmt of ["deflate", "deflate-raw"]) {
-      out = await inflateBytes(sb, fmt, 3000);
-      if (out && out.length) break;
+    const wantsFlate = /FlateDecode/.test(header);
+    if (wantsFlate || rawBytes[0] === 0x78) {
+      for (const fmt of ["deflate", "deflate-raw"]) {
+        out = await inflateBytes(rawBytes, fmt, 3000);
+        if (out && out.length) break;
+      }
     }
-    if (out && out.length) toks.push(...tokensFromRawText(latin1FromBytes(out)));
+    if (!out && !wantsFlate) out = rawBytes;
+    if (out && out.length) decoded.push(latin1FromBytes(out));
   }
-  return uniqText(toks) || extractPdfText(a);
+  const glyphMap = new Map();
+  for (const text of decoded) if (/beginbf(?:char|range)/.test(text)) parseCMapInto(glyphMap, text);
+  const toks = [];
+  let sawTextOps = false;
+  for (const text of decoded) {
+    if (/beginbf(?:char|range)/.test(text)) continue;
+    const t = extractContentText(text, glyphMap);
+    if (t) { sawTextOps = true; toks.push(t); }
+  }
+  if (!sawTextOps && count === 0) {
+    const t = extractContentText(latin, glyphMap);
+    if (t) { sawTextOps = true; toks.push(t); }
+  }
+  const out = uniqText(toks);
+  if (!out || (readableCount(out) < 15 && !sawTextOps)) return SCANNED_PDF_MESSAGE;
+  return out;
 }
 function buildPdf(parts) {
   const out = [enc("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")]; const offs = [0]; let pos = out[0].length;
@@ -111,6 +231,7 @@ export async function analyzePdfDocument(env, opts = {}) {
     for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) { try { const res = await fn("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + key, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: full }, { inlineData: { mimeType: "application/pdf", data: b64 } }] }] }) }); if (res?.ok) { const js = await safeJson(res); const text = (js?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim(); if (text) return { ok: true, text }; } } catch {} }
   }
   const ext = await extractTextFromPdfBytes(pdfBytes); if (!ext) return { ok: false, error: "متن قابل استخراج نیست" };
+  if (ext === SCANNED_PDF_MESSAGE) return { ok: true, text: SCANNED_PDF_MESSAGE };
   const chatFn = opts.chatFn || opts.chat || null; const router = opts.routerCallFn || null; const full2 = prompt + "\n\nمتن استخراج‌شده از PDF:\n" + ext.slice(0, 8000) + "\n\nپاسخ را به فارسی روان، خلاصه و دقیق بده.";
   if (typeof chatFn === "function") { try { const out = await chatFn(full2, { saveText: "", noHistory: true }); const t = chatText(out); if (t) return { ok: true, text: t }; } catch {} }
   if (typeof router === "function") { try { const out3 = await router({ model: "chat", messages: [{ role: "user", content: full2 }] }); const t3 = chatText(out3); if (t3) return { ok: true, text: t3 }; } catch {} }

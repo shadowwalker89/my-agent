@@ -35,18 +35,24 @@ function b64ToBytes(b64) {
   return null;
 }
 
-function bytesToB64(bytes) {
+export function bytesToBase64(bytes) {
   if (!bytes) return "";
-  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   if (typeof Buffer !== "undefined") {
     try {
-      return Buffer.from(arr).toString("base64");
+      return Buffer.from(u8).toString("base64");
     } catch {}
   }
   let bin = "";
-  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+  for (let i = 0; i < u8.length; i += 8192) {
+    bin += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+  }
   if (typeof btoa === "function") return btoa(bin);
   return bin;
+}
+
+function bytesToB64(bytes) {
+  return bytesToBase64(bytes);
 }
 
 async function toBytes(out) {
@@ -163,6 +169,10 @@ function extractNvidiaImage(json) {
     const b = json.artifacts[0]?.base64 || json.artifacts[0]?.image || json.artifacts[0]?.data;
     if (typeof b === "string" && b) return b;
   }
+  if (Array.isArray(json) && json[0]) {
+    const b = json[0]?.base64 || json[0]?.image || json[0]?.data;
+    if (typeof b === "string" && b) return b;
+  }
   return null;
 }
 
@@ -174,59 +184,85 @@ function timeoutSignal(ms) {
   return undefined;
 }
 
+const FA_IMAGE_WORDS = [
+  ["آینده‌نگر", "futuristic"], ["آینده نگر", "futuristic"], ["آینده", "futuristic"],
+  ["خودروی", "car"], ["خودرو", "car"], ["ماشین", "car"],
+  ["خیابان‌های", "streets"], ["خیابان های", "streets"], ["خیابان", "street"],
+  ["تهران", "Tehran"], ["عکس", "image"], ["تصویر", "image"],
+  ["سگ", "dog"], ["گربه", "cat"], ["اسب", "horse"], ["پرنده", "bird"], ["ماهی", "fish"],
+  ["درخت", "tree"], ["جنگل", "forest"], ["کوه", "mountain"], ["دریا", "sea"], ["آسمان", "sky"],
+  ["شهر", "city"], ["روستا", "village"], ["خانه", "house"], ["مرد", "man"], ["زن", "woman"],
+  ["دختر", "girl"], ["پسر", "boy"], ["کودک", "child"], ["غذا", "food"], ["قهوه", "coffee"],
+  ["گل", "flower"], ["رنگارنگ", "colorful"], ["زیبا", "beautiful"], ["بزرگ", "big"], ["کوچک", "small"],
+  ["شب", "night"], ["روز", "day"], ["غروب", "sunset"], ["طلوع", "sunrise"], ["باران", "rain"], ["برف", "snow"],
+];
+function fallbackEnglishPrompt(prompt) {
+  let s = String(prompt || "");
+  if (!PERSIAN_RE.test(s)) return s.trim() || "abstract colorful digital art";
+  for (const [fa, en] of FA_IMAGE_WORDS) s = s.split(fa).join(" " + en + " ");
+  s = s.replace(/[\u0600-\u06FF\u200C\u200D]+/g, " ").replace(/[^\x20-\x7E]+/g, " ").replace(/\s+/g, " ").trim();
+  return s || "abstract colorful digital art";
+}
+
 // Pollinations and several free endpoints block non-browser user agents from
 // Workers, and Persian prompts generate poorly. Translate to English via a
 // caller-supplied translateFn, NVIDIA (the preferred live key), or Gemini.
-// Always fall back to the original text when translation is unavailable.
+// If translation fails, a built-in dictionary fallback guarantees the image
+// providers never receive raw Persian characters.
 async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
-  if (!PERSIAN_RE.test(prompt) || typeof fn !== "function") return prompt;
+  if (!PERSIAN_RE.test(prompt)) return prompt;
   if (typeof opts.translateFn === "function") {
     try { const t = await opts.translateFn(prompt); if (typeof t === "string" && t.trim() && !PERSIAN_RE.test(t)) return t.trim(); } catch {}
   }
-  try {
-    const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
-    if (nvidiaKey) {
-      const res = await fn("https://integrate.api.nvidia.com/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}` },
-        body: JSON.stringify({ model: "meta/llama-3.1-70b-instruct", messages: [{ role: "user", content: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }], max_tokens: 120, temperature: 0.2 }),
-        signal: timeoutSignal(3000),
-      });
-      if (res?.ok) {
-        const json = await safeJson(res);
-        const text = json?.choices?.[0]?.message?.content;
-        if (typeof text === "string" && text.trim()) return text.trim();
+  if (typeof fn === "function") {
+    try {
+      const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
+      if (nvidiaKey) {
+        const res = await fn("https://integrate.api.nvidia.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}` },
+          body: JSON.stringify({ model: "meta/llama-3.1-70b-instruct", messages: [{ role: "user", content: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }], max_tokens: 120, temperature: 0.2 }),
+          signal: timeoutSignal(3000),
+        });
+        if (res?.ok) {
+          const json = await safeJson(res);
+          const text = json?.choices?.[0]?.message?.content;
+          if (typeof text === "string" && text.trim() && !PERSIAN_RE.test(text)) return text.trim();
+        }
       }
+    } catch {}
+    const key = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
+    if (key) {
+      try {
+        const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }] }],
+            generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
+          }),
+          signal: timeoutSignal(4000),
+        });
+        if (res?.ok) {
+          const json = await safeJson(res);
+          const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join(" ").trim();
+          if (text && !PERSIAN_RE.test(text)) return text;
+        }
+      } catch {}
     }
-  } catch {}
-  const key = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
-  if (!key) return prompt;
-  try {
-    const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }] }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
-      }),
-      signal: timeoutSignal(4000),
-    });
-    if (!res?.ok) return prompt;
-    const json = await safeJson(res);
-    const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join(" ").trim();
-    return text || prompt;
-  } catch {
-    return prompt;
   }
+  return fallbackEnglishPrompt(prompt);
 }
 
 export async function generateFreeImage(env, prompt, opts = {}) {
   const clean = String(prompt ?? "").trim();
-  if (!clean) return { ok: false, error: "image_gen_failed" };
+  const diagErrors = [];
+  if (!clean) return { ok: false, error: "image_gen_failed", diagErrors };
   const fn = resolveFetch(opts);
   const userId = opts.userId ?? null;
-  if (typeof fn !== "function") return { ok: false, error: "image_gen_failed" };
-  const visual = await toEnglishImagePrompt(env, userId, clean, fn, opts);
+  if (typeof fn !== "function") return { ok: false, error: "image_gen_failed", diagErrors: ["fetch_unavailable"] };
+  const translated = await toEnglishImagePrompt(env, userId, clean, fn, opts);
+  const visual = PERSIAN_RE.test(translated) ? fallbackEnglishPrompt(translated) : translated;
 
   try {
     const togetherKey = await resolveKey(env, userId, "together", "TOGETHER_API_KEY");
@@ -243,17 +279,20 @@ export async function generateFreeImage(env, prompt, opts = {}) {
           const b64 = extractTogetherImage(json);
           const bytes = b64 ? b64ToBytes(b64) : null;
           if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "together" };
+          diagErrors.push("together:empty");
+        } else {
+          diagErrors.push("together:" + (res?.status || "not_ok"));
         }
-      } catch {}
+      } catch (e) { diagErrors.push("together:" + (e?.message || "error")); }
     }
-  } catch {}
+  } catch (e) { diagErrors.push("together:" + (e?.message || "error")); }
 
   try {
     const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
     if (nvidiaKey) {
-      const tryNvidia = async (body) => {
+      const tryNvidia = async (url, body, label) => {
         try {
-          const res = await fn("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", {
+          const res = await fn(url, {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}`, Accept: "application/json" },
             body: JSON.stringify(body),
@@ -264,15 +303,18 @@ export async function generateFreeImage(env, prompt, opts = {}) {
             const b64 = extractNvidiaImage(json);
             const bytes = b64 ? b64ToBytes(b64) : null;
             if (bytes && bytes.length) return bytes;
+            diagErrors.push(label + ":empty");
+          } else {
+            diagErrors.push(label + ":" + (res?.status || "not_ok"));
           }
-        } catch {}
+        } catch (e) { diagErrors.push(label + ":" + (e?.message || "error")); }
         return null;
       };
-      let nbytes = await tryNvidia({ prompt: visual, width: 1024, height: 1024, steps: 4 });
-      if (!nbytes) nbytes = await tryNvidia({ prompt: visual });
+      let nbytes = await tryNvidia("https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-3-medium", { prompt: visual, cfg_scale: 5, aspect_ratio: "1:1", seed: 0, steps: 25 }, "nvidia-sd3");
+      if (!nbytes) nbytes = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual, width: 1024, height: 1024, seed: 0, steps: 4 }, "nvidia-flux");
       if (nbytes) return { ok: true, bytes: nbytes, mimeType: "image/png", provider: "nvidia" };
     }
-  } catch {}
+  } catch (e) { diagErrors.push("nvidia:" + (e?.message || "error")); }
 
   try {
     const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
@@ -292,10 +334,13 @@ export async function generateFreeImage(env, prompt, opts = {}) {
           const b64 = extractGeminiImage(json);
           const bytes = b64 ? b64ToBytes(b64) : null;
           if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "gemini" };
+          diagErrors.push("gemini:empty");
+        } else {
+          diagErrors.push("gemini:" + (res?.status || "not_ok"));
         }
-      } catch {}
+      } catch (e) { diagErrors.push("gemini:" + (e?.message || "error")); }
     }
-  } catch {}
+  } catch (e) { diagErrors.push("gemini:" + (e?.message || "error")); }
 
   try {
     const hfKey = await resolveKey(env, userId, "huggingface", "HF_TOKEN");
@@ -311,23 +356,38 @@ export async function generateFreeImage(env, prompt, opts = {}) {
           const buf = await res.arrayBuffer();
           const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
           if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "huggingface" };
+          diagErrors.push("huggingface:empty");
+        } else {
+          diagErrors.push("huggingface:" + (res?.status || "not_ok"));
         }
-      } catch {}
+      } catch (e) { diagErrors.push("huggingface:" + (e?.message || "error")); }
     }
-  } catch {}
+  } catch (e) { diagErrors.push("huggingface:" + (e?.message || "error")); }
 
   try {
-    let visualForUrl = visual;
-    if (PERSIAN_RE.test(visualForUrl)) visualForUrl = visualForUrl.replace(/[\u0600-\u06FF\u200C\u200D]+/g, " ").replace(/\s+/g, " ").trim() || "abstract colorful art";
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(visualForUrl)}?width=768&height=768&nologo=true`;
-    const res = await fn(url, { headers: { "User-Agent": "Mozilla/5.0", Accept: "image/*" }, signal: timeoutSignal(10000) });
+    const visualForUrl = PERSIAN_RE.test(visual) ? fallbackEnglishPrompt(visual) : visual;
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(visualForUrl)}?width=768&height=768&nologo=true&seed=42`;
+    const res = await fn(url, { headers: { "User-Agent": "Mozilla/5.0", Accept: "image/*" }, redirect: "follow", signal: timeoutSignal(10000) });
     if (res?.ok) {
       const buf = await res.arrayBuffer();
       const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
       if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/jpeg", provider: "pollinations" };
+      diagErrors.push("pollinations:empty");
+    } else {
+      diagErrors.push("pollinations:" + (res?.status || "not_ok"));
     }
-  } catch {}
-  return { ok: false, error: "image_gen_failed" };
+  } catch (e) { diagErrors.push("pollinations:" + (e?.message || "error")); }
+
+  if (!opts.disableCfFallback && env?.AI && typeof env.AI.run === "function") {
+    try {
+      const out = await env.AI.run("@cf/bytedance/stable-diffusion-xl-lightning", { prompt: visual });
+      const bytes = await toBytes(out);
+      if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "cloudflare" };
+      diagErrors.push("cloudflare:empty");
+    } catch (e) { diagErrors.push("cloudflare:" + (e?.message || "error")); }
+  }
+
+  return { ok: false, error: "image_gen_failed", diagErrors };
 }
 
 export function isImageEditCaption(caption) {
@@ -398,94 +458,100 @@ export async function analyzeImage(env, opts = {}) {
   const userId = opts.userId ?? null;
   const fn = resolveFetch(opts);
   const routerCallFn = opts.routerCallFn ?? null;
-  if (!imageBytes) return { ok: false, error: "image_gen_failed", text: "تحلیل تصویر ممکن نشد؛ هیچ تصویری دریافت نشد." };
-
-  try {
-    const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
-    if (geminiKey && typeof fn === "function") {
-      const b64 = bytesToB64(imageBytes);
-      const geminiSignal = geminiKey.startsWith("AIza") ? undefined : timeoutSignal(4000);
-      for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) {
-        try {
-          const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ role: "user", parts: [{ text: prompt }, { inlineData: { mimeType, data: b64 } }] }],
-            }),
-            signal: geminiSignal,
-          });
-          if (res?.ok) {
-            const json = await safeJson(res);
-            const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
-            if (text) return { ok: true, text };
-          }
-        } catch {}
-      }
-    }
-  } catch {}
-
-  try {
-    const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
-    if (nvidiaKey && typeof fn === "function") {
-      const b64 = bytesToB64(imageBytes);
-      const dataUri = `data:${mimeType || "image/jpeg"};base64,${b64}`;
-      for (const model of ["meta/llama-3.2-90b-vision-instruct", "nvidia/nemotron-3.5-super-vl-120b-a12b"]) {
-        try {
-          const res = await fn("https://integrate.api.nvidia.com/v1/chat/completions", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}` },
-            body: JSON.stringify({
-              model,
-              messages: [{ role: "user", content: [
-                { type: "text", text: "به فارسی دقیق به این سوال درباره تصویر پاسخ بده: " + prompt },
-                { type: "image_url", image_url: { url: dataUri } },
-              ] }],
-              max_tokens: 600,
-            }),
-            signal: timeoutSignal(12000),
-          });
-          if (res?.ok) {
-            const json = await safeJson(res);
-            const text = json?.choices?.[0]?.message?.content;
-            if (typeof text === "string" && text.trim()) return { ok: true, text: text.trim() };
-          }
-        } catch {}
-      }
-    }
-  } catch {}
+  const errors = [];
+  if (!imageBytes) return { ok: false, error: "no_image", text: "تحلیل تصویر ممکن نشد؛ هیچ تصویری دریافت نشد." };
+  const b64 = bytesToBase64(imageBytes);
+  const dataUri = `data:${mimeType || "image/jpeg"};base64,${b64}`;
 
   if (typeof routerCallFn === "function") {
     try {
-      const b64 = bytesToB64(imageBytes);
-      const dataUri = `data:${mimeType};base64,${b64}`;
-      const models = ["vision", "nvidia/nemotron-3.5-super-vl-120b-a12b", "qwen/qwen3.8-omni-flash:free", "meta/llama-3.2-90b-vision-instruct"];
-      for (const model of models) {
-        try {
-          const body = {
-            model,
-            messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUri } }, { type: "text", text: prompt }] }],
-          };
-          const out = await routerCallFn(body);
-          let text = "";
-          if (typeof out === "string") text = out.trim();
-          else if (out && typeof out === "object") {
-            text = out.text || out.finalText || out.answer || out?.data?.choices?.[0]?.message?.content || out?.data?.message?.content || "";
-            if (typeof text !== "string") text = String(text ?? "").trim();
-          }
-          if (text && String(text).trim()) return { ok: true, text: String(text).trim() };
-        } catch {}
+      const body = {
+        model: "vision",
+        messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUri } }, { type: "text", text: prompt }] }],
+      };
+      const out = await routerCallFn(body);
+      let text = "";
+      if (typeof out === "string") text = out.trim();
+      else if (out && typeof out === "object") {
+        text = out.text || out.finalText || out.answer || out?.data?.choices?.[0]?.message?.content || out?.data?.message?.content || "";
+        if (typeof text !== "string") text = String(text ?? "").trim();
       }
-    } catch {}
+      if (text && String(text).trim()) return { ok: true, text: String(text).trim() };
+      errors.push("router:empty");
+    } catch (e) { errors.push("router:" + (e?.message || "error")); }
   }
 
-  return { ok: false, text: "تحلیل تصویر ممکن نشد؛ کلید GEMINI_API_KEY تنظیم نشده و مدل vision هم در دسترس نیست.", error: "vision_unavailable" };
+  if (typeof fn === "function") {
+    try {
+      const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
+      if (geminiKey) {
+        const geminiSignal = geminiKey.startsWith("AIza") ? undefined : timeoutSignal(4000);
+        for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) {
+          try {
+            const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                contents: [{ role: "user", parts: [{ text: prompt }, { inlineData: { mimeType, data: b64 } }] }],
+              }),
+              signal: geminiSignal,
+            });
+            if (res?.ok) {
+              const json = await safeJson(res);
+              const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+              if (text) return { ok: true, text };
+              errors.push(`gemini-${model}:empty`);
+            } else {
+              errors.push(`gemini-${model}:${res?.status || "not_ok"}`);
+            }
+          } catch (e) { errors.push(`gemini-${model}:` + (e?.message || "error")); }
+        }
+      }
+    } catch (e) { errors.push("gemini:" + (e?.message || "error")); }
+
+    try {
+      const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
+      if (nvidiaKey) {
+        for (const model of ["meta/llama-3.2-90b-vision-instruct", "meta/llama-3.2-11b-vision-instruct", "nvidia/nemotron-3.5-super-vl-120b-a12b"]) {
+          try {
+            const res = await fn("https://integrate.api.nvidia.com/v1/chat/completions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}` },
+              body: JSON.stringify({
+                model,
+                messages: [{ role: "user", content: [
+                  { type: "text", text: "به فارسی دقیق به این سوال درباره تصویر پاسخ بده: " + prompt },
+                  { type: "image_url", image_url: { url: dataUri } },
+                ] }],
+                max_tokens: 600,
+              }),
+              signal: timeoutSignal(12000),
+            });
+            if (res?.ok) {
+              const json = await safeJson(res);
+              const text = json?.choices?.[0]?.message?.content;
+              if (typeof text === "string" && text.trim()) return { ok: true, text: text.trim() };
+              errors.push(`nvidia-${model}:empty`);
+            } else {
+              errors.push(`nvidia-${model}:${res?.status || "not_ok"}`);
+            }
+          } catch (e) { errors.push(`nvidia-${model}:` + (e?.message || "error")); }
+        }
+      }
+    } catch (e) { errors.push("nvidia:" + (e?.message || "error")); }
+  }
+
+  return {
+    ok: false,
+    text: "تحلیل تصویر ممکن نشد؛ کلید GEMINI_API_KEY تنظیم نشده و مدل vision هم در دسترس نیست.",
+    error: errors.length ? "vision_unavailable: " + errors.join("; ") : "vision_unavailable",
+  };
 }
 
 export function isVisionQuestionCaption(caption) {
   const s = String(caption ?? "").trim();
   if (!s) return false;
   if (s.endsWith("?") || s.endsWith("؟")) return true;
-  const markers = ["این چیه", "چی نوشته", "ترجمه", "توضیح بده", "تحلیل کن", "تفسیر کن", "تفسیر", "فیش", "فاکتور", "کیلومتر", "متن داخل عکس", "متن عکس", "چنده", "چیست", "بخون", "بخوان", "توضیح", "خلاصه", "بررسی", "OCR", "بگو چیه", "تحلیل"];
+  const markers = ["این چیه", "چیه", "چی نوشته", "ترجمه", "توضیح بده", "تحلیل کن", "تفسیر کن", "تفسیر", "فیش", "فاکتور", "کیلومتر", "متن داخل عکس", "متن عکس", "چنده", "چیست", "بخون", "بخوان", "توضیح", "خلاصه", "بررسی", "OCR", "بگو چیه", "تحلیل"];
   return markers.some((m) => s.includes(m));
 }

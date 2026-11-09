@@ -7934,6 +7934,56 @@ if (DatabaseSync) {
   check(photosI.length === 1 && photosI[0].bytes instanceof Uint8Array && photosI[0].bytes.length === 3 && String(photosI[0].opts?.caption || "").includes("تصویر ساخته شد") && Boolean(photosI[0].opts?.mimeType), `fix3: sendPhoto(bytes, opts) called once with caption/mimeType: ${JSON.stringify(photosI.map((p) => ({ len: p.bytes?.length, opts: p.opts })))}`);
 }
 
+// Regression: chunked base64 on large photos + ToUnicode CMap + image stream skip.
+{
+  const { bytesToBase64, analyzeImage } = await import("../src/media.js");
+  const { extractTextFromPdfBytes } = await import("../src/pdf.js");
+
+  const bigPhoto = new Uint8Array(150000);
+  for (let i = 0; i < bigPhoto.length; i++) bigPhoto[i] = i & 0xff;
+  let bigB64 = "";
+  let b64Threw = false;
+  const savedBuffer = globalThis.Buffer;
+  try {
+    try { delete globalThis.Buffer; } catch {}
+    bigB64 = bytesToBase64(bigPhoto);
+  } catch { b64Threw = true; }
+  finally { globalThis.Buffer = savedBuffer; }
+  check(b64Threw === false && bigB64.length > 0, `fix2: bytesToBase64 handles 150KB without Maximum call stack size exceeded (threw=${b64Threw})`);
+
+  const bigAna = await analyzeImage(
+    { GEMINI_API_KEY: "gkey-big" },
+    {
+      imageBytes: bigPhoto,
+      mimeType: "image/jpeg",
+      prompt: "اون ها چیه روی لباسش",
+      fetchFn: async () => ({ ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: "روی لباس دو شخصیت کارتونی است." }] } }] }) }),
+    },
+  );
+  check(bigAna.ok === true && String(bigAna.text).includes("شخصیت کارتونی"), `fix2: analyzeImage handles a 150KB photo without throwing: ${JSON.stringify(bigAna).slice(0, 120)}`);
+
+  const toUni = [
+    "/CIDInit /ProcSet findresource begin",
+    "begincmap",
+    "beginbfchar",
+    "<0001> <0048>",
+    "<0002> <0069>",
+    "endbfchar",
+    "endcmap",
+  ].join("\n");
+  const content = "BT /F1 12 Tf <0001><0002> Tj ET";
+  const imageBinary = "\x00BT (BINARYIMAGEDATA) Tj ET\xFF";
+  const pdf = new TextEncoder().encode(
+    "%PDF-1.4\n" +
+    "1 0 obj\n<< /Length " + toUni.length + " >>\nstream\n" + toUni + "\nendstream\nendobj\n" +
+    "2 0 obj\n<< /Type /XObject /Subtype /Image /Width 10 /Height 10 /BitsPerComponent 8 /Length " + imageBinary.length + " >>\nstream\n" + imageBinary + "\nendstream\nendobj\n" +
+    "3 0 obj\n<< /Length " + content.length + " >>\nstream\n" + content + "\nendstream\nendobj\n%%EOF",
+  );
+  const cmapText = await extractTextFromPdfBytes(pdf);
+  check(String(cmapText).includes("Hi"), `fix1: ToUnicode beginbfchar maps glyphs to readable text: ${JSON.stringify(cmapText).slice(0, 120)}`);
+  check(!String(cmapText).includes("BINARYIMAGEDATA"), "fix1: /Subtype /Image binary stream is skipped");
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);

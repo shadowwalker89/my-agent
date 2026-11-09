@@ -2060,9 +2060,10 @@ export async function handleVaultFile(env, o) {
       const bytes = await fileBytesFromTelegram(env, tgFileId);
       if (!bytes || !bytes.length) { await send("تحلیل ممکن نشد."); return true; }
       const result = await analyzeImage(env, { imageBytes: bytes, mimeType: mimeType || "image/jpeg", prompt: cap, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
-      await send(result && result.ok && result.text ? result.text : (result?.text || "تحلیل تصویر ممکن نشد."));
-    } catch {
-      await send("تحلیل تصویر ممکن نشد.");
+      if (result && result.ok && result.text) await send(result.text);
+      else await send("❌ خطا در تحلیل تصویر: " + (result?.error || result?.text || "vision_unavailable"));
+    } catch (e) {
+      await send("❌ خطا در تحلیل تصویر: " + (e?.message || "vision_unavailable"));
     }
     return true;
   }
@@ -2084,14 +2085,15 @@ export async function handleVaultFile(env, o) {
   // Case 2: explicit vision/analysis caption
   if (cap && VISION_CAPTION_RE.test(cap)) {
     const bytes2 = await fileBytesFromTelegram(env, tgFileId);
+    let visionError = null;
     if (bytes2 && bytes2.length) {
       const r2 = await analyzeImage(env, { imageBytes: bytes2, mimeType: mimeType || "image/jpeg", prompt: cap, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
       if (r2 && r2.ok && r2.text) { await send(r2.text); return true; }
-      if (r2 && r2.text) { await send(r2.text); return true; }
+      visionError = r2?.error || r2?.text || null;
     }
     const f = { tg_file_id: tgFileId, mime_type: mimeType, file_type: fileType };
     const text = await analyzeVaultImage(env, f, cap, userId);
-    await send(text || "تحلیل ممکن نشد.");
+    await send(text || ("❌ خطا در تحلیل تصویر: " + (visionError || "vision_unavailable")));
     return true;
   }
   // Case 3: no caption / general caption -> choice buttons
