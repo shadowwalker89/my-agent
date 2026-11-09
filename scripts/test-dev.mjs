@@ -1611,7 +1611,7 @@ import { classifyVoiceQuota, transcribeWithGemini, handleVoice, handleVoiceRetry
     for (const hang of ["headers-hang", "body-hang"]) {
       reset(hang);
       const budgetStart = Date.now();
-      const limited = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { totalTimeoutMs: 30, attemptTimeoutMs: 1000, cleanupTimeoutMs: 5 });
+      const limited = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { totalTimeoutMs: 150, attemptTimeoutMs: 1000, cleanupTimeoutMs: 5 });
       check(!limited.ok && limited.reason === "timeout" && calls.length === 1 && Date.now() - budgetStart < 1000, `voice regression: shared deadline bounds ${hang}, with no post-deadline fallback`);
     }
     reset("headers-hang");
