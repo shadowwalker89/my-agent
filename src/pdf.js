@@ -63,6 +63,13 @@ function decodePdfLiteral(raw) {
     switch (g) { case "n": return "\n"; case "r": return "\r"; case "t": return "\t"; case "b": return "\b"; case "f": return "\f"; default: return g; }
   });
 }
+// Arabic Presentation Forms (FB50-FDFF / FE70-FEFF) carry the real Persian
+// letters in many PDFs. NFKC maps them back to standard 0600-06FF characters,
+// so never strip them before normalizing.
+function normalizePdfText(s) {
+  const v = String(s ?? "");
+  try { return v.normalize("NFKC"); } catch { return v; }
+}
 function chooseGlyphWidth(hexLen, map) {
   if (!map || !map.size) return hexLen % 4 === 0 ? 4 : 2;
   let has4 = false; let has2 = false;
@@ -88,37 +95,88 @@ function decodeHexGlyphs(hex, map) {
       if (c >= 0x20 && c !== 0x7f) out += String.fromCharCode(c);
     }
   }
-  return out;
+  return normalizePdfText(out);
 }
 const PDF_JUNK_TOKEN = /^(?:obj|endobj|stream|endstream|FlateDecode|BitsPerComponent|xref|trailer|startxref|BT|ET|Tj|TJ|Tf|Td|TD|Tm|T\*|cm|rg|RG|q|Q)$/;
-function extractContentText(content, glyphMap) {
+function cleanText(s) {
+  const t = normalizePdfText(s).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ").trim();
+  if (!t || PDF_JUNK_TOKEN.test(t)) return "";
+  return t;
+}
+function readableCount(s) { return (String(s || "").match(/[A-Za-z0-9\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]/g) || []).length; }
+function bestDecode(cmaps, fn) {
+  let best = ""; let bestScore = -1;
+  for (const mp of cmaps) {
+    const t = fn(mp);
+    const sc = readableCount(t);
+    if (sc > bestScore) { bestScore = sc; best = t; }
+  }
+  return best;
+}
+function appendText(line, text, addSpace) {
+  const t = String(text || "");
+  if (!t) return line;
+  if (!line) return t;
+  if (!addSpace) return line + t;
+  if (/^\s/.test(t) || /\s$/.test(line)) return line + t;
+  return line + " " + t;
+}
+// TJ arrays use negative numeric offsets as kerning: <-350 is a table column
+// gap, <-80 is a word gap. Turning them into separators keeps Net/VAT/total
+// columns from gluing together.
+function decodeTJArray(inner, currentMap, cmaps) {
+  const src = String(inner || "");
+  const re = /\(((?:[^()\\]|\\.)*)\)|<([0-9A-Fa-f\s]+)>|(-?\d+(?:\.\d+)?)/g;
+  let out = "";
+  let sep = "";
+  let m;
+  while ((m = re.exec(src))) {
+    let text = "";
+    if (m[1] != null) text = cleanText(decodePdfLiteral(m[1]));
+    else if (m[2] != null) text = currentMap ? decodeHexGlyphs(m[2], currentMap) : (cmaps && cmaps.length ? bestDecode(cmaps, (mp) => decodeHexGlyphs(m[2], mp)) : decodeHexGlyphs(m[2], null));
+    else if (m[3] != null) {
+      const n = Number(m[3]);
+      if (Number.isFinite(n) && n < -80) sep = n < -350 ? "  |  " : " ";
+      continue;
+    }
+    if (!text) continue;
+    if (sep && out) out = out.replace(/[ \t]+$/, "") + sep;
+    out += text;
+    sep = "";
+  }
+  return out;
+}
+function extractContentText(content, cmaps, fontResolver) {
   const src = String(content || "");
   const segments = [];
   for (const seg of src.matchAll(/\bBT\b([\s\S]*?)\bET\b/g)) segments.push(seg[1]);
   if (!segments.length) return "";
+  const list = (Array.isArray(cmaps) ? cmaps : (cmaps ? [cmaps] : [])).filter(Boolean);
+  const resolve = (name) => { try { return fontResolver ? fontResolver(name) : null; } catch { return null; } };
   const parts = [];
-  const push = (t, kind) => {
-    const s = String(t || "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ").trim();
-    if (s && !PDF_JUNK_TOKEN.test(s)) parts.push({ text: s, kind });
-  };
   for (const seg of segments) {
-    for (const m of seg.matchAll(/\(((?:[^()\\]|\\.)*)\)/g)) push(decodePdfLiteral(m[1]), "lit");
-    for (const m of seg.matchAll(/<(?!<)([0-9A-Fa-f\s]+)>/g)) push(decodeHexGlyphs(m[1], glyphMap), "hex");
+    let currentMap = null;
+    let line = "";
+    let lastKind = "";
+    const re = /\/([A-Za-z0-9_.+-]+)\s+[-\d.]+\s+Tf|\[((?:[^\[\]\\]|\\.)*)\]\s*TJ|\(((?:[^()\\]|\\.)*)\)\s*Tj|(T\*|Td|TD)|<(?![<])([0-9A-Fa-f\s]+)>|\(((?:[^()\\]|\\.)*)\)/g;
+    let m;
+    while ((m = re.exec(seg))) {
+      if (m[1] != null) { currentMap = resolve(m[1]); continue; }
+      if (m[2] != null) { const t = decodeTJArray(m[2], currentMap, list); if (t) { line = appendText(line, t, true); lastKind = "tj"; } continue; }
+      if (m[3] != null) { const t = cleanText(decodePdfLiteral(m[3])); if (t) { line = appendText(line, t, true); lastKind = "lit"; } continue; }
+      if (m[4] != null) { if (line && !/\s$/.test(line)) line += " "; lastKind = ""; continue; }
+      if (m[5] != null) { const t = currentMap ? decodeHexGlyphs(m[5], currentMap) : (list.length ? bestDecode(list, (mp) => decodeHexGlyphs(m[5], mp)) : decodeHexGlyphs(m[5], null)); if (t) { line = appendText(line, cleanText(t), lastKind !== "hex"); lastKind = "hex"; } continue; }
+      if (m[6] != null) { const t = cleanText(decodePdfLiteral(m[6])); if (t) { line = appendText(line, t, true); lastKind = "lit"; } continue; }
+    }
+    if (line.trim()) parts.push(line.trim());
   }
-  let out = "";
-  let lastKind = "";
-  for (const p of parts) {
-    if (!out) out = p.text;
-    else out += p.kind === "hex" && lastKind === "hex" ? p.text : " " + p.text;
-    lastKind = p.kind;
-  }
-  return out.replace(/[ \t]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
+  if (!parts.length) return "";
+  return parts.join("\n").replace(/[ \t]+/g, " ").replace(/\s*\|\s*/g, "  |  ").replace(/\s*\n\s*/g, "\n").trim();
 }
-function readableCount(s) { return (String(s || "").match(/[A-Za-z0-9\u0600-\u06FF]/g) || []).length; }
 function uniqText(toks) {
   const seen = new Set();
   const uniq = toks.filter((t) => { const k = String(t).toLowerCase(); if (!k || seen.has(k)) return false; seen.add(k); return true; });
-  return uniq.join("\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim().slice(0, 12000);
+  return normalizePdfText(uniq.join("\n")).replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim().slice(0, 12000);
 }
 async function inflateBytes(bytes, format, timeoutMs = 3000) {
   if (typeof DecompressionStream !== "function" || typeof Response !== "function") return null;
@@ -150,6 +208,9 @@ export async function extractTextFromPdfBytes(pdfBytes) {
     const end = latin.indexOf("endstream", start);
     if (end < 0) continue;
     const objIdx = latin.lastIndexOf(" obj", m.index);
+    const near = latin.slice(Math.max(0, m.index - 500), m.index);
+    const objMatches = [...near.matchAll(/(\d+)\s+0\s+obj\b/g)];
+    const objNum = objMatches.length ? Number(objMatches[objMatches.length - 1][1]) : null;
     const header = latin.slice(objIdx >= 0 ? objIdx : Math.max(0, m.index - 300), m.index);
     re.lastIndex = end + 9;
     if (end - start < 1 || end - start > 4000000) continue;
@@ -168,19 +229,49 @@ export async function extractTextFromPdfBytes(pdfBytes) {
       }
     }
     if (!out && !wantsFlate) out = rawBytes;
-    if (out && out.length) decoded.push(latin1FromBytes(out));
+    if (out && out.length) decoded.push({ text: latin1FromBytes(out), objNum });
   }
-  const glyphMap = new Map();
-  for (const text of decoded) if (/beginbf(?:char|range)/.test(text)) parseCMapInto(glyphMap, text);
+  // Each font's /ToUnicode stream is its own namespace: <0001> means a
+  // different glyph per font. Keep one table per CMap object instead of
+  // letting the last (often Latin/symbol) font overwrite the Persian body.
+  const cmapByObj = new Map();
+  for (const d of decoded) {
+    if (!/beginbf(?:char|range)/.test(d.text)) continue;
+    const mp = parseCMapInto(new Map(), d.text);
+    if (d.objNum != null) cmapByObj.set(d.objNum, mp);
+  }
+  const cmaps = [];
+  const seenCmaps = new Set();
+  for (const mp of cmapByObj.values()) { if (mp && mp.size && !seenCmaps.has(mp)) { seenCmaps.add(mp); cmaps.push(mp); } }
+  // Link /F1 -> font object -> /ToUnicode object -> CMap table.
+  const objects = new Map();
+  for (const om of latin.matchAll(/(\d+)\s+0\s+obj\b([\s\S]*?)endobj/g)) objects.set(Number(om[1]), om[2]);
+  const fontObjToCmap = new Map();
+  for (const [num, body] of objects) {
+    if (!/\/Type\s*\/Font\b/.test(body)) continue;
+    const tu = /\/ToUnicode\s+(\d+)\s+0\s+R/.exec(body);
+    if (!tu) continue;
+    const mp = cmapByObj.get(Number(tu[1]));
+    if (mp && mp.size) fontObjToCmap.set(num, mp);
+  }
+  const fontNameToCmap = new Map();
+  for (const fm of latin.matchAll(/\/Font\s*<<([\s\S]*?)>>/g)) {
+    if (/\/Type\s*\/Font\b/.test(fm[1])) continue;
+    for (const rm of fm[1].matchAll(/\/([A-Za-z0-9_.+-]+)\s+(\d+)\s+0\s+R/g)) {
+      const mp = fontObjToCmap.get(Number(rm[2]));
+      if (mp) fontNameToCmap.set(rm[1], mp);
+    }
+  }
+  const fontResolver = (name) => fontNameToCmap.get(name) || null;
   const toks = [];
   let sawTextOps = false;
-  for (const text of decoded) {
-    if (/beginbf(?:char|range)/.test(text)) continue;
-    const t = extractContentText(text, glyphMap);
+  for (const d of decoded) {
+    if (/beginbf(?:char|range)/.test(d.text)) continue;
+    const t = extractContentText(d.text, cmaps, fontResolver);
     if (t) { sawTextOps = true; toks.push(t); }
   }
   if (!sawTextOps && count === 0) {
-    const t = extractContentText(latin, glyphMap);
+    const t = extractContentText(latin, cmaps, fontResolver);
     if (t) { sawTextOps = true; toks.push(t); }
   }
   const out = uniqText(toks);

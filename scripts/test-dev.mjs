@@ -7510,8 +7510,8 @@ if (DatabaseSync) {
   let cfCalls = 0;
   const pollFn = async () => ({ ok: true, arrayBuffer: async () => new Uint8Array([9, 9, 9]).buffer });
   const r1 = await generateFreeImage({ AI: { run: async () => { cfCalls++; return new Uint8Array([1,2,3]); } } }, "kand", { fetchFn: pollFn });
-  check(cfCalls === 0, `3.2: generateFreeImage never calls env.AI.run: cfCalls=${cfCalls}`);
-  check(r1.ok === true && r1.provider === "pollinations" && r1.bytes.length === 3, `3.2: pollinations fallback without AI: ${JSON.stringify(r1).slice(0, 200)}`);
+  check(cfCalls === 1, `3.2: generateFreeImage prefers env.AI.run: cfCalls=${cfCalls}`);
+  check(r1.ok === true && r1.provider === "cloudflare" && r1.bytes.length === 3, `3.2: Workers AI preferred over Pollinations: ${JSON.stringify(r1).slice(0, 200)}`);
   const b64 = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString("base64");
   let togetherUrl = "";
   let togetherCalled = false;
@@ -7549,7 +7549,7 @@ if (DatabaseSync) {
     return { ok: false, json: async () => ({}) };
   }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
   check(r32 === "handled", `3.2: handleDailyText image gen handled: ${r32}`);
-  check(cfCalls32 === 0, `3.2: handleDailyText never calls env.AI.run`);
+  check(cfCalls32 === 1, `3.2: handleDailyText uses Workers AI image generation`);
   check(photos32.length === 1 || sent32.some((t) => String(t).includes("تصویر ساخته شد")), `3.2: image confirmation sent: photos=${photos32.length} sent=${JSON.stringify(sent32)}`);
   check(rows32("SELECT COUNT(*) AS n FROM notes")[0].n === 0, "3.2: image gen creates no note");
   check(rows32("SELECT COUNT(*) AS n FROM tasks")[0].n === 0, "3.2: image gen creates no task");
@@ -7632,7 +7632,7 @@ if (DatabaseSync) {
   let cf34 = 0;
   const poll34 = async () => ({ ok: true, arrayBuffer: async () => new Uint8Array([1,2,3]).buffer });
   const g0 = await genImg({ AI: { run: async () => { cf34++; return new Uint8Array([9]); } } }, "test", { fetchFn: poll34 });
-  check(cf34 === 0 && g0.ok === true && g0.provider === "pollinations", `3.4: generateFreeImage never uses env.AI.run: cf=${cf34} provider=${g0.provider}`);
+  check(cf34 === 1 && g0.ok === true && g0.provider === "cloudflare", `3.4: generateFreeImage prefers Workers AI over Pollinations: cf=${cf34} provider=${g0.provider}`);
   const b64edited = Buffer.from([10,20,30]).toString("base64");
   const geminiEditFn = async (url, init = {}) => {
     const u = String(url);
@@ -7982,6 +7982,77 @@ if (DatabaseSync) {
   const cmapText = await extractTextFromPdfBytes(pdf);
   check(String(cmapText).includes("Hi"), `fix1: ToUnicode beginbfchar maps glyphs to readable text: ${JSON.stringify(cmapText).slice(0, 120)}`);
   check(!String(cmapText).includes("BINARYIMAGEDATA"), "fix1: /Subtype /Image binary stream is skipped");
+}
+
+// Fix #3/#4: reply-to-photo edit + direct photo vision.
+if (DatabaseSync) {
+  const sqF = new DatabaseSync(":memory:");
+  sqF.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqF.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqF.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  sqF.exec("INSERT INTO users (id, telegram_id) VALUES (4242, '4242')");
+  const baseF = (sql) => { const st = sqF.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+  const dbF = { prepare(sql) { return baseF(sql); } };
+  const origFetchF = global.fetch;
+  const visionReplyF = "روی لباسش دو شخصیت کارتونی است.";
+  global.fetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith("https://api.telegram.org/")) {
+      const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+      if (m && m[1] === "getFile") return Response.json({ ok: true, result: { file_path: "photos/f.jpg" } });
+      return Response.json({ ok: true, result: { message_id: 1 } });
+    }
+    if (u.includes("/file/bot")) return new Response(new Uint8Array([1, 2, 3]).buffer, { headers: { "content-type": "image/jpeg" } });
+    if (u.includes("generativelanguage.googleapis.com")) return Response.json({ candidates: [{ content: { parts: [{ text: visionReplyF }] } }] });
+    return Response.json({ ok: true });
+  };
+  try {
+    const sentDirect = [];
+    const handledDirect = await handleVaultFile({ STATE: fakeKV(), DB: dbF, TG_TOKEN: "fake-token", GEMINI_API_KEY: "gkey-f" }, {
+      userId: 4242, chatId: 4242, tgFileId: "photo-direct", fileType: "photo", mimeType: "image/jpeg", caption: "اون ها چیه روی لباسش",
+      send: async (t) => { sentDirect.push(String(t)); },
+    });
+    check(handledDirect === true && sentDirect.length === 1 && sentDirect[0].includes(visionReplyF), `fix4: direct photo vision passes downloaded bytes to analyzeImage: ${JSON.stringify(sentDirect)}`);
+
+    const sentEdit = []; const photosEdit = [];
+    const editFetch = async (url) => {
+      const u = String(url);
+      if (u.includes("integrate.api.nvidia.com/v1/chat/completions")) return { ok: true, json: async () => ({ choices: [{ message: { content: "futuristic car, no people, empty street, clear blue sky without pollution" } }] }) };
+      if (u.includes("ai.api.nvidia.com")) return { ok: false, status: 500, json: async () => ({}) };
+      if (u.includes("image.pollinations.ai")) return { ok: true, arrayBuffer: async () => new Uint8Array([5, 6, 7]).buffer };
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const rEdit = await handleDailyText({ STATE: fakeKV(), DB: dbF, TG_TOKEN: "fake-token", NVIDIA_API_KEY: "nvap-edit" }, {
+      userId: 4242, chatId: 4242,
+      text: "ادمها رو از عکس حذف کن. الودگی هوا رو هم کم کن",
+      replyToPhoto: { fileId: "photo-reply", caption: "🎨 تصویر ساخته شد: یک خودروی آینده‌نگر در خیابان‌های تهران" },
+      send: async (t) => { sentEdit.push(String(t)); },
+      sendPhoto: async (bytes, opts) => { photosEdit.push({ bytes, opts }); return { ok: true }; },
+      fetchFn: editFetch,
+    });
+    check(rEdit === "handled" && sentEdit.some((t) => t.includes("در حال ویرایش تصویر")), `fix3: reply-to-image edit sends progress: ${JSON.stringify(sentEdit)}`);
+    check(photosEdit.length === 1 && photosEdit[0].bytes instanceof Uint8Array && photosEdit[0].bytes.length === 3 && String(photosEdit[0].opts?.caption || "").includes("ویرایش"), `fix3: reply-to-image edit regenerates and sends a new photo: ${JSON.stringify(photosEdit.map((p) => ({ len: p.bytes?.length, caption: p.opts?.caption })))}`);
+    check(!sentEdit.some((t) => /فتوشاپ|Photoshop|OpenCV|آموزش/u.test(t)), "fix3: edit never falls through to a text tutorial");
+  } finally {
+    global.fetch = origFetchF;
+  }
+}
+
+// Fix #1: TJ kerning -> table separators + Arabic Presentation Forms -> NFKC.
+{
+  const { extractTextFromPdfBytes } = await import("../src/pdf.js");
+  const cmapP = ["begincmap", "beginbfchar", "<0001> <FB56FE98>", "endbfchar", "endcmap"].join("\n");
+  const colsP = "BT /F1 12 Tf [ (Net) -400 (7,03 EUR) -400 (19%) -400 (8,37 EUR) ] TJ ET";
+  const persianP = "BT /F2 12 Tf <0001> Tj ET";
+  const pdfP = new TextEncoder().encode(
+    "%PDF-1.4\n" +
+    "1 0 obj\n<< /Length " + cmapP.length + " >>\nstream\n" + cmapP + "\nendstream\nendobj\n" +
+    "2 0 obj\n<< /Length " + colsP.length + " >>\nstream\n" + colsP + "\nendstream\nendobj\n" +
+    "3 0 obj\n<< /Length " + persianP.length + " >>\nstream\n" + persianP + "\nendstream\nendobj\n%%EOF",
+  );
+  const outP = await extractTextFromPdfBytes(pdfP);
+  check(String(outP).includes("Net") && /\|\s*7,03 EUR/.test(outP) && /\|\s*19%/.test(outP) && /\|\s*8,37 EUR/.test(outP), `fix1: TJ kerning offsets become table column separators: ${JSON.stringify(outP).slice(0, 200)}`);
+  check(String(outP).includes("پت"), `fix1: Arabic Presentation Forms normalize via NFKC to Persian: ${JSON.stringify(outP).slice(0, 200)}`);
 }
 
 if (failures.length) {

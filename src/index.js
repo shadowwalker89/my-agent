@@ -816,7 +816,13 @@ async function handlePlainText(env, msg, text, opts = {}) {
   // Allow-list already checked in handleUpdate; only then create the row.
   await ensureUserRow(env, userId);
   // Order: explicit /dev (tgCommand) -> everyday -> chat/task/dev.
-  const dailyO = { chatId, userId, text, chatType: msg.chat?.type, source: opts.source, hasImage: updateHasImage(msg), ...dailySenders(env, chatId), ...fileSenders(env, chatId),
+  const replyMsg = msg.reply_to_message && typeof msg.reply_to_message === "object" ? msg.reply_to_message : null;
+  const replyPhoto = Array.isArray(replyMsg?.photo) && replyMsg.photo.length ? replyMsg.photo[replyMsg.photo.length - 1] : null;
+  const replyToPhoto = replyPhoto
+    ? { fileId: replyPhoto.file_id, caption: typeof replyMsg?.caption === "string" ? replyMsg.caption : "" }
+    : null;
+  const dailyO = { chatId, userId, text, chatType: msg.chat?.type, source: opts.source, hasImage: updateHasImage(msg), replyToPhoto, ...dailySenders(env, chatId), ...fileSenders(env, chatId),
+    routerCallFn: (body) => runCombo(env, body?.model || "chat", body, { totalTimeoutMs: 15000, requireFinalText: true }),
     chat: (modelText, copts) => answerChatText(env, chatId, userId, modelText, updateHasImage(msg), copts) };
   const daily = await handleDailyText(env, dailyO);
   // Save-first entry row already owns the user message: downstream chat

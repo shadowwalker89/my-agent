@@ -209,25 +209,51 @@ function fallbackEnglishPrompt(prompt) {
 // caller-supplied translateFn, NVIDIA (the preferred live key), or Gemini.
 // If translation fails, a built-in dictionary fallback guarantees the image
 // providers never receive raw Persian characters.
+function acceptEnglish(t) { return typeof t === "string" && t.trim() && !PERSIAN_RE.test(t); }
+function outText(out) {
+  if (typeof out === "string") return out;
+  if (out && typeof out === "object") {
+    const t = out.text || out.finalText || out.answer || out?.data?.choices?.[0]?.message?.content || out?.data?.message?.content || "";
+    if (typeof t === "string") return t;
+  }
+  return "";
+}
 async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
   if (!PERSIAN_RE.test(prompt)) return prompt;
   if (typeof opts.translateFn === "function") {
-    try { const t = await opts.translateFn(prompt); if (typeof t === "string" && t.trim() && !PERSIAN_RE.test(t)) return t.trim(); } catch {}
+    try { const t = await opts.translateFn(prompt); if (acceptEnglish(t)) return t.trim(); } catch {}
+  }
+  // Prefer the router's low-latency combos for a detailed cinematic prompt.
+  if (typeof opts.routerCallFn === "function") {
+    for (const model of ["fast", "chat"]) {
+      try {
+        const out = await opts.routerCallFn({
+          model,
+          messages: [{ role: "user", content: `Translate this image prompt into a detailed, cinematic English prompt for a photorealistic image model. Return only the English prompt, no quotes:\n${prompt}` }],
+        });
+        const t = outText(out);
+        if (acceptEnglish(t)) return t.trim();
+      } catch {}
+    }
   }
   if (typeof fn === "function") {
     try {
       const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
       if (nvidiaKey) {
-        const res = await fn("https://integrate.api.nvidia.com/v1/chat/completions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}` },
-          body: JSON.stringify({ model: "meta/llama-3.1-70b-instruct", messages: [{ role: "user", content: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }], max_tokens: 120, temperature: 0.2 }),
-          signal: timeoutSignal(3000),
-        });
-        if (res?.ok) {
-          const json = await safeJson(res);
-          const text = json?.choices?.[0]?.message?.content;
-          if (typeof text === "string" && text.trim() && !PERSIAN_RE.test(text)) return text.trim();
+        for (const model of ["meta/llama-3.1-70b-instruct", "qwen/qwen2.5-72b-instruct"]) {
+          try {
+            const res = await fn("https://integrate.api.nvidia.com/v1/chat/completions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}` },
+              body: JSON.stringify({ model, messages: [{ role: "user", content: `Translate this image prompt into a detailed, cinematic English prompt for a photorealistic image model. Return only the English prompt, no quotes:\n${prompt}` }], max_tokens: 160, temperature: 0.2 }),
+              signal: timeoutSignal(4000),
+            });
+            if (res?.ok) {
+              const json = await safeJson(res);
+              const text = json?.choices?.[0]?.message?.content;
+              if (acceptEnglish(text)) return text.trim();
+            }
+          } catch {}
         }
       }
     } catch {}
@@ -262,7 +288,10 @@ export async function generateFreeImage(env, prompt, opts = {}) {
   const userId = opts.userId ?? null;
   if (typeof fn !== "function") return { ok: false, error: "image_gen_failed", diagErrors: ["fetch_unavailable"] };
   const translated = await toEnglishImagePrompt(env, userId, clean, fn, opts);
-  const visual = PERSIAN_RE.test(translated) ? fallbackEnglishPrompt(translated) : translated;
+  const visualBase = PERSIAN_RE.test(translated) ? fallbackEnglishPrompt(translated) : translated;
+  const visual = /^(?:photorealistic|cinematic|hyperrealistic|ultra[- ]?detailed)/i.test(visualBase)
+    ? visualBase
+    : `Photorealistic, high detail, 8k, no watermark: ${visualBase}`;
 
   try {
     const togetherKey = await resolveKey(env, userId, "together", "TOGETHER_API_KEY");
@@ -302,16 +331,22 @@ export async function generateFreeImage(env, prompt, opts = {}) {
             const json = await safeJson(res);
             const b64 = extractNvidiaImage(json);
             const bytes = b64 ? b64ToBytes(b64) : null;
-            if (bytes && bytes.length) return bytes;
+            if (bytes && bytes.length) return { bytes, status: res?.status || 200 };
             diagErrors.push(label + ":empty");
           } else {
             diagErrors.push(label + ":" + (res?.status || "not_ok"));
           }
-        } catch (e) { diagErrors.push(label + ":" + (e?.message || "error")); }
-        return null;
+          return { bytes: null, status: res?.status || null };
+        } catch (e) { diagErrors.push(label + ":" + (e?.message || "error")); return { bytes: null, status: null }; }
       };
-      let nbytes = await tryNvidia("https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-3-medium", { prompt: visual, cfg_scale: 5, aspect_ratio: "1:1", seed: 0, steps: 25 }, "nvidia-sd3");
-      if (!nbytes) nbytes = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual, width: 1024, height: 1024, seed: 0, steps: 4 }, "nvidia-flux");
+      // SD3 accepts the full schema. FLUX.1-schnell rejects width/height with
+      // HTTP 422, so send the minimal body and retry prompt-only on 422.
+      let nbytes = (await tryNvidia("https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-3-medium", { prompt: visual, cfg_scale: 5, aspect_ratio: "1:1", seed: 0, steps: 30, negative_prompt: "watermark, text, logo, blurry, low quality, deformed" }, "nvidia-sd3")).bytes;
+      if (!nbytes) {
+        let flux = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual, steps: 4, seed: 0 }, "nvidia-flux");
+        if (!flux.bytes && flux.status === 422) flux = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual }, "nvidia-flux-min");
+        nbytes = flux.bytes;
+      }
       if (nbytes) return { ok: true, bytes: nbytes, mimeType: "image/png", provider: "nvidia" };
     }
   } catch (e) { diagErrors.push("nvidia:" + (e?.message || "error")); }
@@ -364,9 +399,25 @@ export async function generateFreeImage(env, prompt, opts = {}) {
     }
   } catch (e) { diagErrors.push("huggingface:" + (e?.message || "error")); }
 
+  // Prefer Workers AI (high-res, no watermark) over the public Pollinations
+  // endpoint so a failed paid provider never degrades to a tiny watermarked
+  // image.
+  if (!opts.disableCfFallback && env?.AI && typeof env.AI.run === "function") {
+    for (const model of ["@cf/black-forest-labs/flux-1-schnell", "@cf/bytedance/stable-diffusion-xl-lightning"]) {
+      try {
+        const out = model.includes("flux")
+          ? await env.AI.run(model, { prompt: visual, steps: 6 })
+          : await env.AI.run(model, { prompt: visual });
+        const bytes = await toBytes(out);
+        if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "cloudflare" };
+        diagErrors.push("cloudflare:" + model.split("/").pop() + ":empty");
+      } catch (e) { diagErrors.push("cloudflare:" + (e?.message || "error")); }
+    }
+  }
+
   try {
     const visualForUrl = PERSIAN_RE.test(visual) ? fallbackEnglishPrompt(visual) : visual;
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(visualForUrl)}?width=768&height=768&nologo=true&seed=42`;
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(visualForUrl)}?model=flux&width=1024&height=1024&nologo=true&private=true&enhance=true&seed=42`;
     const res = await fn(url, { headers: { "User-Agent": "Mozilla/5.0", Accept: "image/*" }, redirect: "follow", signal: timeoutSignal(10000) });
     if (res?.ok) {
       const buf = await res.arrayBuffer();
@@ -378,15 +429,6 @@ export async function generateFreeImage(env, prompt, opts = {}) {
     }
   } catch (e) { diagErrors.push("pollinations:" + (e?.message || "error")); }
 
-  if (!opts.disableCfFallback && env?.AI && typeof env.AI.run === "function") {
-    try {
-      const out = await env.AI.run("@cf/bytedance/stable-diffusion-xl-lightning", { prompt: visual });
-      const bytes = await toBytes(out);
-      if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "cloudflare" };
-      diagErrors.push("cloudflare:empty");
-    } catch (e) { diagErrors.push("cloudflare:" + (e?.message || "error")); }
-  }
-
   return { ok: false, error: "image_gen_failed", diagErrors };
 }
 
@@ -395,7 +437,7 @@ export function isImageEditCaption(caption) {
   if (!s) return false;
   if (/^\s*(ویرایش\s*عکس|ویرایش|ادیت)\s*[:：-]/u.test(s)) return true;
   if (/^(ویرایش|ادیت)\s+/.test(s)) return true;
-  const markers = ["ویرایش عکس", "ادیت", "ویرایش کن", "ادیت کن", "پس‌زمینه", "پسزمینه", "کارتونی کن", "کارتونی", "تغییر بده", "نور عکس", "بهتر کن", "حذف کن", "تغییر بده", "اصلاح کن"];
+  const markers = ["ویرایش عکس", "ادیت", "ویرایش کن", "ادیت کن", "پس‌زمینه", "پسزمینه", "کارتونی کن", "کارتونی", "تغییر بده", "نور عکس", "بهتر کن", "حذف کن", "حذف", "کم کن", "اضافه کن", "عوض کن", "تغییر بده", "اصلاح کن"];
   return markers.some((m) => s.includes(m));
 }
 

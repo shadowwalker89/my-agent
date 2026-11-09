@@ -1975,18 +1975,26 @@ function csvRow(...fields) { return fields.map(csvField).join(","); }
 async function fileBytesFromTelegram(env, tgFileId) {
   const data = await getFileDownloadData(env, tgFileId);
   if (!data) return null;
-  return data.data instanceof Uint8Array ? data.data : new Uint8Array(data.data ?? []);
+  // getFileDownloadData returns { data: ArrayBuffer, filePath, contentType };
+  // accept { bytes } / { ok, bytes } too so callers never silently drop a
+  // photo because of a shape mismatch.
+  const raw = data.bytes ?? data.data ?? data.arrayBuffer ?? data.body ?? null;
+  if (raw == null) return null;
+  if (raw instanceof Uint8Array) return raw;
+  if (typeof raw === "string") {
+    try { return raw ? new Uint8Array([...raw].map((c) => c.charCodeAt(0))) : new Uint8Array(0); } catch { return null; }
+  }
+  try { return new Uint8Array(raw); } catch { return null; }
 }
 
 const VAULT_CAPTION_RE = /(?:ذخیره|آرشیو|گاوصندوق|ثبت)\s*(?:کن)?|(?:کارت\s*ملی|شناسنامه|پاسپورت|گواهینامه|بیمه\s*نامه|بیمه‌نامه|آزمایش|سند|مدرک|قرارداد)/i;
 const VISION_CAPTION_RE = /(?:تحلیل|بررسی|بخون|بخوان|ترجمه|توضیح|چیه|چیست|خلاصه|OCR)/i;
 
 async function analyzeVaultImage(env, file, prompt, userId = null) {
-  const data = await getFileDownloadData(env, file.tg_file_id);
+  const arr = await fileBytesFromTelegram(env, file.tg_file_id);
   let key = null;
   try { key = await getConnectorSecret(env, userId ?? file.user_id ?? null, "gemini"); } catch {}
-  if (!data || !key) return null;
-  const arr = new Uint8Array(data.data);
+  if (!arr || !arr.length || !key) return null;
   let bin = "";
   for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
   const b64 = btoa(bin);
@@ -2511,14 +2519,79 @@ export async function handleDailyText(env, o) {
       return "handled";
     }
   }
+  // Reply-to-photo: edit/regenerate the replied image or answer a vision
+  // question about it instead of falling through to a generic text answer.
+  const replyPhoto = o.replyToPhoto && (o.replyToPhoto.fileId || o.replyToPhoto.file_id) ? o.replyToPhoto : null;
+  if (replyPhoto) {
+    const rpFileId = replyPhoto.fileId || replyPhoto.file_id;
+    const rpCaption = String(replyPhoto.caption ?? "");
+    const userText = String(text ?? "").trim();
+    const isGeneratedCaption = /^🎨 تصویر (?:ساخته|ویرایش) شد:/.test(rpCaption);
+    const askedQuestion = isVisionQuestionCaption(userText) || /[؟?]\s*$/.test(userText);
+    const askedEdit = isImageEditCaption(userText) || (isGeneratedCaption && !askedQuestion);
+    const targetChatId = o.chatId ?? o.userId ?? userId;
+    const sendEditedPhoto = async (bytes, mimeType, caption) => {
+      let ok = false;
+      if (typeof o.sendPhoto === "function") {
+        try { const r = await o.sendPhoto(bytes, { caption, mimeType, filename: "edited.png" }); ok = !(r && r.ok === false); } catch {}
+      }
+      if (!ok && (env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN) && targetChatId) {
+        try { const r = await sendPhoto({ ...env, TG_TOKEN: env.TG_TOKEN || env.TELEGRAM_BOT_TOKEN }, targetChatId, "edited.png", bytes, { caption, contentType: mimeType }); ok = !(r && r.ok === false); } catch {}
+      }
+      if (!ok && typeof o.send === "function") await o.send("❌ ارسال تصویر به تلگرام ناموفق بود؛ دوباره تلاش کن.");
+      return ok;
+    };
+    if (askedEdit && !askedQuestion) {
+      if (typeof o.send === "function") await o.send("🎨 در حال ویرایش تصویر، لطفاً چند ثانیه صبر کنید...");
+      const imageBytes = await fileBytesFromTelegram(env, rpFileId);
+      let basePrompt = rpCaption.replace(/^🎨 تصویر (?:ساخته|ویرایش) شد:\s*/u, "").trim();
+      if (!basePrompt && imageBytes && imageBytes.length) {
+        const desc = await analyzeImage(env, { imageBytes, mimeType: "image/jpeg", prompt: "این تصویر را کوتاه و دقیق به فارسی توصیف کن.", userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
+        if (desc && desc.ok && desc.text) basePrompt = desc.text;
+      }
+      if (!basePrompt) basePrompt = "the scene in the attached image";
+      const negatives = [];
+      if (/(ادم|آدم|افراد|مردم|person|people)/i.test(userText)) negatives.push("no people, empty street");
+      if (/(الودگی|آلای|دود|مه‌آلود|مه آلود|pollution|smog)/i.test(userText)) negatives.push("clear blue sky without pollution");
+      const negativeText = negatives.length ? ` Negative constraints: ${negatives.join(", ")}.` : "";
+      const instruction = `Apply this edit to the scene: ${basePrompt}. User edit request: ${userText}.${negativeText}`;
+      let result = null;
+      if (imageBytes && imageBytes.length) {
+        const edited = await editImage(env, { imageBytes, mimeType: "image/jpeg", instruction, userId, fetchFn: o.fetchFn });
+        if (edited && edited.ok) result = edited;
+      }
+      if (!result) {
+        const generated = await generateFreeImage(env, instruction, { userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
+        if (generated && generated.ok) result = generated;
+      }
+      if (result && result.ok) {
+        await sendEditedPhoto(result.bytes, result.mimeType, `🎨 تصویر ویرایش شد (${result.provider}): ${userText}`);
+      } else if (typeof o.send === "function") {
+        await o.send("ویرایش تصویر ممکن نشد؛ دوباره تلاش کن.");
+      }
+      return "handled";
+    }
+    if (askedQuestion) {
+      const imageBytes = await fileBytesFromTelegram(env, rpFileId);
+      if (!imageBytes || !imageBytes.length) {
+        if (typeof o.send === "function") await o.send("تحلیل تصویر ممکن نشد.");
+        return "handled";
+      }
+      const result = await analyzeImage(env, { imageBytes, mimeType: "image/jpeg", prompt: userText, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
+      if (typeof o.send === "function") {
+        await o.send(result && result.ok && result.text ? result.text : "❌ خطا در تحلیل تصویر: " + (result?.error || result?.text || "vision_unavailable"));
+      }
+      return "handled";
+    }
+  }
   const parsedImage = parseImageGenCommand(text);
   if (parsedImage.isImageGen) {
     const targetChatId = o.chatId ?? o.userId ?? userId;
-    const caption = `🎨 تصویر ساخته شد: ${parsedImage.prompt}`;
     try {
       if (typeof o.send === "function") await o.send("🎨 در حال ساخت تصویر، لطفاً چند ثانیه صبر کنید...");
-      const res = await generateFreeImage(env, parsedImage.prompt, { userId, fetchFn: o.fetchFn });
+      const res = await generateFreeImage(env, parsedImage.prompt, { userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
       if (res && res.ok) {
+        const caption = `🎨 تصویر ساخته شد (${res.provider || "auto"}): ${parsedImage.prompt}`;
         let photoSent = false;
         if (typeof o.sendPhoto === "function") {
           try {
