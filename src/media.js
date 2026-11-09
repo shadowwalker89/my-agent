@@ -169,12 +169,36 @@ function extractNvidiaImage(json) {
 const IMAGE_USER_AGENT = "Mozilla/5.0 (compatible; my-agent/1.0)";
 const PERSIAN_RE = /[\u0600-\u06FF]/;
 
+function timeoutSignal(ms) {
+  try { if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") return AbortSignal.timeout(ms); } catch {}
+  return undefined;
+}
+
 // Pollinations and several free endpoints block non-browser user agents from
-// Workers, and Persian prompts generate poorly. Ask Gemini (the same key the
-// voice path uses) for a concise English visual prompt, but always fall back
-// to the original text when translation is unavailable.
-async function toEnglishImagePrompt(env, userId, prompt, fn) {
+// Workers, and Persian prompts generate poorly. Translate to English via a
+// caller-supplied translateFn, NVIDIA (the preferred live key), or Gemini.
+// Always fall back to the original text when translation is unavailable.
+async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
   if (!PERSIAN_RE.test(prompt) || typeof fn !== "function") return prompt;
+  if (typeof opts.translateFn === "function") {
+    try { const t = await opts.translateFn(prompt); if (typeof t === "string" && t.trim() && !PERSIAN_RE.test(t)) return t.trim(); } catch {}
+  }
+  try {
+    const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
+    if (nvidiaKey) {
+      const res = await fn("https://integrate.api.nvidia.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}` },
+        body: JSON.stringify({ model: "meta/llama-3.1-70b-instruct", messages: [{ role: "user", content: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }], max_tokens: 120, temperature: 0.2 }),
+        signal: timeoutSignal(3000),
+      });
+      if (res?.ok) {
+        const json = await safeJson(res);
+        const text = json?.choices?.[0]?.message?.content;
+        if (typeof text === "string" && text.trim()) return text.trim();
+      }
+    }
+  } catch {}
   const key = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
   if (!key) return prompt;
   try {
@@ -185,6 +209,7 @@ async function toEnglishImagePrompt(env, userId, prompt, fn) {
         contents: [{ role: "user", parts: [{ text: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }] }],
         generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
       }),
+      signal: timeoutSignal(4000),
     });
     if (!res?.ok) return prompt;
     const json = await safeJson(res);
@@ -201,7 +226,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
   const fn = resolveFetch(opts);
   const userId = opts.userId ?? null;
   if (typeof fn !== "function") return { ok: false, error: "image_gen_failed" };
-  const visual = await toEnglishImagePrompt(env, userId, clean, fn);
+  const visual = await toEnglishImagePrompt(env, userId, clean, fn, opts);
 
   try {
     const togetherKey = await resolveKey(env, userId, "together", "TOGETHER_API_KEY");
@@ -211,6 +236,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${togetherKey}` },
           body: JSON.stringify({ model: "black-forest-labs/FLUX.1-schnell-Free", prompt: visual, width: 1024, height: 1024, n: 1, response_format: "b64_json" }),
+          signal: timeoutSignal(8000),
         });
         if (res?.ok) {
           const json = await safeJson(res);
@@ -225,19 +251,26 @@ export async function generateFreeImage(env, prompt, opts = {}) {
   try {
     const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
     if (nvidiaKey) {
-      try {
-        const res = await fn("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}`, Accept: "application/json" },
-          body: JSON.stringify({ prompt: visual, width: 1024, height: 1024, steps: 4 }),
-        });
-        if (res?.ok) {
-          const json = await safeJson(res);
-          const b64 = extractNvidiaImage(json);
-          const bytes = b64 ? b64ToBytes(b64) : null;
-          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "nvidia" };
-        }
-      } catch {}
+      const tryNvidia = async (body) => {
+        try {
+          const res = await fn("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}`, Accept: "application/json" },
+            body: JSON.stringify(body),
+            signal: timeoutSignal(8000),
+          });
+          if (res?.ok) {
+            const json = await safeJson(res);
+            const b64 = extractNvidiaImage(json);
+            const bytes = b64 ? b64ToBytes(b64) : null;
+            if (bytes && bytes.length) return bytes;
+          }
+        } catch {}
+        return null;
+      };
+      let nbytes = await tryNvidia({ prompt: visual, width: 1024, height: 1024, steps: 4 });
+      if (!nbytes) nbytes = await tryNvidia({ prompt: visual });
+      if (nbytes) return { ok: true, bytes: nbytes, mimeType: "image/png", provider: "nvidia" };
     }
   } catch {}
 
@@ -252,6 +285,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
             contents: [{ role: "user", parts: [{ text: visual }] }],
             generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
           }),
+          signal: timeoutSignal(8000),
         });
         if (res?.ok) {
           const json = await safeJson(res);
@@ -271,6 +305,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${hfKey}`, Accept: "image/png" },
           body: JSON.stringify({ inputs: visual }),
+          signal: timeoutSignal(8000),
         });
         if (res?.ok && typeof res.arrayBuffer === "function") {
           const buf = await res.arrayBuffer();
@@ -282,8 +317,10 @@ export async function generateFreeImage(env, prompt, opts = {}) {
   } catch {}
 
   try {
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(visual)}?model=flux&width=1024&height=1024&nologo=true`;
-    const res = await fn(url, { headers: { "User-Agent": IMAGE_USER_AGENT, Accept: "image/*" } });
+    let visualForUrl = visual;
+    if (PERSIAN_RE.test(visualForUrl)) visualForUrl = visualForUrl.replace(/[\u0600-\u06FF\u200C\u200D]+/g, " ").replace(/\s+/g, " ").trim() || "abstract colorful art";
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(visualForUrl)}?width=768&height=768&nologo=true`;
+    const res = await fn(url, { headers: { "User-Agent": "Mozilla/5.0", Accept: "image/*" }, signal: timeoutSignal(10000) });
     if (res?.ok) {
       const buf = await res.arrayBuffer();
       const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
@@ -367,6 +404,7 @@ export async function analyzeImage(env, opts = {}) {
     const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
     if (geminiKey && typeof fn === "function") {
       const b64 = bytesToB64(imageBytes);
+      const geminiSignal = geminiKey.startsWith("AIza") ? undefined : timeoutSignal(4000);
       for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) {
         try {
           const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
@@ -375,11 +413,42 @@ export async function analyzeImage(env, opts = {}) {
             body: JSON.stringify({
               contents: [{ role: "user", parts: [{ text: prompt }, { inlineData: { mimeType, data: b64 } }] }],
             }),
+            signal: geminiSignal,
           });
           if (res?.ok) {
             const json = await safeJson(res);
             const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
             if (text) return { ok: true, text };
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  try {
+    const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
+    if (nvidiaKey && typeof fn === "function") {
+      const b64 = bytesToB64(imageBytes);
+      const dataUri = `data:${mimeType || "image/jpeg"};base64,${b64}`;
+      for (const model of ["meta/llama-3.2-90b-vision-instruct", "nvidia/nemotron-3.5-super-vl-120b-a12b"]) {
+        try {
+          const res = await fn("https://integrate.api.nvidia.com/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}` },
+            body: JSON.stringify({
+              model,
+              messages: [{ role: "user", content: [
+                { type: "text", text: "به فارسی دقیق به این سوال درباره تصویر پاسخ بده: " + prompt },
+                { type: "image_url", image_url: { url: dataUri } },
+              ] }],
+              max_tokens: 600,
+            }),
+            signal: timeoutSignal(12000),
+          });
+          if (res?.ok) {
+            const json = await safeJson(res);
+            const text = json?.choices?.[0]?.message?.content;
+            if (typeof text === "string" && text.trim()) return { ok: true, text: text.trim() };
           }
         } catch {}
       }

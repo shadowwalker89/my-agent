@@ -1125,9 +1125,10 @@ async function handleUpdate(env, update) {
         send: (msgText, opts) => tgSend(env, chatId, msgText, opts),
         ...fileSenders(env, chatId),
         chat: (t, copts) => answerChatText(env, chatId, userId, t, false, copts),
+        chatFn: (t) => runCombo(env, "chat", { messages: [{ role: "user", content: t }] }, { totalTimeoutMs: 22000, requireFinalText: true }),
         routerCallFn: (body) => visionRouterCall(env, body),
       });
-      if (handled) return;
+      if (handled === true || handled === "handled") return;
     }
     await tgSend(env, msg.chat.id, "فعلاً فقط پیام متنی پشتیبانی می‌شود 🙏");
     return;

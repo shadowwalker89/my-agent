@@ -7846,6 +7846,94 @@ if (DatabaseSync) {
   }
 }
 
+// Regression: PDF single reply + FlateDecode, NVIDIA vision, image-gen progress/sendPhoto.
+if (DatabaseSync) {
+  const { extractTextFromPdfBytes } = await import("../src/pdf.js");
+  const { analyzeImage } = await import("../src/media.js");
+  const { handleIncomingFile, handleDailyText } = await import("../src/everyday.js");
+
+  const deflateText = async (text) => {
+    const stream = new Response(new TextEncoder().encode(text)).body.pipeThrough(new CompressionStream("deflate"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  };
+  const flateBody = await deflateText("BT (Flate Secret Text) Tj ET");
+  const fHead = new TextEncoder().encode("%PDF-1.4\n1 0 obj\n<< /Length " + flateBody.length + " /Filter /FlateDecode >>\nstream\n");
+  const fTail = new TextEncoder().encode("\nendstream\nendobj\n%%EOF");
+  const flatePdf = new Uint8Array(fHead.length + flateBody.length + fTail.length);
+  flatePdf.set(fHead, 0); flatePdf.set(flateBody, fHead.length); flatePdf.set(fTail, fHead.length + flateBody.length);
+  const flateText = await extractTextFromPdfBytes(flatePdf);
+  check(String(flateText).includes("Flate Secret Text"), `fix1: extractTextFromPdfBytes inflates FlateDecode stream: ${JSON.stringify(flateText).slice(0, 120)}`);
+
+  const sqR = new DatabaseSync(":memory:");
+  sqR.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqR.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqR.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  sqR.exec("INSERT INTO users (id, telegram_id) VALUES (4242, '4242')");
+  const baseR = (sql) => { const st = sqR.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+  const dbR = { prepare(sql) { return baseR(sql); } };
+  const origFetchR = global.fetch;
+  const plainPdf = new TextEncoder().encode("%PDF-1.4\nBT (Hello World) Tj ET\n%%EOF");
+  global.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes("/file/bot")) return new Response(plainPdf.slice().buffer, { headers: { "content-type": "application/pdf" } });
+    if (u.startsWith("https://api.telegram.org/")) {
+      const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+      const method = m ? m[1] : "";
+      if (method === "getFile") return Response.json({ ok: true, result: { file_path: "doc/r.pdf" } });
+      return Response.json({ ok: true, result: { message_id: 1 } });
+    }
+    return Response.json({ ok: true });
+  };
+  try {
+    const envR = { STATE: fakeKV(), DB: dbR, TG_TOKEN: "fake-token" };
+    const sentR = [];
+    const handledR = await handleIncomingFile(envR, {
+      userId: 4242, chatId: 4242, tgFileId: "pdf-r", fileType: "document", mimeType: "application/pdf", fileName: "scan.pdf",
+      caption: "این پی‌دی‌اف رو خلاصه کن",
+      send: async (t) => { sentR.push(String(t)); },
+      chatFn: async (t) => { check(String(t).includes("Hello World"), "fix1: pure chatFn receives extracted PDF text"); return "خلاصه فارسی: یک بار"; },
+      routerCallFn: null,
+    });
+    check(handledR === true && sentR.length === 1 && sentR[0].includes("خلاصه فارسی"), `fix1: PDF summary sends exactly ONE reply: count=${sentR.length} ${JSON.stringify(sentR)}`);
+  } finally {
+    global.fetch = origFetchR;
+  }
+
+  let nvSeen = null;
+  const nvFn = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes("integrate.api.nvidia.com/v1/chat/completions")) {
+      nvSeen = { url: u, init };
+      return { ok: true, json: async () => ({ choices: [{ message: { content: "روی لباسش دو شخصیت کارتونی است." } }] }) };
+    }
+    return { ok: false, json: async () => ({}) };
+  };
+  const anaNv = await analyzeImage({ STATE: fakeKV(), GEMINI_API_KEY: "AQ.not-a-rest-key", NVIDIA_API_KEY: "nvap-test" }, {
+    imageBytes: new Uint8Array([1, 2, 3]), mimeType: "image/jpeg", prompt: "اون ها چیه روی لباسش", fetchFn: nvFn,
+  });
+  check(anaNv.ok === true && String(anaNv.text).includes("شخصیت کارتونی") && nvSeen && nvSeen.url.includes("integrate.api.nvidia.com") && String(nvSeen.init?.headers?.Authorization || "").startsWith("Bearer nvap-"), `fix2: analyzeImage uses NVIDIA vision key: ${JSON.stringify(anaNv)} seen=${nvSeen && nvSeen.url}`);
+
+  const sentI = [];
+  const photosI = [];
+  const imgFn = async (url) => {
+    const u = String(url);
+    if (u.includes("integrate.api.nvidia.com/v1/chat/completions")) {
+      return { ok: true, json: async () => ({ choices: [{ message: { content: "futuristic car on Tehran streets" } }] }) };
+    }
+    if (u.includes("ai.api.nvidia.com")) return { ok: false, json: async () => ({}) };
+    if (u.includes("image.pollinations.ai")) return { ok: true, arrayBuffer: async () => new Uint8Array([7, 8, 9]).buffer };
+    return { ok: false, json: async () => ({}) };
+  };
+  const rI = await handleDailyText({ STATE: fakeKV(), DB: dbR, NVIDIA_API_KEY: "nvap-img" }, {
+    userId: 4242, chatId: 4242, text: "یه عکس از یک خودروی آینده‌نگر در خیابان‌های تهران بساز",
+    send: async (t) => { sentI.push(String(t)); },
+    sendPhoto: async (bytes, opts) => { photosI.push({ bytes, opts }); return { ok: true }; },
+    fetchFn: imgFn,
+  });
+  check(rI === "handled" && sentI.some((t) => t.includes("در حال ساخت تصویر")), `fix3: image gen sends progress message: ${JSON.stringify(sentI)}`);
+  check(photosI.length === 1 && photosI[0].bytes instanceof Uint8Array && photosI[0].bytes.length === 3 && String(photosI[0].opts?.caption || "").includes("تصویر ساخته شد") && Boolean(photosI[0].opts?.mimeType), `fix3: sendPhoto(bytes, opts) called once with caption/mimeType: ${JSON.stringify(photosI.map((p) => ({ len: p.bytes?.length, opts: p.opts })))}`);
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);

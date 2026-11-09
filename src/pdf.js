@@ -7,14 +7,65 @@ async function safeJson(r) { try { if (typeof r?.json === "function") return awa
 function htmlEsc(s) { return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function pdfEsc(s) { return String(s ?? "").replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)"); }
 function chatText(out) { if (!out) return ""; if (typeof out === "string") return out.trim(); if (typeof out === "object") { const t = out.text || out.finalText || out.answer || out?.data?.choices?.[0]?.message?.content || out?.data?.message?.content || ""; if (typeof t === "string" && t.trim()) return t.trim(); if (t && typeof t === "object") { try { return String(t).trim(); } catch {} } } try { return String(out).trim(); } catch { return ""; } }
-function extractPdfText(bytes) {
-  const a = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []); if (!a.length) return "";
+function latin1FromBytes(bytes) {
+  const a = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
   let raw = ""; for (let i = 0; i < a.length; i += 4096) raw += String.fromCharCode.apply(null, a.subarray(i, i + 4096));
+  return raw;
+}
+function tokensFromRawText(raw) {
   const toks = [];
   for (const m of raw.matchAll(/\(((?:[^()\\]|\\.)*)\)/g)) { let t = m[1].replace(/\\n/g, " ").replace(/\\r/g, " ").replace(/\\t/g, " ").replace(/\\\(/g, "(").replace(/\\\)/g, ")").replace(/\\\\/g, "\\").trim(); if (t.length >= 2 && /[A-Za-z0-9\u0600-\u06FF]/.test(t) && !/^(BT|ET|Tf|Td|stream|endstream)$/.test(t)) toks.push(t); }
   for (const m of raw.matchAll(/<([0-9A-Fa-f\s]{4,})>/g)) { let hx = m[1].replace(/\s+/g, ""); if (hx.length % 2) hx = hx.slice(0, -1); if (hx.length < 4) continue; const bb = new Uint8Array(hx.length / 2); for (let j = 0; j < bb.length; j++) bb[j] = parseInt(hx.slice(j * 2, j * 2 + 2), 16); let s = ""; if (/^FEFF/i.test(hx)) { for (let k = 2; k < bb.length; k += 2) s += String.fromCharCode((bb[k] << 8) | bb[k + 1]); } else { let u = ""; for (let k = 0; k + 1 < bb.length; k += 2) u += String.fromCharCode((bb[k] << 8) | bb[k + 1]); const plausible = u.length >= 2 && /[A-Za-z0-9\u0600-\u06FF]/.test(u) && (u.charCodeAt(0) > 255 || bb[0] === 0 || /[\u0600-\u06FF]/.test(u)); if (plausible) s = u; else { for (let k = 0; k < bb.length; k++) s += String.fromCharCode(bb[k]); if (!/[A-Za-z0-9\u0600-\u06FF]/.test(s)) s = ""; } } s = s.replace(/\0/g, "").trim(); if (s.length >= 2 && /[A-Za-z0-9\u0600-\u06FF]/.test(s)) toks.push(s); }
+  return toks;
+}
+function uniqText(toks) {
   const seen = new Set(); const uniq = toks.filter((t) => { const k = t.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
   return uniq.join("\n").replace(/\s+\n/g, "\n").trim().slice(0, 12000);
+}
+function extractPdfText(bytes) {
+  const a = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []); if (!a.length) return "";
+  return uniqText(tokensFromRawText(latin1FromBytes(a)));
+}
+async function inflateBytes(bytes, format, timeoutMs = 3000) {
+  if (typeof DecompressionStream !== "function" || typeof Response !== "function") return null;
+  let timer = null;
+  try {
+    const body = new Response(bytes).body;
+    if (!body) return null;
+    const stream = body.pipeThrough(new DecompressionStream(format));
+    const buf = await Promise.race([
+      new Response(stream).arrayBuffer(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("inflate timeout")), timeoutMs); }),
+    ]);
+    return new Uint8Array(buf);
+  } catch { return null; }
+  finally { if (timer) clearTimeout(timer); }
+}
+export async function extractTextFromPdfBytes(pdfBytes) {
+  const a = pdfBytes instanceof Uint8Array ? pdfBytes : new Uint8Array(pdfBytes || []);
+  if (!a.length) return "";
+  const raw = latin1FromBytes(a);
+  const toks = tokensFromRawText(raw);
+  const re = /\bstream\r?\n/g;
+  let m; let count = 0;
+  while ((m = re.exec(raw)) && count < 80) {
+    count++;
+    const start = m.index + m[0].length;
+    const end = raw.indexOf("endstream", start);
+    if (end < 0) continue;
+    const data = raw.slice(start, end).replace(/\r?\n$/, "");
+    re.lastIndex = end + 9;
+    if (!data.length || data.length > 3000000) continue;
+    const sb = new Uint8Array(data.length);
+    for (let i = 0; i < data.length; i++) sb[i] = data.charCodeAt(i) & 0xff;
+    let out = null;
+    for (const fmt of ["deflate", "deflate-raw"]) {
+      out = await inflateBytes(sb, fmt, 3000);
+      if (out && out.length) break;
+    }
+    if (out && out.length) toks.push(...tokensFromRawText(latin1FromBytes(out)));
+  }
+  return uniqText(toks) || extractPdfText(a);
 }
 function buildPdf(parts) {
   const out = [enc("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")]; const offs = [0]; let pos = out[0].length;
@@ -59,9 +110,9 @@ export async function analyzePdfDocument(env, opts = {}) {
   if (key && typeof fn === "function") { const b64 = bytesToB64(pdfBytes); const full = prompt + "\nلطفاً این PDF را به فارسی خلاصه/ترجمه کن، سؤال کاربر را دقیق پاسخ بده و خلاصه فارسی روان تحویل بده.";
     for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) { try { const res = await fn("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + key, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: full }, { inlineData: { mimeType: "application/pdf", data: b64 } }] }] }) }); if (res?.ok) { const js = await safeJson(res); const text = (js?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim(); if (text) return { ok: true, text }; } } catch {} }
   }
-  const ext = extractPdfText(pdfBytes); if (!ext) return { ok: false, error: "متن قابل استخراج نیست" };
+  const ext = await extractTextFromPdfBytes(pdfBytes); if (!ext) return { ok: false, error: "متن قابل استخراج نیست" };
   const chatFn = opts.chatFn || opts.chat || null; const router = opts.routerCallFn || null; const full2 = prompt + "\n\nمتن استخراج‌شده از PDF:\n" + ext.slice(0, 8000) + "\n\nپاسخ را به فارسی روان، خلاصه و دقیق بده.";
-  if (typeof chatFn === "function") { try { const out = await chatFn(full2, { saveText: "", noHistory: true }); const t = chatText(out); if (t) return { ok: true, text: t }; } catch {} try { const out2 = await chatFn(full2); const t2 = chatText(out2); if (t2) return { ok: true, text: t2 }; } catch {} }
+  if (typeof chatFn === "function") { try { const out = await chatFn(full2, { saveText: "", noHistory: true }); const t = chatText(out); if (t) return { ok: true, text: t }; } catch {} }
   if (typeof router === "function") { try { const out3 = await router({ model: "chat", messages: [{ role: "user", content: full2 }] }); const t3 = chatText(out3); if (t3) return { ok: true, text: t3 }; } catch {} }
   return { ok: true, text: ext.slice(0, 8000) };
 }

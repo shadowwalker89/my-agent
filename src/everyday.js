@@ -2018,7 +2018,8 @@ export async function handleVaultFile(env, o) {
   if (cap && isPdfAnalysisRequest(cap, mimeType, fileName)) {
     const pdfBytesPdf = await fileBytesFromTelegram(env, tgFileId);
     if (!pdfBytesPdf || !pdfBytesPdf.length) { await send("تحلیل ممکن نشد."); return true; }
-    const resultPdf = await analyzePdfDocument(env, { pdfBytes: pdfBytesPdf, prompt: cap, userId, fetchFn: o.fetchFn, chatFn: typeof o.chat === "function" ? o.chat : o.chatFn, routerCallFn: o.routerCallFn });
+    const chatFn = typeof o.chatFn === "function" ? o.chatFn : null;
+    const resultPdf = await analyzePdfDocument(env, { pdfBytes: pdfBytesPdf, prompt: cap, userId, fetchFn: o.fetchFn, chatFn, routerCallFn: o.routerCallFn });
     if (resultPdf && resultPdf.ok && resultPdf.text) await send(resultPdf.text);
     else await send(resultPdf?.text || resultPdf?.error || "تحلیل ممکن نشد.");
     return true;
@@ -2054,12 +2055,15 @@ export async function handleVaultFile(env, o) {
     }
     return true;
   }
-  if (isPhoto && cap && isVisionQuestionCaption(cap) && !/در گاوصندوق ذخیره کن|آرشیو کن/.test(cap)) {
-    const bytes = await fileBytesFromTelegram(env, tgFileId);
-    if (!bytes || !bytes.length) { await send("تحلیل ممکن نشد."); return true; }
-    const result = await analyzeImage(env, { imageBytes: bytes, mimeType: mimeType || "image/jpeg", prompt: cap, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
-    if (result && result.ok && result.text) await send(result.text);
-    else await send(result?.text || "تحلیل ممکن نشد.");
+  if (isPhoto && cap && !VAULT_CAPTION_RE.test(cap)) {
+    try {
+      const bytes = await fileBytesFromTelegram(env, tgFileId);
+      if (!bytes || !bytes.length) { await send("تحلیل ممکن نشد."); return true; }
+      const result = await analyzeImage(env, { imageBytes: bytes, mimeType: mimeType || "image/jpeg", prompt: cap, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
+      await send(result && result.ok && result.text ? result.text : (result?.text || "تحلیل تصویر ممکن نشد."));
+    } catch {
+      await send("تحلیل تصویر ممکن نشد.");
+    }
     return true;
   }
   // Case 1: explicit vault caption
@@ -2509,23 +2513,28 @@ export async function handleDailyText(env, o) {
   if (parsedImage.isImageGen) {
     const targetChatId = o.chatId ?? o.userId ?? userId;
     const caption = `🎨 تصویر ساخته شد: ${parsedImage.prompt}`;
-    const res = await generateFreeImage(env, parsedImage.prompt, { userId, fetchFn: o.fetchFn });
-    if (res.ok) {
-      let photoSent = false;
-      if (typeof o.sendPhoto === "function") {
-        try {
-          const tgRes = await o.sendPhoto(res.bytes, { caption, mimeType: res.mimeType, filename: "generated.png" });
-          photoSent = !(tgRes && tgRes.ok === false);
-        } catch {}
+    try {
+      if (typeof o.send === "function") await o.send("🎨 در حال ساخت تصویر، لطفاً چند ثانیه صبر کنید...");
+      const res = await generateFreeImage(env, parsedImage.prompt, { userId, fetchFn: o.fetchFn });
+      if (res && res.ok) {
+        let photoSent = false;
+        if (typeof o.sendPhoto === "function") {
+          try {
+            const tgRes = await o.sendPhoto(res.bytes, { caption, mimeType: res.mimeType, filename: "generated.png" });
+            photoSent = !(tgRes && tgRes.ok === false);
+          } catch {}
+        }
+        if (!photoSent && (env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN) && targetChatId) {
+          try {
+            const tgRes = await sendPhoto({ ...env, TG_TOKEN: env.TG_TOKEN || env.TELEGRAM_BOT_TOKEN }, targetChatId, "generated.png", res.bytes, { caption, contentType: res.mimeType });
+            photoSent = !(tgRes && tgRes.ok === false);
+          } catch {}
+        }
+        if (!photoSent && typeof o.send === "function") await o.send("❌ ارسال تصویر به تلگرام ناموفق بود؛ دوباره تلاش کن.");
+      } else {
+        if (typeof o.send === "function") await o.send("❌ تولید تصویر در حال حاضر ناموفق بود؛ دوباره تلاش کن.");
       }
-      if (!photoSent && (env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN) && targetChatId) {
-        try {
-          const tgRes = await sendPhoto({ ...env, TG_TOKEN: env.TG_TOKEN || env.TELEGRAM_BOT_TOKEN }, targetChatId, "generated.png", res.bytes, { caption, contentType: res.mimeType });
-          photoSent = !(tgRes && tgRes.ok === false);
-        } catch {}
-      }
-      if (!photoSent && typeof o.send === "function") await o.send("❌ ارسال تصویر به تلگرام ناموفق بود؛ دوباره تلاش کن.");
-    } else {
+    } catch {
       if (typeof o.send === "function") await o.send("❌ تولید تصویر در حال حاضر ناموفق بود؛ دوباره تلاش کن.");
     }
     return "handled";
