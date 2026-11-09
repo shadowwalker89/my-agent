@@ -25,7 +25,7 @@ function buildPdf(parts) {
 export function isPdfAnalysisRequest(caption, mimeType, fileName) {
   const isPdf = String(mimeType || "").toLowerCase() === "application/pdf" || String(fileName || "").toLowerCase().endsWith(".pdf"); if (!isPdf) return false;
   const s = String(caption ?? "").trim(); if (!s) return false;
-  return /(خلاصه|ترجمه|تحلیل|بررسی|توضیح|بخون|بخوان|دربیار|در بیار|استخراج|متن|درباره|چیه|چیست|سوال|سؤال|جواب|پردازش)/.test(s) || /(summar|translat|analys|extract|explain|what.*about|read.*this)/i.test(s);
+  return /(خلاصه|ترجمه|تحلیل|بررسی|توضیح|ببین|ببینم|نگاه|بخون|بخوان|دربیار|در بیار|استخراج|متن|درباره|چیه|چیست|سوال|سؤال|جواب|پردازش)/.test(s) || /(summar|translat|analys|extract|explain|what.*about|read.*this)/i.test(s);
 }
 export function parsePdfCreateCommand(text) {
   const t = String(text ?? "").trim(); const no = { isPdfCreate: false, match: false, ok: false, text: "", title: "", bodyText: "" }; if (!t) return no;

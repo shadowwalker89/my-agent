@@ -166,12 +166,42 @@ function extractNvidiaImage(json) {
   return null;
 }
 
+const IMAGE_USER_AGENT = "Mozilla/5.0 (compatible; my-agent/1.0)";
+const PERSIAN_RE = /[\u0600-\u06FF]/;
+
+// Pollinations and several free endpoints block non-browser user agents from
+// Workers, and Persian prompts generate poorly. Ask Gemini (the same key the
+// voice path uses) for a concise English visual prompt, but always fall back
+// to the original text when translation is unavailable.
+async function toEnglishImagePrompt(env, userId, prompt, fn) {
+  if (!PERSIAN_RE.test(prompt) || typeof fn !== "function") return prompt;
+  const key = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
+  if (!key) return prompt;
+  try {
+    const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
+      }),
+    });
+    if (!res?.ok) return prompt;
+    const json = await safeJson(res);
+    const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join(" ").trim();
+    return text || prompt;
+  } catch {
+    return prompt;
+  }
+}
+
 export async function generateFreeImage(env, prompt, opts = {}) {
   const clean = String(prompt ?? "").trim();
   if (!clean) return { ok: false, error: "image_gen_failed" };
   const fn = resolveFetch(opts);
   const userId = opts.userId ?? null;
   if (typeof fn !== "function") return { ok: false, error: "image_gen_failed" };
+  const visual = await toEnglishImagePrompt(env, userId, clean, fn);
 
   try {
     const togetherKey = await resolveKey(env, userId, "together", "TOGETHER_API_KEY");
@@ -180,7 +210,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
         const res = await fn("https://api.together.xyz/v1/images/generations", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${togetherKey}` },
-          body: JSON.stringify({ model: "black-forest-labs/FLUX.1-schnell-Free", prompt: clean, width: 1024, height: 1024, n: 1, response_format: "b64_json" }),
+          body: JSON.stringify({ model: "black-forest-labs/FLUX.1-schnell-Free", prompt: visual, width: 1024, height: 1024, n: 1, response_format: "b64_json" }),
         });
         if (res?.ok) {
           const json = await safeJson(res);
@@ -199,7 +229,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
         const res = await fn("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}`, Accept: "application/json" },
-          body: JSON.stringify({ prompt: clean, width: 1024, height: 1024, steps: 4 }),
+          body: JSON.stringify({ prompt: visual, width: 1024, height: 1024, steps: 4 }),
         });
         if (res?.ok) {
           const json = await safeJson(res);
@@ -219,7 +249,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: clean }] }],
+            contents: [{ role: "user", parts: [{ text: visual }] }],
             generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
           }),
         });
@@ -240,7 +270,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
         const res = await fn("https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${hfKey}`, Accept: "image/png" },
-          body: JSON.stringify({ inputs: clean }),
+          body: JSON.stringify({ inputs: visual }),
         });
         if (res?.ok && typeof res.arrayBuffer === "function") {
           const buf = await res.arrayBuffer();
@@ -252,8 +282,8 @@ export async function generateFreeImage(env, prompt, opts = {}) {
   } catch {}
 
   try {
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(clean)}?model=flux&width=1024&height=1024&nologo=true`;
-    const res = await fn(url);
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(visual)}?model=flux&width=1024&height=1024&nologo=true`;
+    const res = await fn(url, { headers: { "User-Agent": IMAGE_USER_AGENT, Accept: "image/*" } });
     if (res?.ok) {
       const buf = await res.arrayBuffer();
       const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);

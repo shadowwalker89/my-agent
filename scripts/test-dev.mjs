@@ -7769,6 +7769,83 @@ if (DatabaseSync) {
   }
 }
 
+// Real Telegram wiring: slash passthrough + photo->PDF + PDF summary + vision.
+if (DatabaseSync) {
+  const sqliteW = new DatabaseSync(":memory:");
+  sqliteW.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  sqliteW.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+  sqliteW.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+  sqliteW.exec("INSERT INTO users (id, telegram_id) VALUES (4242, '4242')");
+  const baseW = (sql) => { const st = sqliteW.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+  const dbW = { prepare(sql) { return baseW(sql); } };
+  const photoBytesW = new Uint8Array([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x64, 0x00, 0x80, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xff, 0xd9]);
+  const pdfBytesW = new TextEncoder().encode("%PDF-1.4\nBT (Hello World) Tj ET\n%%EOF");
+  const sendsW = [];
+  const geminiReplyW = "تحلیل فارسی: این تصویر یک خودروی آینده‌نگر است.";
+  const origFetchW = global.fetch;
+  global.fetch = async (url, init = {}) => {
+    const u = String(url);
+    const m = /\/bot[^/]+\/(\w+)$/.exec(u);
+    if (m) {
+      const method = m[1];
+      let payload = {};
+      let doc = null;
+      if (init.body instanceof FormData) {
+        const blob = init.body.get("document");
+        if (blob && typeof blob.arrayBuffer === "function") doc = Buffer.from(await blob.arrayBuffer());
+        payload = { caption: init.body.get("caption") };
+      } else {
+        try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+      }
+      sendsW.push({ method, payload, doc });
+      if (method === "getFile") return Response.json({ ok: true, result: { file_path: "doc/test" } });
+      return Response.json({ ok: true, result: { message_id: 1 } });
+    }
+    if (u.includes("/file/bot")) return new Response(pdfBytesW.slice().buffer, { headers: { "content-type": "application/pdf" } });
+    if (u.includes("generativelanguage.googleapis.com")) {
+      return Response.json({ candidates: [{ content: { parts: [{ text: geminiReplyW }] } }] });
+    }
+    return Response.json({ ok: true });
+  };
+  const sendUpdateW = async (env, message) => {
+    resetSeenUpdateIdsForTests();
+    await handleUpdate(env, {
+      update_id: 880000 + sendsW.length,
+      message: {
+        message_id: 1,
+        date: Math.floor(Date.now() / 1000),
+        from: { id: 4242, is_bot: false, first_name: "T" },
+        chat: { id: 4242, type: "private" },
+        ...message,
+      },
+    });
+  };
+  const allTextsW = () => sendsW.map((s) => String(s.payload?.text ?? ""));
+  try {
+    const envW = { STATE: fakeKV(), DB: dbW, TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", GEMINI_API_KEY: "gkey-w" };
+    await sendUpdateW(envW, { text: "/setup" });
+    check(!allTextsW().some((t) => t.includes("دستور ناشناس")), "/setup must not be swallowed as an unknown slash command");
+    check(sendsW.some((s) => s.method === "sendMessage" && String(s.payload?.text ?? "").includes("وضعیت کانکتور")), "/setup reaches handleDailyText through the real slash handler");
+
+    const beforePdf = sendsW.length;
+    await sendUpdateW(envW, { photo: [{ file_id: "photo-w", file_unique_id: "u-w", width: 100, height: 100 }], caption: "اینو به pdf تبدیل کن برام" });
+    const docW = sendsW.slice(beforePdf).find((s) => s.method === "sendDocument" && s.doc);
+    check(Boolean(docW) && docW.doc.toString("latin1").startsWith("%PDF-1.4"), "/photo with a PDF caption is converted and sent as %PDF-1.4 without the vault prompt");
+    check(!allTextsW().some((t) => t.includes("تصویر/فایل دریافت شد") || t.includes("تحلیل ممکن نشد")), "photo->PDF never falls through to the generic file reply");
+
+    const beforeSummary = sendsW.length;
+    await sendUpdateW(envW, { document: { file_id: "pdf-w", file_name: "140425100040212725.pdf", mime_type: "application/pdf" }, caption: "این فایل رو ببین و خلاصه کن برام" });
+    check(sendsW.slice(beforeSummary).some((s) => s.method === "sendMessage" && String(s.payload?.text ?? "").includes(geminiReplyW)), "PDF summary caption downloads the document and returns the summary");
+
+    const envVisionW = { STATE: fakeKV(), DB: dbW, TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", GOOGLE_API_KEY: "gkey-w2" };
+    const beforeVision = sendsW.length;
+    await sendUpdateW(envVisionW, { photo: [{ file_id: "photo-v", file_unique_id: "u-v", width: 100, height: 100 }], caption: "اون ها چیه روی لباسش" });
+    check(sendsW.slice(beforeVision).some((s) => s.method === "sendMessage" && String(s.payload?.text ?? "").includes(geminiReplyW)), "vision caption reuses env.GOOGLE_API_KEY (same Gemini key as voice) and returns the analysis");
+  } finally {
+    global.fetch = origFetchW;
+  }
+}
+
 if (failures.length) {
   console.error("\nFailures found:");
   for (const f of failures) console.error(`  - ${f}`);

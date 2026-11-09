@@ -22,7 +22,7 @@ import {
   setPrefer,
   validatePattern,
 } from "./overrides.js";
-import { tgApi, tgSend, tgBroadcast, sendProgressMessage, finalizeProgressMessage } from "./telegram.js";
+import { tgApi, tgSend, tgBroadcast, sendProgressMessage, finalizeProgressMessage, sendPhoto, sendDocument } from "./telegram.js";
 import { healthCounts, getMedianLatency, getHealthEntry, markFailure, recordLatency } from "./health.js";
 import { recordVerifiedModel, recordProviderCircuitSuccess } from "./circuit.js";
 import { ADMIN_HTML } from "./admin-page.js";
@@ -396,7 +396,7 @@ const HELP_TEXT =
   "دستورها: /combo [name|clear] /route on|off /showmodel on|off /models [combo] /combos /refresh [provider] " +
   "/test <provider/model> /pin <combo> <provider/model> /unpin <combo> <provider/model> " +
   "/ban <provider/model> /unban <provider/model> /prefer <combo> <rx1,rx2,...|reset> " +
-  "/intent on|off /dev <prompt> /status /ping /start — برای چت، متن ساده بفرست.";
+  "/intent on|off /dev <prompt> /setup [id key] /backup /image <prompt> /pdf <text> /status /ping /start — برای چت، متن ساده بفرست.";
 
 async function providerIds(env) {
   const cfg = await getConfig(env);
@@ -557,10 +557,16 @@ function tgToggleValue(raw) {
   return { on: false, off: false, ok: false };
 }
 
+// Commands owned by handleDailyText / media / pdf. tgCommand must not
+// swallow them as "دستور ناشناس"; the caller re-routes to handlePlainText.
+const DAILY_PASSTHROUGH_CMDS = new Set(["/setup", "/backup", "/image", "/img", "/pdf"]);
+
 async function tgCommand(env, chatId, text, userId) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
   const args = parts.slice(1);
+
+  if (DAILY_PASSTHROUGH_CMDS.has(cmd)) return "passthrough";
 
   if (cmd === "/help") {
     await tgSend(env, chatId, HELP_TEXT);
@@ -779,13 +785,38 @@ async function runIntent(env, chatId, userId, text, intent, hasImage, opts = {})
   await answerChatText(env, chatId, userId, text, hasImage, opts);
 }
 
+// Vision fallback for analyzeImage when no Google key is configured: the
+// live router's "vision" combo gets the same OpenAI-style image message.
+async function visionRouterCall(env, body) {
+  return await runCombo(env, "vision", body, { totalTimeoutMs: 20000, requireFinalText: true });
+}
+
+function fileSenders(env, chatId) {
+  return {
+    sendPhoto: (bytes, opts = {}) => sendPhoto(
+      env,
+      chatId,
+      opts.filename || "image.jpg",
+      bytes,
+      { ...opts, contentType: opts.contentType || opts.mimeType || "image/jpeg" },
+    ),
+    sendDocument: (bytes, opts = {}) => sendDocument(
+      env,
+      chatId,
+      opts.filename || "file",
+      bytes,
+      opts,
+    ),
+  };
+}
+
 async function handlePlainText(env, msg, text, opts = {}) {
-  const chatId = msg.chat.id;
+  const chatId = msg.chat?.id ?? msg.from?.id;
   const userId = msg.from.id;
   // Allow-list already checked in handleUpdate; only then create the row.
   await ensureUserRow(env, userId);
   // Order: explicit /dev (tgCommand) -> everyday -> chat/task/dev.
-  const dailyO = { chatId, userId, text, chatType: msg.chat?.type, source: opts.source, hasImage: updateHasImage(msg), ...dailySenders(env, chatId),
+  const dailyO = { chatId, userId, text, chatType: msg.chat?.type, source: opts.source, hasImage: updateHasImage(msg), ...dailySenders(env, chatId), ...fileSenders(env, chatId),
     chat: (modelText, copts) => answerChatText(env, chatId, userId, modelText, updateHasImage(msg), copts) };
   const daily = await handleDailyText(env, dailyO);
   // Save-first entry row already owns the user message: downstream chat
@@ -1080,8 +1111,22 @@ async function handleUpdate(env, update) {
     const doc = msg.document && typeof msg.document === "object" ? msg.document : null;
     const fileId = photo?.file_id ?? doc?.file_id;
     if (fileId) {
-      await ensureUserRow(env, msg.from.id);
-       const handled = await handleVaultFile(env, { userId: msg.from.id, chatId: msg.chat.id, tgFileId: fileId, fileType: photo ? "photo" : "document", mimeType: doc?.mime_type ?? (photo ? "image/jpeg" : null), fileName: doc?.file_name ?? null, caption: typeof msg.caption === "string" ? msg.caption : null, send: (msgText, opts) => tgSend(env, msg.chat.id, msgText, opts) });
+      const chatId = msg.chat?.id ?? msg.from.id;
+      const userId = msg.from.id;
+      await ensureUserRow(env, userId);
+      const handled = await handleVaultFile(env, {
+        userId,
+        chatId,
+        tgFileId: fileId,
+        fileType: photo ? "photo" : "document",
+        mimeType: doc?.mime_type ?? (photo ? "image/jpeg" : null),
+        fileName: doc?.file_name ?? null,
+        caption: typeof msg.caption === "string" ? msg.caption : null,
+        send: (msgText, opts) => tgSend(env, chatId, msgText, opts),
+        ...fileSenders(env, chatId),
+        chat: (t, copts) => answerChatText(env, chatId, userId, t, false, copts),
+        routerCallFn: (body) => visionRouterCall(env, body),
+      });
       if (handled) return;
     }
     await tgSend(env, msg.chat.id, "فعلاً فقط پیام متنی پشتیبانی می‌شود 🙏");
@@ -1093,7 +1138,8 @@ async function handleUpdate(env, update) {
   } else if (text === "/ping") {
     await tgSend(env, msg.chat.id, "pong");
   } else if (text.startsWith("/")) {
-    await tgCommand(env, msg.chat.id, text, msg.from.id);
+    const routed = await tgCommand(env, msg.chat.id, text, msg.from.id);
+    if (routed === "passthrough") await handlePlainText(env, msg, text);
   } else {
     // عکس/فایل تصویری هنوز هندل نمی‌شود (پیام متنی فقط)؛ hasImage فقط flag تابع طبقه‌بندی است.
     await handlePlainText(env, msg, text);

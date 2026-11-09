@@ -1,4 +1,5 @@
 import { getSetting, setSetting } from "./memory.js";
+import { getConfig } from "./config.js";
 
 export const CONNECTORS = [
   { id: "gemini", label: "Google Gemini (Vision / Image Edit / PDF)", keyName: "GEMINI_API_KEY" },
@@ -19,6 +20,43 @@ function maskKey(v) {
   return `${s.slice(0, 4)}...${s.slice(-2)}`;
 }
 
+// Production deployments use different names for the same Google key
+// (voice.js reads GEMINI_API_KEY). Check every known alias so vision/PDF/
+// image connectors reuse the key that already works elsewhere.
+const ENV_KEY_ALIASES = {
+  gemini: ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_AI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"],
+  nvidia: ["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"],
+};
+const CONFIG_KEY_HINT = {
+  gemini: /gemini|google/i,
+  nvidia: /nvidia/i,
+};
+
+function readEnvKey(env, names) {
+  for (const name of names) {
+    const v = env?.[name];
+    if (typeof v === "string" && v) return v;
+  }
+  return null;
+}
+
+async function readConfigKey(env, id, def) {
+  try {
+    const cfg = await getConfig(env);
+    const hint = CONFIG_KEY_HINT[id] ?? null;
+    for (const p of cfg?.providers ?? []) {
+      if (!p || typeof p !== "object") continue;
+      const matches = p.id === id || (hint && hint.test(String(p.secretName ?? "")));
+      if (!matches) continue;
+      const names = [...(ENV_KEY_ALIASES[id] ?? [def.keyName]), p.secretName]
+        .filter((n) => typeof n === "string" && n);
+      const v = readEnvKey(env, names);
+      if (v) return v;
+    }
+  } catch {}
+  return null;
+}
+
 export async function getConnectorSecret(env, userId, connectorId) {
   const def = CONNECTOR_MAP[String(connectorId ?? "").trim().toLowerCase()];
   if (!def) return null;
@@ -28,8 +66,9 @@ export async function getConnectorSecret(env, userId, connectorId) {
       if (typeof v === "string" && v) return v;
     } catch {}
   }
-  const fromEnv = env?.[def.keyName];
-  return typeof fromEnv === "string" && fromEnv ? fromEnv : null;
+  const fromEnv = readEnvKey(env, ENV_KEY_ALIASES[def.id] ?? [def.keyName]);
+  if (fromEnv) return fromEnv;
+  return readConfigKey(env, def.id, def);
 }
 
 export async function setConnectorSecret(env, userId, connectorId, value) {
@@ -55,7 +94,10 @@ export async function getConnectorStatuses(env, userSettings = {}, userId = null
         if (v) { secret = v; source = "user"; }
       } catch {}
     }
-    if (!secret && env?.[def.keyName]) { secret = env[def.keyName]; source = "env"; }
+    if (!secret) {
+      const fromEnv = readEnvKey(env, ENV_KEY_ALIASES[def.id] ?? [def.keyName]);
+      if (fromEnv) { secret = fromEnv; source = "env"; }
+    }
     out.push({
       id: def.id,
       label: def.label,

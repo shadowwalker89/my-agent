@@ -1981,9 +1981,11 @@ async function fileBytesFromTelegram(env, tgFileId) {
 const VAULT_CAPTION_RE = /(?:ذخیره|آرشیو|گاوصندوق|ثبت)\s*(?:کن)?|(?:کارت\s*ملی|شناسنامه|پاسپورت|گواهینامه|بیمه\s*نامه|بیمه‌نامه|آزمایش|سند|مدرک|قرارداد)/i;
 const VISION_CAPTION_RE = /(?:تحلیل|بررسی|بخون|بخوان|ترجمه|توضیح|چیه|چیست|خلاصه|OCR)/i;
 
-async function analyzeVaultImage(env, file, prompt) {
+async function analyzeVaultImage(env, file, prompt, userId = null) {
   const data = await getFileDownloadData(env, file.tg_file_id);
-  if (!data || !env?.GEMINI_API_KEY) return null;
+  let key = null;
+  try { key = await getConnectorSecret(env, userId ?? file.user_id ?? null, "gemini"); } catch {}
+  if (!data || !key) return null;
   const arr = new Uint8Array(data.data);
   let bin = "";
   for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
@@ -1993,7 +1995,7 @@ async function analyzeVaultImage(env, file, prompt) {
   const fullPrompt = `${userPrompt}لطفاً این تصویر/فایل را تحلیل کن، متن آن را استخراج کن و به فارسی پاسخ بده.`;
   for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) {
     try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: fullPrompt }, { inline_data: { mime_type: mime, data: b64 } }] }] }) });
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: fullPrompt }, { inline_data: { mime_type: mime, data: b64 } }] }] }) });
       const json = await res.json().catch(() => null);
       const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
       if (res.ok && text) return text;
@@ -2021,14 +2023,20 @@ export async function handleVaultFile(env, o) {
     else await send(resultPdf?.text || resultPdf?.error || "تحلیل ممکن نشد.");
     return true;
   }
-  if (isPhoto && cap && /(تبدیل\s+به\s*(?:PDF|پی‌دی‌اف)|پی‌دی‌اف\s+کن|PDF\s+کن|^pdf$)/i.test(cap)) {
+  const mentionsPdf = isPhoto && cap && /(?:\bpdf\b|پی‌دی‌اف|پی\s*دی\s*اف)/i.test(cap);
+  const wantsPdf = mentionsPdf && (/^\s*pdf\s*$/i.test(cap) || /(?:تبدیل|ساخت|درست|کن|بساز|بده|برام|برایم|convert|make)/i.test(cap));
+  if (wantsPdf) {
     const photoBytesPdf = await fileBytesFromTelegram(env, tgFileId);
     if (!photoBytesPdf || !photoBytesPdf.length) { await send("تبدیل به PDF ممکن نشد."); return true; }
     const pdfBytesOut = buildImageToPdfBytes(photoBytesPdf);
     let pdfSent = false;
-    if (typeof o.sendDocument === "function") { await o.sendDocument(pdfBytesOut, { filename: "photo.pdf", contentType: "application/pdf" }); pdfSent = true; }
-    else if ((env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN) && chatId) { await sendDocument({ ...env, TG_TOKEN: env.TG_TOKEN || env.TELEGRAM_BOT_TOKEN }, chatId, "photo.pdf", pdfBytesOut, { contentType: "application/pdf" }); pdfSent = true; }
-    if (!pdfSent && typeof send === "function") await send("📄 PDF آماده شد.");
+    if (typeof o.sendDocument === "function") {
+      try { const r = await o.sendDocument(pdfBytesOut, { filename: "photo.pdf", contentType: "application/pdf" }); pdfSent = !(r && r.ok === false); } catch {}
+    }
+    if (!pdfSent && (env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN) && chatId) {
+      try { const r = await sendDocument({ ...env, TG_TOKEN: env.TG_TOKEN || env.TELEGRAM_BOT_TOKEN }, chatId, "photo.pdf", pdfBytesOut, { contentType: "application/pdf" }); pdfSent = !(r && r.ok === false); } catch {}
+    }
+    if (!pdfSent && typeof send === "function") await send("تبدیل به PDF ممکن نشد.");
     return true;
   }
   if (isPhoto && cap && isImageEditCaption(cap)) {
@@ -2078,7 +2086,7 @@ export async function handleVaultFile(env, o) {
       if (r2 && r2.text) { await send(r2.text); return true; }
     }
     const f = { tg_file_id: tgFileId, mime_type: mimeType, file_type: fileType };
-    const text = await analyzeVaultImage(env, f, cap);
+    const text = await analyzeVaultImage(env, f, cap, userId);
     await send(text || "تحلیل ممکن نشد.");
     return true;
   }
@@ -2132,7 +2140,7 @@ export async function resolveVaultCallback(env, o) {
     const id = Number(analyze[1]);
     const f = await getVaultFile(env, o.fromId, id);
     if (!f) { await o.send("مدرکی پیدا نشد."); return true; }
-    const text = await analyzeVaultImage(env, f, null);
+    const text = await analyzeVaultImage(env, f, null, o.fromId);
     await o.send(text || "تحلیل ممکن نشد.");
     return true;
   }
@@ -2499,12 +2507,24 @@ export async function handleDailyText(env, o) {
   }
   const parsedImage = parseImageGenCommand(text);
   if (parsedImage.isImageGen) {
+    const targetChatId = o.chatId ?? o.userId ?? userId;
+    const caption = `🎨 تصویر ساخته شد: ${parsedImage.prompt}`;
     const res = await generateFreeImage(env, parsedImage.prompt, { userId, fetchFn: o.fetchFn });
     if (res.ok) {
       let photoSent = false;
-      if (typeof o.sendPhoto === "function") { await o.sendPhoto(res.bytes, { caption: `🎨 تصویر ساخته شد: ${parsedImage.prompt}`, mimeType: res.mimeType }); photoSent = true; }
-      else if (env?.TELEGRAM_BOT_TOKEN && o.chatId) { await sendPhoto(env, o.chatId, "generated.png", res.bytes, { caption: `🎨 تصویر ساخته شد: ${parsedImage.prompt}`, contentType: res.mimeType }); photoSent = true; }
-      if (!photoSent && typeof o.send === "function") await o.send(`🎨 تصویر ساخته شد: ${parsedImage.prompt}`);
+      if (typeof o.sendPhoto === "function") {
+        try {
+          const tgRes = await o.sendPhoto(res.bytes, { caption, mimeType: res.mimeType, filename: "generated.png" });
+          photoSent = !(tgRes && tgRes.ok === false);
+        } catch {}
+      }
+      if (!photoSent && (env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN) && targetChatId) {
+        try {
+          const tgRes = await sendPhoto({ ...env, TG_TOKEN: env.TG_TOKEN || env.TELEGRAM_BOT_TOKEN }, targetChatId, "generated.png", res.bytes, { caption, contentType: res.mimeType });
+          photoSent = !(tgRes && tgRes.ok === false);
+        } catch {}
+      }
+      if (!photoSent && typeof o.send === "function") await o.send("❌ ارسال تصویر به تلگرام ناموفق بود؛ دوباره تلاش کن.");
     } else {
       if (typeof o.send === "function") await o.send("❌ تولید تصویر در حال حاضر ناموفق بود؛ دوباره تلاش کن.");
     }
