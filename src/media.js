@@ -1,4 +1,5 @@
 import { getConnectorSecret } from "./connectors.js";
+import { getConfig } from "./config.js";
 
 function cleanPrompt(s) {
   return String(s ?? "").trim().replace(/\s+/g, " ").replace(/[.!؟?۔]+$/u, "").trim();
@@ -93,21 +94,19 @@ export function parseImageGenCommand(text) {
     const p = cleanPrompt(slash[1]);
     return p ? { isImageGen: true, prompt: p } : { isImageGen: false, prompt: "" };
   }
-  const patterns = [
-    /^\s*یک[\s\u200C]+تصویر[\s\u200C]+از[\s\u200C]+(.+?)[\s\u200C]+بساز[.!؟?۔]*\s*$/u,
-    /^\s*یه[\s\u200C]+عکس[\s\u200C]+از[\s\u200C]+(.+?)[\s\u200C]+بساز[.!؟?۔]*\s*$/u,
-    /^\s*تصویری[\s\u200C]+از[\s\u200C]+(.+?)[\s\u200C]+بساز[.!؟?۔]*\s*$/u,
-    /^\s*تصویر[\s\u200C]+(.+?)[\s\u200C]+را[\s\u200C]+تولید[\s\u200C]+کن[.!؟?۔]*\s*$/u,
-    /^\s*عکس[\s\u200C]+(.+?)[\s\u200C]+رو[\s\u200C]+بکش[.!؟?۔]*\s*$/u,
-  ];
-  for (const re of patterns) {
-    const m = t.match(re);
-    if (m) {
-      const p = cleanPrompt(m[1]);
-      if (p) return { isImageGen: true, prompt: p };
-    }
-  }
-  return { isImageGen: false, prompt: "" };
+  // Creation verbs may end the sentence with punctuation. The image noun
+  // may appear with or without "از", and tolerate common typos around it
+  // ("به عکس", "ی عکس", "یک عکس", "عکسی").
+  const verb = t.match(/(?:بساز|بکش|تولید[\s\u200C]+کن|درست[\s\u200C]+کن|طراحی[\s\u200C]+کن|بده)[.!؟?۔]*\s*$/u);
+  if (!verb) return { isImageGen: false, prompt: "" };
+  const before = t.slice(0, verb.index).trim();
+  const noun = before.match(/(?:عکسی|عکس|تصویری|تصویر|نقاشی|پوستر|لوگو)/u);
+  if (!noun) return { isImageGen: false, prompt: "" };
+  let subject = before.slice(noun.index + noun[0].length).trim();
+  subject = subject.replace(/^(?:از|را|رو)\s+/u, "").replace(/[\s،,؛;:：]+(?:را|رو)\s*$/u, "").trim();
+  subject = subject.replace(/^(?:از|را|رو)\s+/u, "").trim();
+  const p = cleanPrompt(subject);
+  return p ? { isImageGen: true, prompt: p } : { isImageGen: false, prompt: "" };
 }
 
 async function resolveKey(env, userId, connectorId, fallbackEnvName) {
@@ -116,7 +115,21 @@ async function resolveKey(env, userId, connectorId, fallbackEnvName) {
     if (typeof v === "string" && v) return v;
   } catch {}
   const fromEnv = env?.[fallbackEnvName];
-  return typeof fromEnv === "string" && fromEnv ? fromEnv : null;
+  if (typeof fromEnv === "string" && fromEnv) return fromEnv;
+  // Config-backed keys: the admin/config store may hold the key on the
+  // provider entry (providers[].apiKey) or under a top-level alias.
+  try {
+    const cfg = await getConfig(env);
+    const id = String(connectorId ?? "").toLowerCase();
+    const provider = (cfg?.providers ?? []).find((p) => String(p?.id ?? "").toLowerCase() === id);
+    const candidates = [
+      provider?.apiKey, provider?.key, provider?.secret,
+      cfg?.providers?.[id]?.apiKey,
+      cfg?.[`${id}ApiKey`], cfg?.[`${id}_api_key`], cfg?.[id]?.apiKey,
+    ];
+    for (const v of candidates) if (typeof v === "string" && v) return v;
+  } catch {}
+  return null;
 }
 
 function resolveFetch(opts) {
@@ -220,6 +233,22 @@ function outText(out) {
 }
 async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
   if (!PERSIAN_RE.test(prompt)) return prompt;
+  // Primary fast translator: free, no key, broad Persian vocabulary. This
+  // must run before any LLM fallback so unknown names/objects are never
+  // dropped from the prompt.
+  if (typeof fn === "function") {
+    try {
+      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=fa&tl=en&dt=t&q=${encodeURIComponent(prompt)}`;
+      const res = await fn(url, { method: "GET", signal: timeoutSignal(4000) });
+      if (res?.ok) {
+        const data = await safeJson(res);
+        const segments = Array.isArray(data?.[0])
+          ? data[0].map((x) => (Array.isArray(x) ? x[0] : "")).filter(Boolean).join("")
+          : "";
+        if (acceptEnglish(segments)) return `${segments.trim()}, high resolution, detailed, photorealistic, 8k`;
+      }
+    } catch {}
+  }
   if (typeof opts.translateFn === "function") {
     try { const t = await opts.translateFn(prompt); if (acceptEnglish(t)) return t.trim(); } catch {}
   }
@@ -325,7 +354,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}`, Accept: "application/json" },
             body: JSON.stringify(body),
-            signal: timeoutSignal(8000),
+            signal: timeoutSignal(14000),
           });
           if (res?.ok) {
             const json = await safeJson(res);
@@ -339,13 +368,17 @@ export async function generateFreeImage(env, prompt, opts = {}) {
           return { bytes: null, status: res?.status || null };
         } catch (e) { diagErrors.push(label + ":" + (e?.message || "error")); return { bytes: null, status: null }; }
       };
-      // SD3 accepts the full schema. FLUX.1-schnell rejects width/height with
-      // HTTP 422, so send the minimal body and retry prompt-only on 422.
-      let nbytes = (await tryNvidia("https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-3-medium", { prompt: visual, cfg_scale: 5, aspect_ratio: "1:1", seed: 0, steps: 30, negative_prompt: "watermark, text, logo, blurry, low quality, deformed" }, "nvidia-sd3")).bytes;
+      // FLUX.1-schnell is the fastest; SD3 and SDXL are fallbacks. FLUX
+      // rejects width/height with HTTP 422, so retry prompt-only on 422.
+      let nbytes = null;
+      let flux = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual, steps: 4, seed: 0 }, "nvidia-flux");
+      if (!flux.bytes && flux.status === 422) flux = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual }, "nvidia-flux-min");
+      nbytes = flux.bytes;
       if (!nbytes) {
-        let flux = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual, steps: 4, seed: 0 }, "nvidia-flux");
-        if (!flux.bytes && flux.status === 422) flux = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual }, "nvidia-flux-min");
-        nbytes = flux.bytes;
+        nbytes = (await tryNvidia("https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-3-medium", { prompt: visual, cfg_scale: 5, aspect_ratio: "1:1", seed: 0, steps: 28 }, "nvidia-sd3")).bytes;
+      }
+      if (!nbytes) {
+        nbytes = (await tryNvidia("https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-xl", { text_prompts: [{ text: visual, weight: 1 }], seed: 0, sampler: "K_EULER_ANCESTRAL", steps: 25 }, "nvidia-sdxl")).bytes;
       }
       if (nbytes) return { ok: true, bytes: nbytes, mimeType: "image/png", provider: "nvidia" };
     }
@@ -402,7 +435,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
   try {
     const englishPrompt = PERSIAN_RE.test(visual) ? fallbackEnglishPrompt(visual) : visual;
     const seed = Number.isFinite(Number(opts.seed)) ? Math.floor(Number(opts.seed)) : Math.floor(Math.random() * 1e9);
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(englishPrompt)}?model=flux&width=1024&height=1024&nologo=true&private=true&enhance=true&seed=${seed}`;
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(englishPrompt)}?model=flux&width=1024&height=1024&nologo=true&enhance=true&seed=${seed}`;
     const res = await fn(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -410,7 +443,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
         Referer: "https://pollinations.ai/",
       },
       redirect: "follow",
-      signal: timeoutSignal(10000),
+      signal: timeoutSignal(16000),
     });
     if (res?.ok) {
       const buf = await res.arrayBuffer();

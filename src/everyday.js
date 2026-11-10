@@ -2462,6 +2462,27 @@ export async function runNluBranch(env, o, ctx) {
       const kind = nlu.summary_target === "tasks" ? "task" : "note";
       return viaBranch({ intent: "summary", kind, projectName: nlu.project });
     }
+    case "image_gen": {
+      const prompt = String(nlu.body || nlu.title || text || "").trim();
+      if (!prompt) return null;
+      const targetChatId = o.chatId ?? o.userId ?? userId;
+      if (typeof o.send === "function") await o.send("🎨 در حال ساخت تصویر، لطفاً چند ثانیه صبر کنید...");
+      const res = await generateFreeImage(env, prompt, { userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
+      if (res && res.ok) {
+        const caption = `🎨 تصویر ساخته شد (${res.provider || "auto"}): ${prompt}`;
+        let photoSent = false;
+        if (typeof o.sendPhoto === "function") {
+          try { const tgRes = await o.sendPhoto(res.bytes, { caption, mimeType: res.mimeType, filename: "generated.png" }); photoSent = !(tgRes && tgRes.ok === false); } catch {}
+        }
+        if (!photoSent && (env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN) && targetChatId) {
+          try { const tgRes = await sendPhoto({ ...env, TG_TOKEN: env.TG_TOKEN || env.TELEGRAM_BOT_TOKEN }, targetChatId, "generated.png", res.bytes, { caption, contentType: res.mimeType }); photoSent = !(tgRes && tgRes.ok === false); } catch {}
+        }
+        if (!photoSent && typeof o.send === "function") await o.send("❌ ارسال تصویر به تلگرام ناموفق بود؛ دوباره تلاش کن.");
+      } else if (typeof o.send === "function") {
+        await o.send("❌ تولید تصویر در حال حاضر ناموفق بود؛ دوباره تلاش کن.");
+      }
+      return "handled";
+    }
     default:
       return null;
   }
@@ -2552,7 +2573,7 @@ export async function handleDailyText(env, o) {
       let result = null;
       if (generatedFollowUp) {
         const scene = basePrompt || "the scene in the generated image";
-        const combined = `${scene}. اعمال این تغییر: ${userText}`;
+        const combined = `${scene} — تغییرات: ${userText}`;
         const generated = await generateFreeImage(env, combined, { userId: o.userId ?? userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
         if (generated && generated.ok) result = generated;
       } else {
@@ -2577,7 +2598,8 @@ export async function handleDailyText(env, o) {
         }
       }
       if (result && result.ok) {
-        await sendEditedPhoto(result.bytes, result.mimeType, `🎨 تصویر ویرایش شد (${result.provider}): ${userText}`);
+        const captionScene = basePrompt || "the scene in the attached image";
+        await sendEditedPhoto(result.bytes, result.mimeType, `🎨 تصویر ویرایش شد (${result.provider}): ${captionScene} (${userText})`);
       } else if (typeof o.send === "function") {
         await o.send("ویرایش تصویر ممکن نشد؛ دوباره تلاش کن.");
       }

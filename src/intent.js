@@ -315,7 +315,7 @@ export const NLU_VALID_INTENTS = Object.freeze([
   "note", "task", "reminder", "expense", "income", "note_list", "task_list",
   "project_list", "project_create", "summary", "daypart_reply", "chat",
   "vault_save", "vault_get", "vault_list", "vault_file_get",
-  "memory_save", "unsupported_action",
+  "memory_save", "unsupported_action", "image_gen",
 ]);
 
 export function resolveInterpreterModel(env, opts = {}) {
@@ -426,8 +426,9 @@ function buildNluPrompt(text, context = {}) {
     "You are a Persian intent classifier for a single-user personal assistant bot.",
     "Output ONLY one JSON object, no other text, no markdown fences:",
     '{"intent": "...", "confidence": 0.0-1.0, "project": "name or null", "title": "key or null", "body": "text or null", "date_ref": "امروز|فردا|پسفردا|null", "time_ref": "HH:MM or hour text or null", "daypart": "صبح|عصر|شب|cancel|null", "summary_target": "notes|tasks|null", "leading_framing": "exact text or null", "trailing_framing": "exact text or null"}',
-    "Intents: note, task, reminder, expense, income, note_list, task_list, project_list, project_create, summary, daypart_reply, vault_save, vault_get, vault_list, vault_file_get, memory_save, unsupported_action, chat.",
+    "Intents: note, task, reminder, expense, income, note_list, task_list, project_list, project_create, summary, daypart_reply, vault_save, vault_get, vault_list, vault_file_get, memory_save, unsupported_action, image_gen, chat.",
     "Rules:",
+    "- image_gen: whenever the user asks to generate, draw, create, or design an image/photo/picture/illustration (put the visual subject description in body or title).",
     "- Classify by semantic meaning, not rigid keywords. Information/explanation questions (e.g. تفاوت Cloudflare D1 و KV چیه؟, چطور توی پایتون...) are ALWAYS chat, including questions about the user's own stored facts (e.g. 'اسم من چیه؟', 'من کجا زندگی می‌کنم؟'). Negated commands ('ثبت نکن') are chat.",
     "- memory_save: user is stating a personal fact, attribute, name, location, vehicle, preference, or static info to keep in mind (e.g. 'یادت باشه اسم من محمده', 'یادت بمونه من تهران می‌شینم', 'ماشین من پژو ۲۰۷ هست', 'فراموش نکن تولدم مهره', 'این را به خاطر بسپار: ...'). Extract the clean fact into body (e.g. 'اسم من محمد است') and the key/topic into title (e.g. 'name'). NEVER classify personal facts with 'یادت باشه' as reminder.",
     "- reminder: user wants a time-based future alert/notification to do an action (e.g. 'برای ۲ دقیقه دیگه یادآوری کن...', 'یادم بنداز فردا ساعت ۸...', 'یادت باشه فردا به علی زنگ بزنم', 'یادم بنداز فردا ساعت ۵ عصر به علی زنگ بزنم'). body = title, date_ref, time_ref, daypart, project.",

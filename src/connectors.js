@@ -48,11 +48,15 @@ async function readConfigKey(env, id, def) {
       if (!p || typeof p !== "object") continue;
       const matches = p.id === id || (hint && hint.test(String(p.secretName ?? "")));
       if (!matches) continue;
+      const inline = p.apiKey ?? p.key ?? p.secret;
+      if (typeof inline === "string" && inline) return inline;
       const names = [...(ENV_KEY_ALIASES[id] ?? [def.keyName]), p.secretName]
         .filter((n) => typeof n === "string" && n);
       const v = readEnvKey(env, names);
       if (v) return v;
     }
+    const alias = cfg?.[`${id}ApiKey`] ?? cfg?.[`${id}_api_key`] ?? cfg?.[id]?.apiKey;
+    if (typeof alias === "string" && alias) return alias;
   } catch {}
   return null;
 }

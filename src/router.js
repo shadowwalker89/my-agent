@@ -155,6 +155,22 @@ function tierVerifiedFast(targets, latencies) {
   }
   return fast.length ? [...fast, ...rest] : targets;
 }
+// Runtime guard for cached KV combos: cohere/north-mini-code:free is a
+// code-only model and must never lead a non-code combo (chat/fast/...).
+// It is demoted to the tail, or kept only when it is the sole candidate.
+const NORTH_MINI_CODE_RE = /north-mini-code|mini-code/i;
+function demoteNorthMiniCode(targets, comboName) {
+  if (comboName === "code") return targets;
+  if (!Array.isArray(targets) || targets.length < 2) return targets;
+  const keep = [];
+  const demoted = [];
+  for (const t of targets) {
+    const model = String(t?.model ?? t?.id ?? "");
+    if (NORTH_MINI_CODE_RE.test(model)) demoted.push(t);
+    else keep.push(t);
+  }
+  return demoted.length ? [...keep, ...demoted] : targets;
+}
 function partitionTargetsByHealth(targets) {
   const now = Date.now();
   const healthy = [];
@@ -360,7 +376,7 @@ export async function getComboTargets(env, name, opts = {}) {
   const pinModels = resolvePins(ov.pins?.[name], catalog)
     .map((m) => ({
       ...m,
-      score: scoreModel(m, compiled, { skipVlPenalty: rule.needsVision === true }),
+      score: scoreModel(m, compiled, { skipVlPenalty: rule.needsVision === true, comboName: name }),
     }))
     .filter((m) => !unhealthyProviders[m.provider]);
   const healthyPins = [];
@@ -373,6 +389,7 @@ export async function getComboTargets(env, name, opts = {}) {
   const scored = pickModels(catalog, rule, {
     prefer: preferPatterns,
     bans: ov.bans ?? [],
+    comboName: name,
   })
     .filter((m) => !pinKeys.has(`${m.provider}/${m.id}`.toLowerCase()))
     .filter((m) => !unhealthyProviders[m.provider]);
@@ -405,9 +422,12 @@ export async function getComboTargets(env, name, opts = {}) {
   // demotes that provider the same way, across isolates.
   const verified = await getVerifiedLatencies(env);
   const openCircuits = await getOpenProviderCircuits(env);
-  const reordered = partitionTargetsByOpenProviders(
-    partitionTargetsByProviderStreak(tierVerifiedFast(ordered, verified)),
-    openCircuits,
+  const reordered = demoteNorthMiniCode(
+    partitionTargetsByOpenProviders(
+      partitionTargetsByProviderStreak(tierVerifiedFast(ordered, verified)),
+      openCircuits,
+    ),
+    name,
   );
   return {
     name,
@@ -463,7 +483,10 @@ async function getManualComboTargets(env, combo, cfg, opts = {}) {
     for (const c of candidate) medians[`${c.provider}/${c.model}`] = await getMedianLatency(env, `${c.provider}/${c.model}`);
   }
 
-  const ordered = sortForStrategy(candidate, combo.strategy, { rrStart, medians });
+  const ordered = demoteNorthMiniCode(
+    sortForStrategy(candidate, combo.strategy, { rrStart, medians }),
+    combo.name,
+  );
   return {
     name: combo.name,
     manual: {

@@ -5808,6 +5808,9 @@ if (DatabaseSync) {
     const r1 = await getComboTargets(env, "rrtest");
     const r2 = await getComboTargets(env, "rrtest");
     check((await kv.get("rr:rrtest")) === "0" && r1.targets.map((t) => t.model).join(",") === "a,b" && r2.targets.map((t) => t.model).join(",") === "b,a", "2-d: real getComboTargets advances rr:<combo> and rotates");
+    await kv.put("config:v1", JSON.stringify({ providers: [], combos: [{ name: "chatmini", strategy: "priority", timeoutMs: 13000, retries: 0, targets: [{ provider: "xkiro", model: "cohere/north-mini-code:free", enabled: true }, { provider: "xkiro", model: "good-model", enabled: true }] }] }));
+    const mini = await getComboTargets(env, "chatmini", { preview: true });
+    check(mini.targets.map((t) => t.model).join(",") === "good-model,cohere/north-mini-code:free", `fix4: cached non-code combo demotes north-mini-code to the tail: ${JSON.stringify(mini.targets.map((t) => t.model))}`);
   }
   // (c) Compact keyboards + stray-dot strip (save-time and render-time).
   {
@@ -8052,6 +8055,32 @@ if (DatabaseSync) {
     });
     check(rFollow === "handled" && photosFollow.length === 1 && photosFollow[0].bytes instanceof Uint8Array && photosFollow[0].bytes.length === 3 && String(photosFollow[0].opts?.caption || "").includes("رنگ ماشینو قرمز کن"), `fix3: any-wording reply to generated photo regenerates and sends a new photo: ${JSON.stringify(photosFollow.map((p) => ({ len: p.bytes?.length, caption: p.opts?.caption })))}`);
     check(!sentFollow.some((t) => /فتوشاپ|Photoshop|OpenCV|آموزش/u.test(t)), "fix3: any-wording follow-up never falls through to a text tutorial");
+
+    const sentFollow2 = []; const photosFollow2 = []; const followBodies2 = [];
+    const followFetch2 = async (url, init = {}) => {
+      const u = String(url);
+      if (u.includes("translate.googleapis.com")) return { ok: false, status: 500, json: async () => ({}) };
+      if (u.includes("integrate.api.nvidia.com/v1/chat/completions")) {
+        followBodies2.push(String(init.body || ""));
+        return { ok: true, json: async () => ({ choices: [{ message: { content: "futuristic car in Tehran streets, clearer, daytime" } }] }) };
+      }
+      if (u.includes("ai.api.nvidia.com")) return { ok: false, status: 500, json: async () => ({}) };
+      if (u.includes("image.pollinations.ai")) return { ok: true, arrayBuffer: async () => new Uint8Array([21, 22, 23]).buffer };
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const baseScene = "یک خودروی آینده‌نگر در خیابان‌های تهران";
+    const editText = "خودروی آینده نگر رو واضح تر کن. روز بشه.";
+    const rFollow2 = await handleDailyText({ STATE: fakeKV(), DB: dbF, TG_TOKEN: "fake-token", NVIDIA_API_KEY: "nvap-follow2" }, {
+      userId: 4242, chatId: 4242,
+      text: editText,
+      replyToPhoto: { fileId: "photo-follow2", caption: `🎨 تصویر ساخته شد (pollinations): ${baseScene}` },
+      send: async (t) => { sentFollow2.push(String(t)); },
+      sendPhoto: async (bytes, opts) => { photosFollow2.push({ bytes, opts }); return { ok: true }; },
+      fetchFn: followFetch2,
+    });
+    const passedBoth = followBodies2.some((b) => b.includes(baseScene) && b.includes(editText));
+    check(rFollow2 === "handled" && passedBoth, `fix3: follow-up edit passes base scene and edit into the image generator: ${JSON.stringify(followBodies2).slice(0, 300)}`);
+    check(photosFollow2.length === 1 && String(photosFollow2[0].opts?.caption || "").includes(baseScene) && String(photosFollow2[0].opts?.caption || "").includes(editText), `fix3: follow-up caption preserves base scene and edit text: ${JSON.stringify(photosFollow2.map((p) => p.opts?.caption))}`);
   } finally {
     global.fetch = origFetchF;
   }
@@ -8084,6 +8113,24 @@ if (DatabaseSync) {
   const outP = await extractTextFromPdfBytes(pdfP);
   check(String(outP).includes("Net") && /\|\s*7,03 EUR/.test(outP) && /\|\s*19%/.test(outP) && /\|\s*8,37 EUR/.test(outP), `fix1: TJ kerning offsets become table column separators: ${JSON.stringify(outP).slice(0, 200)}`);
   check(String(outP).includes("پت"), `fix1: Arabic Presentation Forms normalize via NFKC to Persian: ${JSON.stringify(outP).slice(0, 200)}`);
+}
+
+// Fix #1/#2/#3: relaxed image parsing, NLU image_gen, document-wide visual RTL.
+{
+  const { parseImageGenCommand } = await import("../src/media.js");
+  const pTypo = parseImageGenCommand("برام به عکس شکلات کنار چای روی میز خونه در هوایی پاییزی بساز.");
+  const pPlain = parseImageGenCommand("یه عکس شکلات کنار چای روی میز خونه در هوایی پاییزی بساز.");
+  check(pTypo.isImageGen === true && pTypo.prompt.includes("شکلات کنار چای"), `fix1: "برام به عکس ..." matches image gen: ${JSON.stringify(pTypo)}`);
+  check(pPlain.isImageGen === true && pPlain.prompt.includes("شکلات کنار چای"), `fix1: "یه عکس ..." (no از) matches image gen: ${JSON.stringify(pPlain)}`);
+  const nluImg = await classifyIntentNlu({}, "یه عکس شکلات بساز", {}, {
+    model: "test/model",
+    callFn: async () => JSON.stringify({ intent: "image_gen", confidence: 0.92, body: "شکلات کنار چای" }),
+  });
+  check(nluImg.ok === true && nluImg.intent === "image_gen", `fix1: NLU accepts image_gen intent: ${JSON.stringify(nluImg)}`);
+  const { fixVisualRtlPersian } = await import("../src/pdf.js");
+  const rtlDoc = ["راضحتسا تهج ناریا تارباخم", "نایع‌راز دواد"].join("\n");
+  const nameLine = fixVisualRtlPersian(rtlDoc).split("\n")[1].replace(/\u200C/g, "");
+  check(nameLine === "داود زارعیان", `fix3: document-wide visual RTL reverses standalone name line: ${JSON.stringify(nameLine)}`);
 }
 
 if (failures.length) {
