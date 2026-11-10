@@ -1803,7 +1803,7 @@ async function adminApiProbe(request, env) {
   }
 
   // (c) top 3 from scored catalog per provider
-  const scored = pickModels(catalog, RULES.chat, { prefer: null, bans: [] });
+  const scored = pickModels(catalog, RULES.chat, { prefer: null, bans: [], comboName: "chat" });
   for (const p of providers) {
     for (const m of scored.filter((x) => x.provider === p.id).slice(0, 3)) {
       addTarget(p.id, m.id);

@@ -353,7 +353,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
 
   try {
     const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
-    if (geminiKey) {
+    if (geminiKey && geminiKey.startsWith("AIza")) {
       try {
         const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=${geminiKey}`, {
           method: "POST",
@@ -399,26 +399,19 @@ export async function generateFreeImage(env, prompt, opts = {}) {
     }
   } catch (e) { diagErrors.push("huggingface:" + (e?.message || "error")); }
 
-  // Prefer Workers AI (high-res, no watermark) over the public Pollinations
-  // endpoint so a failed paid provider never degrades to a tiny watermarked
-  // image.
-  if (!opts.disableCfFallback && env?.AI && typeof env.AI.run === "function") {
-    for (const model of ["@cf/black-forest-labs/flux-1-schnell", "@cf/bytedance/stable-diffusion-xl-lightning"]) {
-      try {
-        const out = model.includes("flux")
-          ? await env.AI.run(model, { prompt: visual, steps: 6 })
-          : await env.AI.run(model, { prompt: visual });
-        const bytes = await toBytes(out);
-        if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "cloudflare" };
-        diagErrors.push("cloudflare:" + model.split("/").pop() + ":empty");
-      } catch (e) { diagErrors.push("cloudflare:" + (e?.message || "error")); }
-    }
-  }
-
   try {
-    const visualForUrl = PERSIAN_RE.test(visual) ? fallbackEnglishPrompt(visual) : visual;
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(visualForUrl)}?model=flux&width=1024&height=1024&nologo=true&private=true&enhance=true&seed=42`;
-    const res = await fn(url, { headers: { "User-Agent": "Mozilla/5.0", Accept: "image/*" }, redirect: "follow", signal: timeoutSignal(10000) });
+    const englishPrompt = PERSIAN_RE.test(visual) ? fallbackEnglishPrompt(visual) : visual;
+    const seed = Number.isFinite(Number(opts.seed)) ? Math.floor(Number(opts.seed)) : Math.floor(Math.random() * 1e9);
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(englishPrompt)}?model=flux&width=1024&height=1024&nologo=true&private=true&enhance=true&seed=${seed}`;
+    const res = await fn(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        Accept: "image/*",
+        Referer: "https://pollinations.ai/",
+      },
+      redirect: "follow",
+      signal: timeoutSignal(10000),
+    });
     if (res?.ok) {
       const buf = await res.arrayBuffer();
       const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
@@ -437,7 +430,7 @@ export function isImageEditCaption(caption) {
   if (!s) return false;
   if (/^\s*(ویرایش\s*عکس|ویرایش|ادیت)\s*[:：-]/u.test(s)) return true;
   if (/^(ویرایش|ادیت)\s+/.test(s)) return true;
-  const markers = ["ویرایش عکس", "ادیت", "ویرایش کن", "ادیت کن", "پس‌زمینه", "پسزمینه", "کارتونی کن", "کارتونی", "تغییر بده", "نور عکس", "بهتر کن", "حذف کن", "حذف", "کم کن", "اضافه کن", "عوض کن", "تغییر بده", "اصلاح کن"];
+  const markers = ["ویرایش عکس", "ادیت", "ویرایش کن", "ادیت کن", "پس‌زمینه", "پسزمینه", "کارتونی کن", "کارتونی", "تغییر بده", "تغییر", "نور عکس", "بهتر کن", "حذف کن", "حذف", "کم کن", "اضافه کن", "عوض کن", "اصلاح کن", "رنگ", "رنگش", "قرمز", "آبی", "سبز", "زرد", "بلندتر", "بلند تر", "کوتاه‌تر", "کوتاه تر", "بزرگ‌تر", "بزرگ تر", "کوچک‌تر", "کوچک تر", "روشن‌تر", "روشن تر", "تیره‌تر", "تیره تر", "تبدیل کن", "color", "recolor", "change", "modify"];
   return markers.some((m) => s.includes(m));
 }
 
@@ -493,10 +486,25 @@ export async function editImage(env, opts = {}) {
   return { ok: false, reason: "نیاز به تنظیم کلید GEMINI_API_KEY یا HF_TOKEN در /setup برای ویرایش تصویر است." };
 }
 
+export const VISION_PERSIAN_INSTRUCTION =
+  "فقط پاسخ نهایی را به زبان فارسی روان و طبیعی بنویس. هرگز به انگلیسی فکر نکن، عبارت _IMAGE_ یا wait ننویس و از کلمات فرانسوی/انگلیسی وسط فارسی استفاده نکن.";
+
+export function cleanVisionPersianText(raw) {
+  let s = String(raw ?? "");
+  if (!s.trim()) return "";
+  s = s.replace(/<think>[\s\S]*?<\/think>/gi, " ");
+  s = s.replace(/_IMAGE_/g, " ");
+  s = s.replace(/\.\.\.\s*wait,\s*let me look[\s\S]*?(?=\n\n[\u0600-\u06FF]|$)/gi, " ");
+  s = s.replace(/\bwait,\s*let me look[^\n]*/gi, " ");
+  s = s.replace(/(?:,\s*)?[}\]]{2,}\]?/g, " ");
+  return s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").replace(/[ \t]{2,}/g, " ").trim();
+}
+
 export async function analyzeImage(env, opts = {}) {
   const imageBytes = opts.imageBytes ?? opts.bytes ?? null;
   const mimeType = opts.mimeType || "image/jpeg";
   const prompt = String(opts.prompt ?? "این تصویر را به فارسی تحلیل کن.").trim() || "این تصویر را به فارسی تحلیل کن.";
+  const visionPrompt = `${VISION_PERSIAN_INSTRUCTION}\n${prompt}`;
   const userId = opts.userId ?? null;
   const fn = resolveFetch(opts);
   const routerCallFn = opts.routerCallFn ?? null;
@@ -509,7 +517,7 @@ export async function analyzeImage(env, opts = {}) {
     try {
       const body = {
         model: "vision",
-        messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUri } }, { type: "text", text: prompt }] }],
+        messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUri } }, { type: "text", text: visionPrompt }] }],
       };
       const out = await routerCallFn(body);
       let text = "";
@@ -518,7 +526,8 @@ export async function analyzeImage(env, opts = {}) {
         text = out.text || out.finalText || out.answer || out?.data?.choices?.[0]?.message?.content || out?.data?.message?.content || "";
         if (typeof text !== "string") text = String(text ?? "").trim();
       }
-      if (text && String(text).trim()) return { ok: true, text: String(text).trim() };
+      const cleaned = cleanVisionPersianText(text);
+      if (cleaned) return { ok: true, text: cleaned };
       errors.push("router:empty");
     } catch (e) { errors.push("router:" + (e?.message || "error")); }
   }
@@ -534,14 +543,15 @@ export async function analyzeImage(env, opts = {}) {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
-                contents: [{ role: "user", parts: [{ text: prompt }, { inlineData: { mimeType, data: b64 } }] }],
+                contents: [{ role: "user", parts: [{ text: visionPrompt }, { inlineData: { mimeType, data: b64 } }] }],
               }),
               signal: geminiSignal,
             });
             if (res?.ok) {
               const json = await safeJson(res);
               const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
-              if (text) return { ok: true, text };
+              const cleaned = cleanVisionPersianText(text);
+              if (cleaned) return { ok: true, text: cleaned };
               errors.push(`gemini-${model}:empty`);
             } else {
               errors.push(`gemini-${model}:${res?.status || "not_ok"}`);
@@ -562,7 +572,7 @@ export async function analyzeImage(env, opts = {}) {
               body: JSON.stringify({
                 model,
                 messages: [{ role: "user", content: [
-                  { type: "text", text: "به فارسی دقیق به این سوال درباره تصویر پاسخ بده: " + prompt },
+                  { type: "text", text: visionPrompt + "\nبه این سوال درباره تصویر پاسخ بده: " + prompt },
                   { type: "image_url", image_url: { url: dataUri } },
                 ] }],
                 max_tokens: 600,
@@ -572,7 +582,8 @@ export async function analyzeImage(env, opts = {}) {
             if (res?.ok) {
               const json = await safeJson(res);
               const text = json?.choices?.[0]?.message?.content;
-              if (typeof text === "string" && text.trim()) return { ok: true, text: text.trim() };
+              const cleaned = cleanVisionPersianText(text);
+              if (cleaned) return { ok: true, text: cleaned };
               errors.push(`nvidia-${model}:empty`);
             } else {
               errors.push(`nvidia-${model}:${res?.status || "not_ok"}`);

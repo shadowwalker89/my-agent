@@ -70,6 +70,35 @@ function normalizePdfText(s) {
   const v = String(s ?? "");
   try { return v.normalize("NFKC"); } catch { return v; }
 }
+// Many Persian PDFs store every visual line in reversed character order
+// ("راضحتسا تهج ناریا تارباخم" instead of "مخابرات ایران جهت استحضار").
+// Reverse visual-RTL lines back to logical order while keeping numbers and
+// Latin words left-to-right.
+const VISUAL_RTL_MARKER_RE = /(?<![\u0600-\u06FF])(?:خیرات|هرامش|تسویپ|درادن|هسانش|تارباخم|تامدخ|شورف|ناریا|خروم|هبنشود|هسلج|روضح|علاطا|تهج|نواعم|نایرتشم|راضحتسا|نفلت|راگنرود|رد|زا|هب|اب|یاه|نیا)(?![\u0600-\u06FF])/u;
+const VISUAL_FINAL_FORM_RE = /[\uFE8E\uFE90\uFE92\uFE94\uFE96\uFE98\uFEAE\uFEB0\uFB8B\uFB8F\uFB93\uFBFD]/u;
+// A number or a Latin word is one atomic unit, so it stays readable while the
+// surrounding Persian characters are flipped.
+const VISUAL_ATOM_RE = /[0-9\u06F0-\u06F9][0-9\u06F0-\u06F9.,/:\\_-]*|[A-Za-z0-9@._:/\\-]+|[\s\S]/gu;
+function reverseVisualRtlLine(line) {
+  const s = String(line ?? "");
+  const units = s.match(VISUAL_ATOM_RE) || [];
+  let out = units.reverse().join("");
+  const lead = /^([:،؛,.؟!?»«]+)([\s\S]*)$/u.exec(out);
+  if (lead) out = lead[2] + lead[1];
+  return out;
+}
+export function fixVisualRtlPersian(text) {
+  const s = String(text ?? "");
+  if (!s || !/[\u0600-\u06FF]/u.test(s)) return s;
+  return s
+    .split("\n")
+    .map((line) => {
+      if (!/[\u0600-\u06FF]/u.test(line)) return line;
+      if (!VISUAL_RTL_MARKER_RE.test(line) && !VISUAL_FINAL_FORM_RE.test(line)) return line;
+      return reverseVisualRtlLine(line);
+    })
+    .join("\n");
+}
 function chooseGlyphWidth(hexLen, map) {
   if (!map || !map.size) return hexLen % 4 === 0 ? 4 : 2;
   let has4 = false; let has2 = false;
@@ -274,7 +303,7 @@ export async function extractTextFromPdfBytes(pdfBytes) {
     const t = extractContentText(latin, cmaps, fontResolver);
     if (t) { sawTextOps = true; toks.push(t); }
   }
-  const out = uniqText(toks);
+  const out = fixVisualRtlPersian(uniqText(toks));
   if (!out || (readableCount(out) < 15 && !sawTextOps)) return SCANNED_PDF_MESSAGE;
   return out;
 }

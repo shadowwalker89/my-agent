@@ -2519,17 +2519,22 @@ export async function handleDailyText(env, o) {
       return "handled";
     }
   }
-  // Reply-to-photo: edit/regenerate the replied image or answer a vision
-  // question about it instead of falling through to a generic text answer.
+  // Reply-to-photo: a reply to a generated image is ALWAYS a follow-up edit,
+  // whatever the wording. Editing uses the original scene + the new request.
+  // Every other photo reply goes to vision. A photo reply must never fall
+  // through to blind text-only chat.
   const replyPhoto = o.replyToPhoto && (o.replyToPhoto.fileId || o.replyToPhoto.file_id) ? o.replyToPhoto : null;
-  if (replyPhoto) {
+  const replyUserText = String(text ?? "").trim();
+  if (replyPhoto && !replyUserText.startsWith("/")) {
     const rpFileId = replyPhoto.fileId || replyPhoto.file_id;
     const rpCaption = String(replyPhoto.caption ?? "");
-    const userText = String(text ?? "").trim();
-    const isGeneratedCaption = /^🎨 تصویر (?:ساخته|ویرایش) شد:/.test(rpCaption);
-    const askedQuestion = isVisionQuestionCaption(userText) || /[؟?]\s*$/.test(userText);
-    const askedEdit = isImageEditCaption(userText) || (isGeneratedCaption && !askedQuestion);
+    const userText = replyUserText;
     const targetChatId = o.chatId ?? o.userId ?? userId;
+    const isGeneratedCaption = /🎨 تصویر (?:ساخته|ویرایش) شد/.test(rpCaption);
+    const isPureQuestion = /[?؟]|(?:^|[^\u0600-\u06FF])(?:چیه|کیه|کجاست|چنده|چقدر)(?![\u0600-\u06FF])/u.test(userText);
+    const askedQuestion = isPureQuestion || isVisionQuestionCaption(userText);
+    const generatedFollowUp = isGeneratedCaption && !isPureQuestion;
+    const askedEdit = generatedFollowUp || (!isGeneratedCaption && !askedQuestion && isImageEditCaption(userText));
     const sendEditedPhoto = async (bytes, mimeType, caption) => {
       let ok = false;
       if (typeof o.sendPhoto === "function") {
@@ -2541,28 +2546,35 @@ export async function handleDailyText(env, o) {
       if (!ok && typeof o.send === "function") await o.send("❌ ارسال تصویر به تلگرام ناموفق بود؛ دوباره تلاش کن.");
       return ok;
     };
-    if (askedEdit && !askedQuestion) {
+    if (askedEdit) {
       if (typeof o.send === "function") await o.send("🎨 در حال ویرایش تصویر، لطفاً چند ثانیه صبر کنید...");
-      const imageBytes = await fileBytesFromTelegram(env, rpFileId);
-      let basePrompt = rpCaption.replace(/^🎨 تصویر (?:ساخته|ویرایش) شد:\s*/u, "").trim();
-      if (!basePrompt && imageBytes && imageBytes.length) {
-        const desc = await analyzeImage(env, { imageBytes, mimeType: "image/jpeg", prompt: "این تصویر را کوتاه و دقیق به فارسی توصیف کن.", userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
-        if (desc && desc.ok && desc.text) basePrompt = desc.text;
-      }
-      if (!basePrompt) basePrompt = "the scene in the attached image";
-      const negatives = [];
-      if (/(ادم|آدم|افراد|مردم|person|people)/i.test(userText)) negatives.push("no people, empty street");
-      if (/(الودگی|آلای|دود|مه‌آلود|مه آلود|pollution|smog)/i.test(userText)) negatives.push("clear blue sky without pollution");
-      const negativeText = negatives.length ? ` Negative constraints: ${negatives.join(", ")}.` : "";
-      const instruction = `Apply this edit to the scene: ${basePrompt}. User edit request: ${userText}.${negativeText}`;
+      let basePrompt = rpCaption.replace(/^🎨 تصویر (?:ساخته|ویرایش) شد(?:\s*\([^)]*\))?\s*:\s*/u, "").trim();
       let result = null;
-      if (imageBytes && imageBytes.length) {
-        const edited = await editImage(env, { imageBytes, mimeType: "image/jpeg", instruction, userId, fetchFn: o.fetchFn });
-        if (edited && edited.ok) result = edited;
-      }
-      if (!result) {
-        const generated = await generateFreeImage(env, instruction, { userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
+      if (generatedFollowUp) {
+        const scene = basePrompt || "the scene in the generated image";
+        const combined = `${scene}. اعمال این تغییر: ${userText}`;
+        const generated = await generateFreeImage(env, combined, { userId: o.userId ?? userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
         if (generated && generated.ok) result = generated;
+      } else {
+        const imageBytes = await fileBytesFromTelegram(env, rpFileId);
+        if (!basePrompt && imageBytes && imageBytes.length) {
+          const desc = await analyzeImage(env, { imageBytes, mimeType: "image/jpeg", prompt: "این تصویر را کوتاه و دقیق به فارسی توصیف کن.", userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
+          if (desc && desc.ok && desc.text) basePrompt = desc.text;
+        }
+        if (!basePrompt) basePrompt = "the scene in the attached image";
+        const negatives = [];
+        if (/(ادم|آدم|افراد|مردم|person|people)/i.test(userText)) negatives.push("no people, empty street");
+        if (/(الودگی|آلای|دود|مه‌آلود|مه آلود|pollution|smog)/i.test(userText)) negatives.push("clear blue sky without pollution");
+        const negativeText = negatives.length ? ` Negative constraints: ${negatives.join(", ")}.` : "";
+        const instruction = `Apply this edit to the scene: ${basePrompt}. User edit request: ${userText}.${negativeText}`;
+        if (imageBytes && imageBytes.length) {
+          const edited = await editImage(env, { imageBytes, mimeType: "image/jpeg", instruction, userId, fetchFn: o.fetchFn });
+          if (edited && edited.ok) result = edited;
+        }
+        if (!result) {
+          const generated = await generateFreeImage(env, instruction, { userId: o.userId ?? userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
+          if (generated && generated.ok) result = generated;
+        }
       }
       if (result && result.ok) {
         await sendEditedPhoto(result.bytes, result.mimeType, `🎨 تصویر ویرایش شد (${result.provider}): ${userText}`);
@@ -2571,18 +2583,17 @@ export async function handleDailyText(env, o) {
       }
       return "handled";
     }
-    if (askedQuestion) {
-      const imageBytes = await fileBytesFromTelegram(env, rpFileId);
-      if (!imageBytes || !imageBytes.length) {
-        if (typeof o.send === "function") await o.send("تحلیل تصویر ممکن نشد.");
-        return "handled";
-      }
-      const result = await analyzeImage(env, { imageBytes, mimeType: "image/jpeg", prompt: userText, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
-      if (typeof o.send === "function") {
-        await o.send(result && result.ok && result.text ? result.text : "❌ خطا در تحلیل تصویر: " + (result?.error || result?.text || "vision_unavailable"));
-      }
+    // Not an edit: analyze/answer with vision using the user's own wording.
+    const imageBytes = await fileBytesFromTelegram(env, rpFileId);
+    if (!imageBytes || !imageBytes.length) {
+      if (typeof o.send === "function") await o.send("تحلیل تصویر ممکن نشد.");
       return "handled";
     }
+    const result = await analyzeImage(env, { imageBytes, mimeType: "image/jpeg", prompt: userText, userId: o.userId ?? userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
+    if (typeof o.send === "function") {
+      await o.send(result && result.ok && result.text ? result.text : "❌ خطا در تحلیل تصویر: " + (result?.error || result?.text || "vision_unavailable"));
+    }
+    return "handled";
   }
   const parsedImage = parseImageGenCommand(text);
   if (parsedImage.isImageGen) {

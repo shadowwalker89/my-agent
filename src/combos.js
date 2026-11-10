@@ -185,6 +185,7 @@ export const WEIGHTS = {
   unstablePenalty: 50,  // مدل‌های ناپایدار/هنگ‌کننده (gemma-4/glm-5/qwen3.5-3.9/deepseek-v4/...) در production
   workhorseBoost: 45,   // مدل‌های instruct سریع و اثبات‌شده (llama-3.3-70b/...) در chat/fast
   provenFastBonus: 28,  // مدل‌های سریعِ اثبات‌شده در production (Phase 2-l)
+  miniCodePenalty: 40,  // north-mini-code در comboهای غیر code (فارسی/چندزبانه ضعیف)
 };
 
 const NOVELTY_RE = /preview|beta|alpha|exp|-rc\d/i;
@@ -199,6 +200,9 @@ const WORKHORSE_RE = /llama-3\.3-70b-instruct|llama-3\.1-70b-instruct|llama-3\.1
 // Phase 2-l: models that stayed fast and stable in production. A flat
 // bonus in chat/fast keeps them ahead of newer-but-unproven siblings.
 const PROVEN_FAST_RE = /minimax-m3\.1-flash|cohere\/north-mini-code|nemotron-3\.5-super-vl/i;
+// north-mini-code is fast but produces broken Persian/foreign mix in chat.
+// Keep it for the code combo only; everywhere else it is heavily demoted.
+const MINI_CODE_RE = /north-mini-code|mini-code/i;
 
 function compileSafe(pattern, flags) {
   try {
@@ -289,7 +293,7 @@ export function applyVersionBonus(scored, { enabled = true } = {}) {
   }
 }
 
-export function scoreModel(m, compiledPrefer, { skipVlPenalty = false, demoteUltra = false, demoteUnstable = false, boostWorkhorse = false, provenFast = false } = {}) {
+export function scoreModel(m, compiledPrefer, { skipVlPenalty = false, demoteUltra = false, demoteUnstable = false, boostWorkhorse = false, provenFast = false, comboName = null } = {}) {
   const name = namePartOf(m.id);
   const sizeB = sizeBOf(name);
   const sizeAdj = sizeAdjust(sizeB);
@@ -298,6 +302,7 @@ export function scoreModel(m, compiledPrefer, { skipVlPenalty = false, demoteUlt
   if (demoteUnstable && UNSTABLE_RE.test(m.id)) score -= WEIGHTS.unstablePenalty;
   if (boostWorkhorse && WORKHORSE_RE.test(m.id)) score += WEIGHTS.workhorseBoost;
   if (provenFast && PROVEN_FAST_RE.test(m.id)) score += WEIGHTS.provenFastBonus;
+  if (comboName && comboName !== "code" && MINI_CODE_RE.test(m.id)) score -= WEIGHTS.miniCodePenalty;
   compiledPrefer.forEach((entry, i) => {
     if (!entry?.re) return;
     // الگوی «coder» فقط وقتی مدل جریمه‌ی اندازه نخورده اعمال می‌شود —
@@ -322,7 +327,7 @@ export function scoreModel(m, compiledPrefer, { skipVlPenalty = false, demoteUlt
   return Math.round(score * 10) / 10;
 }
 
-export function pickModels(catalog, rule, { prefer = null, bans = [] } = {}) {
+export function pickModels(catalog, rule, { prefer = null, bans = [], comboName = null } = {}) {
   const excludeRe = (rule.exclude ?? []).map((p) => compileSafe(p, "i")).filter(Boolean);
   const compiledPrefer = compilePrefer(prefer ?? rule.prefer ?? []);
   const banSet = new Set(bans.map((b) => String(b).toLowerCase()));
@@ -342,6 +347,7 @@ export function pickModels(catalog, rule, { prefer = null, bans = [] } = {}) {
       demoteUnstable: rule.demoteUnstable === true,
       boostWorkhorse: rule.boostWorkhorse === true,
       provenFast: rule.provenFast === true,
+      comboName,
     }),
   }));
   applyVersionBonus(scored, { enabled: rule.neutralizeVersion !== true });
