@@ -239,7 +239,7 @@ async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
   if (typeof fn === "function") {
     try {
       const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=fa&tl=en&dt=t&q=${encodeURIComponent(prompt)}`;
-      const res = await fn(url, { method: "GET", signal: timeoutSignal(4000) });
+      const res = await fn(url, { method: "GET", signal: timeoutSignal(3000) });
       if (res?.ok) {
         const data = await safeJson(res);
         const segments = Array.isArray(data?.[0])
@@ -322,15 +322,23 @@ export async function generateFreeImage(env, prompt, opts = {}) {
     ? visualBase
     : `Photorealistic, high detail, 8k, no watermark: ${visualBase}`;
 
+  // Fast path: keep the whole provider phase under ~5.5s. Cloudflare's
+  // wall clock is 30s, so a slow provider must never eat the image
+  // budget (three sequential NVIDIA calls used to take ~42s).
+  const preFallbackStart = Date.now();
+  const PRE_FALLBACK_BUDGET_MS = 5500;
+  const preFallbackRemaining = () => PRE_FALLBACK_BUDGET_MS - (Date.now() - preFallbackStart);
+  const attemptTimeoutMs = () => Math.max(250, Math.min(5000, preFallbackRemaining()));
+
   try {
     const togetherKey = await resolveKey(env, userId, "together", "TOGETHER_API_KEY");
-    if (togetherKey) {
+    if (togetherKey && preFallbackRemaining() > 0) {
       try {
         const res = await fn("https://api.together.xyz/v1/images/generations", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${togetherKey}` },
           body: JSON.stringify({ model: "black-forest-labs/FLUX.1-schnell-Free", prompt: visual, width: 1024, height: 1024, n: 1, response_format: "b64_json" }),
-          signal: timeoutSignal(8000),
+          signal: timeoutSignal(attemptTimeoutMs()),
         });
         if (res?.ok) {
           const json = await safeJson(res);
@@ -347,14 +355,14 @@ export async function generateFreeImage(env, prompt, opts = {}) {
 
   try {
     const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
-    if (nvidiaKey) {
+    if (nvidiaKey && preFallbackRemaining() > 0) {
       const tryNvidia = async (url, body, label) => {
         try {
           const res = await fn(url, {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}`, Accept: "application/json" },
             body: JSON.stringify(body),
-            signal: timeoutSignal(14000),
+            signal: timeoutSignal(attemptTimeoutMs()),
           });
           if (res?.ok) {
             const json = await safeJson(res);
@@ -368,25 +376,19 @@ export async function generateFreeImage(env, prompt, opts = {}) {
           return { bytes: null, status: res?.status || null };
         } catch (e) { diagErrors.push(label + ":" + (e?.message || "error")); return { bytes: null, status: null }; }
       };
-      // FLUX.1-schnell is the fastest; SD3 and SDXL are fallbacks. FLUX
-      // rejects width/height with HTTP 422, so retry prompt-only on 422.
-      let nbytes = null;
+      // Only FLUX.1-schnell: the extra SD3/SDXL calls blew the 30s
+      // Cloudflare limit. FLUX rejects width/height, so retry prompt-only.
       let flux = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual, steps: 4, seed: 0 }, "nvidia-flux");
-      if (!flux.bytes && flux.status === 422) flux = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual }, "nvidia-flux-min");
-      nbytes = flux.bytes;
-      if (!nbytes) {
-        nbytes = (await tryNvidia("https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-3-medium", { prompt: visual, cfg_scale: 5, aspect_ratio: "1:1", seed: 0, steps: 28 }, "nvidia-sd3")).bytes;
+      if (!flux.bytes && flux.status === 422 && preFallbackRemaining() > 0) {
+        flux = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual }, "nvidia-flux-min");
       }
-      if (!nbytes) {
-        nbytes = (await tryNvidia("https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-xl", { text_prompts: [{ text: visual, weight: 1 }], seed: 0, sampler: "K_EULER_ANCESTRAL", steps: 25 }, "nvidia-sdxl")).bytes;
-      }
-      if (nbytes) return { ok: true, bytes: nbytes, mimeType: "image/png", provider: "nvidia" };
+      if (flux.bytes) return { ok: true, bytes: flux.bytes, mimeType: "image/png", provider: "nvidia" };
     }
   } catch (e) { diagErrors.push("nvidia:" + (e?.message || "error")); }
 
   try {
     const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
-    if (geminiKey && geminiKey.startsWith("AIza")) {
+    if (geminiKey && geminiKey.startsWith("AIza") && preFallbackRemaining() > 0) {
       try {
         const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=${geminiKey}`, {
           method: "POST",
@@ -395,7 +397,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
             contents: [{ role: "user", parts: [{ text: visual }] }],
             generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
           }),
-          signal: timeoutSignal(8000),
+          signal: timeoutSignal(attemptTimeoutMs()),
         });
         if (res?.ok) {
           const json = await safeJson(res);
@@ -412,13 +414,13 @@ export async function generateFreeImage(env, prompt, opts = {}) {
 
   try {
     const hfKey = await resolveKey(env, userId, "huggingface", "HF_TOKEN");
-    if (hfKey) {
+    if (hfKey && preFallbackRemaining() > 0) {
       try {
         const res = await fn("https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${hfKey}`, Accept: "image/png" },
           body: JSON.stringify({ inputs: visual }),
-          signal: timeoutSignal(8000),
+          signal: timeoutSignal(attemptTimeoutMs()),
         });
         if (res?.ok && typeof res.arrayBuffer === "function") {
           const buf = await res.arrayBuffer();
@@ -435,24 +437,33 @@ export async function generateFreeImage(env, prompt, opts = {}) {
   try {
     const englishPrompt = PERSIAN_RE.test(visual) ? fallbackEnglishPrompt(visual) : visual;
     const seed = Number.isFinite(Number(opts.seed)) ? Math.floor(Number(opts.seed)) : Math.floor(Math.random() * 1e9);
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(englishPrompt)}?model=flux&width=1024&height=1024&nologo=true&enhance=true&seed=${seed}`;
-    const res = await fn(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        Accept: "image/*",
-        Referer: "https://pollinations.ai/",
-      },
-      redirect: "follow",
-      signal: timeoutSignal(16000),
-    });
-    if (res?.ok) {
-      const buf = await res.arrayBuffer();
-      const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-      if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/jpeg", provider: "pollinations" };
-      diagErrors.push("pollinations:empty");
-    } else {
-      diagErrors.push("pollinations:" + (res?.status || "not_ok"));
-    }
+    // No enhance/private flags: they made Pollinations hang and return
+    // 502. Keep the exact fast URL shape that worked historically.
+    const pollinationsAttempt = async (width, height, timeoutMs) => {
+      const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(englishPrompt)}?width=${width}&height=${height}&nologo=true&seed=${seed}`;
+      const res = await fn(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+          Accept: "image/*",
+          Referer: "https://pollinations.ai/",
+        },
+        redirect: "follow",
+        signal: timeoutSignal(timeoutMs),
+      });
+      if (res?.ok) {
+        const buf = await res.arrayBuffer();
+        const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+        if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/jpeg", provider: "pollinations" };
+        diagErrors.push("pollinations:empty");
+      } else {
+        diagErrors.push("pollinations:" + (res?.status || "not_ok"));
+      }
+      return null;
+    };
+    const big = await pollinationsAttempt(1024, 1024, 12000);
+    if (big) return big;
+    const small = await pollinationsAttempt(768, 768, 10000);
+    if (small) return small;
   } catch (e) { diagErrors.push("pollinations:" + (e?.message || "error")); }
 
   return { ok: false, error: "image_gen_failed", diagErrors };

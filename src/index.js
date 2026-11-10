@@ -380,7 +380,7 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
   }
   // show: ترجیح هر کاربر؛ SHOW_MODEL=1 همیشه override جهانی است.
   if (prefs.show === true || env.SHOW_MODEL === "1") {
-    answer += `\n- ${usedCombo} / ${result.used}`;
+    answer += `\n───────────────\n⚡️ <i>${usedCombo} · <code>${result.used}</code></i>`;
   }
   console.log(JSON.stringify({ combo: usedCombo, used: result.used, routed }));
   // 1-d-1: a quick-convert keyboard rides on the LAST chunk only

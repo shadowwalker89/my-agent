@@ -2061,8 +2061,8 @@ if (DatabaseSync) {
       const first = JSON.parse(String(sends[0]?.body ?? "{}"));
       const second = JSON.parse(String(sends[1]?.body ?? "{}"));
       check(
-        sends.length === 2 && first.parse_mode === "HTML" && first.text === "<b>bold</b>" && second.text === "**bold**" && second.parse_mode === undefined,
-        "3-a: sendMessage retries plain text when Telegram rejects HTML",
+        sends.length === 2 && first.parse_mode === "HTML" && first.text === "<b>bold</b>" && second.text === "bold" && second.parse_mode === undefined,
+        "3-a: sendMessage retries stripped plain text when Telegram rejects HTML",
       );
       calls.length = 0;
       await editMessage(env, 1, 9, "**bold**");
@@ -6134,7 +6134,7 @@ if (DatabaseSync) {
       const edit = calls.find((c) => c.method === "editMessageText");
       const answerText = String(edit?.payload?.text ?? "");
       check(providerModels.length >= 1 && providerModels.every((m) => !/coder/i.test(String(m))), `2-h: code-heavy note summary uses a non-coder target (models: ${providerModels.join(", ")})`);
-      check(answerText.includes("- chat /") && !answerText.includes("- code /"), `2-h: code-heavy note summary routes to the chat combo, never code (${answerText})`);
+      check(answerText.includes("chat ·") && !answerText.includes("code ·") && !answerText.includes("- chat /"), `2-h: code-heavy note summary routes to the chat combo, never code (${answerText})`);
     }
     // ── Phase 2-f: in-combo empty-final failover (Telegram-only),
     // summary 2200-token headroom, /admin Empty-final counter ──
@@ -8131,6 +8131,33 @@ if (DatabaseSync) {
   const rtlDoc = ["راضحتسا تهج ناریا تارباخم", "نایع‌راز دواد"].join("\n");
   const nameLine = fixVisualRtlPersian(rtlDoc).split("\n")[1].replace(/\u200C/g, "");
   check(nameLine === "داود زارعیان", `fix3: document-wide visual RTL reverses standalone name line: ${JSON.stringify(nameLine)}`);
+}
+
+// Fix #2: Telegram formatting upgrade — headings, bold, bullets, dividers,
+// markdown tables as mobile cards, and preserved safe HTML.
+{
+  const h = formatTelegramHtml("### نکات\n**مهم**\n- مورد اول\n---\n| نام | نقش |\n|---|---|\n| علی | مدیر |");
+  check(h.includes("📌 <b>نکات</b>") && h.includes("<b>مهم</b>") && h.includes("• مورد اول") && h.includes("───────────────"), `fix2: headings/bold/bullets/dividers convert cleanly: ${JSON.stringify(h)}`);
+  check(h.includes("▫️ <b>نام:</b> علی  •  <b>نقش:</b> مدیر") && !h.includes("|---|") && !h.includes("| نام |"), `fix2: markdown tables render as mobile cards without pipes: ${JSON.stringify(h)}`);
+  check(!h.includes("**") && !h.includes("###"), `fix2: no raw markdown symbols remain: ${JSON.stringify(h)}`);
+  const preserved = formatTelegramHtml("<b>موجود</b> و **جدید**");
+  check(preserved === "<b>موجود</b> و <b>جدید</b>", `fix2: existing <b> tags are preserved and not double-escaped: ${JSON.stringify(preserved)}`);
+}
+
+// Fix #1: Pollinations uses the clean URL (no enhance/private) and shrinks
+// to 768 only after the 1024 attempt fails.
+{
+  const { generateFreeImage } = await import("../src/media.js");
+  const urls = [];
+  const fn = async (url) => {
+    urls.push(String(url));
+    if (urls.length === 1) return { ok: false, status: 502 };
+    return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
+  };
+  const r = await generateFreeImage({}, "sunset over the city", { fetchFn: fn });
+  check(r.ok === true && r.provider === "pollinations" && r.bytes.length === 3, `fix1: pollinations 768 fallback succeeds: ${JSON.stringify(r).slice(0, 160)}`);
+  check(urls.length === 2 && urls[0].includes("width=1024") && urls[1].includes("width=768"), `fix1: 1024 first, then 768: ${JSON.stringify(urls)}`);
+  check(!urls.some((u) => u.includes("enhance=true") || u.includes("private=true") || u.includes("model=flux")), `fix1: clean Pollinations URL has no enhance/private/model flags: ${JSON.stringify(urls)}`);
 }
 
 if (failures.length) {

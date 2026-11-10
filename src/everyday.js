@@ -2479,7 +2479,7 @@ export async function runNluBranch(env, o, ctx) {
         }
         if (!photoSent && typeof o.send === "function") await o.send("❌ ارسال تصویر به تلگرام ناموفق بود؛ دوباره تلاش کن.");
       } else if (typeof o.send === "function") {
-        await o.send("❌ تولید تصویر در حال حاضر ناموفق بود؛ دوباره تلاش کن.");
+        await o.send(`❌ تولید تصویر در حال حاضر ناموفق بود (${res?.error || "خطای سرویس"})؛ دوباره تلاش کن.`);
       }
       return "handled";
     }
@@ -2640,7 +2640,7 @@ export async function handleDailyText(env, o) {
         }
         if (!photoSent && typeof o.send === "function") await o.send("❌ ارسال تصویر به تلگرام ناموفق بود؛ دوباره تلاش کن.");
       } else {
-        if (typeof o.send === "function") await o.send("❌ تولید تصویر در حال حاضر ناموفق بود؛ دوباره تلاش کن.");
+        if (typeof o.send === "function") await o.send(`❌ تولید تصویر در حال حاضر ناموفق بود (${res?.error || "خطای سرویس"})؛ دوباره تلاش کن.`);
       }
     } catch {
       if (typeof o.send === "function") await o.send("❌ تولید تصویر در حال حاضر ناموفق بود؛ دوباره تلاش کن.");

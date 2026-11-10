@@ -10,15 +10,17 @@ export async function tgApi(env, method, body) {
 }
 
 export async function tgSend(env, chatId, text, opts) {
-  if (!env.TG_TOKEN) return;
+  if (!env.TG_TOKEN) return null;
+  const { html, body } = telegramPayload(chatId, text, opts);
   try {
-    await fetch(`${TG_API}/bot${env.TG_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, ...(opts?.replyMarkup ? { reply_markup: opts.replyMarkup } : {}) }),
-    });
+    const res = await tgApi(env, "sendMessage", body);
+    if (html && res && res.ok === false) {
+      return await tgApi(env, "sendMessage", { ...body, text: stripTelegramMarkup(text), parse_mode: undefined });
+    }
+    return res;
   } catch (err) {
     console.error("sendMessage failed:", err && err.message);
+    return null;
   }
 }
 
@@ -33,17 +35,105 @@ export function escapeHtml(text) {
     .replace(/>/g, "&gt;");
 }
 
+// Only these tags are allowed through untouched. Everything else is
+// escaped, so a model answer can never inject arbitrary HTML.
+const SAFE_TAG_RE = /<\/?(?:b|strong|i|em|u|s|code|pre|blockquote)>|<a\s+href="[^"]*"\s*>|<\/a>/gi;
+
+function splitTableCells(line) {
+  return String(line ?? "").trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function cleanTableHeader(cell) {
+  return String(cell ?? "").replace(/\*\*/g, "").replace(/~~/g, "").replace(/`/g, "").trim();
+}
+
+// Mobile-friendly cards instead of broken ASCII pipes: every data row
+// becomes one "▫️ header: value • header: value" bullet.
+function renderMarkdownTables(text) {
+  const lines = String(text ?? "").split("\n");
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\s*\|.*\|\s*$/.test(lines[i])) {
+      out.push(lines[i]);
+      continue;
+    }
+    const block = [];
+    let j = i;
+    while (j < lines.length && /^\s*\|.*\|\s*$/.test(lines[j])) {
+      block.push(lines[j]);
+      j += 1;
+    }
+    const sepIdx = block.findIndex((line, idx) => idx > 0 && splitTableCells(line).every((cell) => /^:?-{2,}:?$/.test(cell)));
+    if (sepIdx < 1) {
+      out.push(...block);
+      i = j - 1;
+      continue;
+    }
+    const header = splitTableCells(block[sepIdx - 1]);
+    const rows = block.slice(sepIdx + 1);
+    if (!rows.length) {
+      out.push(...block.filter((_, idx) => idx !== sepIdx));
+      i = j - 1;
+      continue;
+    }
+    for (const row of rows) {
+      const cells = splitTableCells(row);
+      const parts = [];
+      for (let k = 0; k < Math.max(header.length, cells.length); k++) {
+        const label = cleanTableHeader(header[k]);
+        const value = cells[k] ?? "";
+        if (!label && !value) continue;
+        parts.push(label ? `<b>${label}:</b> ${value}` : value);
+      }
+      if (parts.length) out.push(`▫️ ${parts.join("  •  ")}`);
+    }
+    i = j - 1;
+  }
+  return out.join("\n");
+}
+
+// Plain-text fallback: Telegram rejected our HTML (e.g. a malformed
+// entity), so drop markup symbols instead of showing them literally.
+export function stripTelegramMarkup(text) {
+  return String(text ?? "")
+    .replace(/```[^\n]*\n?([\s\S]*?)```/g, "$1")
+    .replace(/<[^>]+>/g, "")
+    .replace(/^#{1,4}[ \t]+/gm, "")
+    .replace(/^[ \t]*(?:---|___|\*\*\*)[ \t]*$/gm, "───────────────")
+    .replace(/^[ \t]*[-*]\s+/gm, "• ")
+    .replace(/\*\*([^*\n]+)\*\*/g, "$1")
+    .replace(/~~([^~\n]+)~~/g, "$1")
+    .replace(/`([^`\n]+)`/g, "$1");
+}
+
 export function formatTelegramHtml(text) {
   const src = String(text ?? "");
   const blocks = [];
-  let s = src.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
-    const i = blocks.push(`<pre>${escapeHtml(code.replace(/\n$/, ""))}</pre>`) - 1;
+  const tags = [];
+  let s = src.replace(/```([^\n]*)\n?([\s\S]*?)```/g, (_, info, code) => {
+    const body = escapeHtml(code.replace(/\n$/, ""));
+    // A language-tagged fence keeps the historical <pre> shape; a bare
+    // fence gets the richer <pre><code> wrapper.
+    const rendered = String(info).trim() ? `<pre>${body}</pre>` : `<pre><code>${body}</code></pre>`;
+    const i = blocks.push(rendered) - 1;
     return `\u0000B${i}\u0000`;
   });
+  // Stash already-safe HTML before escaping so <b>...</b> stays bold
+  // instead of printing literally (and is never double-escaped).
+  s = s.replace(SAFE_TAG_RE, (tag) => {
+    const i = tags.push(tag) - 1;
+    return `\u0000T${i}\u0000`;
+  });
   s = escapeHtml(s);
+  s = renderMarkdownTables(s);
+  s = s.replace(/^#{1,4}[ \t]+(.+)$/gm, "\n📌 <b>$1</b>");
+  s = s.replace(/^[ \t]*(?:---|___|\*\*\*)[ \t]*$/gm, "───────────────");
+  s = s.replace(/^[ \t]*[-*]\s+(.+)$/gm, "• $1");
   s = s.replace(/`([^`\n]+)`/g, (_, code) => `<code>${code}</code>`);
   s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
   s = s.replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
+  s = s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, "$1<i>$2</i>");
+  s = s.replace(/\u0000T(\d+)\u0000/g, (_, i) => tags[Number(i)] ?? "");
   s = s.replace(/\u0000B(\d+)\u0000/g, (_, i) => blocks[Number(i)] ?? "");
   return s;
 }
@@ -71,7 +161,7 @@ export async function sendMessage(env, chatId, text, opts = {}) {
   try {
     const res = await tgApi(env, "sendMessage", body);
     if (html && res && res.ok === false) {
-      return await tgApi(env, "sendMessage", { ...body, text, parse_mode: undefined });
+      return await tgApi(env, "sendMessage", { ...body, text: stripTelegramMarkup(text), parse_mode: undefined });
     }
     return res;
   } catch (err) {
@@ -87,7 +177,7 @@ export async function editMessage(env, chatId, messageId, text, opts = {}) {
   try {
     const res = await tgApi(env, "editMessageText", payload);
     if (html && res && res.ok === false) {
-      return await tgApi(env, "editMessageText", { ...payload, text, parse_mode: undefined });
+      return await tgApi(env, "editMessageText", { ...payload, text: stripTelegramMarkup(text), parse_mode: undefined });
     }
     return res;
   } catch (err) {
@@ -216,10 +306,12 @@ export async function finalizeProgressMessage(env, chatId, progressMsgId, fullTe
   };
   if (Number.isInteger(progressMsgId) && progressMsgId > 0 && env?.TG_TOKEN) {
     try {
+      const formattedFirst = formatTelegramHtml(chunks[0]);
       const res = await tgApi(env, "editMessageText", {
         chat_id: chatId,
         message_id: progressMsgId,
-        text: chunks[0],
+        text: formattedFirst,
+        ...(formattedFirst !== chunks[0] ? { parse_mode: "HTML" } : {}),
         ...(chunks.length === 1 && markup ? { reply_markup: markup } : {}),
       });
       if (res && res.ok !== false) {
