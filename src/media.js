@@ -239,7 +239,7 @@ async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
   if (typeof fn === "function") {
     try {
       const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=fa&tl=en&dt=t&q=${encodeURIComponent(prompt)}`;
-      const res = await fn(url, { method: "GET", signal: timeoutSignal(3000) });
+      const res = await fn(url, { method: "GET", signal: timeoutSignal(2500) });
       if (res?.ok) {
         const data = await safeJson(res);
         const segments = Array.isArray(data?.[0])
@@ -309,6 +309,84 @@ async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
   return fallbackEnglishPrompt(prompt);
 }
 
+// Tier 3: HuggingFace ZeroGPU official FLUX.1-schnell Gradio Space. Free,
+// no key, genuine FLUX.1 on H200. Gradio uses an async call/SSE protocol:
+// POST returns an event_id, then GET streams events until "complete".
+export async function generateViaHfFluxSpace(englishPrompt, fetchFn, seed = 0) {
+  const diagErrors = [];
+  const base = "https://black-forest-labs-flux-1-schnell.hf.space";
+  const body = JSON.stringify({ data: [englishPrompt, Number(seed) || 0, true, 1024, 1024, 4] });
+  const postInfer = (url) => fetchFn(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    signal: timeoutSignal(12000),
+  });
+  try {
+    let post = await postInfer(`${base}/gradio_api/call/infer`);
+    if (post?.status === 404) post = await postInfer(`${base}/call/infer`);
+    if (!post?.ok) {
+      diagErrors.push(`hf-space:${post?.status || "not_ok"}`);
+      return { ok: false, diagErrors };
+    }
+    const meta = await safeJson(post);
+    const eventId = meta?.event_id || meta?.eventId;
+    if (!eventId) {
+      diagErrors.push("hf-space:no_event_id");
+      return { ok: false, diagErrors };
+    }
+    const sse = await fetchFn(`${base}/gradio_api/call/infer/${eventId}`, {
+      method: "GET",
+      headers: { Accept: "text/event-stream" },
+      signal: timeoutSignal(12000),
+    });
+    if (!sse?.ok) {
+      diagErrors.push(`hf-space:${sse?.status || "not_ok"}`);
+      return { ok: false, diagErrors };
+    }
+    const raw = typeof sse.text === "function" ? await sse.text() : "";
+    let completeData = null;
+    for (const block of String(raw ?? "").split(/\r?\n\r?\n+/)) {
+      if (!/event:\s*complete/i.test(block)) continue;
+      const m = /data:\s*(.+)/.exec(block);
+      if (m) { completeData = m[1].trim(); break; }
+    }
+    if (!completeData) {
+      diagErrors.push("hf-space:no_complete");
+      return { ok: false, diagErrors };
+    }
+    let parsed = null;
+    try { parsed = JSON.parse(completeData); } catch {}
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    let imageUrl = null;
+    for (const item of items) {
+      const first = Array.isArray(item) ? item[0] : item;
+      const u = first?.url || first?.path;
+      if (typeof u === "string" && u) { imageUrl = u; break; }
+    }
+    if (!imageUrl) {
+      diagErrors.push("hf-space:no_url");
+      return { ok: false, diagErrors };
+    }
+    if (!/^https?:\/\//i.test(imageUrl)) imageUrl = `${base}${imageUrl.startsWith("/") ? "" : "/"}${imageUrl}`;
+    const img = await fetchFn(imageUrl, { method: "GET", signal: timeoutSignal(12000) });
+    if (!img?.ok || typeof img.arrayBuffer !== "function") {
+      diagErrors.push(`hf-space-img:${img?.status || "not_ok"}`);
+      return { ok: false, diagErrors };
+    }
+    const buf = await img.arrayBuffer();
+    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    if (!bytes.length) {
+      diagErrors.push("hf-space:empty");
+      return { ok: false, diagErrors };
+    }
+    return { ok: true, bytes, mimeType: "image/webp", provider: "hf-flux-space", diagErrors };
+  } catch (e) {
+    diagErrors.push("hf-space:" + (e?.message || "error"));
+    return { ok: false, diagErrors };
+  }
+}
+
 export async function generateFreeImage(env, prompt, opts = {}) {
   const clean = String(prompt ?? "").trim();
   const diagErrors = [];
@@ -322,29 +400,24 @@ export async function generateFreeImage(env, prompt, opts = {}) {
     ? visualBase
     : `Photorealistic, high detail, 8k, no watermark: ${visualBase}`;
 
-  // Fast path: keep the whole provider phase under ~5.5s. Cloudflare's
-  // wall clock is 30s, so a slow provider must never eat the image
-  // budget (three sequential NVIDIA calls used to take ~42s).
-  const preFallbackStart = Date.now();
-  const PRE_FALLBACK_BUDGET_MS = 5500;
-  const preFallbackRemaining = () => PRE_FALLBACK_BUDGET_MS - (Date.now() - preFallbackStart);
-  const attemptTimeoutMs = () => Math.max(250, Math.min(5000, preFallbackRemaining()));
+  const seed = Number.isFinite(Number(opts.seed)) ? Math.floor(Number(opts.seed)) : Math.floor(Math.random() * 1e9);
 
+  // Tier 1: configured Together AI / HuggingFace token (10s each).
   try {
     const togetherKey = await resolveKey(env, userId, "together", "TOGETHER_API_KEY");
-    if (togetherKey && preFallbackRemaining() > 0) {
+    if (togetherKey) {
       try {
         const res = await fn("https://api.together.xyz/v1/images/generations", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${togetherKey}` },
           body: JSON.stringify({ model: "black-forest-labs/FLUX.1-schnell-Free", prompt: visual, width: 1024, height: 1024, n: 1, response_format: "b64_json" }),
-          signal: timeoutSignal(attemptTimeoutMs()),
+          signal: timeoutSignal(10000),
         });
         if (res?.ok) {
           const json = await safeJson(res);
           const b64 = extractTogetherImage(json);
           const bytes = b64 ? b64ToBytes(b64) : null;
-          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "together" };
+          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "together", diagErrors };
           diagErrors.push("together:empty");
         } else {
           diagErrors.push("together:" + (res?.status || "not_ok"));
@@ -354,41 +427,76 @@ export async function generateFreeImage(env, prompt, opts = {}) {
   } catch (e) { diagErrors.push("together:" + (e?.message || "error")); }
 
   try {
-    const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
-    if (nvidiaKey && preFallbackRemaining() > 0) {
-      const tryNvidia = async (url, body, label) => {
+    const hfKey = await resolveKey(env, userId, "huggingface", "HF_TOKEN");
+    if (hfKey) {
+      for (const url of [
+        "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell",
+        "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
+      ]) {
         try {
           const res = await fn(url, {
             method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}`, Accept: "application/json" },
-            body: JSON.stringify(body),
-            signal: timeoutSignal(attemptTimeoutMs()),
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${hfKey}`, Accept: "image/png" },
+            body: JSON.stringify({ inputs: visual }),
+            signal: timeoutSignal(10000),
           });
-          if (res?.ok) {
-            const json = await safeJson(res);
-            const b64 = extractNvidiaImage(json);
-            const bytes = b64 ? b64ToBytes(b64) : null;
-            if (bytes && bytes.length) return { bytes, status: res?.status || 200 };
-            diagErrors.push(label + ":empty");
+          if (res?.ok && typeof res.arrayBuffer === "function") {
+            const buf = await res.arrayBuffer();
+            const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+            if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "huggingface", diagErrors };
+            diagErrors.push("huggingface:empty");
           } else {
-            diagErrors.push(label + ":" + (res?.status || "not_ok"));
+            diagErrors.push("huggingface:" + (res?.status || "not_ok"));
           }
-          return { bytes: null, status: res?.status || null };
-        } catch (e) { diagErrors.push(label + ":" + (e?.message || "error")); return { bytes: null, status: null }; }
-      };
-      // Only FLUX.1-schnell: the extra SD3/SDXL calls blew the 30s
-      // Cloudflare limit. FLUX rejects width/height, so retry prompt-only.
-      let flux = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual, steps: 4, seed: 0 }, "nvidia-flux");
-      if (!flux.bytes && flux.status === 422 && preFallbackRemaining() > 0) {
-        flux = await tryNvidia("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual }, "nvidia-flux-min");
+        } catch (e) { diagErrors.push("huggingface:" + (e?.message || "error")); }
       }
-      if (flux.bytes) return { ok: true, bytes: flux.bytes, mimeType: "image/png", provider: "nvidia" };
+    }
+  } catch (e) { diagErrors.push("huggingface:" + (e?.message || "error")); }
+
+  // Tier 2: NVIDIA NIM parallel race. All 3 endpoints share one 11s
+  // window (NVIDIA can take >5s to generate + transfer 1.5MB base64), and
+  // the fastest working endpoint wins via Promise.any.
+  try {
+    const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
+    if (nvidiaKey) {
+      const nvidiaDeadline = Date.now() + 11000;
+      const branchSignal = () => timeoutSignal(Math.max(500, nvidiaDeadline - Date.now()));
+      const nvidiaBranch = async (url, body, label) => {
+        const res = await fn(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}`, Accept: "application/json" },
+          body: JSON.stringify(body),
+          signal: branchSignal(),
+        });
+        if (!res || (res.status !== 200 && res.ok !== true)) {
+          const json = await safeJson(res);
+          const snippet = String(json?.error?.message || json?.error || json?.detail || json?.message || "").slice(0, 40) || "error";
+          diagErrors.push(`${label}:${res?.status || "not_ok"}:${snippet}`);
+          throw new Error(label);
+        }
+        const json = await safeJson(res);
+        const b64 = json?.image || json?.artifacts?.[0]?.base64 || json?.data?.[0]?.b64_json;
+        const bytes = b64 ? b64ToBytes(b64) : null;
+        if (!bytes || !bytes.length) {
+          diagErrors.push(`${label}:empty`);
+          throw new Error(`${label}:empty`);
+        }
+        return bytes;
+      };
+      try {
+        const bytes = await Promise.any([
+          nvidiaBranch("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell", { prompt: visual, width: 1024, height: 1024, seed: 0, steps: 4 }, "nvidia-flux"),
+          nvidiaBranch("https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-3-medium", { prompt: visual, cfg_scale: 5, aspect_ratio: "1:1", seed: 0, steps: 28, negative_prompt: "" }, "nvidia-sd3"),
+          nvidiaBranch("https://ai.api.nvidia.com/v1/genai/stabilityai/sdxl-turbo", { text_prompts: [{ text: visual, weight: 1 }], seed: 0, sampler: "K_EULER_ANCESTRAL", steps: 4 }, "nvidia-sdxl"),
+        ]);
+        if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "nvidia", diagErrors };
+      } catch {}
     }
   } catch (e) { diagErrors.push("nvidia:" + (e?.message || "error")); }
 
   try {
     const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
-    if (geminiKey && geminiKey.startsWith("AIza") && preFallbackRemaining() > 0) {
+    if (geminiKey && geminiKey.startsWith("AIza")) {
       try {
         const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=${geminiKey}`, {
           method: "POST",
@@ -397,13 +505,13 @@ export async function generateFreeImage(env, prompt, opts = {}) {
             contents: [{ role: "user", parts: [{ text: visual }] }],
             generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
           }),
-          signal: timeoutSignal(attemptTimeoutMs()),
+          signal: timeoutSignal(10000),
         });
         if (res?.ok) {
           const json = await safeJson(res);
           const b64 = extractGeminiImage(json);
           const bytes = b64 ? b64ToBytes(b64) : null;
-          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "gemini" };
+          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "gemini", diagErrors };
           diagErrors.push("gemini:empty");
         } else {
           diagErrors.push("gemini:" + (res?.status || "not_ok"));
@@ -412,31 +520,15 @@ export async function generateFreeImage(env, prompt, opts = {}) {
     }
   } catch (e) { diagErrors.push("gemini:" + (e?.message || "error")); }
 
+  // Tier 3: keyless HuggingFace ZeroGPU FLUX.1-schnell Space.
   try {
-    const hfKey = await resolveKey(env, userId, "huggingface", "HF_TOKEN");
-    if (hfKey && preFallbackRemaining() > 0) {
-      try {
-        const res = await fn("https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${hfKey}`, Accept: "image/png" },
-          body: JSON.stringify({ inputs: visual }),
-          signal: timeoutSignal(attemptTimeoutMs()),
-        });
-        if (res?.ok && typeof res.arrayBuffer === "function") {
-          const buf = await res.arrayBuffer();
-          const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-          if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "huggingface" };
-          diagErrors.push("huggingface:empty");
-        } else {
-          diagErrors.push("huggingface:" + (res?.status || "not_ok"));
-        }
-      } catch (e) { diagErrors.push("huggingface:" + (e?.message || "error")); }
-    }
-  } catch (e) { diagErrors.push("huggingface:" + (e?.message || "error")); }
+    const hfSpace = await generateViaHfFluxSpace(visual, fn, seed);
+    if (hfSpace?.ok) return hfSpace;
+    if (Array.isArray(hfSpace?.diagErrors)) diagErrors.push(...hfSpace.diagErrors);
+  } catch (e) { diagErrors.push("hf-space:" + (e?.message || "error")); }
 
   try {
     const englishPrompt = PERSIAN_RE.test(visual) ? fallbackEnglishPrompt(visual) : visual;
-    const seed = Number.isFinite(Number(opts.seed)) ? Math.floor(Number(opts.seed)) : Math.floor(Math.random() * 1e9);
     // No enhance/private flags: they made Pollinations hang and return
     // 502. Keep the exact fast URL shape that worked historically.
     const pollinationsAttempt = async (width, height, timeoutMs) => {
@@ -453,7 +545,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
       if (res?.ok) {
         const buf = await res.arrayBuffer();
         const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-        if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/jpeg", provider: "pollinations" };
+        if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/jpeg", provider: "pollinations", diagErrors };
         diagErrors.push("pollinations:empty");
       } else {
         diagErrors.push("pollinations:" + (res?.status || "not_ok"));

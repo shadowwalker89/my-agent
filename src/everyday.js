@@ -2469,7 +2469,8 @@ export async function runNluBranch(env, o, ctx) {
       if (typeof o.send === "function") await o.send("🎨 در حال ساخت تصویر، لطفاً چند ثانیه صبر کنید...");
       const res = await generateFreeImage(env, prompt, { userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
       if (res && res.ok) {
-        const caption = `🎨 تصویر ساخته شد (${res.provider || "auto"}): ${prompt}`;
+        let caption = `🎨 تصویر ساخته شد (${res.provider || "auto"}): ${prompt}`;
+        if (res.provider === "pollinations" && res.diagErrors?.length) caption += `\n⚠️ دیباگ موتور اصلی: ${res.diagErrors.slice(0, 3).join(" | ")}`;
         let photoSent = false;
         if (typeof o.sendPhoto === "function") {
           try { const tgRes = await o.sendPhoto(res.bytes, { caption, mimeType: res.mimeType, filename: "generated.png" }); photoSent = !(tgRes && tgRes.ok === false); } catch {}
@@ -2599,7 +2600,9 @@ export async function handleDailyText(env, o) {
       }
       if (result && result.ok) {
         const captionScene = basePrompt || "the scene in the attached image";
-        await sendEditedPhoto(result.bytes, result.mimeType, `🎨 تصویر ویرایش شد (${result.provider}): ${captionScene} (${userText})`);
+        let editCaption = `🎨 تصویر ویرایش شد (${result.provider}): ${captionScene} (${userText})`;
+        if (result.provider === "pollinations" && result.diagErrors?.length) editCaption += `\n⚠️ دیباگ موتور اصلی: ${result.diagErrors.slice(0, 3).join(" | ")}`;
+        await sendEditedPhoto(result.bytes, result.mimeType, editCaption);
       } else if (typeof o.send === "function") {
         await o.send("ویرایش تصویر ممکن نشد؛ دوباره تلاش کن.");
       }
@@ -2624,7 +2627,8 @@ export async function handleDailyText(env, o) {
       if (typeof o.send === "function") await o.send("🎨 در حال ساخت تصویر، لطفاً چند ثانیه صبر کنید...");
       const res = await generateFreeImage(env, parsedImage.prompt, { userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
       if (res && res.ok) {
-        const caption = `🎨 تصویر ساخته شد (${res.provider || "auto"}): ${parsedImage.prompt}`;
+        let caption = `🎨 تصویر ساخته شد (${res.provider || "auto"}): ${parsedImage.prompt}`;
+        if (res.provider === "pollinations" && res.diagErrors?.length) caption += `\n⚠️ دیباگ موتور اصلی: ${res.diagErrors.slice(0, 3).join(" | ")}`;
         let photoSent = false;
         if (typeof o.sendPhoto === "function") {
           try {

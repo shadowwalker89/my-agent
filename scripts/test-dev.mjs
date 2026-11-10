@@ -8150,14 +8150,54 @@ if (DatabaseSync) {
   const { generateFreeImage } = await import("../src/media.js");
   const urls = [];
   const fn = async (url) => {
-    urls.push(String(url));
-    if (urls.length === 1) return { ok: false, status: 502 };
-    return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
+    const u = String(url);
+    urls.push(u);
+    if (u.includes("hf.space")) return { ok: false, status: 503 };
+    if (u.includes("image.pollinations.ai") && u.includes("width=1024")) return { ok: false, status: 502 };
+    if (u.includes("image.pollinations.ai") && u.includes("width=768")) return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
+    return { ok: false, status: 404 };
   };
   const r = await generateFreeImage({}, "sunset over the city", { fetchFn: fn });
+  const pollUrls = urls.filter((u) => u.includes("image.pollinations.ai"));
   check(r.ok === true && r.provider === "pollinations" && r.bytes.length === 3, `fix1: pollinations 768 fallback succeeds: ${JSON.stringify(r).slice(0, 160)}`);
-  check(urls.length === 2 && urls[0].includes("width=1024") && urls[1].includes("width=768"), `fix1: 1024 first, then 768: ${JSON.stringify(urls)}`);
-  check(!urls.some((u) => u.includes("enhance=true") || u.includes("private=true") || u.includes("model=flux")), `fix1: clean Pollinations URL has no enhance/private/model flags: ${JSON.stringify(urls)}`);
+  check(pollUrls.length === 2 && pollUrls[0].includes("width=1024") && pollUrls[1].includes("width=768"), `fix1: 1024 first, then 768: ${JSON.stringify(pollUrls)}`);
+  check(!pollUrls.some((u) => u.includes("enhance=true") || u.includes("private=true") || u.includes("model=flux")), `fix1: clean Pollinations URL has no enhance/private/model flags: ${JSON.stringify(pollUrls)}`);
+}
+
+// NVIDIA NIM parallel race: sd3/sdxl win even when flux returns 404/422.
+{
+  const { generateFreeImage } = await import("../src/media.js");
+  const b64 = Buffer.from([1, 2, 3, 4, 5]).toString("base64");
+  const seen = [];
+  const fn = async (url) => {
+    const u = String(url);
+    seen.push(u);
+    if (u.includes("flux.1-schnell")) return { ok: false, status: 404, json: async () => ({ error: "model not found" }) };
+    if (u.includes("stable-diffusion-3-medium")) return { ok: true, status: 200, json: async () => ({ image: b64 }) };
+    if (u.includes("sdxl-turbo")) return { ok: false, status: 422, json: async () => ({ error: "bad params" }) };
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const r = await generateFreeImage({ NVIDIA_API_KEY: "nkey" }, "a red fox in the snow", { fetchFn: fn });
+  check(r.ok === true && r.provider === "nvidia" && r.bytes.length === 5, `race: nvidia Promise.any uses sd3 when flux fails: ${JSON.stringify(r).slice(0, 200)}`);
+  check(seen.some((u) => u.includes("flux.1-schnell")) && seen.some((u) => u.includes("stable-diffusion-3-medium")) && seen.some((u) => u.includes("sdxl-turbo")), `race: all three NVIDIA endpoints raced: ${JSON.stringify(seen.filter((u) => u.includes("ai.api.nvidia.com")))}`);
+  check(Array.isArray(r.diagErrors) && r.diagErrors.some((d) => /^nvidia-flux:404:/.test(d)), `race: flux failure recorded in diagErrors: ${JSON.stringify(r.diagErrors)}`);
+}
+
+// HF ZeroGPU FLUX.1-schnell Space: Gradio event_id + SSE complete flow.
+{
+  const { generateViaHfFluxSpace } = await import("../src/media.js");
+  const calls = [];
+  const fn = async (url, init = {}) => {
+    const u = String(url);
+    calls.push({ url: u, method: init.method });
+    if (u.endsWith("/gradio_api/call/infer")) return { ok: true, status: 200, json: async () => ({ event_id: "evt-42" }) };
+    if (u.endsWith("/gradio_api/call/infer/evt-42")) return { ok: true, status: 200, text: async () => "event: generating\ndata: null\n\nevent: complete\ndata: [[{\"url\":\"https://cdn.example/img.webp\"}]]\n\n" };
+    if (u === "https://cdn.example/img.webp") return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([9, 8, 7, 6]).buffer };
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const r = await generateViaHfFluxSpace("a red fox in the snow", fn, 7);
+  check(r.ok === true && r.provider === "hf-flux-space" && r.mimeType === "image/webp" && r.bytes.length === 4, `hf-space: parses event_id + SSE complete: ${JSON.stringify({ ok: r.ok, provider: r.provider, mimeType: r.mimeType, len: r.bytes?.length, diag: r.diagErrors })}`);
+  check(calls.some((c) => c.method === "POST" && c.url.endsWith("/gradio_api/call/infer")) && calls.some((c) => c.method === "GET" && c.url.endsWith("/gradio_api/call/infer/evt-42")), `hf-space: uses Gradio POST + SSE GET: ${JSON.stringify(calls)}`);
 }
 
 if (failures.length) {
