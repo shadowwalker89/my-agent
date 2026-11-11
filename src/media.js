@@ -197,6 +197,14 @@ function timeoutSignal(ms) {
   return undefined;
 }
 
+export function createDeadline(budgetMs = 22000) {
+  const end = Date.now() + budgetMs;
+  return {
+    remaining() { return Math.max(0, end - Date.now()); },
+    signal(stepMaxMs) { return timeoutSignal(Math.max(500, Math.min(stepMaxMs, this.remaining()))); },
+  };
+}
+
 const FA_IMAGE_WORDS = [
   ["آینده‌نگر", "futuristic"], ["آینده نگر", "futuristic"], ["آینده", "futuristic"],
   ["خودروی", "car"], ["خودرو", "car"], ["ماشین", "car"],
@@ -231,7 +239,7 @@ function outText(out) {
   }
   return "";
 }
-async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
+async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}, budget = createDeadline()) {
   if (!PERSIAN_RE.test(prompt)) return prompt;
   // Primary fast translator: free, no key, broad Persian vocabulary. This
   // must run before any LLM fallback so unknown names/objects are never
@@ -239,7 +247,7 @@ async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
   if (typeof fn === "function") {
     try {
       const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=fa&tl=en&dt=t&q=${encodeURIComponent(prompt)}`;
-      const res = await fn(url, { method: "GET", signal: timeoutSignal(2500) });
+      const res = await fn(url, { method: "GET", signal: budget.signal(2500) });
       if (res?.ok) {
         const data = await safeJson(res);
         const segments = Array.isArray(data?.[0])
@@ -275,7 +283,7 @@ async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
               method: "POST",
               headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}` },
               body: JSON.stringify({ model, messages: [{ role: "user", content: `Translate this image prompt into a detailed, cinematic English prompt for a photorealistic image model. Return only the English prompt, no quotes:\n${prompt}` }], max_tokens: 160, temperature: 0.2 }),
-              signal: timeoutSignal(4000),
+              signal: budget.signal(4000),
             });
             if (res?.ok) {
               const json = await safeJson(res);
@@ -289,14 +297,14 @@ async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
     const key = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
     if (key) {
       try {
-        const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`, {
+        const res = await fn("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "x-goog-api-key": key },
           body: JSON.stringify({
             contents: [{ role: "user", parts: [{ text: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }] }],
             generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
           }),
-          signal: timeoutSignal(4000),
+          signal: budget.signal(4000),
         });
         if (res?.ok) {
           const json = await safeJson(res);
@@ -312,7 +320,7 @@ async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}) {
 // Tier 3: HuggingFace ZeroGPU official FLUX.1-schnell Gradio Space. Free,
 // no key, genuine FLUX.1 on H200. Gradio uses an async call/SSE protocol:
 // POST returns an event_id, then GET streams events until "complete".
-export async function generateViaHfFluxSpace(englishPrompt, fetchFn, seed = 0) {
+export async function generateViaHfFluxSpace(englishPrompt, fetchFn, seed = 0, budget = createDeadline()) {
   const diagErrors = [];
   const base = "https://black-forest-labs-flux-1-schnell.hf.space";
   const body = JSON.stringify({ data: [englishPrompt, Number(seed) || 0, true, 1024, 1024, 4] });
@@ -320,11 +328,15 @@ export async function generateViaHfFluxSpace(englishPrompt, fetchFn, seed = 0) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,
-    signal: timeoutSignal(12000),
+    signal: budget.signal(12000),
   });
   try {
-    let post = await postInfer(`${base}/gradio_api/call/infer`);
-    if (post?.status === 404) post = await postInfer(`${base}/call/infer`);
+    let callPath = "/gradio_api/call/infer";
+    let post = await postInfer(`${base}${callPath}`);
+    if (post?.status === 404) {
+      callPath = "/call/infer";
+      post = await postInfer(`${base}${callPath}`);
+    }
     if (!post?.ok) {
       diagErrors.push(`hf-space:${post?.status || "not_ok"}`);
       return { ok: false, diagErrors };
@@ -335,10 +347,10 @@ export async function generateViaHfFluxSpace(englishPrompt, fetchFn, seed = 0) {
       diagErrors.push("hf-space:no_event_id");
       return { ok: false, diagErrors };
     }
-    const sse = await fetchFn(`${base}/gradio_api/call/infer/${eventId}`, {
+    const sse = await fetchFn(`${base}${callPath}/${eventId}`, {
       method: "GET",
       headers: { Accept: "text/event-stream" },
-      signal: timeoutSignal(12000),
+      signal: budget.signal(12000),
     });
     if (!sse?.ok) {
       diagErrors.push(`hf-space:${sse?.status || "not_ok"}`);
@@ -369,7 +381,7 @@ export async function generateViaHfFluxSpace(englishPrompt, fetchFn, seed = 0) {
       return { ok: false, diagErrors };
     }
     if (!/^https?:\/\//i.test(imageUrl)) imageUrl = `${base}${imageUrl.startsWith("/") ? "" : "/"}${imageUrl}`;
-    const img = await fetchFn(imageUrl, { method: "GET", signal: timeoutSignal(12000) });
+    const img = await fetchFn(imageUrl, { method: "GET", signal: budget.signal(12000) });
     if (!img?.ok || typeof img.arrayBuffer !== "function") {
       diagErrors.push(`hf-space-img:${img?.status || "not_ok"}`);
       return { ok: false, diagErrors };
@@ -390,11 +402,12 @@ export async function generateViaHfFluxSpace(englishPrompt, fetchFn, seed = 0) {
 export async function generateFreeImage(env, prompt, opts = {}) {
   const clean = String(prompt ?? "").trim();
   const diagErrors = [];
+  const budget = createDeadline();
   if (!clean) return { ok: false, error: "image_gen_failed", diagErrors };
   const fn = resolveFetch(opts);
   const userId = opts.userId ?? null;
   if (typeof fn !== "function") return { ok: false, error: "image_gen_failed", diagErrors: ["fetch_unavailable"] };
-  const translated = await toEnglishImagePrompt(env, userId, clean, fn, opts);
+  const translated = await toEnglishImagePrompt(env, userId, clean, fn, opts, budget);
   const visualBase = PERSIAN_RE.test(translated) ? fallbackEnglishPrompt(translated) : translated;
   const visual = /^(?:photorealistic|cinematic|hyperrealistic|ultra[- ]?detailed)/i.test(visualBase)
     ? visualBase
@@ -411,7 +424,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${togetherKey}` },
           body: JSON.stringify({ model: "black-forest-labs/FLUX.1-schnell-Free", prompt: visual, width: 1024, height: 1024, n: 1, response_format: "b64_json" }),
-          signal: timeoutSignal(10000),
+          signal: budget.signal(10000),
         });
         if (res?.ok) {
           const json = await safeJson(res);
@@ -438,7 +451,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: `Bearer ${hfKey}`, Accept: "image/png" },
             body: JSON.stringify({ inputs: visual }),
-            signal: timeoutSignal(10000),
+            signal: budget.signal(10000),
           });
           if (res?.ok && typeof res.arrayBuffer === "function") {
             const buf = await res.arrayBuffer();
@@ -459,8 +472,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
   try {
     const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
     if (nvidiaKey) {
-      const nvidiaDeadline = Date.now() + 11000;
-      const branchSignal = () => timeoutSignal(Math.max(500, nvidiaDeadline - Date.now()));
+      const branchSignal = () => budget.signal(11000);
       const nvidiaBranch = async (url, body, label) => {
         const res = await fn(url, {
           method: "POST",
@@ -498,14 +510,14 @@ export async function generateFreeImage(env, prompt, opts = {}) {
     const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
     if (geminiKey && geminiKey.startsWith("AIza")) {
       try {
-        const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=${geminiKey}`, {
+        const res = await fn("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "x-goog-api-key": geminiKey },
           body: JSON.stringify({
             contents: [{ role: "user", parts: [{ text: visual }] }],
             generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
           }),
-          signal: timeoutSignal(10000),
+          signal: budget.signal(10000),
         });
         if (res?.ok) {
           const json = await safeJson(res);
@@ -522,7 +534,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
 
   // Tier 3: keyless HuggingFace ZeroGPU FLUX.1-schnell Space.
   try {
-    const hfSpace = await generateViaHfFluxSpace(visual, fn, seed);
+    const hfSpace = await generateViaHfFluxSpace(visual, fn, seed, budget);
     if (hfSpace?.ok) return hfSpace;
     if (Array.isArray(hfSpace?.diagErrors)) diagErrors.push(...hfSpace.diagErrors);
   } catch (e) { diagErrors.push("hf-space:" + (e?.message || "error")); }
@@ -540,7 +552,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
           Referer: "https://pollinations.ai/",
         },
         redirect: "follow",
-        signal: timeoutSignal(timeoutMs),
+        signal: budget.signal(timeoutMs),
       });
       if (res?.ok) {
         const buf = await res.arrayBuffer();
@@ -563,7 +575,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
 
 export function isImageEditCaption(caption) {
   const s = String(caption ?? "").trim();
-  if (!s) return false;
+  if (!s || isVisionQuestionCaption(s)) return false;
   if (/^\s*(ویرایش\s*عکس|ویرایش|ادیت)\s*[:：-]/u.test(s)) return true;
   if (/^(ویرایش|ادیت)\s+/.test(s)) return true;
   const markers = ["ویرایش عکس", "ادیت", "ویرایش کن", "ادیت کن", "پس‌زمینه", "پسزمینه", "کارتونی کن", "کارتونی", "تغییر بده", "تغییر", "نور عکس", "بهتر کن", "حذف کن", "حذف", "کم کن", "اضافه کن", "عوض کن", "اصلاح کن", "رنگ", "رنگش", "قرمز", "آبی", "سبز", "زرد", "بلندتر", "بلند تر", "کوتاه‌تر", "کوتاه تر", "بزرگ‌تر", "بزرگ تر", "کوچک‌تر", "کوچک تر", "روشن‌تر", "روشن تر", "تیره‌تر", "تیره تر", "تبدیل کن", "color", "recolor", "change", "modify"];
@@ -576,6 +588,7 @@ export async function editImage(env, opts = {}) {
   const instruction = String(opts.instruction ?? "").trim();
   const userId = opts.userId ?? null;
   const fn = resolveFetch(opts);
+  const budget = createDeadline();
   if (!imageBytes || !instruction || typeof fn !== "function") return { ok: false, reason: "نیاز به تنظیم کلید GEMINI_API_KEY یا HF_TOKEN در /setup برای ویرایش تصویر است." };
 
   try {
@@ -583,13 +596,14 @@ export async function editImage(env, opts = {}) {
     if (geminiKey) {
       try {
         const b64 = bytesToB64(imageBytes);
-        const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=${geminiKey}`, {
+        const res = await fn("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "x-goog-api-key": geminiKey },
           body: JSON.stringify({
             contents: [{ role: "user", parts: [{ text: instruction }, { inlineData: { mimeType, data: b64 } }] }],
             generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
           }),
+          signal: budget.signal(10000),
         });
         if (res?.ok) {
           const json = await safeJson(res);
@@ -605,10 +619,11 @@ export async function editImage(env, opts = {}) {
     const hfKey = await resolveKey(env, userId, "huggingface", "HF_TOKEN");
     if (hfKey) {
       try {
-        const res = await fn("https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell", {
+        const res = await fn("https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${hfKey}`, Accept: "image/png" },
           body: JSON.stringify({ inputs: instruction, image: bytesToB64(imageBytes) }),
+          signal: budget.signal(10000),
         });
         if (res?.ok && typeof res.arrayBuffer === "function") {
           const buf = await res.arrayBuffer();
@@ -648,6 +663,7 @@ export async function analyzeImage(env, opts = {}) {
   if (!imageBytes) return { ok: false, error: "no_image", text: "تحلیل تصویر ممکن نشد؛ هیچ تصویری دریافت نشد." };
   const b64 = bytesToBase64(imageBytes);
   const dataUri = `data:${mimeType || "image/jpeg"};base64,${b64}`;
+  const budget = createDeadline();
 
   if (typeof routerCallFn === "function") {
     try {
@@ -672,16 +688,15 @@ export async function analyzeImage(env, opts = {}) {
     try {
       const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
       if (geminiKey) {
-        const geminiSignal = geminiKey.startsWith("AIza") ? undefined : timeoutSignal(4000);
         for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) {
           try {
-            const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+            const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: { "Content-Type": "application/json", "x-goog-api-key": geminiKey },
               body: JSON.stringify({
                 contents: [{ role: "user", parts: [{ text: visionPrompt }, { inlineData: { mimeType, data: b64 } }] }],
               }),
-              signal: geminiSignal,
+              signal: budget.signal(8000),
             });
             if (res?.ok) {
               const json = await safeJson(res);
@@ -708,12 +723,12 @@ export async function analyzeImage(env, opts = {}) {
               body: JSON.stringify({
                 model,
                 messages: [{ role: "user", content: [
-                  { type: "text", text: visionPrompt + "\nبه این سوال درباره تصویر پاسخ بده: " + prompt },
+                  { type: "text", text: visionPrompt },
                   { type: "image_url", image_url: { url: dataUri } },
                 ] }],
                 max_tokens: 600,
               }),
-              signal: timeoutSignal(12000),
+              signal: budget.signal(12000),
             });
             if (res?.ok) {
               const json = await safeJson(res);

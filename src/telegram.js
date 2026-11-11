@@ -5,8 +5,11 @@ export async function tgApi(env, method, body) {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body ?? {}),
+    signal: AbortSignal.timeout(10000),
   });
-  return await res.json();
+  const json = await res.json().catch(() => ({ ok: false }));
+  if (!json?.ok) console.warn(JSON.stringify({ tg: method, code: json?.error_code ?? res?.status }));
+  return json;
 }
 
 export async function tgSend(env, chatId, text, opts) {

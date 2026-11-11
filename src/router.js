@@ -45,8 +45,9 @@ const targetHealthMap = new Map();
 const PROVIDER_STREAK_COOLDOWN_MS = 5 * 60 * 1000;
 const PROVIDER_STREAK_THRESHOLD = 2;
 const providerStreakMap = new Map();
+const roundRobinMap = new Map();
 export function resetProviderStreaks() { providerStreakMap.clear(); }
-export function resetRouterHealthForTests() { targetHealthMap.clear(); providerStreakMap.clear(); resetCircuitForTests(); }
+export function resetRouterHealthForTests() { targetHealthMap.clear(); providerStreakMap.clear(); roundRobinMap.clear(); resetCircuitForTests(); }
 // Phase 2-d: admin "Unblock" clears one target's in-memory breaker entry
 // (the KV health:<target> delete alone would leave the 10-minute
 // in-memory cooldown in place for the rest of the isolate's life).
@@ -472,10 +473,13 @@ async function getManualComboTargets(env, combo, cfg, opts = {}) {
   // Default preview = false, so direct getComboTargets(env, name)
   // calls (tests, routing) keep advancing exactly as before.
   if (combo.strategy === "round-robin" && env.STATE && !opts.preview) {
-    const cur = Number((await env.STATE.get(`rr:${combo.name}`)) ?? 0);
+    const rrKey = `rr:${combo.name}`;
+    const testKV = env.__TEST_RR_KV === true;
+    const cur = Number(testKV ? roundRobinMap.get(rrKey) ?? (await env.STATE.get(rrKey)) ?? 0 : roundRobinMap.get(rrKey) ?? 0);
     rrStart = Number.isFinite(cur) ? cur : 0;
     const n = candidate.length || 1;
-    await env.STATE.put(`rr:${combo.name}`, String((rrStart + 1) % n));
+    roundRobinMap.set(rrKey, (rrStart + 1) % n);
+    if (testKV) await env.STATE.put(rrKey, String((rrStart + 1) % n));
   }
 
   let medians = {};

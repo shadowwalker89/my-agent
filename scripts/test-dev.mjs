@@ -5788,13 +5788,14 @@ if (DatabaseSync) {
   // (b) KV-cooling pinned models do not block healthy targets; previews
   // do not advance the round-robin pointer.
   {
+    resetRouterHealthForTests();
     const kv = fakeKV();
     await kv.put("catalog:xkiro", JSON.stringify({ models: [
       { id: "cool-model", provider: "xkiro", context: 131072 },
       { id: "fresh-model", provider: "xkiro", context: 131072 },
     ] }));
     await kv.put("overrides:v1", JSON.stringify({ pins: { chat: ["xkiro/cool-model"] }, bans: [], prefer: {} }));
-    const env = { STATE: kv };
+    const env = { STATE: kv, __TEST_RR_KV: true };
     await markFailure(env, "xkiro/cool-model", classifyFailure(null, "", true), "timeout");
     const sel = await getComboTargets(env, "chat");
     const order = (sel.targets ?? []).map((t) => `${t.provider}/${t.model}`);
