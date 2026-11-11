@@ -242,6 +242,12 @@ check(
     WEIGHTS.provenFastBonus === 28 && RULES.chat.provenFast === true && RULES.fast.provenFast === true,
     "2-l: proven-fast +28 is enabled in chat/fast",
   );
+  const chatScore = scoreModel({ id: "cohere/north-mini-code", ...base }, cp, { demoteUnstable: true, boostWorkhorse: true, provenFast: true, comboName: "chat" });
+  const codeScore = scoreModel({ id: "cohere/north-mini-code", ...base }, cp, { demoteUnstable: true, boostWorkhorse: true, provenFast: true, comboName: "code" });
+  check(
+    codeScore - chatScore === WEIGHTS.miniCodePenalty && WEIGHTS.miniCodePenalty === 40,
+    `2-l: north-mini-code is penalized ${WEIGHTS.miniCodePenalty} outside code (chat=${chatScore}, code=${codeScore})`,
+  );
 }
 
 const asserts = {

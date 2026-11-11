@@ -5,6 +5,7 @@ export const CONNECTORS = [
   { id: "gemini", label: "Google Gemini (Vision / Image Edit / PDF)", keyName: "GEMINI_API_KEY" },
   { id: "nvidia", label: "NVIDIA NIM (Flux Image / Vision / Chat)", keyName: "NVIDIA_API_KEY" },
   { id: "together", label: "Together AI (FLUX.1-schnell-Free)", keyName: "TOGETHER_API_KEY" },
+  { id: "puter", label: "Puter AI (Flux-2-Pro / Gemini-3-Image / GPT-Image)", keyName: "PUTER_API_TOKEN" },
   { id: "huggingface", label: "HuggingFace (Flux / Image Edit)", keyName: "HF_TOKEN" },
   { id: "upload_am", label: "Upload.am (اشتراک فایل غیرحساس)", keyName: "UPLOAD_AM_API_KEY", optionalKey: true },
   { id: "google_drive", label: "Google Drive (آرشیو اختیاری کاربر)", keyName: "GOOGLE_REFRESH_TOKEN" },
@@ -26,10 +27,12 @@ function maskKey(v) {
 const ENV_KEY_ALIASES = {
   gemini: ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_AI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"],
   nvidia: ["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"],
+  puter: ["PUTER_API_TOKEN", "PUTER_AUTH_TOKEN"],
 };
 const CONFIG_KEY_HINT = {
   gemini: /gemini|google/i,
   nvidia: /nvidia/i,
+  puter: /puter/i,
 };
 
 function readEnvKey(env, names) {

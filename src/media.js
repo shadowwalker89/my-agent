@@ -189,6 +189,34 @@ function extractNvidiaImage(json) {
   return null;
 }
 
+// Puter's driver-call responses vary by driver: the image may arrive as a
+// data URL, a plain base64 string, a remote URL, or nested under result/data.
+function extractPuterImage(json) {
+  const scan = (v, depth) => {
+    if (v == null || depth > 5) return null;
+    if (typeof v === "string") {
+      if (/^data:image\//i.test(v)) return { b64: v };
+      if (/^https?:\/\//i.test(v)) return { url: v };
+      if (v.length > 200 && /^[A-Za-z0-9+/=\r\n]+$/.test(v)) return { b64: v };
+      return null;
+    }
+    if (Array.isArray(v)) {
+      for (const item of v) { const hit = scan(item, depth + 1); if (hit) return hit; }
+      return null;
+    }
+    if (typeof v === "object") {
+      for (const key of ["b64_json", "base64", "image_base64"]) {
+        if (typeof v[key] === "string" && v[key]) return { b64: v[key] };
+      }
+      for (const key of ["url", "image_url", "src", "image", "data", "result", "output", "outputs", "images"]) {
+        if (key in v) { const hit = scan(v[key], depth + 1); if (hit) return hit; }
+      }
+    }
+    return null;
+  };
+  return scan(json, 0);
+}
+
 const IMAGE_USER_AGENT = "Mozilla/5.0 (compatible; my-agent/1.0)";
 const PERSIAN_RE = /[\u0600-\u06FF]/;
 
@@ -414,6 +442,52 @@ export async function generateFreeImage(env, prompt, opts = {}) {
     : `Photorealistic, high detail, 8k, no watermark: ${visualBase}`;
 
   const seed = Number.isFinite(Number(opts.seed)) ? Math.floor(Number(opts.seed)) : Math.floor(Math.random() * 1e9);
+
+  // Tier 0: Puter AI free image generation (/setup puter <token>). Top-tier
+  // because it fronts several strong models (Flux-2-Pro / Gemini-3-Image /
+  // GPT-Image) behind one key with no per-model billing.
+  try {
+    const puterToken = await resolveKey(env, userId, "puter", "PUTER_API_TOKEN");
+    if (puterToken) {
+      for (const model of [
+        "black-forest-labs/FLUX.1-schnell",
+        "black-forest-labs/FLUX-2-pro",
+        "google/gemini-3-image",
+        "openai/gpt-image-1",
+      ]) {
+        if (budget.remaining() <= 0) break;
+        try {
+          const res = await fn("https://api.puter.com/drivers/call", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${puterToken}` },
+            body: JSON.stringify({
+              interface: "puter-image-generation",
+              driver: "together",
+              method: "generate",
+              args: { prompt: visual, model },
+            }),
+            signal: budget.signal(12000),
+          });
+          if (res?.ok) {
+            const json = await safeJson(res);
+            const hit = extractPuterImage(json);
+            let bytes = hit?.b64 ? b64ToBytes(hit.b64) : null;
+            if (!bytes && hit?.url) {
+              const img = await fn(hit.url, { method: "GET", signal: budget.signal(12000) });
+              if (img?.ok && typeof img.arrayBuffer === "function") {
+                const buf = await img.arrayBuffer();
+                bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+              }
+            }
+            if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "puter", diagErrors };
+            diagErrors.push("puter:empty");
+          } else {
+            diagErrors.push("puter:" + (res?.status || "not_ok"));
+          }
+        } catch (e) { diagErrors.push("puter:" + (e?.message || "error")); }
+      }
+    }
+  } catch (e) { diagErrors.push("puter:" + (e?.message || "error")); }
 
   // Tier 1: configured Together AI / HuggingFace token (10s each).
   try {

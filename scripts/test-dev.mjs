@@ -1611,11 +1611,19 @@ import { classifyVoiceQuota, transcribeWithGemini, handleVoice, handleVoiceRetry
     const ready = await transcribeWithGemini(env, new ArrayBuffer(8), "audio/ogg", { cleanupTimeoutMs: 10 });
     check(ready.ok && ready.text === "سلام دنیا" && deleted === 1 && Date.now() - cleanupStart < 1000, "voice regression: stalled cleanup cannot hold a ready transcript");
 
+    // CI Linux runners can pause the event loop for 50-200ms (GC / task
+    // scheduling), so the old 150ms deadline sometimes expired before the
+    // hanging request was even issued (calls.length stayed 0) or the 1000ms
+    // wall-clock ceiling was too tight. Keep the attempt cap above the total
+    // budget so the timer fires exactly at the shared deadline, give the
+    // upload/poll steps headroom, and use a ceiling well above runner jitter.
+    // The test still proves the deadline aborts the hanging body/headers and
+    // that no post-deadline fallback call is made.
     for (const hang of ["headers-hang", "body-hang"]) {
       reset(hang);
       const budgetStart = Date.now();
-      const limited = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { totalTimeoutMs: 150, attemptTimeoutMs: 1000, cleanupTimeoutMs: 5 });
-      check(!limited.ok && limited.reason === "timeout" && calls.length === 1 && Date.now() - budgetStart < 1000, `voice regression: shared deadline bounds ${hang}, with no post-deadline fallback`);
+      const limited = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { totalTimeoutMs: 600, attemptTimeoutMs: 1000, cleanupTimeoutMs: 5 });
+      check(!limited.ok && limited.reason === "timeout" && calls.length === 1 && Date.now() - budgetStart < 2500, `voice regression: shared deadline bounds ${hang}, with no post-deadline fallback`);
     }
     reset("headers-hang");
     const attemptStart = Date.now();
@@ -7566,6 +7574,18 @@ if (DatabaseSync) {
   const togetherFn = async (url, init = {}) => { togetherCalled = true; togetherUrl = String(url); return { ok: true, json: async () => ({ data: [{ b64_json: b64 }] }) }; };
   const rT = await generateFreeImage({ TOGETHER_API_KEY: "tkey", AI: { run: async () => { throw new Error("should not be called"); } } }, "kand", { fetchFn: togetherFn });
   check(togetherCalled && togetherUrl.includes("api.together.xyz") && rT.ok === true && rT.provider === "together" && rT.bytes.length === 8, `3.2: together provider used: ok=${rT.ok} provider=${rT.provider} url=${togetherUrl}`);
+  let puterUrl = "", puterAuth = "", puterBody = null;
+  const puterFn = async (url, init = {}) => {
+    puterUrl = String(url); puterAuth = init.headers?.Authorization || "";
+    puterBody = JSON.parse(init.body);
+    return { ok: true, json: async () => ({ result: { url: `data:image/png;base64,${b64}` } }) };
+  };
+  const rP = await generateFreeImage({ PUTER_API_TOKEN: "pkey", AI: { run: async () => { throw new Error("should not be called"); } } }, "kand", { fetchFn: puterFn });
+  check(puterUrl.includes("api.puter.com/drivers/call") && puterAuth === "Bearer pkey"
+    && puterBody?.interface === "puter-image-generation" && puterBody?.driver === "together" && puterBody?.method === "generate"
+    && puterBody?.args?.model === "black-forest-labs/FLUX.1-schnell"
+    && rP.ok === true && rP.provider === "puter" && rP.bytes.length === 8,
+    `3.2: puter top-tier provider used: ok=${rP.ok} provider=${rP.provider} url=${puterUrl} body=${JSON.stringify(puterBody).slice(0, 160)}`);
   const nvidiaB64 = Buffer.from([5,5,5]).toString("base64");
   let nvidiaUrl = "";
   const nvidiaFn = async (url) => { nvidiaUrl = String(url); return { ok: true, json: async () => ({ artifacts: [{ base64: nvidiaB64 }] }) }; };
@@ -7616,7 +7636,7 @@ if (DatabaseSync) {
   const db33 = { prepare(sql) { return base33(sql); } };
   const rows33 = (sql, params = []) => sq33.prepare(sql).all(...params);
   const env33 = { STATE: fakeKV(), DB: db33, VAULT_SECRET: "s33", TG_TOKEN: "fake", TELEGRAM_BOT_TOKEN: "fake" };
-  check(CONNECTORS.length === 8 && CONNECTORS.some((c) => c.id === "gemini" && c.keyName === "GEMINI_API_KEY") && CONNECTORS.some((c) => c.id === "upload_am" && c.optionalKey), "3.3: connector registry has 8 connectors");
+  check(CONNECTORS.length === 9 && CONNECTORS.some((c) => c.id === "gemini" && c.keyName === "GEMINI_API_KEY") && CONNECTORS.some((c) => c.id === "upload_am" && c.optionalKey) && CONNECTORS.some((c) => c.id === "puter" && c.keyName === "PUTER_API_TOKEN"), "3.3: connector registry has 9 connectors including puter");
   sq33.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, 'note one', 'text', '2026-10-30T00:00:00.000Z')").run();
   sq33.prepare("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'task one', 'open', 'text', '2026-10-30T00:00:00.000Z')").run();
   sq33.prepare("INSERT INTO expenses (user_id, type, amount, currency_code, item, date, created_at) VALUES (1, 'expense', 500, 'TOMAN', 'bread', '2026-10-30', '2026-10-30T00:00:00.000Z')").run();
