@@ -40,6 +40,7 @@ export function askText(q) {
 export function buildChatContext(rows, opts = {}) {
   const headerRaw = typeof opts === "string" ? opts : opts && typeof opts === "object" ? (opts.memoryHeader ?? opts.userMemoryHeader ?? opts.header ?? opts.memory ?? null) : null;
   const memoryHeader = typeof headerRaw === "string" && headerRaw.trim() ? headerRaw.trim() : "";
+  const replyToText = opts && typeof opts === "object" && typeof opts.replyToText === "string" ? opts.replyToText.trim().slice(0, 1200) : "";
   const excludeId = opts && opts.excludeMessageId != null ? Number(opts.excludeMessageId) : null;
   const msgs = (rows || []).filter((r) => r && typeof r.content === "string" && r.content && (excludeId === null || Number(r.id) !== excludeId)).slice(-50);
   const kept = []; let total = 0;
@@ -56,6 +57,7 @@ export function buildChatContext(rows, opts = {}) {
     kept.push({ role: msgs[i].role === "assistant" ? "assistant" : "user", content }); total += content.length;
   }
   const result = kept.reverse();
+  if (replyToText) result.unshift({ role: "system", content: `[در پاسخ به پیام قبلی: «${replyToText}»]` });
   if (memoryHeader) result.unshift({ role: "system", content: memoryHeader });
   return result;
 }
@@ -2266,6 +2268,13 @@ export async function resolveVaultCallback(env, o) {
 // on the NLU path, where they may route to a list instead of chat.
 const NLU_SKIP_QUESTION_PREFIXES = ["تفاوت ", "چرا ", "چطور ", "چگونه ", "چیست", "چیه"];
 const NLU_SKIP_KEYWORDS = ["یادداشت", "تسک", "یادآوری", "یادم بنداز", "زنگ", "هزینه", "خرج", "پروژه", "پوشه", "خلاصه", "جدول"];
+export const REF_RE = /(?:^|[\s،,.:؛!؟])(همونو|همون|اونو|اینو)(?=[\s،,.:؛!؟]|$)/u;
+const RECALL_REMINDER_RE = /^(?:یادم\s+بنداز|یادت\s+باشه)(?=[\s،,.:؛!؟?]|$)/u;
+const RECALL_QUESTION_RE = /(?:چی\s*بود|چیه|کی\s*بود|کجا\s*بود|چند\s*بود|[?؟])/u;
+export function isRecallQuestionReminder(text) {
+  const t = String(text ?? "").trim();
+  return RECALL_REMINDER_RE.test(t) && RECALL_QUESTION_RE.test(t);
+}
 export function isUnambiguousQuestion(text) {
   const t = String(text ?? "").trim();
   if (!t) return false;
@@ -2299,9 +2308,17 @@ export async function runNluBranch(env, o, ctx) {
   const nluT0 = Date.now();
   const nowIso = iranIso(now);
   const source = o.source || "text";
+  const replyContext = typeof o.replyToText === "string" && o.replyToText.trim() ? `[در پاسخ به پیام قبلی: «${o.replyToText.trim().slice(0, 1200)}»]` : "";
+  const needsRefTargets = REF_RE.test(text) || Boolean(replyContext);
   let openTasks = [], recentNotes = [], lastAction = ctx.lastAction ?? null;
-  try { const tr = await listOpenTasksResult(env, userId, null, 5, 0); if (tr?.ok) openTasks = (tr.tasks || []).map((t) => t.title).filter(Boolean); } catch {}
-  try { const nr = await listNotesResult(env, userId, { limit: 5, offset: 0 }); if (nr?.ok) recentNotes = (nr.notes || []).map((n) => n.text).filter(Boolean); } catch {}
+  if (needsRefTargets) {
+    try { const tr = await listOpenTasksResult(env, userId, null, 5, 0); if (tr?.ok) openTasks = (tr.tasks || []).map((t) => t.title).filter(Boolean); } catch {}
+    try { const nr = await listNotesResult(env, userId, { limit: 5, offset: 0 }); if (nr?.ok) recentNotes = (nr.notes || []).map((n) => n.text).filter(Boolean); } catch {}
+  }
+  if (replyContext) {
+    const base = lastAction ? (typeof lastAction === "string" ? lastAction : JSON.stringify(lastAction)) : "";
+    lastAction = base ? `${replyContext}; ${base}` : replyContext;
+  }
   if (!lastAction) lastAction = openTasks[0] ? { kind: "task", title: openTasks[0] } : recentNotes[0] ? { kind: "note", title: recentNotes[0] } : null;
   const nlu = await classifyIntent(env, text, { projects: (pres.projects || []).map((p) => p.name), pendingAsk: null, source, nowIso, lastAction, openTasks, recentNotes });
   let nluRoutedTo = "chat";
@@ -2314,9 +2331,9 @@ export async function runNluBranch(env, o, ctx) {
   // A05/A13 reference resolution: "همونو برای فردا بذار" etc. resolve
   // against the single recent task/note; with multiple open targets ask
   // a clarification question instead of guessing.
-  const isRef = /همونو|همون|اونو|اینو/.test(text);
+  const isRef = REF_RE.test(text);
   const refTargets = [...openTasks.map((t) => ({ kind: "task", title: t })), ...recentNotes.map((t) => ({ kind: "note", title: t }))];
-  if (isRef && ["note", "task", "reminder"].includes(nlu.intent) && (!nlu.body || /همونو|همون|اونو|اینو/.test(nlu.body))) {
+  if (isRef && ["note", "task", "reminder"].includes(nlu.intent) && (!nlu.body || REF_RE.test(String(nlu.body ?? "")))) {
     if (refTargets.length > 1) {
       nluRoutedTo = nlu.intent;
       await o.send(`کدام مورد را منظورت است؟\n${refTargets.map((t, i) => `${i + 1}. ${t.title}`).join("\n")}`);
@@ -2692,6 +2709,7 @@ export async function handleDailyText(env, o) {
   if (o.chat) { const rawChat = o.chat; o.chat = (t, copts = {}) => rawChat(t, { ...copts, ...(o.voiceHeader && !copts.voiceHeader ? { voiceHeader: o.voiceHeader } : {}), ...(o.entryMessageId && copts.excludeMessageId == null ? { excludeMessageId: o.entryMessageId } : {}), ...(o.entryMessageId && !copts.retryEntryId && !copts.retryData ? { retryEntryId: o.entryMessageId } : {}), ...(o.entryMessageId && !copts.quickConvertId ? { quickConvertId: o.entryMessageId } : {}) }); }
   const finalizeEntry = async (kind) => { if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; await finalizeMessageKind(env, o.entryMessageId, userId, kind); } };
   const viaBranch = async (cc) => { const r = await runDailyBranch(env, o, cc, ctx); await finalizeEntry(r === "chat" ? "chat" : "daily"); return r; };
+  if ((c.intent === "reminder" || c.intent === "remember") && isRecallQuestionReminder(text)) { await clearPendingAsk(env, userId); await finalizeEntry("chat"); return "chat"; }
   // Bare-note ask bypasses the model step: the model is exactly what
   // failed live for bare notes (chat verdict -> hallucinated storage).
   // runDailyBranch asks for the text and sets the note-text slot itself.

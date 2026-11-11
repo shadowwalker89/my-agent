@@ -3,7 +3,7 @@
 // reminders) are never sent to a model as chat context. The default
 // currency is a fixed constant unless the user explicitly remembers a
 // different one — it is never inferred from an expense.
-import { getChatMessages, getMemory, setMemory, listActiveUserFactsResult, getMessageRow } from "./db.js";
+import { getChatMessages, getMemory, setMemory, listActiveUserFactsResult, getMessageRow, listOpenTasksResult, listNotesResult } from "./db.js";
 
 export const CHAT_CONTEXT_LIMIT = 50;
 export const DEFAULT_CURRENCY = "TOMAN";
@@ -215,6 +215,18 @@ export async function buildUserMemoryHeader(envOrDb, userId, { replyToMessageId,
         .slice(0, 5);
       if (ents.length) parts.push(`entities=${ents.join(",")}`);
     }
+    try {
+      const tr = await listOpenTasksResult(envOrDb, uid, null, 50, 0);
+      const nr = await listNotesResult(envOrDb, uid, { limit: 3, offset: 0 });
+      const recent = [];
+      const safe = (v) => {
+        const s = String(v ?? "").replace(/\s+/g, " ").trim();
+        return s && !/🔒|گاوصندوق|رمز|پسوورد|password|token|api[_-]?key/i.test(s) ? s.slice(0, 40) : "";
+      };
+      if (tr?.ok) for (const t of (tr.tasks || []).slice(-3).reverse()) { const s = safe(t?.title); if (s) recent.push(`task:${s}`); }
+      if (nr?.ok) for (const n of (nr.notes || []).slice(0, 3)) { const s = safe(n?.text); if (s) recent.push(`note:${s}`); }
+      if (recent.length) parts.push(`recent_daily=${recent.join("|")}`);
+    } catch {}
     if (!parts.length) return "";
     return parts.join("; ").slice(0, 299);
   } catch {

@@ -34,7 +34,7 @@ import {
 import { isProtectedPath } from "../src/guard.js";
 import { normalizePrefs, DEFAULT_PREFS } from "../src/tgprefs.js";
 import fs from "node:fs";
-import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, ensureVaultFilesTable, ensureVaultTable, ensureUserFactsTable, upsertUserFact, listActiveUserFactsResult, forgetUserFact } from "../src/db.js";
+import { saveMessage, getLatestFileMessage, getChatMessages, listProjects, listProjectsResult, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, listOpenTasks, listOpenTasksResult, listDoneTasks, listDoneTasksResult, getTask, addProjectAlias, setTaskStatus, updateTaskFields, insertIntentFeedback, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, ensureVaultFilesTable, ensureVaultTable, ensureUserFactsTable, upsertUserFact, listActiveUserFactsResult, forgetUserFact, claimTelegramUpdateId } from "../src/db.js";
 import { encryptVaultValue, decryptVaultValue, isEncryptedVaultValue, getGoogleVaultConfig, googleVaultStatus, syncVaultItemToGoogle, syncVaultFileToGoogle, fetchVaultFromGoogle } from "../src/vault.js";
 import {
   getChatContext,
@@ -1160,7 +1160,7 @@ if (DatabaseSync) {
 }
 
 // ── Step 1b-2a: wiring (routing, storage, callbacks, money) ───────────────
-import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, deriveNoteTitle, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion, SUMMARY_SYSTEM, handleVaultFile, resolveVaultCallback, runNluBranch } from "../src/everyday.js";
+import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, deriveNoteTitle, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion, SUMMARY_SYSTEM, handleVaultFile, resolveVaultCallback, runNluBranch, REF_RE } from "../src/everyday.js";
 import { markFailure, isModelHealthy } from "../src/health.js";
 {
   check(mapQuestion("ambiguous") === "amount" && mapQuestion("period") === "period", "ambiguous maps to amount in wiring");
@@ -1173,6 +1173,9 @@ import { markFailure, isModelHealthy } from "../src/health.js";
   const short = Array.from({ length: 60 }, (_, i) => ({ role: "user", content: `m${i}` }));
   const shortCapped = buildChatContext(short);
   check(shortCapped.length === 50 && shortCapped[0].content === "m10", "count cap keeps newest 50");
+  const replied = buildChatContext([{ id: 1, role: "user", content: "سلام" }], { memoryHeader: "name=رضا", replyToText: "قبلی" });
+  check(replied.length === 3 && replied[0].content === "name=رضا" && replied[1].content === "[در پاسخ به پیام قبلی: «قبلی»]" && replied[2].content === "سلام", `reply context injected after memory header: ${JSON.stringify(replied)}`);
+  check(!REF_RE.test("همونجا باش") && REF_RE.test("همونو بنداز فردا"), "REF_RE respects word boundaries");
 }
 if (DatabaseSync) {
   const sqlite = new DatabaseSync(":memory:");
@@ -5879,6 +5882,37 @@ if (DatabaseSync) {
       check(pongs.length === 2, "2-d: redelivered update_id is ignored, a new update_id still answers");
     } finally { global.fetch = prev; }
   }
+  if (DatabaseSync) {
+    const sqD = new DatabaseSync(":memory:");
+    const dbD = { prepare(sql) { const st = sqD.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; } };
+    check(await claimTelegramUpdateId(dbD, 7001, 1) === true, "C8: first update_id claim is new");
+    check(await claimTelegramUpdateId(dbD, 7001, 2) === false, "C8: duplicate update_id claim is rejected");
+    check(await claimTelegramUpdateId({}, 7002, 3) === true, "C8: missing DB fails open");
+    const sqN = new DatabaseSync(":memory:");
+    const dbN = { prepare(sql) { const st = sqN.prepare(sql); return { bind(...p) { return { run: async () => { st.run(...p); return { success: true }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; } };
+    check(await claimTelegramUpdateId(dbN, 7003, 4) === true && await claimTelegramUpdateId(dbN, 7003, 5) === false, "C8: duplicate detected without meta.changes");
+    const sendsD = [];
+    const prevD = global.fetch;
+    global.fetch = async (url, init = {}) => {
+      const m = /\/bot[^/]+\/(\w+)$/.exec(String(url));
+      let payload = {};
+      try { payload = JSON.parse(String(init.body ?? "{}")); } catch {}
+      sendsD.push({ method: m ? m[1] : "", payload });
+      return Response.json({ ok: true, result: { message_id: 1 } });
+    };
+    try {
+      const envD = { TG_TOKEN: "x", ALLOWED_TG_IDS: "1", DB: dbD };
+      const updD = (id) => ({ update_id: id, message: { from: { id: 1 }, chat: { id: 1 }, text: "/ping" } });
+      resetSeenUpdateIdsForTests();
+      await handleUpdate(envD, updD(7004));
+      resetSeenUpdateIdsForTests();
+      await handleUpdate(envD, updD(7004));
+      resetSeenUpdateIdsForTests();
+      await handleUpdate(envD, updD(7005));
+      const pongsD = sendsD.filter((s) => s.method === "sendMessage" && s.payload.text === "pong");
+      check(pongsD.length === 2, "C8: D1 claim blocks cross-isolate redelivery and accepts a new id");
+    } finally { global.fetch = prevD; }
+  }
   // (g) ask:dp tap edits the original ask message in place when
   // editText is available; without it, the old send path is kept.
   {
@@ -7271,6 +7305,8 @@ if (DatabaseSync) {
     sq.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)").run(1, "جلسه بودجه فردا", "text", new Date().toISOString());
     const noteId = sq.prepare("SELECT id FROM notes WHERE user_id = ?").get(1).id;
     sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (?, ?, ?, ?, ?)").run(1, "خرید نان", "open", "text", new Date().toISOString());
+    const dailyHeader = await buildUserMemoryHeader(env, 1, {});
+    check(dailyHeader.includes("خرید نان") && dailyHeader.includes("جلسه بودجه فردا") && dailyHeader.length < 300, `A05/2.2: recent daily actions are compact in header: ${JSON.stringify(dailyHeader)}`);
     let s = await searchPersonalMemoryResult(env, 1, "جلسه");
     check(s.ok === true && s.notes.length === 1 && s.notes[0].id === noteId, `A13: search finds note by keyword: ${JSON.stringify(s)}`);
     await deleteNote(env, 1, noteId);
@@ -7368,7 +7404,7 @@ if (DatabaseSync) {
     sc.sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'خرید نان', 'open', 'text', '2026-10-28T00:00:00.000Z')").run();
     const capture = {}; const sent = [];
     const env = { STATE: fakeKV(), DB: sc.db, VAULT_SECRET: "s1", AI: ai23({ intent: "vault_list", confidence: 0.9 }, capture) };
-    const o = { chatId: 1, userId: 1, text: "کارت‌هام رو نشون بده", send: async (t) => { sent.push(t); }, chat: async () => {}, nowMs: MORNING23 };
+    const o = { chatId: 1, userId: 1, text: "کارت‌هام رو نشون بده", replyToText: "کارت‌هام رو نشون بده", send: async (t) => { sent.push(t); }, chat: async () => {}, nowMs: MORNING23 };
     const r = await runNluBranch(env, o, { now: MORNING23, remembered: "TOMAN" });
     const promptText = String(capture.body?.messages?.[0]?.content ?? "");
     check(r === "handled" && sent.some((t) => String(t).includes("گاوصندوق خالی")), `2.3: NLU vault_list executes instead of chat: ${JSON.stringify(sent)}`);
@@ -7458,6 +7494,14 @@ if (DatabaseSync) {
     const dueMs = tasks[0] && tasks[0].remind_at ? Date.parse(tasks[0].remind_at) : NaN;
     check(dueMs === NOW_LIVE + 120000, `live4: due +120s: ${tasks[0]?.remind_at} ms=${dueMs} want=${NOW_LIVE + 120000}`);
     check(!c.sent.some((x) => String(x.text).includes("ساعت یادآوری را بگو.")), "live4: no time ask");
+  }
+  {
+    const sc = freshLive(); const c = convoLive(sc);
+    const r1 = await c.say("یادم بنداز اسمم چی بود؟", NOW_LIVE);
+    const r2 = await c.say("یادت باشه اسمم چیه؟", NOW_LIVE);
+    const tasks = sc.sq.prepare("SELECT id FROM tasks WHERE user_id = 1").all();
+    const name = await getSetting(c.env, 1, "name");
+    check(r1 === "chat" && r2 === "chat" && c.chats.length === 0 && tasks.length === 0 && !name && !c.sent.some((x) => String(x.text).includes("ساعت یادآوری را بگو.")), `live5: recall questions route to chat without storage: ${JSON.stringify({ r1, r2, sent: c.sent, tasks, name })}`);
   }
   {
     const sc = freshLive();

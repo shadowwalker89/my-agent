@@ -61,6 +61,30 @@ export async function finalizeMessageKind(envOrDb, id, userId, kind) {
   try { await db.prepare("UPDATE messages SET kind = ? WHERE id = ? AND user_id = ?").bind(kind, Number(id), Number(userId)).run(); return { ok: true }; } catch { return { ok: false }; }
 }
 
+export async function claimTelegramUpdateId(envOrDb, updateId, nowMs = Date.now()) {
+  const db = dbOf(envOrDb);
+  const uid = Number(updateId);
+  if (!db || !Number.isInteger(uid)) return true;
+  try {
+    const existing = await db.prepare("SELECT 1 AS found FROM tg_updates WHERE update_id = ?1").bind(uid).first();
+    if (existing) return false;
+  } catch {
+    try {
+      await db.prepare("CREATE TABLE IF NOT EXISTS tg_updates (update_id INTEGER PRIMARY KEY, created_at INTEGER)").bind().run();
+    } catch {
+      return true;
+    }
+  }
+  try {
+    const createdAt = Number.isFinite(Number(nowMs)) ? Math.floor(Number(nowMs)) : Date.now();
+    const res = await db.prepare("INSERT OR IGNORE INTO tg_updates VALUES (?1, ?2)").bind(uid, createdAt).run();
+    if (res && (res.success === false || res.meta?.changes === 0 || res.changes === 0)) return false;
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 // A08: vault credentials must never remain in messages.content. Replaces
 // the stored text in place, scoped by owner so a stray id cannot edit
 // another user's row. Safe when D1 is missing or the update fails.

@@ -30,7 +30,7 @@ import { classifyIntent, needsConfirmation } from "./intent.js";
 import { getChatContext, buildUserMemoryHeader } from "./memory.js";
 import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, handleVaultFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, resolveVaultCallback, chatFailureNotice, formatFailureDetail, runReminderTick, quickConvertKeyboard } from "./everyday.js";
 import { handleVoice, handleVoiceRetry } from "./voice.js";
-import { saveMessage, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus } from "./db.js";
+import { saveMessage, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus, claimTelegramUpdateId } from "./db.js";
 import { encryptVaultValue, decryptVaultValue, getGoogleVaultConfig, googleVaultStatus, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
 import {
   dispatchDev,
@@ -198,7 +198,7 @@ export async function answerChatText(env, chatId, userId, text, hasImage, opts =
   // Chat context: last 50 chat-kind rows, capped at 8,000 characters.
   // Translate skips history entirely: a weak model let note-themed history
   // override the translate system prompt (observed in Telegram tests).
-  const history = opts.noHistory ? [] : buildChatContext(await getChatContext(env, userId), { excludeMessageId: opts.excludeMessageId });
+  const history = opts.noHistory ? [] : buildChatContext(await getChatContext(env, userId), { excludeMessageId: opts.excludeMessageId, replyToText: opts.replyToText });
   const memoryHeader = await buildUserMemoryHeader(env, userId);
   const basePrompt = opts.systemPrompt || CHAT_SYSTEM_PROMPT;
   const systemContent = memoryHeader ? `[حافظه و اطلاعات شخصی کاربر] ${memoryHeader}\n\n${basePrompt}` : basePrompt;
@@ -818,12 +818,17 @@ async function handlePlainText(env, msg, text, opts = {}) {
   // Order: explicit /dev (tgCommand) -> everyday -> chat/task/dev.
   const replyMsg = msg.reply_to_message && typeof msg.reply_to_message === "object" ? msg.reply_to_message : null;
   const replyPhoto = Array.isArray(replyMsg?.photo) && replyMsg.photo.length ? replyMsg.photo[replyMsg.photo.length - 1] : null;
-  const replyToPhoto = replyPhoto
-    ? { fileId: replyPhoto.file_id, caption: typeof replyMsg?.caption === "string" ? replyMsg.caption : "" }
+  const replyDoc = replyMsg?.document && typeof replyMsg.document === "object" && String(replyMsg.document.mime_type ?? "").startsWith("image/") ? replyMsg.document : null;
+  const replyImageFileId = replyPhoto?.file_id ?? replyDoc?.file_id ?? null;
+  const replyToPhoto = replyImageFileId
+    ? { fileId: replyImageFileId, caption: typeof replyMsg?.caption === "string" ? replyMsg.caption : "" }
     : null;
-  const dailyO = { chatId, userId, text, chatType: msg.chat?.type, source: opts.source, hasImage: updateHasImage(msg), replyToPhoto, ...dailySenders(env, chatId), ...fileSenders(env, chatId),
+  const replyToText = !replyToPhoto && replyMsg ? (String(replyMsg.text ?? replyMsg.caption ?? "").trim().slice(0, 1200) || null) : null;
+  const replyToMessageId = Number.isInteger(replyMsg?.message_id) ? replyMsg.message_id : null;
+  const replyChatOpts = replyToText ? { replyToText } : {};
+  const dailyO = { chatId, userId, text, chatType: msg.chat?.type, source: opts.source, hasImage: updateHasImage(msg), replyToPhoto, replyToText, replyToMessageId, ...dailySenders(env, chatId), ...fileSenders(env, chatId),
     routerCallFn: (body) => runCombo(env, body?.model || "chat", body, { totalTimeoutMs: 15000, requireFinalText: true }),
-    chat: (modelText, copts) => answerChatText(env, chatId, userId, modelText, updateHasImage(msg), copts) };
+    chat: (modelText, copts) => answerChatText(env, chatId, userId, modelText, updateHasImage(msg), { ...replyChatOpts, ...copts }) };
   const daily = await handleDailyText(env, dailyO);
   // Save-first entry row already owns the user message: downstream chat
   // answers must not save it a second time (saveText "" + the guard above).
@@ -836,7 +841,7 @@ async function handlePlainText(env, msg, text, opts = {}) {
   // offers retry + quick-convert instead of dropping silently.
   const voiceHeader = opts.source === "voice" ? `🎙 «${text}»\n\n` : undefined;
   if (voiceHeader) dailyO.voiceHeader = voiceHeader;
-  const chatOpts = dailyO.entryMessageId ? { ...skipUserSave, excludeMessageId: dailyO.entryMessageId, ...(voiceHeader ? { voiceHeader } : {}), retryEntryId: dailyO.entryMessageId, quickConvertId: dailyO.entryMessageId, replyMarkup: { inline_keyboard: quickConvertKeyboard(dailyO.entryMessageId) } } : skipUserSave;
+  const chatOpts = dailyO.entryMessageId ? { ...skipUserSave, ...replyChatOpts, excludeMessageId: dailyO.entryMessageId, ...(voiceHeader ? { voiceHeader } : {}), retryEntryId: dailyO.entryMessageId, quickConvertId: dailyO.entryMessageId, replyMarkup: { inline_keyboard: quickConvertKeyboard(dailyO.entryMessageId) } } : (skipUserSave ? { ...skipUserSave, ...replyChatOpts } : replyChatOpts);
   // Model already said chat for a text message: answer directly, skip
   // classifyIntent (dev was in the model allow-list and was rejected).
   // Image messages keep today's path (they return "chat", not "chat-direct").
@@ -1079,6 +1084,7 @@ async function handleUpdate(env, update) {
   const uid = update?.update_id;
   if (Number.isInteger(uid)) {
     if (seenUpdateIds.has(uid)) return;
+    if (!(await claimTelegramUpdateId(env, uid))) return;
     if (seenUpdateIds.size >= 200) seenUpdateIds.delete(seenUpdateIds.values().next().value);
     seenUpdateIds.add(uid);
   }
@@ -1131,7 +1137,11 @@ async function handleUpdate(env, update) {
         send: (msgText, opts) => tgSend(env, chatId, msgText, opts),
         ...fileSenders(env, chatId),
         chat: (t, copts) => answerChatText(env, chatId, userId, t, false, copts),
-        chatFn: (t) => runCombo(env, "chat", { messages: [{ role: "user", content: t }] }, { totalTimeoutMs: 22000, requireFinalText: true }),
+        chatFn: async (t) => {
+          const memoryHeader = await buildUserMemoryHeader(env, userId);
+          const systemContent = memoryHeader ? `[حافظه و اطلاعات شخصی کاربر] ${memoryHeader}\n\n${CHAT_SYSTEM_PROMPT}` : CHAT_SYSTEM_PROMPT;
+          return runCombo(env, "chat", { messages: [{ role: "system", content: systemContent }, { role: "user", content: t }] }, { totalTimeoutMs: 22000, requireFinalText: true });
+        },
         routerCallFn: (body) => visionRouterCall(env, body),
       });
       if (handled === true || handled === "handled") return;
