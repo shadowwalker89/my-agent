@@ -21,6 +21,14 @@ function vaultSecret(env) {
   return typeof s === "string" && s ? s : null;
 }
 
+export function isVaultSecretConfigured(env) {
+  return vaultSecret(env) !== null;
+}
+
+export function isVaultMasterKeyConfigured(env) {
+  return typeof env?.VAULT_MASTER_KEY === "string" && Boolean(env.VAULT_MASTER_KEY);
+}
+
 async function vaultKey(env) {
   const secret = vaultSecret(env);
   if (!secret) throw new Error("vault secret is not configured");
@@ -61,6 +69,10 @@ function pemToBytes(pem) {
 // "enc:v1:<iv_b64>:<cipher_b64>" prefix, and pre-release rows may be bare
 // "<iv_b64>:<cipher_b64>" (12-byte IV = 16 base64 chars, then ciphertext).
 const BARE_LEGACY_RE = /^[A-Za-z0-9+/]{16}:[A-Za-z0-9+/]{16,}={0,2}$/;
+
+export function isBareLegacyVaultValue(value) {
+  return typeof value === "string" && BARE_LEGACY_RE.test(value);
+}
 
 function vaultCipherBody(value) {
   if (typeof value !== "string") return null;

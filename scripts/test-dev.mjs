@@ -7635,7 +7635,7 @@ if (DatabaseSync) {
   const base33 = (sql) => { const st = sq33.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
   const db33 = { prepare(sql) { return base33(sql); } };
   const rows33 = (sql, params = []) => sq33.prepare(sql).all(...params);
-  const env33 = { STATE: fakeKV(), DB: db33, VAULT_SECRET: "s33", TG_TOKEN: "fake", TELEGRAM_BOT_TOKEN: "fake" };
+  const env33 = { STATE: fakeKV(), DB: db33, VAULT_MASTER_KEY: "master33", VAULT_SECRET: "s33", TG_TOKEN: "fake", TELEGRAM_BOT_TOKEN: "fake" };
   check(CONNECTORS.length === 9 && CONNECTORS.some((c) => c.id === "gemini" && c.keyName === "GEMINI_API_KEY") && CONNECTORS.some((c) => c.id === "upload_am" && c.optionalKey) && CONNECTORS.some((c) => c.id === "puter" && c.keyName === "PUTER_API_TOKEN"), "3.3: connector registry has 9 connectors including puter");
   sq33.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (1, 'note one', 'text', '2026-10-30T00:00:00.000Z')").run();
   sq33.prepare("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'task one', 'open', 'text', '2026-10-30T00:00:00.000Z')").run();
@@ -7652,9 +7652,10 @@ if (DatabaseSync) {
   // /setup together test-key-123 stores, redacts, marks configured
   {
     const sent = [];
-    const r = await handleDailyText({ ...env33 }, { chatId: 1, userId: 1, text: "/setup together test-key-123", send: async (t) => { sent.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    const r = await handleDailyText({ ...env33 }, { chatId: 1, userId: 1, text: "/setup together test-key-123", chatType: "private", send: async (t) => { sent.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
     check(r === "handled" && sent.join(" ").includes("✅ کانکتور **together** با موفقیت تنظیم و فعال شد."), "3.3: /setup together confirms");
-    check(rows33("SELECT value FROM memories WHERE user_id = 1 AND kind = 'setting' AND key = 'conn_together'")[0]?.value === "test-key-123", "3.3: connector key stored in memories settings");
+    const storedTogether = rows33("SELECT value FROM memories WHERE user_id = 1 AND kind = 'setting' AND key = 'conn_together'")[0]?.value;
+    check(typeof storedTogether === "string" && storedTogether.startsWith("v1:") && storedTogether !== "test-key-123", "3.3: connector key stored encrypted in memories settings");
     check(rows33("SELECT COUNT(*) AS n FROM messages WHERE content LIKE '%test-key-123%'")[0].n === 0, "3.3: raw API key redacted from messages");
     check(rows33("SELECT COUNT(*) AS n FROM messages WHERE content LIKE '%کلید کانکتور%'")[0].n >= 1, "3.3: redacted message row exists");
     check((await getConnectorSecret(env33, 1, "together")) === "test-key-123", "3.3: getConnectorSecret reads user key");
@@ -7667,7 +7668,7 @@ if (DatabaseSync) {
   // Persian set form + upload mock
   {
     const sent = [];
-    const r = await handleDailyText({ ...env33 }, { chatId: 1, userId: 1, text: "تنظیم کانکتور gemini AIzaSyTestKey9f", send: async (t) => { sent.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    const r = await handleDailyText({ ...env33 }, { chatId: 1, userId: 1, text: "تنظیم کانکتور gemini AIzaSyTestKey9f", chatType: "private", send: async (t) => { sent.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
     check(r === "handled" && (await getConnectorSecret(env33, 1, "gemini")) === "AIzaSyTestKey9f", "3.3: Persian تنظیم کانکتور stores gemini key");
     check(rows33("SELECT COUNT(*) AS n FROM messages WHERE content LIKE '%AIzaSyTestKey9f%'")[0].n === 0, "3.3: gemini key redacted from messages");
     const up = await uploadToUploadAm(new TextEncoder().encode("hello"), "a.txt", { apiKey: "k", fetchFn: async () => ({ ok: true, json: async () => ({ url: "https://upload.am/f/abc" }) }) });
@@ -7690,6 +7691,280 @@ if (DatabaseSync) {
     check(snap.vault_items?.[0]?.value_enc === enc && !JSON.stringify(snap).includes("vault-plaintext-33"), "3.3: backup keeps vault items encrypted, never decrypted");
     const direct = await exportUserBackupSnapshot(env33, 1, { nowMs: 0 });
     check(direct.ok === true && direct.counts.notes === 1 && direct.vault_items[0].value_enc === enc, "3.3: exportUserBackupSnapshot direct works");
+  }
+}
+
+// Phase 3.3b: P0-A connector secret encryption — dual-read, lazy re-encryption, bounded sweep
+if (DatabaseSync) {
+  const { isConnectorSecretError, sweepConnectorSecrets, resolveConnectorSweepOwner, getConnectorStatuses, getConnectorSecret, setConnectorSecret } = await import("../src/connectors.js");
+  const { editImage, generateFreeImage, analyzeImage } = await import("../src/media.js");
+  const { analyzePdfDocument } = await import("../src/pdf.js");
+
+  const makeP0Env = (masterKey = "master-p0") => {
+    const sq = new DatabaseSync(":memory:");
+    sq.exec(fs.readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0002_step1_columns.sql", import.meta.url), "utf8"));
+    sq.exec(fs.readFileSync(new URL("../migrations/0003_tasks_projects.sql", import.meta.url), "utf8"));
+    sq.exec("INSERT INTO users (id, telegram_id) VALUES (1, '1')");
+    const base = (sql) => { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; };
+    const db = { prepare(sql) { return base(sql); } };
+    const rows = (sql, params = []) => sq.prepare(sql).all(...params);
+    const put = (key, value, userId = 1) => sq.prepare("INSERT OR REPLACE INTO memories (user_id, kind, key, value, updated_at) VALUES (?, 'setting', ?, ?, ?)").run(userId, key, value, new Date().toISOString());
+    const env = { STATE: fakeKV(), DB: db, VAULT_MASTER_KEY: masterKey, VAULT_SECRET: "s-p0", TG_TOKEN: "fake" };
+    return { sq, db, rows, put, env };
+  };
+
+  // A: write/read, lazy migration, bare plaintext, wrong key, missing key, status isolation
+  {
+    const A = makeP0Env();
+    const w = await setConnectorSecret(A.env, 1, "gemini", "AIzaRoundTrip");
+    check(w.ok === true, "P0-A: setConnectorSecret writes ok");
+    const stored = A.rows("SELECT value FROM memories WHERE user_id = 1 AND kind = 'setting' AND key = 'conn_gemini'")[0]?.value;
+    check(typeof stored === "string" && stored.startsWith("v1:") && stored !== "AIzaRoundTrip", "P0-A: stored value is v1 ciphertext");
+    check((await getConnectorSecret(A.env, 1, "gemini")) === "AIzaRoundTrip", "P0-A: getConnectorSecret decrypts round trip");
+
+    A.put("conn_together", "legacy-plain-key");
+    check((await getConnectorSecret(A.env, 1, "together")) === "legacy-plain-key", "P0-A: legacy plaintext read returns plaintext");
+    const lazy = A.rows("SELECT value FROM memories WHERE user_id = 1 AND kind = 'setting' AND key = 'conn_together'")[0]?.value;
+    check(typeof lazy === "string" && lazy.startsWith("v1:"), "P0-A: legacy plaintext lazily re-encrypted");
+    check((await getConnectorSecret(A.env, 1, "together")) === "legacy-plain-key", "P0-A: lazily re-encrypted value still reads");
+
+    A.put("conn_huggingface", "AAAAAAAAAAAAAAAA:BBBBBBBBBBBBBBBB");
+    let bareThrew = null, bareValue = null;
+    try { bareValue = await getConnectorSecret(A.env, 1, "huggingface"); } catch (e) { bareThrew = e; }
+    check(!bareThrew && bareValue === "AAAAAAAAAAAAAAAA:BBBBBBBBBBBBBBBB", "P0-A: bare iv:cipher plaintext is not misclassified");
+
+    const wrongEnc = await encryptVaultValue({ VAULT_MASTER_KEY: "other-key" }, "secret");
+    A.put("conn_nvidia", wrongEnc);
+    let wrongThrew = null;
+    try { await getConnectorSecret(A.env, 1, "nvidia"); } catch (e) { wrongThrew = e; }
+    check(isConnectorSecretError(wrongThrew) && wrongThrew.reason === "decrypt_failed", "P0-A: wrong-key encrypted row throws decrypt_failed");
+
+    const stP0 = await getConnectorStatuses(A.env, {}, 1);
+    const gStatus = stP0.find((x) => x.id === "gemini");
+    const nStatus = stP0.find((x) => x.id === "nvidia");
+    check(gStatus?.configured === true && gStatus?.masked === "AIza...ip", `P0-A: status masks decrypted plaintext: ${JSON.stringify(gStatus)}`);
+    check(nStatus?.configured === false && nStatus?.error === "decrypt_failed" && stP0.find((x) => x.id === "together")?.configured === true, `M2: one corrupt connector does not break status for others: ${JSON.stringify(stP0)}`);
+
+    const envNoMaster = { STATE: fakeKV(), DB: A.db, VAULT_SECRET: "s-p0", TG_TOKEN: "fake" };
+    const w2 = await setConnectorSecret(envNoMaster, 1, "puter", "puter-token");
+    check(w2.ok === false && w2.error === "vault master key is not configured", "P0-A: missing VAULT_MASTER_KEY fails closed");
+    check(A.rows("SELECT COUNT(*) AS n FROM memories WHERE user_id = 1 AND kind = 'setting' AND key = 'conn_puter'")[0].n === 0, "P0-A: missing key writes no plaintext");
+
+    const B = makeP0Env();
+    B.put("conn_gemini", await encryptVaultValue({ VAULT_MASTER_KEY: "other-key" }, "secret"));
+    let missingKeyThrew = null;
+    try { await getConnectorSecret({ DB: B.db }, 1, "gemini"); } catch (e) { missingKeyThrew = e; }
+    check(isConnectorSecretError(missingKeyThrew) && missingKeyThrew.reason === "key_missing", "M1: missing keyring is distinguished from corrupt ciphertext");
+  }
+
+  // H2: accurate remaining count, no pending:1 undercount
+  {
+    const C = makeP0Env();
+    for (const id of ["gemini", "nvidia", "together", "puter", "huggingface"]) C.put(`conn_${id}`, `${id}-plain`);
+    const sw1 = await sweepConnectorSecrets(C.env, { limit: 2, callerId: 1 });
+    check(sw1.ok === false && sw1.complete === false && sw1.scanned === 2 && sw1.encrypted === 2 && sw1.remaining === 3 && sw1.pending === 3, `H2: first batch reports exact remaining and not complete: ${JSON.stringify(sw1)}`);
+    const sw2 = await sweepConnectorSecrets(C.env, { limit: 2, callerId: 1 });
+    check(sw2.remaining === 1 && sw2.pending === 1 && sw2.encrypted === 2 && sw2.ok === false && sw2.complete === false, `H2: second batch reports exact remaining and not complete: ${JSON.stringify(sw2)}`);
+    const sw3 = await sweepConnectorSecrets(C.env, { limit: 2, callerId: 1 });
+    check(sw3.ok === true && sw3.complete === true && sw3.remaining === 0 && sw3.pending === 0 && sw3.alreadyEncrypted === 4 && sw3.scanned === 1, `H2: completion only after no plaintext remains: ${JSON.stringify(sw3)}`);
+    const sw4 = await sweepConnectorSecrets(C.env, { limit: 2, callerId: 1 });
+    check(sw4.ok === true && sw4.scanned === 0 && sw4.alreadyEncrypted === 5 && sw4.remaining === 0, `H2: sweep is idempotent: ${JSON.stringify(sw4)}`);
+  }
+
+  // H1: K1-encrypted records followed by K2 configuration must not look healthy
+  {
+    const D = makeP0Env("key-two");
+    const k1Enc = await encryptVaultValue({ VAULT_MASTER_KEY: "key-one" }, "gemini-secret");
+    D.put("conn_gemini", k1Enc);
+    D.put("conn_nvidia", "nvidia-plain");
+    const sw = await sweepConnectorSecrets(D.env, { limit: 50, callerId: 1 });
+    check(sw.ok === false && sw.decryptFailed === 1 && sw.alreadyEncrypted === 0 && sw.encrypted === 1 && sw.remaining === 0, `H1: wrong-key record is a failure, not already-migrated: ${JSON.stringify(sw)}`);
+    check(D.rows("SELECT value FROM memories WHERE kind = 'setting' AND key = 'conn_gemini'")[0]?.value === k1Enc, "H1: undecryptable record is not rewritten");
+    const swNoKey = await sweepConnectorSecrets({ DB: D.db }, { limit: 50, callerId: 1 });
+    check(swNoKey.ok === false && swNoKey.error === "vault master key is not configured", "H1: missing key never reports ok");
+  }
+
+  // M3: invalid rows are reported, never rewritten, and cannot starve valid rows
+  {
+    const E = makeP0Env();
+    E.put("conn_gemini", "");
+    E.put("conn_unknown", "do-not-touch");
+    E.put("conn_nvidia", "nvidia-plain");
+    const sw = await sweepConnectorSecrets(E.env, { limit: 1, callerId: 1 });
+    check(sw.scanned === 1 && sw.encrypted === 1 && sw.invalid === 2 && sw.invalidEmpty === 1 && sw.invalidUnknown === 1 && sw.remaining === 0 && sw.ok === true && sw.complete === false, `M3: invalid rows counted, valid row processed: ${JSON.stringify(sw)}`);
+    check(E.rows("SELECT value FROM memories WHERE kind = 'setting' AND key = 'conn_unknown'")[0]?.value === "do-not-touch", "M3: unknown connector row is never rewritten");
+    check(E.rows("SELECT value FROM memories WHERE kind = 'setting' AND key = 'conn_gemini'")[0]?.value === "", "M3: empty connector row is never rewritten");
+    const sw2 = await sweepConnectorSecrets(E.env, { limit: 1, callerId: 1 });
+    check(sw2.ok === true && sw2.encrypted === 0 && sw2.invalid === 2 && sw2.complete === false, `M3: repeated sweep stays deterministic: ${JSON.stringify(sw2)}`);
+  }
+
+  // M4: zero-row conditional UPDATE may be a concurrent success
+  {
+    const F = makeP0Env();
+    F.put("conn_gemini", "concurrent-plain");
+    const encConcurrent = await encryptVaultValue({ VAULT_MASTER_KEY: "master-p0" }, "concurrent-plain");
+    let intercepted = 0;
+    const fakeDb = {
+      prepare(sql) {
+        if (/^\s*UPDATE memories SET value =/.test(sql)) {
+          return { bind(...params) { return { run: async () => {
+            intercepted++;
+            F.sq.prepare("UPDATE memories SET value = ? WHERE user_id = 1 AND kind = 'setting' AND key = 'conn_gemini'").run(encConcurrent);
+            const r = F.sq.prepare(sql).run(...params);
+            return { success: true, meta: { changes: r.changes } };
+          }, all: async () => ({ results: [] }), first: async () => null }; } };
+        }
+        return F.db.prepare(sql);
+      },
+    };
+    const sw = await sweepConnectorSecrets({ ...F.env, DB: fakeDb }, { limit: 10, callerId: 1 });
+    check(intercepted === 1 && sw.encrypted === 1 && sw.concurrent === 1 && sw.failed === 0 && sw.ok === true, `M4: zero-row update verified as concurrent success: ${JSON.stringify(sw)}`);
+    check(F.rows("SELECT value FROM memories WHERE kind = 'setting' AND key = 'conn_gemini'")[0]?.value === encConcurrent, "M4: concurrent ciphertext is not overwritten");
+
+    const F2 = makeP0Env();
+    F2.put("conn_gemini", "original-plain");
+    const changedDb = {
+      prepare(sql) {
+        if (/^\s*UPDATE memories SET value =/.test(sql)) {
+          return { bind(...params) { return { run: async () => {
+            F2.sq.prepare("UPDATE memories SET value = ? WHERE user_id = 1 AND kind = 'setting' AND key = 'conn_gemini'").run("changed-plain");
+            const r = F2.sq.prepare(sql).run(...params);
+            return { success: true, meta: { changes: r.changes } };
+          }, all: async () => ({ results: [] }), first: async () => null }; } };
+        }
+        return F2.db.prepare(sql);
+      },
+    };
+    const swChanged = await sweepConnectorSecrets({ ...F2.env, DB: changedDb }, { limit: 10, callerId: 1 });
+    check(swChanged.changed === 1 && swChanged.ok === false && swChanged.remaining === 1, `M4: concurrent value change is not reported as success: ${JSON.stringify(swChanged)}`);
+    check(F2.rows("SELECT value FROM memories WHERE kind = 'setting' AND key = 'conn_gemini'")[0]?.value === "changed-plain", "M4: concurrent plaintext change is not overwritten");
+
+    const G = makeP0Env();
+    G.put("conn_together", "lazy-plain");
+    const encLazy = await encryptVaultValue({ VAULT_MASTER_KEY: "master-p0" }, "lazy-plain");
+    let lazyIntercepted = 0;
+    const lazyDb = {
+      prepare(sql) {
+        if (/^\s*UPDATE memories SET value =/.test(sql)) {
+          return { bind(...params) { return { run: async () => {
+            lazyIntercepted++;
+            G.sq.prepare("UPDATE memories SET value = ? WHERE user_id = 1 AND kind = 'setting' AND key = 'conn_together'").run(encLazy);
+            const r = G.sq.prepare(sql).run(...params);
+            return { success: true, meta: { changes: r.changes } };
+          }, all: async () => ({ results: [] }), first: async () => null }; } };
+        }
+        return G.db.prepare(sql);
+      },
+    };
+    const lazyValue = await getConnectorSecret({ ...G.env, DB: lazyDb }, 1, "together");
+    check(lazyIntercepted === 1 && lazyValue === "lazy-plain" && G.rows("SELECT value FROM memories WHERE kind = 'setting' AND key = 'conn_together'")[0]?.value === encLazy, "M4: lazy re-encryption treats zero-row update as concurrent success");
+  }
+
+  // M5: canonical owner scope and authorization
+  {
+    const H = makeP0Env();
+    H.put("conn_gemini", "owner-secret", 1);
+    H.put("conn_gemini", "other-secret", 2);
+    const owner = await resolveConnectorSweepOwner(H.env);
+    check(owner.ok === true && owner.userId === 1 && owner.telegramId === "1", `M5: canonical owner resolved from users row: ${JSON.stringify(owner)}`);
+    const denied = await sweepConnectorSecrets(H.env, { limit: 10, callerId: 2 });
+    check(denied.ok === false && denied.error === "owner authorization required", `M5: non-owner is rejected: ${JSON.stringify(denied)}`);
+    const missingCaller = await sweepConnectorSecrets(H.env, { limit: 10 });
+    check(missingCaller.ok === false && missingCaller.error === "owner authorization required", "M5: sweep requires caller identity");
+    const own = await sweepConnectorSecrets(H.env, { limit: 10, callerId: 1 });
+    check(own.ok === true && own.encrypted === 1, `M5: owner sweep runs: ${JSON.stringify(own)}`);
+    check(H.rows("SELECT value FROM memories WHERE user_id = 2 AND kind = 'setting' AND key = 'conn_gemini'")[0]?.value === "other-secret", "M5: other users' records are never modified");
+
+    const I = makeP0Env();
+    I.sq.exec("INSERT INTO users (id, telegram_id) VALUES (2, '2')");
+    const ambiguous = await sweepConnectorSecrets(I.env, { limit: 10, callerId: 1 });
+    check(ambiguous.ok === false && ambiguous.error === "owner identity is ambiguous", `M5: ambiguous owner fails closed: ${JSON.stringify(ambiguous)}`);
+  }
+
+  // M6: connector credential setup is private-chat-only for every alias
+  {
+    const J = makeP0Env();
+    const group1 = [];
+    const r1 = await handleDailyText(J.env, { chatId: -1, userId: 1, text: "/setup gemini GROUP_SECRET_1", chatType: "group", send: async (t) => { group1.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    check(r1 === "handled" && group1.join(" ").includes("چت خصوصی"), "M6: /setup credential rejected in group chat");
+    const group2 = [];
+    const r2 = await handleDailyText(J.env, { chatId: -1, userId: 1, text: "تنظیم کانکتور gemini GROUP_SECRET_2", chatType: "group", send: async (t) => { group2.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    check(r2 === "handled" && group2.join(" ").includes("چت خصوصی"), "M6: Persian setup alias rejected in group chat");
+    check(J.rows("SELECT COUNT(*) AS n FROM memories WHERE kind = 'setting' AND key = 'conn_gemini'")[0].n === 0, "M6: group credentials are never stored");
+    check(J.rows("SELECT COUNT(*) AS n FROM messages WHERE content LIKE '%GROUP_SECRET%'")[0].n === 0, "M6: group credentials are never persisted in messages");
+    const priv = [];
+    const r3 = await handleDailyText(J.env, { chatId: 1, userId: 1, text: "/setup gemini PRIVATE_SECRET_1", chatType: "private", send: async (t) => { priv.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    check(r3 === "handled" && (await getConnectorSecret(J.env, 1, "gemini")) === "PRIVATE_SECRET_1", "M6: private setup still works");
+  }
+
+  // M1: DB failure vs absent vs plaintext vs decrypted vs corrupt
+  {
+    const K = makeP0Env();
+    K.put("conn_gemini", await encryptVaultValue({ VAULT_MASTER_KEY: "other-key" }, "x"));
+    let dbFail = null;
+    try { await getConnectorSecret({ DB: { prepare() { throw new Error("db down"); } }, GEMINI_API_KEY: "env-key" }, 1, "gemini"); } catch (e) { dbFail = e; }
+    check(isConnectorSecretError(dbFail) && dbFail.reason === "db_read_failed", "M1: DB read failure does not fall back to env");
+    const absent = await getConnectorSecret({ ...K.env, NVIDIA_API_KEY: "env-key" }, 1, "nvidia");
+    check(absent === "env-key", "M1: absent connector may use safe env fallback");
+    check((await getConnectorSecret({ DB: K.db, NVIDIA_API_KEY: "env-key" }, 1, "nvidia")) === "env-key", "M1: absent secret falls back to env when DB is readable");
+    check((await getConnectorSecret({ GEMINI_API_KEY: "env-key" }, 1, "gemini")) === "env-key", "M1: no DB binding keeps env fallback");
+  }
+
+  // M2: a corrupt secret for one provider does not disable unrelated providers
+  {
+    const L = makeP0Env();
+    L.put("conn_gemini", await encryptVaultValue({ VAULT_MASTER_KEY: "other-key" }, "gemini-real"));
+    const envL = { ...L.env, NVIDIA_API_KEY: "nvidia-key", HF_TOKEN: "hf-key" };
+
+    const gen = await generateFreeImage(envL, "test", { userId: 1, fetchFn: async (url) => {
+      const u = String(url);
+      if (u.includes("ai.api.nvidia.com") && u.includes("/genai/")) return { ok: true, json: async () => ({ artifacts: [{ base64: "AAAA" }] }) };
+      return { ok: false, status: 404, json: async () => ({}) };
+    } });
+    check(gen.ok === true && gen.provider === "nvidia", `M2: corrupt gemini does not abort nvidia image generation: ${JSON.stringify(gen).slice(0, 200)}`);
+
+    const an = await analyzeImage(envL, { imageBytes: new Uint8Array([1, 2, 3]), mimeType: "image/jpeg", prompt: "تحلیل", userId: 1, fetchFn: async (url) => {
+      const u = String(url);
+      if (u.includes("integrate.api.nvidia.com")) return { ok: true, json: async () => ({ choices: [{ message: { content: "سلام دنیا" } }] }) };
+      return { ok: false, status: 404, json: async () => ({}) };
+    } });
+    check(an.ok === true && an.text.includes("سلام"), `M2: corrupt gemini does not abort nvidia vision: ${JSON.stringify(an).slice(0, 200)}`);
+
+    const ed = await editImage(envL, { imageBytes: new Uint8Array([1, 2, 3]), mimeType: "image/jpeg", instruction: "edit", userId: 1, fetchFn: async (url) => {
+      if (String(url).includes("router.huggingface.co")) return { ok: true, arrayBuffer: async () => new Uint8Array([9, 8, 7]).buffer };
+      return { ok: false, status: 404, json: async () => ({}) };
+    } });
+    check(ed.ok === true && ed.provider === "huggingface-edit", `M2: corrupt gemini does not abort HF image edit: ${JSON.stringify(ed).slice(0, 200)}`);
+
+    const envOnlyBad = { ...makeP0Env().env };
+    envOnlyBad.DB = L.db;
+    const genOnly = await generateFreeImage(envOnlyBad, "test", { userId: 1, fetchFn: async () => ({ ok: false, status: 404, json: async () => ({}) }) });
+    check(genOnly.ok === false && Array.isArray(genOnly.diagErrors) && genOnly.diagErrors.some((d) => String(d).startsWith("gemini:connector_secret_unavailable")), `M2: affected provider failure is reported, not silently skipped: ${JSON.stringify(genOnly).slice(0, 250)}`);
+
+    const envBadNoHf = { ...L.env, NVIDIA_API_KEY: "" };
+    const edOnly = await editImage(envBadNoHf, { imageBytes: new Uint8Array([1, 2, 3]), mimeType: "image/jpeg", instruction: "edit", userId: 1, fetchFn: async () => ({ ok: false, status: 404, json: async () => ({}) }) });
+    check(edOnly.ok === false && edOnly.error === "connector_secret_unavailable", `M2: edit fails closed when only credential is corrupt: ${JSON.stringify(edOnly).slice(0, 200)}`);
+
+    let pdfThrew = null;
+    try { await analyzePdfDocument(envL, { pdfBytes: new Uint8Array([1, 2, 3]), prompt: "خلاصه کن", userId: 1, fetchFn: async () => ({ ok: false, status: 404, json: async () => ({}) }) }); } catch (e) { pdfThrew = e; }
+    check(isConnectorSecretError(pdfThrew), "M2: pdf fails closed for its required connector secret");
+  }
+
+  // Sweep command: owner private-only, counts only, no secrets
+  {
+    const M = makeP0Env();
+    M.put("conn_gemini", "sweep-command-plain");
+    const sentSweep = [];
+    const rSweep = await handleDailyText(M.env, { chatId: 1, userId: 1, text: "رمزنگاری مجدد کانکتورها", chatType: "private", send: async (t) => { sentSweep.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    const sweepText = sentSweep.join(" ");
+    check(rSweep === "handled" && sweepText.includes("مهاجرت کلیدها") && !sweepText.includes("sweep-command-plain"), "P0-A: owner private sweep runs and reports counts only");
+    const sentDenied = [];
+    const rDenied = await handleDailyText(M.env, { chatId: 1, userId: 1, text: "رمزنگاری مجدد کانکتورها", chatType: "group", send: async (t) => { sentDenied.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    check(rDenied === "handled" && sentDenied.join(" ").includes("فقط برای مالک"), "P0-A: sweep command denied outside private chat");
+    const sentNonOwner = [];
+    const rNonOwner = await handleDailyText(M.env, { chatId: 2, userId: 2, text: "/setup sweep", chatType: "private", send: async (t) => { sentNonOwner.push(String(t)); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+    check(rNonOwner === "handled" && sentNonOwner.join(" ").includes("مالک") === false && !sentNonOwner.join(" ").includes("✅"), "P0-A: non-owner private sweep does not run");
   }
 }
 

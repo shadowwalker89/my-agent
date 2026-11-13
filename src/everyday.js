@@ -9,7 +9,7 @@ import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadData, escapeHtml, formatTelegramHtml } from "./telegram.js";
 import { encryptVaultValue, decryptVaultValue, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
 import { parseImageGenCommand, generateFreeImage, editImage, analyzeImage, isVisionQuestionCaption, isImageEditCaption } from "./media.js";
-import { CONNECTORS, getConnectorStatuses, setConnectorSecret, getConnectorSecret, renderSetupStatusText } from "./connectors.js";
+import { CONNECTORS, getConnectorStatuses, setConnectorSecret, getConnectorSecret, renderSetupStatusText, sweepConnectorSecrets, isConnectorSecretError } from "./connectors.js";
 import { isPdfAnalysisRequest, analyzePdfDocument, buildImageToPdfBytes, buildTextPdfOrHtmlReport, parsePdfCreateCommand } from "./pdf.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
@@ -63,6 +63,7 @@ export function buildChatContext(rows, opts = {}) {
 }
 
 function dbOf(env) { const db = env && env.DB; return db && typeof db.prepare === "function" ? db : null; }
+const CONNECTOR_PRIVATE_ONLY_TEXT = "🔒 تنظیم کلید کانکتور فقط در چت خصوصی مجاز است.";
 async function runDb(env, sql, params) { const db = dbOf(env); if (!db) return { ok: false }; try { await db.prepare(sql).bind(...params).run(); return { ok: true }; } catch { return { ok: false }; } }
 async function allDb(env, sql, params) { const db = dbOf(env); if (!db) return []; try { const res = await db.prepare(sql).bind(...params).all(); return Array.isArray(res?.results) ? res.results : []; } catch { return []; } }
 // Single-row read that distinguishes "no row" from "query failed".
@@ -1995,7 +1996,7 @@ const VISION_CAPTION_RE = /(?:تحلیل|بررسی|بخون|بخوان|ترجم
 async function analyzeVaultImage(env, file, prompt, userId = null) {
   const arr = await fileBytesFromTelegram(env, file.tg_file_id);
   let key = null;
-  try { key = await getConnectorSecret(env, userId ?? file.user_id ?? null, "gemini"); } catch {}
+  try { key = await getConnectorSecret(env, userId ?? file.user_id ?? null, "gemini"); } catch (e) { if (isConnectorSecretError(e)) throw e; }
   if (!arr || !arr.length || !key) return null;
   let bin = "";
   for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
@@ -2020,6 +2021,7 @@ export async function handleIncomingFile(env, o) {
 
 // Case A (caption) / Case B (no caption) for incoming document/photo uploads.
 export async function handleVaultFile(env, o) {
+  try {
   const { userId, chatId, tgFileId, fileType, mimeType, fileName, caption, send } = o;
   if (!dbOf(env)) return false;
   const cap = typeof caption === "string" ? caption.trim() : "";
@@ -2115,6 +2117,13 @@ export async function handleVaultFile(env, o) {
     [{ text: "❌ انصراف", callback_data: `vault:cancel:${saved.id}` }],
   ] } });
   return true;
+  } catch (e) {
+    if (isConnectorSecretError(e)) {
+      if (typeof o.send === "function") await o.send("❌ کلید کانکتور قابل خواندن نیست؛ لطفاً دوباره تنظیم کنید.");
+      return true;
+    }
+    throw e;
+  }
 }
 
 // Next-turn naming for a pending __pending__ vault upload. Returns true when
@@ -2151,6 +2160,7 @@ async function namePendingVaultFile(env, o) {
 
 // Vault callbacks: vault:csv, vault:sync, vault:file:<id>.
 export async function resolveVaultCallback(env, o) {
+  try {
   const analyze = /^vault:analyze:(\d+)$/.exec(o.data);
   if (analyze) {
     const id = Number(analyze[1]);
@@ -2240,6 +2250,13 @@ export async function resolveVaultCallback(env, o) {
     return true;
   }
   return false;
+  } catch (e) {
+    if (isConnectorSecretError(e)) {
+      if (typeof o.send === "function") await o.send("❌ کلید کانکتور قابل خواندن نیست؛ لطفاً دوباره تنظیم کنید.");
+      return true;
+    }
+    throw e;
+  }
 }
 
 // Everyday text, Phase 0-b: deterministic gates first (commands, bare-note
@@ -2511,6 +2528,7 @@ export async function runNluBranch(env, o, ctx) {
 }
 
 export async function handleDailyText(env, o) {
+  try {
   const { userId, text } = o;
   const now = o.nowMs ?? Date.now();
   if (!dbOf(env)) { await clearPendingAsk(env, userId); return "chat"; } // D1 unavailable: everyday off, chat keeps working
@@ -2519,14 +2537,33 @@ export async function handleDailyText(env, o) {
     const isSetupList = raw === "/setup" || raw === "تنظیمات کانکتورها" || raw === "وضعیت کانکتورها";
     const setupSet = raw.match(/^\/(?:setup)\s+([A-Za-z0-9_]+)\s+(.+)$/) || raw.match(/^تنظیم کانکتور\s+([A-Za-z0-9_]+)\s+(.+)$/);
     const isBackup = raw === "/backup" || raw === "بکاپ اطلاعات" || raw === "پشتیبان‌گیری";
+    const isConnectorSweep = raw === "/setup sweep" || raw === "رمزنگاری مجدد کانکتورها";
+    if (isConnectorSweep) {
+      if (o.chatType !== "private") {
+        if (typeof o.send === "function") await o.send("❌ این دستور فقط برای مالک در چت خصوصی مجاز است.");
+        return "handled";
+      }
+      const r = await sweepConnectorSecrets(env, { limit: 100, callerId: o.userId });
+      if (typeof o.send === "function") {
+        if (r.ok) await o.send(`✅ مهاجرت کلیدها: بررسی ${r.scanned}، رمزنگاری ${r.encrypted}، از پیش رمزنگاری ${r.alreadyEncrypted}، ناموفق ${r.decryptFailed + r.failed}، نامعتبر ${r.invalid}، باقی‌مانده ${r.remaining}${r.complete ? " (کامل)" : ""}.`);
+        else await o.send(`❌ مهاجرت کلیدها انجام نشد: ${r.error || (r.changed ? "تغییر همزمان" : "خطا")} (باقی‌مانده ${r.remaining}).`);
+      }
+      return "handled";
+    }
     if (isSetupList) {
-      const userSettings = {};
-      for (const c of CONNECTORS) { try { const s = await getConnectorSecret(env, userId, c.id); if (s) userSettings[`conn_${c.id}`] = s; } catch {} }
-      const statuses = await getConnectorStatuses(env, userSettings);
+      const statuses = await getConnectorStatuses(env, {}, userId);
       if (typeof o.send === "function") await o.send(renderSetupStatusText(statuses));
       return "handled";
     }
     if (setupSet) {
+      // Raw connector credentials are accepted only in a private chat for
+      // every supported alias (/setup and تنظیم کانکتور).
+      if (o.chatType !== "private") {
+        const existing = o.messageRowId ?? o.msgId ?? o.entryMessageId ?? null;
+        if (existing) { try { await redactMessageContent(env, userId, existing, CONNECTOR_PRIVATE_ONLY_TEXT); } catch {} }
+        if (typeof o.send === "function") await o.send(CONNECTOR_PRIVATE_ONLY_TEXT);
+        return "handled";
+      }
       const cid = setupSet[1].trim().toLowerCase();
       const value = setupSet[2].trim().split(/\s+/)[0];
       if (!CONNECTORS.some((c) => c.id === cid) || !value) {
@@ -2838,6 +2875,13 @@ export async function handleDailyText(env, o) {
   }
   // Everything else goes to the interpreter, never directly to chat.
   return handleInterpreterText(env, o, ctx);
+  } catch (e) {
+    if (isConnectorSecretError(e)) {
+      if (typeof o.send === "function") await o.send("❌ کلید کانکتور قابل خواندن نیست؛ لطفاً دوباره تنظیم کنید.");
+      return "handled";
+    }
+    throw e;
+  }
 }
 
 // daily: callbacks. Returns true when the data was a daily: callback.
