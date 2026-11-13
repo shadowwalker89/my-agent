@@ -6,7 +6,7 @@ import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_IN
 import { saveMessage, finalizeMessageKind, redactMessageContent, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, setVaultSyncStatus, upsertUserFact, exportUserBackupSnapshot } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
-import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadData, escapeHtml, formatTelegramHtml } from "./telegram.js";
+import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadData } from "./channels/telegram.js"; import { escapeHtml, formatTelegramHtml } from "./pipeline/respond.js";
 import { encryptVaultValue, decryptVaultValue, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
 import { parseImageGenCommand, generateFreeImage, editImage, analyzeImage, isVisionQuestionCaption, isImageEditCaption } from "./media.js";
 import { CONNECTORS, getConnectorStatuses, setConnectorSecret, getConnectorSecret, renderSetupStatusText, sweepConnectorSecrets, isConnectorSecretError } from "./connectors.js";

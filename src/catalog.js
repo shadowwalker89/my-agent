@@ -1,6 +1,6 @@
 import { listProviderModelsDetailed } from "./providers.js";
 import { getProviderCtx, getConfig } from "./config.js";
-import { tgBroadcast } from "./telegram.js";
+import { tgBroadcast } from "./channels/telegram.js";
 
 const NOTIFY_LIMIT = 15;
 
