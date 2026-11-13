@@ -2,7 +2,7 @@
 // plain-text path (dev -> everyday -> chat). No separate command.
 // Audio bytes are never stored (not in D1, not in R2) and never logged.
 // GEMINI_API_KEY is read from env only; it is never logged or returned.
-import { tgApi } from "./telegram.js";
+import { tgApi } from "./channels/telegram.js";
 
 export const VOICE_MAX_DURATION_SEC = 600;
 export const VOICE_LANGUAGE = "fa-IR";

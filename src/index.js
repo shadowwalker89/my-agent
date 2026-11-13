@@ -22,7 +22,7 @@ import {
   setPrefer,
   validatePattern,
 } from "./overrides.js";
-import { tgApi, tgSend, tgBroadcast, sendProgressMessage, finalizeProgressMessage, sendPhoto, sendDocument } from "./telegram.js";
+import { tgApi, tgSend, tgBroadcast, sendProgressMessage, finalizeProgressMessage, sendPhoto, sendDocument } from "./channels/telegram.js";
 import { healthCounts, getMedianLatency, getHealthEntry, markFailure, recordLatency } from "./health.js";
 import { recordVerifiedModel, recordProviderCircuitSuccess } from "./circuit.js";
 import { ADMIN_HTML } from "./admin-page.js";
