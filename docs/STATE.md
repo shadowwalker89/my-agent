@@ -1,24 +1,22 @@
 # STATE (update in every PR)
 
 ## Current phase
-R0.2 safety net
+R0.3 split tests
 
 ## Done
-- R0.1 governance: ADR index, STATE, structure lint.
-- R0.2 offline safety net: `eval/golden-persian.json` plus the existing 70 synthetic cases, deterministic golden runner, and real migration smoke check on `node:sqlite`.
+- R0.1 governance (`chore/r0-1-governance`) — ADR index (`0000`, `0001`), `docs/STATE.md`, `scripts/check-structure.mjs` + `scripts/legacy-sizes.json`, CI structure lint step.
+- R0.2 safety net (`test/r0-2-safety-net`) — `eval/golden-persian.json` (113 new cases; 183 total with `intent-synthetic.json`), `scripts/test-golden.mjs` (660 checks + `node:sqlite` migrations 0001–0003 round-trip), `docs/adr/0002-offline-d1-test-harness.md`.
+- R0.3 split tests (`test/r0-3-split-tests`) — split 8,547-line `scripts/test-dev.mjs` into `scripts/tests/harness.mjs` + modular test suites under `scripts/tests/`, keeping `scripts/test-dev.mjs` < 200 lines with 0 lost assertions.
 
 ## In progress
-- `test/r0-2-safety-net` — golden Persian dataset (113 new cases, 183 combined), `scripts/test-golden.mjs`, ADR 0002.
+- (none — ready for R0.4)
 
 ## Decisions
-- ADR index: docs/adr/ (initial decisions D1–D21 in `docs/adr/0001-initial-decisions.md`).
-- ADR 0002: offline D1 testing uses zero-dependency `node:sqlite` with the real migration SQL; `@cloudflare/vitest-pool-workers` stays optional/deferred to workerd-binding tests.
+- ADR index: `docs/adr/` (`0001-initial-decisions.md` D1–D21, `0002-offline-d1-test-harness.md`).
 
 ## Known issues / risks
-- AGENTS.md still references "Decision Log D1–D14"; `docs/contract-v3.md` now records D1–D21 (this PR does not edit AGENTS.md).
 - Legacy modules above 300 lines are recorded in `scripts/legacy-sizes.json`; they may only shrink.
-- `src/daily.js` does not recognise `درهم` (AED/dirham), so Contract §7.1's «امروز ۲۵۰ درهم ناهار» currently fails the amount validator. R0.2 pins this as a documented known gap in `eval/golden-persian.json`; the fix belongs to the R2 accounting work.
-- The offline D1 harness needs Node 22+ (`node:sqlite`); it does not cover workerd bindings, cron, or CPU limits.
+- `src/daily.js` does not yet parse `درهم`/`AED` (pinned as a documented known gap in `eval/golden-persian.json`; scheduled for R3 multi-currency accounting per Contract v3 §7.1 & §11.3).
 
 ## Measurements (fill during R1)
 - CPU per invocation (worst cases): 
@@ -27,4 +25,4 @@ R0.2 safety net
 - Actions minutes per month: 
 
 ## Next step
-- R0.3: split `scripts/test-dev.mjs` into module-sized test files.
+- R0.4 channel extraction: extract `src/channels/telegram.js` (Envelope/Reply) and move HTML formatting to `src/pipeline/respond.js`. 
