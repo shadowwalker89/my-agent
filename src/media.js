@@ -1,4 +1,4 @@
-import { getConnectorSecret } from "./connectors.js";
+import { getConnectorSecret, isConnectorSecretError } from "./connectors.js";
 import { getConfig } from "./config.js";
 
 function cleanPrompt(s) {
@@ -110,10 +110,13 @@ export function parseImageGenCommand(text) {
 }
 
 async function resolveKey(env, userId, connectorId, fallbackEnvName) {
+  let v = null;
   try {
-    const v = await getConnectorSecret(env, userId, connectorId);
-    if (typeof v === "string" && v) return v;
-  } catch {}
+    v = await getConnectorSecret(env, userId, connectorId);
+  } catch (e) {
+    if (isConnectorSecretError(e)) throw e;
+  }
+  if (typeof v === "string" && v) return v;
   const fromEnv = env?.[fallbackEnvName];
   if (typeof fromEnv === "string" && fromEnv) return fromEnv;
   // Config-backed keys: the admin/config store may hold the key on the
@@ -130,6 +133,13 @@ async function resolveKey(env, userId, connectorId, fallbackEnvName) {
     for (const v of candidates) if (typeof v === "string" && v) return v;
   } catch {}
   return null;
+}
+
+// Provider-isolated diagnostics: a corrupt secret for one connector must not
+// abort providers whose credentials come from a different connector.
+function connectorDiag(prefix, e) {
+  if (isConnectorSecretError(e)) return `${prefix}:connector_secret_unavailable:${e?.reason || "error"}`;
+  return `${prefix}:${e?.message || "error"}`;
 }
 
 function resolveFetch(opts) {
@@ -322,25 +332,27 @@ async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}, budget =
         }
       }
     } catch {}
-    const key = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
-    if (key) {
-      try {
-        const res = await fn("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }] }],
-            generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
-          }),
-          signal: budget.signal(4000),
-        });
-        if (res?.ok) {
-          const json = await safeJson(res);
-          const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join(" ").trim();
-          if (text && !PERSIAN_RE.test(text)) return text;
-        }
-      } catch {}
-    }
+    try {
+      const key = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
+      if (key) {
+        try {
+          const res = await fn("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+            body: JSON.stringify({
+              contents: [{ role: "user", parts: [{ text: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }] }],
+              generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
+            }),
+            signal: budget.signal(4000),
+          });
+          if (res?.ok) {
+            const json = await safeJson(res);
+            const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join(" ").trim();
+            if (text && !PERSIAN_RE.test(text)) return text;
+          }
+        } catch {}
+      }
+    } catch {}
   }
   return fallbackEnglishPrompt(prompt);
 }
@@ -487,7 +499,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
         } catch (e) { diagErrors.push("puter:" + (e?.message || "error")); }
       }
     }
-  } catch (e) { diagErrors.push("puter:" + (e?.message || "error")); }
+  } catch (e) { diagErrors.push(connectorDiag("puter", e)); }
 
   // Tier 1: configured Together AI / HuggingFace token (10s each).
   try {
@@ -511,7 +523,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
         }
       } catch (e) { diagErrors.push("together:" + (e?.message || "error")); }
     }
-  } catch (e) { diagErrors.push("together:" + (e?.message || "error")); }
+  } catch (e) { diagErrors.push(connectorDiag("together", e)); }
 
   try {
     const hfKey = await resolveKey(env, userId, "huggingface", "HF_TOKEN");
@@ -538,7 +550,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
         } catch (e) { diagErrors.push("huggingface:" + (e?.message || "error")); }
       }
     }
-  } catch (e) { diagErrors.push("huggingface:" + (e?.message || "error")); }
+  } catch (e) { diagErrors.push(connectorDiag("huggingface", e)); }
 
   // Tier 2: NVIDIA NIM parallel race. All 3 endpoints share one 11s
   // window (NVIDIA can take >5s to generate + transfer 1.5MB base64), and
@@ -578,7 +590,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
         if (bytes && bytes.length) return { ok: true, bytes, mimeType: "image/png", provider: "nvidia", diagErrors };
       } catch {}
     }
-  } catch (e) { diagErrors.push("nvidia:" + (e?.message || "error")); }
+  } catch (e) { diagErrors.push(connectorDiag("nvidia", e)); }
 
   try {
     const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
@@ -604,7 +616,7 @@ export async function generateFreeImage(env, prompt, opts = {}) {
         }
       } catch (e) { diagErrors.push("gemini:" + (e?.message || "error")); }
     }
-  } catch (e) { diagErrors.push("gemini:" + (e?.message || "error")); }
+  } catch (e) { diagErrors.push(connectorDiag("gemini", e)); }
 
   // Tier 3: keyless HuggingFace ZeroGPU FLUX.1-schnell Space.
   try {
@@ -663,6 +675,7 @@ export async function editImage(env, opts = {}) {
   const userId = opts.userId ?? null;
   const fn = resolveFetch(opts);
   const budget = createDeadline();
+  let secretError = null;
   if (!imageBytes || !instruction || typeof fn !== "function") return { ok: false, reason: "نیاز به تنظیم کلید GEMINI_API_KEY یا HF_TOKEN در /setup برای ویرایش تصویر است." };
 
   try {
@@ -687,7 +700,7 @@ export async function editImage(env, opts = {}) {
         }
       } catch {}
     }
-  } catch {}
+  } catch (e) { if (isConnectorSecretError(e)) secretError = e; }
 
   try {
     const hfKey = await resolveKey(env, userId, "huggingface", "HF_TOKEN");
@@ -706,9 +719,9 @@ export async function editImage(env, opts = {}) {
         }
       } catch {}
     }
-  } catch {}
+  } catch (e) { if (isConnectorSecretError(e)) secretError = e; }
 
-  return { ok: false, reason: "نیاز به تنظیم کلید GEMINI_API_KEY یا HF_TOKEN در /setup برای ویرایش تصویر است." };
+  return { ok: false, reason: "نیاز به تنظیم کلید GEMINI_API_KEY یا HF_TOKEN در /setup برای ویرایش تصویر است.", ...(secretError ? { error: "connector_secret_unavailable", reasonCode: secretError.reason || "error" } : {}) };
 }
 
 export const VISION_PERSIAN_INSTRUCTION =
@@ -784,7 +797,7 @@ export async function analyzeImage(env, opts = {}) {
           } catch (e) { errors.push(`gemini-${model}:` + (e?.message || "error")); }
         }
       }
-    } catch (e) { errors.push("gemini:" + (e?.message || "error")); }
+    } catch (e) { errors.push(connectorDiag("gemini", e)); }
 
     try {
       const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
@@ -816,7 +829,7 @@ export async function analyzeImage(env, opts = {}) {
           } catch (e) { errors.push(`nvidia-${model}:` + (e?.message || "error")); }
         }
       }
-    } catch (e) { errors.push("nvidia:" + (e?.message || "error")); }
+    } catch (e) { errors.push(connectorDiag("nvidia", e)); }
   }
 
   return {

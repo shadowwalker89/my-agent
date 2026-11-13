@@ -1,9 +1,9 @@
 // Phase 3.5: Bidirectional PDF engine — read/translate PDFs + generate PDFs. Zero external deps.
-import { getConnectorSecret } from "./connectors.js";
+import { getConnectorSecret, isConnectorSecretError } from "./connectors.js";
 export function bytesToBase64(b) { const a = b instanceof Uint8Array ? b : new Uint8Array(b || []); if (typeof Buffer !== "undefined") { try { return Buffer.from(a).toString("base64"); } catch {} } let s = ""; for (let i = 0; i < a.length; i += 8192) s += String.fromCharCode.apply(null, a.subarray(i, i + 8192)); return typeof btoa === "function" ? btoa(s) : s; }
 function bytesToB64(b) { return bytesToBase64(b); }
 function enc(s) { return new TextEncoder().encode(s); }
-async function resolveKey(env, uid, cid, fb) { try { const v = await getConnectorSecret(env, uid, cid); if (typeof v === "string" && v) return v; } catch {} const e = env?.[fb]; return typeof e === "string" && e ? e : null; }
+async function resolveKey(env, uid, cid, fb) { let v = null; try { v = await getConnectorSecret(env, uid, cid); } catch (err) { if (isConnectorSecretError(err)) throw err; } if (typeof v === "string" && v) return v; const e = env?.[fb]; return typeof e === "string" && e ? e : null; }
 async function safeJson(r) { try { if (typeof r?.json === "function") return await r.json(); } catch {} try { if (typeof r?.text === "function") { const t = await r.text(); return t ? JSON.parse(t) : null; } } catch {} return null; }
 function htmlEsc(s) { return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function pdfEsc(s) { return String(s ?? "").replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)"); }

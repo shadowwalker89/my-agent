@@ -7,3 +7,5 @@ probe/
 or-models.json
 nv-models.json
 xk-models.json
+
+docs/_pack/
