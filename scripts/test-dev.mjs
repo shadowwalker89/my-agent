@@ -16,6 +16,7 @@ const suites = [
   "./tests/11-domain-tasks.test.mjs",
   "./tests/12-domain-notes.test.mjs",
   "./tests/13-domain-expenses.test.mjs",
+  "./tests/14-platform-vault.test.mjs",
 ];
 
 for (const suite of suites) {

@@ -13,7 +13,7 @@ if (typeof globalThis.caches === "undefined") {
   globalThis.caches = { default: { match: async () => undefined, put: async () => {} } };
 }
 
-const RANKS = { channels: 1, ingress: 2, pipeline: 3, domain: 4, skills: 4, platform: 5 };
+const RANKS = { channels: 1, ingress: 2, pipeline: 3, domain: 4, skills: 4, platform: 5, admin: 2 };
 const root = path.resolve("src");
 function walk(dir) {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
