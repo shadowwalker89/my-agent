@@ -19,6 +19,9 @@ import { maskSensitive, unmaskAction } from "./pipeline/interpret.js";
 import { SEED_PROJECTS, resolveProjects, defaultProjectId, resolveFolderTag, findProjectByName } from "./domain/tasks/projects.js";
 import { renderTaskList, resolveTaskCallback as resolveTaskCallbackCore, sendListMessage, parseListOffset, chunkButtons, TASK_LIST_FAILED_TEXT } from "./domain/tasks/service.js";
 export { SEED_PROJECTS, resolveProjects, renderTaskList, TASK_LIST_FAILED_TEXT };
+import { renderNoteList, stripLeadingNotePunct, tehranParts, NOTE_LIST_FAILED_TEXT } from "./domain/notes/render.js";
+import { resolveNoteCallback as resolveNoteCallbackCore, noteCardKeyboard, insertNoteRow } from "./domain/notes/service.js";
+export { renderNoteList, stripLeadingNotePunct, deriveNoteTitle } from "./domain/notes/render.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
 export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی مثل /یادداشت، /تسکم، یا /اضافه کردن هزینه به کاربر پیشنهاد نده. کاربر برای ثبت موارد فقط کافی است با زبان طبیعی بنویسد یا ویس بدهد (مثلاً: «یادداشت کن فردا جلسه دارم» یا «امروز ۲۰۰ تومن نون خریدم» یا «خرجای امروز»).";
@@ -123,29 +126,6 @@ export function formatFailureDetail(lines) {
   const parts = [`تعداد مدل‌های بررسی‌شده: ${arr.length}`, ...arr.slice(0, 3)];
   if (arr.length > 3) parts.push(`(+${arr.length - 3} مورد دیگر)`);
   return parts.join("\n");
-}
-// Phase 2-d: a leading "." (or ":" / "-") left by a folder-strip or a
-// "یادداشت: . ..." form must never reach storage or the list render.
-// E.g. "یادداشت توی پروژه عمومی: . یه قابلیت" re-classifies to a body
-// starting with ". ", which used to render as "[📁 عمومی] . یه قابلیت...".
-export function stripLeadingNotePunct(text) {
-  // Leading run only: the directive is a stray leading ". "/" : "/" -".
-  // No trailing trim — a note body must be stored byte-identical apart
-  // from that leading run (a trailing space is user content).
-  return String(text ?? "").replace(/^[\s.·:؛،\-–—()[\]]+/u, "");
-}
-
-// Phase 3-A: the note list is a scannable index, not a transcript.
-// Derive a one-line title from the first meaningful line and cap it on
-// a word boundary so a long note never turns the list into a wall.
-export function deriveNoteTitle(text, maxLen = 60) {
-  const first = String(text ?? "").split(/\r?\n/).find((line) => stripLeadingNotePunct(line).trim()) ?? "";
-  const s = stripLeadingNotePunct(first).replace(/\s+/g, " ").trim();
-  if (!s) return "بدون عنوان";
-  if (s.length <= maxLen) return s;
-  const cut = s.slice(0, maxLen);
-  const sp = cut.lastIndexOf(" ");
-  return `${(sp > Math.floor(maxLen * 0.6) ? cut.slice(0, sp) : cut).trimEnd()}…`;
 }
 function newId() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
 async function putKv(env, key, value) { if (!env.STATE) return; try { await env.STATE.put(key, JSON.stringify(value), { expirationTtl: DRAFT_TTL_SEC }); } catch {} }
@@ -738,60 +718,6 @@ export async function runModelBranch(env, o, rule, ctx) {
   }
 }
 
-// 1-d-3: Tehran wall-clock parts of a stored ISO timestamp (live rows mix +03:30 and Z forms).
-function tehranParts(isoStr) {
-  const ms = Date.parse(isoStr);
-  if (!Number.isFinite(ms)) return null;
-  const s = new Date(ms + IRAN_OFFSET_MIN * 60000).toISOString();
-  return { date: s.slice(0, 10), hhmm: s.slice(11, 16) };
-}
-
-const NOTE_LIST_FAILED_TEXT = "یادداشت‌ها خوانده نشد؛ دوباره تلاش کن.";
-// 1-d-3: rich note render — 8 rows newest-first, row number + Jalali date + Tehran HH:MM + folder badge + text,
-// per-note delete, project filter, pagination. {ok:false} ONLY on a note-read failure (Fix A); names degrade to
-// no badge when THEIR read fails. The more callback carries the date filter as an optional 4th segment (the spec
-// shape note:more:<pid|all>:<offset> still parses): without it, paging a date-filtered list would drop the filter.
-export async function renderNoteList(env, userId, { projectName = null, projectId = null, date = null, offset = 0 } = {}) {
-  const rp = await listProjectsResult(env, userId);
-  if (projectName) {
-    if (!rp.ok) return { ok: false, text: NOTE_LIST_FAILED_TEXT, keyboard: null };
-    const hit = findProjectByName(rp.projects, projectName);
-    if (!hit) return { ok: true, text: `📁 پروژه «${projectName}» پیدا نشد.`, keyboard: null };
-    projectId = hit.id;
-  }
-  const names = new Map();
-  if (rp.ok) for (const p of rp.projects) if (p.id != null) names.set(p.id, p.name);
-  let sinceIso = null, untilIso = null;
-  if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) { const [y, m, d] = date.split("-").map(Number); const start = Date.UTC(y, m - 1, d) - IRAN_OFFSET_MIN * 60000; sinceIso = new Date(start).toISOString(); untilIso = new Date(start + 86400000).toISOString(); }
-  const r = await listNotesResult(env, userId, { projectId, sinceIso, untilIso, limit: 8, offset });
-  if (!r.ok) return { ok: false, text: NOTE_LIST_FAILED_TEXT, keyboard: null };
-  const pidTag = projectId == null ? "all" : projectId;
-  const moreTag = (off) => `note:more:${pidTag}:${off}${date ? `:${date}` : ""}`;
-  if (r.notes.length === 0) return { ok: true, text: offset > 0 ? "صفحه‌ی دیگری نیست." : "یادداشتی پیدا نشد.", keyboard: offset > 0 ? [[{ text: "↩ فهرست", callback_data: moreTag(0) }]] : null };
-  const text = r.notes.map((n, i) => {
-    const tp = tehranParts(n.created_at);
-    const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : "";
-    const badge = n.project_id != null && names.get(n.project_id) ? `📁 ${names.get(n.project_id)}` : "";
-    const parts = [when, badge].filter(Boolean).join(" · ");
-    // Phase 3-A: title-only rows keep the list scannable; the full body
-    // is still available through the summary/delete actions.
-    return `📖 #${offset + i + 1}${parts ? ` · ${parts}` : ""} — ${deriveNoteTitle(n.text)}`;
-  }).join("\n");
-  // Phase 3-A: view buttons (📖 #N -> note:view:<id>) render the full note
-  // on tap; delete buttons follow below, both packed 4 per row.
-  const keyboard = [];
-  keyboard.push(...chunkButtons(r.notes.map((n, i) => ({ text: `📖 #${offset + i + 1}`, callback_data: `note:view:${n.id}` })), 4));
-  keyboard.push(...chunkButtons(r.notes.map((n, i) => ({ text: `🗑 #${offset + i + 1}`, callback_data: `note:del:${n.id}` })), 4));
-  if (r.notes.length === 8) keyboard.push([{ text: "بیشتر", callback_data: moreTag(offset + 8) }]);
-  keyboard.push([{ text: "📊 خلاصه و جدول", callback_data: `note:sum:${pidTag}` }]);
-  if (rp.ok) {
-    const filters = rp.projects.filter((p) => p.id != null).map((p) => ({ text: p.name, callback_data: `note:proj:${p.id}` }));
-    if (projectId != null) filters.push({ text: "همه", callback_data: "note:proj:all" });
-    keyboard.push(...chunkButtons(filters, 3));
-  }
-  return { ok: true, text, keyboard };
-}
-
 // 1-d-4: D1-grounded summary/table. Verified rows are fetched FIRST
 // (up to 30, newest-first for notes, open order for tasks); a D1
 // failure reports the failure, 0 rows reports none found — both with
@@ -841,76 +767,11 @@ async function runSummary(env, o, kind, projectId, userId, retryData = null) {
   return true;
 }
 
-// 1-d-3: note: namespace. del re-checks ownership via the user-scoped delete (foreign/missing -> silent; D1 failure -> buttons kept); more/proj validate the project user-scoped.
+// 1-d-3: note: namespace (delegated to the domain service). The summary
+// tap needs runSummary, which stays in this file (it also serves tasks),
+// so it is passed in as a dependency instead of an upward import.
 export async function resolveNoteCallback(env, o) {
-  const del = /^note:del:(\d+)$/.exec(o.data);
-  if (del) {
-    const id = Number(del[1]);
-    if (!Number.isSafeInteger(id) || id <= 0) return true; // invalid: silent
-    const r = await deleteNote(env, o.fromId, id);
-    if (!r.ok) { await o.send(NOT_SAVED_TEXT); return true; } // D1 failure: buttons kept
-    if (!r.deleted) return true; // foreign/missing: silent
-    if (o.editMarkup) await o.editMarkup();
-    await o.send("🗑 یادداشت حذف شد.");
-    return true;
-  }
-  const view = /^note:view:(\d+)$/.exec(o.data);
-  if (view) {
-    const id = Number(view[1]);
-    if (!Number.isSafeInteger(id) || id <= 0) return true;
-    const row = await firstDb(env, "SELECT id, text, project_id, created_at FROM notes WHERE id = ? AND user_id = ?", [id, o.fromId]);
-    if (!row.ok || !row.row) { await o.send("یادداشتی پیدا نشد."); return true; }
-    let pname = null;
-    if (row.row.project_id != null) {
-      const rp = await listProjectsResult(env, o.fromId);
-      if (rp.ok) { const hit = rp.projects.find((p) => String(p.id) === String(row.row.project_id)); if (hit) pname = hit.name; }
-    }
-    const tp = tehranParts(row.row.created_at);
-    const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : "";
-    const body = String(row.row.text ?? "");
-    const title = deriveNoteTitle(body);
-    let text = `📌 **${title}**`;
-    if (when) text += `\n🗓 ${when}`;
-    if (pname) text += ` [📁 ${pname}]`;
-    text += `\n\n${body}`;
-    await o.send(text, { replyMarkup: { inline_keyboard: [[{ text: "🗑 حذف یادداشت", callback_data: `note:del:${id}` }]] } });
-    return true;
-  }
-  const proj = /^note:proj:([^:]+)$/.exec(o.data);
-  if (proj) {
-    if (proj[1] !== "all" && !/^\d+$/.test(proj[1])) return true; // invalid: silent
-    if (proj[1] !== "all") {
-      const rp = await listProjectsResult(env, o.fromId);
-      if (!rp.ok) { await o.send(NOTE_LIST_FAILED_TEXT); return true; }
-      if (!rp.projects.some((p) => String(p.id) === proj[1])) return true; // foreign/missing: silent
-    }
-    await sendListMessage(o, await renderNoteList(env, o.fromId, { projectId: proj[1] === "all" ? null : Number(proj[1]) }));
-    return true;
-  }
-  const more = /^note:more:([^:]+):([^:]+)(?::([^:]+))?$/.exec(o.data);
-  if (more) {
-    const date = more[3] && /^\d{4}-\d{2}-\d{2}$/.test(more[3]) ? more[3] : null;
-    if (more[1] !== "all" && !/^\d+$/.test(more[1])) return true; // invalid: silent
-    if (more[1] !== "all") {
-      const rp = await listProjectsResult(env, o.fromId);
-      if (!rp.ok) { await o.send(NOTE_LIST_FAILED_TEXT); return true; }
-      if (!rp.projects.some((p) => String(p.id) === more[1])) return true; // foreign/missing: silent
-    }
-    await sendListMessage(o, await renderNoteList(env, o.fromId, { projectId: more[1] === "all" ? null : Number(more[1]), date, offset: parseListOffset(more[2]) }));
-    return true;
-  }
-  const sum = /^note:sum:([^:]+)$/.exec(o.data);
-  if (sum) {
-    if (sum[1] !== "all" && !/^\d+$/.test(sum[1])) return true; // invalid: silent
-    if (sum[1] !== "all") {
-      const rp = await listProjectsResult(env, o.fromId);
-      if (!rp.ok) { await o.send(NOTE_LIST_FAILED_TEXT); return true; }
-      if (!rp.projects.some((p) => String(p.id) === sum[1])) return true; // foreign/missing: silent
-    }
-    await runSummary(env, o, "note", sum[1] === "all" ? null : Number(sum[1]), o.fromId, o.data);
-    return true;
-  }
-  return false;
+  return resolveNoteCallbackCore(env, o, { runSummary });
 }
 
 // 1-d-5: 1-tap quick convert (qconv:note:<msgId> / qconv:task:<msgId>).
@@ -988,16 +849,7 @@ function interpKey(id) { return `interp:${id}`; }
 function interpTypeKeyboard(id) {
   return [[{ text: "📋 تسک", callback_data: `interp:type:task:${id}` }, { text: "📝 یادداشت", callback_data: `interp:type:note:${id}` }], [{ text: "💰 خرج", callback_data: `interp:type:expense:${id}` }, { text: "💬 چت", callback_data: `interp:type:chat:${id}` }]];
 }
-function noteCardKeyboard(id) { return [[{ text: "🔄 تغییر نوع", callback_data: `interp:change:${id}` }, { text: "🗑 لغو", callback_data: `interp:del:${id}` }]]; }
 async function newInterpRecord(env, userId, value) { const id = newId(); await putKv(env, interpKey(id), { owner: userId, ...value }); return id; }
-async function insertNoteRow(env, userId, text, source, projectId = null) {
-  const db = dbOf(env); if (!db) return { ok: false, id: null };
-  try {
-    if (projectId === null || projectId === undefined) await db.prepare("INSERT INTO notes (user_id, text, source, created_at) VALUES (?, ?, ?, ?)").bind(userId, text, source, new Date().toISOString()).run();
-    else await db.prepare("INSERT INTO notes (user_id, text, source, created_at, project_id) VALUES (?, ?, ?, ?, ?)").bind(userId, text, source, new Date().toISOString(), projectId).run();
-    const row = await db.prepare("SELECT last_insert_rowid() AS id").bind().first(); const id = row?.id ?? null; if (id) await putKv(env, correctionKey(userId), { table: "notes", id }); return { ok: true, id };
-  } catch { return { ok: false, id: null }; }
-}
 function rangeForPeriod(periodText, nowMs) {
   const t = normalizeText(periodText ?? ""), today = iranDate(nowMs);
   if (/دیروز/.test(t)) { const d = new Date(Date.parse(today) - 86400000).toISOString().slice(0, 10); return { start: d, end: d }; }
