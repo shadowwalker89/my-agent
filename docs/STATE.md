@@ -1,7 +1,7 @@
 # STATE (update in every PR)
 
 ## Current phase
-R0.7 domain & skill extraction (R0.7f skills media, pdf, voice — R0.7 complete)
+R0.8 shrink `src/everyday.js` below 300 lines (R0.8a pipeline branches extracted)
 
 ## Done
 - R0.1 governance (`chore/r0-1-governance`) — ADR index (`0000`, `0001`), `docs/STATE.md`, `scripts/check-structure.mjs` + `scripts/legacy-sizes.json`, CI structure lint step.
@@ -15,16 +15,17 @@ R0.7 domain & skill extraction (R0.7f skills media, pdf, voice — R0.7 complete
 - R0.7c domain notes (`refactor/r0-7c-domain-notes`) — extracted `src/domain/notes/parse.js`, `render.js`, and `service.js` (< 250 lines each); shrank `src/daily.js` (508→434) and `src/everyday.js` (2649→2501); added `scripts/tests/12-domain-notes.test.mjs`.
 - R0.7d domain expenses (`refactor/r0-7d-domain-expenses`) — extracted `src/domain/expenses/` modules (< 250 lines each); shrank `src/daily.js` below 300 lines and removed it from `scripts/legacy-sizes.json`; shrank `src/everyday.js` further; added `scripts/tests/13-domain-expenses.test.mjs`.
 - R0.7e platform vault & admin setup (`refactor/r0-7e-platform-vault`) — extracted `src/platform/vault/` modules and `src/admin/setup.js` (< 250 lines each); shrank `src/vault.js` and `src/connectors.js` to shims and removed both from `scripts/legacy-sizes.json`; shrank `src/everyday.js` further; added `scripts/tests/14-platform-vault.test.mjs`.
-- R0.7f skills media, pdf & voice (`refactor/r0-7f-skills-media-pdf`) — extracted `src/skills/media/*` and `src/skills/pdf/*` (< 250 lines each); shrank `src/media.js`, `src/pdf.js`, and `src/voice.js` to thin shims and removed all three from `scripts/legacy-sizes.json`; shrank `src/everyday.js` further; added `scripts/tests/15-skills-media-pdf.test.mjs`.
+- R0.7f skills media, pdf & voice (`refactor/r0-7f-skills-media-pdf`) — extracted `src/skills/media/*` and `src/skills/pdf/*` (< 250 lines each); shrank `src/media.js`, `src/pdf.js`, and `src/voice.js` to shims and removed all three from `scripts/legacy-sizes.json`; shrank `src/everyday.js` further; added `scripts/tests/15-skills-media-pdf.test.mjs` (2,870 checks).
+- R0.8a pipeline branches (`refactor/r0-8a-pipeline-branches`) — extracted chat context, model-slot branch, interpreter policy/runner, and NLU branch out of `src/everyday.js` into `< 250`-line modules under `src/pipeline/*`; tightened `scripts/legacy-sizes.json` (`src/everyday.js` 2,354→1,139); added `scripts/tests/16-pipeline-branches.test.mjs`.
 
 ## In progress
-- (none — ready for R0.8 final `src/everyday.js` shell reduction below 300 lines)
+- R0.8b final `src/everyday.js` shell reduction below 300 lines
 
 ## Decisions
 - ADR index: `docs/adr/` (`0001-initial-decisions.md` D1–D21, `0002-offline-d1-test-harness.md`).
 
 ## Known issues / risks
-- Remaining legacy modules above 300 lines are recorded in `scripts/legacy-sizes.json`; they may only shrink.
+- Remaining legacy modules above 300 lines are recorded in `scripts/legacy-sizes.json` (7 files); they may only shrink.
 - `src/domain/expenses/` does not yet parse `درهم`/`AED` (pinned as a documented known gap in `eval/golden-persian.json`; scheduled for R3 multi-currency accounting per Contract v3 §7.1 & §11.3).
 - `wrangler.jsonc` still defines 4 cron triggers; consolidation to a single `* * * * *` cron + `schedules` table is scheduled for R1 per Contract v3 §5 & §8.
 
@@ -35,4 +36,4 @@ R0.7 domain & skill extraction (R0.7f skills media, pdf, voice — R0.7 complete
 - Actions minutes per month: 
 
 ## Next step
-- R0.8 shrink `src/everyday.js` shell below 300 lines (extract remaining pipeline/execution/memory/backup branches from `src/everyday.js` so `src/everyday.js` is < 300 lines and removed from `scripts/legacy-sizes.json`, completing the R0 acceptance gate).
+- R0.8b extract remaining `runDailyBranch`, `handleDailyText`, `resolveDailyCallback`, `handleIncomingFile`, and `/backup` out of `src/everyday.js` so `src/everyday.js` drops below 300 lines and is removed from `scripts/legacy-sizes.json` (completing Phase R0).
