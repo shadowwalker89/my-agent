@@ -11,6 +11,7 @@ const suites = [
   "./tests/06-memory-graph-media.test.mjs",
   "./tests/07-channel-telegram.test.mjs",
   "./tests/08-platform-scheduler.test.mjs",
+  "./tests/09-pipeline.test.mjs",
 ];
 
 for (const suite of suites) {
