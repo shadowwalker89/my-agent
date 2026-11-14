@@ -1,7 +1,7 @@
 // Step 1b-2: everyday wiring (money, notes, reminders, translate,
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
-import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, extractFolderTag, matchKnownProjectAt, IRAN_OFFSET_MIN } from "./daily.js";
+import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, IRAN_OFFSET_MIN } from "./daily.js";
 import { isRecallQuestionReminder } from "./domain/reminders/parse.js";
 export { isRecallQuestionReminder };
 import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO, resolveInterpreterModel, recoverFullNoteBody } from "./intent.js";
@@ -16,6 +16,9 @@ import { isPdfAnalysisRequest, analyzePdfDocument, buildImageToPdfBytes, buildTe
 import { runReminderTick as runSchedulerReminderTick, makeTelegramSendMessage } from "./platform/scheduler/index.js";
 import { mapQuestion, askText, setPendingAsk, parseLanguageAnswer, slotKind, isBodySlot, kindForAskKey, getPendingAsk, clearPendingAsk, askKeyboard, hourAmbiguousKeyboard, sendHourAmbiguousAsk, reaskPending, deriveTranslateBody } from "./pipeline/route.js";
 import { maskSensitive, unmaskAction } from "./pipeline/interpret.js";
+import { SEED_PROJECTS, resolveProjects, defaultProjectId, resolveFolderTag, findProjectByName } from "./domain/tasks/projects.js";
+import { renderTaskList, resolveTaskCallback as resolveTaskCallbackCore, sendListMessage, parseListOffset, chunkButtons, TASK_LIST_FAILED_TEXT } from "./domain/tasks/service.js";
+export { SEED_PROJECTS, resolveProjects, renderTaskList, TASK_LIST_FAILED_TEXT };
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
 export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی مثل /یادداشت، /تسکم، یا /اضافه کردن هزینه به کاربر پیشنهاد نده. کاربر برای ثبت موارد فقط کافی است با زبان طبیعی بنویسد یا ویس بدهد (مثلاً: «یادداشت کن فردا جلسه دارم» یا «امروز ۲۰۰ تومن نون خریدم» یا «خرجای امروز»).";
@@ -143,13 +146,6 @@ export function deriveNoteTitle(text, maxLen = 60) {
   const cut = s.slice(0, maxLen);
   const sp = cut.lastIndexOf(" ");
   return `${(sp > Math.floor(maxLen * 0.6) ? cut.slice(0, sp) : cut).trimEnd()}…`;
-}
-// Phase 2-d: chunk a flat button list into rows of at most n (Telegram
-// keyboards with one unbounded row overflow; one row per item towers).
-function chunkButtons(buttons, n) {
-  const rows = [];
-  for (let i = 0; i < buttons.length; i += n) rows.push(buttons.slice(i, i + n));
-  return rows;
 }
 function newId() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
 async function putKv(env, key, value) { if (!env.STATE) return; try { await env.STATE.put(key, JSON.stringify(value), { expirationTtl: DRAFT_TTL_SEC }); } catch {} }
@@ -742,181 +738,6 @@ export async function runModelBranch(env, o, rule, ctx) {
   }
 }
 
-// ── Phase 0-b: interpreter wiring (design v3, 3.1-3.5; cards in 0-b2) ──
-// Seed projects until migration 0003 lands (Phase 1-a swaps this constant
-// for a D1 read). Never auto-create: unknown names get type buttons.
-export const SEED_PROJECTS = [{ name: "عمومی", aliases: [] }, { name: "ایجنت", aliases: [] },
-  { name: "گلبهار", aliases: ["گل"] }, { name: "قرارها و ملاقات‌ها", aliases: ["قرارها"] }];
-
-// Phase 1-b-0a (Fix A): resolve the user's projects from D1. Exported
-// for tests but NOT yet called by any runtime path in this slice (pure
-// functions + tests, no wiring). Returns:
-//   {ok: true, fallback: false, projects: [{id, name, aliases[], is_default}]}
-//     on a D1 read with rows (aliases JSON parsed, malformed -> []);
-//   {ok: true, fallback: true, projects: SEED_PROJECTS} on genuine
-//     empty success (seed shape preserved, entries carry no D1 id);
-//   {ok: false, projects: []} on a D1 failure — NO seed fallback, so a
-//     failure is never misread as "user has no projects".
-function parseAliasesText(raw) {
-  try {
-    const v = JSON.parse(typeof raw === "string" ? raw : "[]");
-    return Array.isArray(v) ? v.filter((a) => typeof a === "string") : [];
-  } catch { return []; }
-}
-// 1-d-4: shared name/alias resolution (used by renderNoteList and the
-// summary branch, so the two never drift apart). Null when unresolved.
-function findProjectByName(projects, name) {
-  const norm = normalizeText(name).trim();
-  return (projects || []).filter((p) => p.id != null).find((p) => normalizeText(p.name).trim() === norm || parseAliasesText(p.aliases).some((a) => normalizeText(a).trim() === norm)) || null;
-}
-export async function resolveProjects(env, userId) {
-  const r = await listProjectsResult(env, userId);
-  if (!r.ok) return { ok: false, projects: [] };
-  if (r.projects.length === 0) return { ok: true, fallback: true, projects: SEED_PROJECTS };
-  return {
-    ok: true,
-    fallback: false,
-    projects: r.projects.map((p) => ({ id: p.id, name: p.name, aliases: parseAliasesText(p.aliases), is_default: p.is_default })),
-  };
-}
-
-// 1-b-1 (decision 5): the rule note's default project — the D1 row with
-// is_default = 1, else NULL. A project lookup never fails a note.
-async function defaultProjectId(env, userId) {
-  const rp = await resolveProjects(env, userId);
-  if (!rp.ok || rp.fallback) return null;
-  return rp.projects.find((p) => p.is_default === 1)?.id ?? null;
-}
-
-// 1-d-2: resolve an explicit folder phrase against D1 active projects
-// (listProjectsResult — real rows with ids only; a seed fallback has no
-// id and is never attached). Start form: longest project name/alias
-// prefix of rest, with a word boundary (space/colon/end) after the name;
-// end form: exact normalized name/alias match of the tail. Returns
-// { project, body } or null. The caller re-classifies body and only
-// uses the tag when the intent family is preserved, so a false prefix
-// (e.g. a name that is a prefix of another word) can never mis-store.
-async function resolveFolderTag(env, userId, fullText) {
-  // Phase 2-b: load the real D1 projects FIRST and pass them into
-  // extractFolderTag, so mid-sentence known names ("... برای پروژه
-  // گلبهار برسه") resolve with 0 model calls. A seed fallback has no
-  // id and is never attached (pre-existing invariant), so D1 failure
-  // or an empty project list still returns null.
-  const rp = await listProjectsResult(env, userId);
-  if (!rp.ok || rp.projects.length === 0) return null;
-  const tag = extractFolderTag(fullText, rp.projects.map((p) => ({ name: p.name, aliases: parseAliasesText(p.aliases) })));
-  if (!tag) return null;
-  const cands = [];
-  for (const p of rp.projects) {
-    if (p.id == null) continue;
-    cands.push({ name: normalizeText(p.name).trim(), project: p });
-    for (const a of parseAliasesText(p.aliases)) cands.push({ name: normalizeText(a).trim(), project: p });
-  }
-  cands.sort((a, b) => b.name.length - a.name.length);
-  // Phase 2-b known form: the name is already a known name/alias, so
-  // it resolves exactly; the body keeps every remaining word intact.
-  if (tag.at === "known") {
-    const hit = cands.find((c) => c.name && c.name === normalizeText(tag.name).trim());
-    return hit ? { project: hit.project, body: tag.body } : null;
-  }
-  if (tag.at === "end") {
-    const hit = cands.find((c) => c.name && c.name === normalizeText(tag.name).trim());
-    if (hit) return { project: hit.project, body: tag.body };
-    // Phase 2-b fallback (resolveProjectMatch upgrade): a raw
-    // candidate that still has trailing words ("گلبهار برسه")
-    // resolves to the known project it starts with, and the trailing
-    // words rejoin the body — this path only fires when the known
-    // scan above missed (e.g. an introducer spelling it does not
-    // cover).
-    const prefix = matchKnownProjectAt(tag.name, cands.map((c) => c.name));
-    if (prefix) {
-      const pHit = cands.find((c) => c.name === prefix.name);
-      if (pHit) return { project: pHit.project, body: prefix.rest ? `${tag.body} ${prefix.rest}` : tag.body };
-    }
-    return null;
-  }
-  // 1-d-6 middle form: the name is already colon-bounded, so it resolves
-  // exactly like the end form; the body is the phrase-stripped text.
-  if (tag.at === "middle") {
-    const hit = cands.find((c) => c.name && c.name === normalizeText(tag.name).trim());
-    return hit ? { project: hit.project, body: tag.body } : null;
-  }
-  const rest = normalizeText(tag.rest).trim();
-  const origRest = tag.rest.trim();
-  for (const c of cands) {
-    if (!c.name) continue;
-    if (rest === c.name) return { project: c.project, body: "" };
-    if (rest.startsWith(c.name)) {
-      // Lengths agree (normalisation is one-to-one), so the original
-      // remainder is sliced by the normalized name's length — ZWNJ
-      // survives in the returned body.
-      const after = origRest.slice(c.name.length);
-      if (/^[\s:：]/.test(after)) return { project: c.project, body: after.replace(/^[\s:：]+/u, "").trim() };
-    }
-  }
-  return null;
-}
-
-const TASK_LIST_FAILED_TEXT = "تسک‌ها خوانده نشد؛ دوباره تلاش کن";
-// 1-b-2: full list render — 8 rows, open only, with project names,
-// per-task ✅/🗑 buttons, more/archive/filter navigation. {ok:false}
-// ONLY on a task-read failure (Fix A); name resolution degrades to
-// titles only when IT fails, since names are decoration. The more
-// button renders ONLY on a full page; beyond-end renders no-more.
-// Phase 2-g: opts.remindOnly renders only tasks with a reminder set
-// (the reminder-list view); opts.morePrefix renames the paging
-// callback (rem:more for reminders, so paging never drops the filter);
-// opts.hideFilters/hideSummary drop the project-filter and
-// archive/summary rows for reminders (those rows would switch to the
-// unfiltered task list); opts.emptyText overrides the empty message.
-// Defaults reproduce the pre-2-g output byte for byte.
-export async function renderTaskList(env, userId, projectId = null, offset = 0, opts = {}) {
-  const r = await listOpenTasksResult(env, userId, projectId, 8, offset, { remindOnly: opts.remindOnly === true });
-  if (!r.ok) return { ok: false, text: TASK_LIST_FAILED_TEXT, keyboard: null };
-  const morePrefix = opts.morePrefix ?? "task:more";
-  if (r.tasks.length === 0) return { ok: true, text: offset > 0 ? "صفحه‌ی دیگری نیست." : (opts.emptyText ?? "تسک بازی پیدا نشد."), keyboard: offset > 0 ? [[{ text: "↩ فهرست", callback_data: projectId == null ? `${morePrefix}:0` : `${morePrefix}:0:${projectId}` }]] : null };
-  const rp = await resolveProjects(env, userId);
-  const names = new Map();
-  if (rp.ok && !rp.fallback) for (const p of rp.projects) if (p.id != null) names.set(p.id, p.name);
-  // Phase 2-d: numbered lines (so numbered buttons map to rows) and
-  // compact buttons — 2 tasks per row instead of one row per task.
-  const text = r.tasks.map((t, i) => `${offset + i + 1}. ${t.title}${t.project_id != null && names.get(t.project_id) ? ` — ${names.get(t.project_id)}` : ""}`).join("\n");
-  const perTask = r.tasks.map((t, i) => [
-    { text: `✅${offset + i + 1}`, callback_data: `task:done:${t.id}` },
-    { text: `🗑${offset + i + 1}`, callback_data: `task:del:${t.id}` },
-  ]);
-  const keyboard = [];
-  for (let i = 0; i < perTask.length; i += 2) {
-    keyboard.push([...perTask[i], ...(perTask[i + 1] ?? [])]);
-  }
-  if (r.tasks.length === 8) keyboard.push([{ text: "بیشتر", callback_data: projectId == null ? `${morePrefix}:${offset + 8}` : `${morePrefix}:${offset + 8}:${projectId}` }]);
-  if (opts.hideSummary) {
-    keyboard.push([{ text: "↩ تسک‌ها", callback_data: "task:more:0" }]);
-  } else {
-    keyboard.push([{ text: "📦 آرشیو", callback_data: "task:arch:0" }, { text: "📊 خلاصه و جدول", callback_data: `task:sum:${projectId == null ? "all" : projectId}` }]);
-  }
-  if (!opts.hideFilters && rp.ok && !rp.fallback) {
-    const filters = rp.projects.filter((p) => p.id != null).map((p) => ({ text: p.name, callback_data: `task:proj:${p.id}:0` }));
-    if (projectId != null) filters.push({ text: "همه", callback_data: "task:more:0" });
-    // Phase 2-d: project filters chunked to at most 3 per row, never
-    // one unbounded horizontal row.
-    keyboard.push(...chunkButtons(filters, 3));
-  }
-  return { ok: true, text, keyboard };
-}
-
-// 1-b-2: archive render — done only, newest-first (listDoneTasks
-// core, never the wrapper, so a failure is never an "empty archive").
-async function renderTaskArchive(env, userId, offset = 0) {
-  const r = await listDoneTasksResult(env, userId, null, 8, offset);
-  if (!r.ok) return { ok: false, text: TASK_LIST_FAILED_TEXT, keyboard: null };
-  if (r.tasks.length === 0) return { ok: true, text: offset > 0 ? "صفحه‌ی دیگری نیست." : "تسک آرشیوشده‌ای پیدا نشد.", keyboard: offset > 0 ? [[{ text: "↩ آرشیو", callback_data: "task:arch:0" }]] : null };
-  const keyboard = [];
-  if (r.tasks.length === 8) keyboard.push([{ text: "بیشتر", callback_data: `task:arch:${offset + 8}` }]);
-  keyboard.push([{ text: "↩ فهرست باز", callback_data: "task:more:0" }]);
-  return { ok: true, text: r.tasks.map((t) => `• ${t.title}`).join("\n"), keyboard };
-}
-
 // 1-d-3: Tehran wall-clock parts of a stored ISO timestamp (live rows mix +03:30 and Z forms).
 function tehranParts(isoStr) {
   const ms = Date.parse(isoStr);
@@ -1149,93 +970,11 @@ export async function resolveChatRetryCallback(env, o) {
   return true;
 }
 
-// 1-b-2: send a list render, splitting at Telegram's 4096-character
-// cap on line boundaries (a single over-long line is hard-split);
-// the keyboard rides on the LAST chunk only.
-async function sendListMessage(o, rendered) {
-  const chunks = [];
-  for (const line of rendered.text.split("\n")) {
-    if (line.length > 4096) { for (let i = 0; i < line.length; i += 4096) chunks.push(line.slice(i, i + 4096)); continue; }
-    const last = chunks[chunks.length - 1];
-    if (last !== undefined && last.length + 1 + line.length <= 4096) chunks[chunks.length - 1] = `${last}\n${line}`;
-    else chunks.push(line);
-  }
-  for (let i = 0; i < chunks.length; i++) await o.send(chunks[i], i === chunks.length - 1 && rendered.keyboard ? { replyMarkup: { inline_keyboard: rendered.keyboard } } : undefined);
-}
-
-// Amendment 1: unparseable offset -> page 0; negative -> clamped to 0.
-function parseListOffset(raw) {
-  if (!/^-?\d+$/.test(String(raw ?? ""))) return 0;
-  return Math.max(0, Number(raw));
-}
-
-// Fix B ordering shared by task:done and task:del: getTask first,
-// then the atomic status change; markup removed ONLY after success.
-async function actTaskStatus(env, o, id, status, successText) {
-  const g = await getTask(env, o.fromId, id);
-  if (!g.ok) { await o.send(NOT_SAVED_TEXT); return true; } // D1 failure: buttons kept
-  if (!g.task) return true; // foreign/missing/invalid: silent
-  if (g.task.status !== "open") { await o.send(EXPIRED_TEXT); if (o.editMarkup) await o.editMarkup(); return true; } // consumed: fixed message + markup removed
-  const r = await setTaskStatus(env, o.fromId, id, status);
-  if (!r.ok) { const g2 = await getTask(env, o.fromId, id); if (g2.ok && g2.task && g2.task.status !== "open") { await o.send(EXPIRED_TEXT); if (o.editMarkup) await o.editMarkup(); return true; } await o.send(NOT_SAVED_TEXT); return true; } // lost race: re-read once, else buttons kept
-  if (o.editMarkup) await o.editMarkup();
-  await o.send(successText);
-  return true;
-}
-
-// 1-b-2: full task: namespace. done/del act on one row via getTask
-// (amendment 3); more/arch/proj carry NO row and never call getTask
-// (amendment 1: allow-list gate already ran; proj validates the
-// project user-scoped, foreign/missing -> silent, no data, no filter).
+// 1-b-2: full task: namespace (delegated to the domain service). The
+// summary tap needs runSummary, which stays in this file (it also serves
+// notes), so it is passed in as a dependency instead of an upward import.
 export async function resolveTaskCallback(env, o) {
-  const done = /^task:(done|del):(\d+)$/.exec(o.data);
-  if (done) return actTaskStatus(env, o, Number(done[2]), done[1] === "done" ? "done" : "deleted", done[1] === "done" ? "✅ انجام شد." : "🗑 حذف شد.");
-  const more = /^task:more:([^:]+)(?::(\d+))?$/.exec(o.data);
-  if (more) { await sendListMessage(o, await renderTaskList(env, o.fromId, more[2] !== undefined ? Number(more[2]) : null, parseListOffset(more[1]))); return true; }
-  // Phase 2-g: reminder-list paging — same shape as task:more, but the
-  // remindOnly filter rides along so page 2 is still reminders only.
-  const remMore = /^rem:more:([^:]+)(?::(\d+))?$/.exec(o.data);
-  if (remMore) { await sendListMessage(o, await renderTaskList(env, o.fromId, remMore[2] !== undefined ? Number(remMore[2]) : null, parseListOffset(remMore[1]), { remindOnly: true, morePrefix: "rem:more", hideFilters: true, hideSummary: true, emptyText: "یادآوری بازی پیدا نشد." })); return true; }
-  const arch = /^task:arch:([^:]+)$/.exec(o.data);
-  if (arch) { await sendListMessage(o, await renderTaskArchive(env, o.fromId, parseListOffset(arch[1]))); return true; }
-  const proj = /^task:proj:([^:]+):([^:]+)$/.exec(o.data);
-  if (proj) {
-    if (!/^\d+$/.test(proj[1])) return true; // invalid project id: silent, like foreign/missing
-    const rp = await listProjectsResult(env, o.fromId);
-    if (!rp.ok) { await o.send(TASK_LIST_FAILED_TEXT); return true; }
-    if (!rp.projects.some((p) => String(p.id) === proj[1])) return true; // foreign/missing: silent, no data, no filter
-    await sendListMessage(o, await renderTaskList(env, o.fromId, Number(proj[1]), parseListOffset(proj[2])));
-    return true;
-  }
-  // 1-d-4: task summary button (task:sum:<id|all>); same validation as proj.
-  const tsum = /^task:sum:([^:]+)$/.exec(o.data);
-  if (tsum) {
-    if (tsum[1] !== "all" && !/^\d+$/.test(tsum[1])) return true; // invalid: silent
-    if (tsum[1] !== "all") {
-      const rp = await listProjectsResult(env, o.fromId);
-      if (!rp.ok) { await o.send(TASK_LIST_FAILED_TEXT); return true; }
-      if (!rp.projects.some((p) => String(p.id) === tsum[1])) return true; // foreign/missing: silent
-    }
-    await runSummary(env, o, "task", tsum[1] === "all" ? null : Number(tsum[1]), o.fromId, o.data);
-    return true;
-  }
-  // 1-c-2: snooze follows the same Fix B ordering as done/del: getTask
-  // first, then the atomic snooze; markup removed ONLY after success.
-  const snooze = /^task:snooze:(\d+)$/.exec(o.data);
-  if (snooze) {
-    const id = Number(snooze[1]);
-    const g = await getTask(env, o.fromId, id);
-    if (!g.ok) { await o.send(NOT_SAVED_TEXT); return true; } // D1 failure: buttons kept
-    if (!g.task) return true; // foreign/missing/invalid: silent
-    if (g.task.status !== "open") { await o.send(EXPIRED_TEXT); if (o.editMarkup) await o.editMarkup(); return true; } // consumed: fixed message + markup removed
-    const r = await snoozeTaskReminder(env, o.fromId, id, new Date((o.nowMs ?? Date.now()) + 10 * 60 * 1000).toISOString());
-    if (!r.ok) { await o.send(NOT_SAVED_TEXT); return true; } // D1 failure on write: buttons kept
-    if (!r.updated) { const g2 = await getTask(env, o.fromId, id); if (g2.ok && g2.task && g2.task.status !== "open") { await o.send(EXPIRED_TEXT); if (o.editMarkup) await o.editMarkup(); return true; } await o.send(NOT_SAVED_TEXT); return true; } // lost race: re-read once, else buttons kept
-    if (o.editMarkup) await o.editMarkup();
-    await o.send("💤 یادآوری برای ۱۰ دقیقه‌ی دیگر تنظیم شد.");
-    return true;
-  }
-  return false;
+  return resolveTaskCallbackCore(env, o, { runSummary });
 }
 
 export async function runReminderTick(env, opts = {}) {

@@ -13,6 +13,7 @@ const suites = [
   "./tests/08-platform-scheduler.test.mjs",
   "./tests/09-pipeline.test.mjs",
   "./tests/10-domain-reminders.test.mjs",
+  "./tests/11-domain-tasks.test.mjs",
 ];
 
 for (const suite of suites) {

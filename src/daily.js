@@ -1,5 +1,7 @@
 import { JMONTHS, addDays, findMonth, normalizeDigits, normalizeText, parseRelativeDate, iranDate, weekRange, monthRange } from "./domain/reminders/time.js";
 import { parseReminder } from "./domain/reminders/parse.js";
+import { parseListRequest, stripMiddleFolderTag, extractFolderTag, matchKnownProjectAt, resolveProjectName } from "./domain/tasks/parse.js";
+export { parseListRequest, stripMiddleFolderTag, extractFolderTag, matchKnownProjectAt, resolveProjectName };
 export { IRAN_OFFSET_MIN, normalizeDigits, iranDate, jalaliToGregorian, gregorianToJalali, formatJalali, parseRelativeDate, weekRange, monthRange, parseHour, normalizeText } from "./domain/reminders/time.js";
 export { parseReminder, normalizeDaypartToken, parseDaypartReply, hasDaypartReply, mergeHourAmbiguousFollowup, resolveHourAmbiguousFollowup, REMINDER_TRIGGERS } from "./domain/reminders/parse.js";
 export const DEFAULT_CURRENCY = "TOMAN";
@@ -214,45 +216,6 @@ export function parseSummaryQuery(raw) {
   return { intent: "summary", confidence: 1, kind, projectName: rest };
 }
 const NOTE_QUERY_RE = /(یادداشت\s*های(م|مو| امروز)?|یادداشت\s*هامو?|نوت\s*های(م|مو)?|نوت\s*هامو?)/;
-// Phase 2-g: colloquial list routing for tasks and reminders (zero
-// model calls). This replaces the 1-b-1 TASK_LIST_RE closed list, which
-// missed the colloquial object marker «رو» (it allowed only formal
-// «را»), the verbs بیار/لیست کن, the «های من» possessive, and the
-// کار/یادآوری/ریمایندر subjects — so «تسک‌هام رو نشون بده» fell
-// through to free chat while «یادداشت‌هام رو نشون بده» matched
-// deterministically (that divergence is the proven 2-g trace finding).
-// Grammar: [لیست|فهرست] SUBJECT [پروژه <name>] [رو|را] [show verb],
-// where SUBJECT is تسک/کار (→ task-list) or یادآوری/ریمایندر
-// (→ reminder-list) with a plural/possessive ending. A bare subject
-// or a marker-only tail still requires a possessive or a project
-// segment; any other tail (a body word, ببینم, جلسه, جدول کن)
-// rejects, so creation and chat keep their existing routes.
-const LIST_SUBJECT_RE = /^(تسک|کار|یادآوری|ریمایندر)\s*(?:(های|ها)\s*(مو|من|یم|م)?|(هامو|هام))\s*/u;
-const LIST_TAIL_RE = /^(?:(رو|را)\s+)?(نشان\s+بده|نشون\s+بده|نمایش\s+بده|بیار|بیاور|لیست\s+کنید|لیست\s+کن|لیست|چی\s+دارم|چه\s+دارم|چه\s+(?:\S+\s+){0,3}دارم)$/u;
-// NOTE: no \b here — JavaScript \b is ASCII-only, so it never matches
-// after a Persian word (رو followed by a space has no ASCII boundary
-// and the project name would swallow the whole tail). The verb is
-// instead followed by an explicit whitespace-or-end guard.
-const LIST_PROJECT_RE = /(?:^|\s+)(?:(?:توی|تو|در|برای|بابت)\s+)?پروژه\s+(.+?)(?=\s+(?:رو|را|نشان\s+بده|نشون\s+بده|نمایش\s+بده|بیار|بیاور|لیست|چی|چه)(?:\s|$)|\s*$)/u;
-export function parseListRequest(raw) {
-  let s = String(raw ?? "").trim().replace(/[؟?!.،,]+$/u, "");
-  s = s.replace(/^(?:لیست|فهرست)\s+/u, "");
-  const subj = LIST_SUBJECT_RE.exec(s);
-  if (!subj) return null;
-  const intent = subj[1] === "تسک" || subj[1] === "کار" ? "task-list" : "reminder-list";
-  const possessive = Boolean(subj[3] || subj[4]);
-  let rest = s.slice(subj[0].length).trim();
-  let projectName = null;
-  const pm = LIST_PROJECT_RE.exec(rest);
-  if (pm && pm[1].trim()) {
-    projectName = pm[1].trim().replace(/[؟?!.،,]+$/u, "").trim();
-    rest = `${rest.slice(0, pm.index)} ${rest.slice(pm.index + pm[0].length)}`.replace(/\s+/g, " ").trim();
-  }
-  if (rest === "") return possessive || projectName ? { intent, confidence: 1, projectName } : null;
-  if (/^(رو|را)$/.test(rest)) return possessive || projectName ? { intent, confidence: 1, projectName } : null;
-  if (LIST_TAIL_RE.test(rest)) return { intent, confidence: 1, projectName };
-  return null;
-}
 const FILE_RE = /(?<!\p{L})(خلاصه\s+اش\s+کن(?![\p{L}])|خلاصه\s+کن(?![\p{L}])|خلاصه\s+اش|این فایل را خلاصه\s+کن(?![\p{L}]))/u;
 const TRANSLATE_VERB = /(?<!\p{L})(?:ترجمه\s+(?:کن|کنید|بکن))(?![\p{L}])/u;
 function countAnchoredAmounts(text) { const toks = stripThousands(normalizeDigits(normalizeText(text))).replace(/[؟?!.،,]/g, " ").split(/\s+/).filter(Boolean); let n = 0; for (let ci = 0; ci < toks.length; ci++) if (CUR_WORDS.includes(toks[ci])) for (let s = Math.max(0, ci - 7); s < ci; s++) { const ph = parseNumberPhrase(toks.slice(s, ci), 0); if (ph && !ph.error && ph.consumed === ci - s) { n++; break; } } return n; }
@@ -542,129 +505,4 @@ if (isVaultLookup && !hasCardNumber && !/ثبت|ذخیره/u.test(raw)) return {
   // Phase 3-A: archived file retrieval ("آخرین آزمایشم رو بفرست", "تصویر کارت ملی رو بده").
   if ((/فایل|مدرک|عکس|تصویر|کارت\s*ملی|آزمایش|بیمه|گواهینامه|شناسنامه|پاسپورت|سند/u.test(raw)) && /بفرست(?!\p{L})|بده(?!\p{L})|رو\s*فرست/u.test(raw)) return { intent: "vault_file_get", confidence: 1, keywords: raw.split(/\s+/).filter(Boolean).slice(-6) };
   return { intent: "chat", confidence: 1 };
-}
-
-// 1-d-2: explicit folder phrase at the START or END only (a phrase in
-// the middle never tags). Start form returns { at: "start", rest } —
-// the text after the phrase, for longest-name-prefix resolution in
-// everyday.js; end form returns { at: "end", body, name } — the body
-// before the phrase and the trailing name, for exact resolution.
-// 1-d-6 middle form: a folder phrase between a leading keyword and the
-// colon ("یادداشت توی پروژه گلبهار: ...") returns { at: "middle",
-// body, name } — body is the phrase-stripped, re-classifiable text
-// ("یادداشت: ...", "تسک: ...", "یادآوری کن ..."), name is exact for
-// resolution. The colon is required: without it the name boundary is
-// ambiguous in a pure function, so colon-less middle phrases keep the
-// old behaviour (no tag).
-const FOLDER_START_RE = /^(?:توی|در|برای)\s+پروژه\s+([\s\S]+)$/u;
-const FOLDER_END_RE = /^([\s\S]+?)\s+(?:توی|در|برای)\s+پروژه\s+(.+?)\s*[؟?!.،,]*$/u;
-const MIDDLE_KEYWORDS = "یادداشت کن|یادداشت|تسک جدید|تسک|یادآوری کن|یادآوری"; // longest first
-const MIDDLE_TAG_RE = new RegExp(`^\\s*(?:(?:لطفا|لطفاً|ببین)\\s+)?(${MIDDLE_KEYWORDS})\\s+(?:توی|در|برای)\\s+پروژه(?:\\s+ی)?\\s+(.+?)\\s*[:：]\\s*([\\s\\S]+)$`, "ud");
-function middleTagBody(keyword, rest) { const base = keyword === "یادآوری" || keyword === "یادآوری کن" ? "یادآوری کن" : keyword.split(" ")[0]; return base === "یادآوری کن" ? `${base} ${rest}` : `${base}: ${rest}`; }
-export function stripMiddleFolderTag(text) {
-  const raw = normalizeText(text ?? "");
-  const m = MIDDLE_TAG_RE.exec(raw);
-  if (!m) return null;
-  const keyword = m[1], name = m[2].trim(), rest = m[3].trim();
-  if (!name || !rest) return null;
-  return { keyword, name, body: middleTagBody(keyword, rest), nameSpan: m.indices[2], restSpan: m.indices[3] };
-}
-
-// Phase 2-b Pillar B: known-project boundary matching. The old end
-// form captured everything after "برای پروژه " up to punctuation/EOL
-// ("گلبهار برسه", "یوتیوب ضبط ویدیوی معرفی"), so resolution returned
-// null and the badge was dropped. When the caller supplies the known
-// projects, an introducer followed by a known name/alias (longest
-// first, followed by end-of-string, whitespace, colon, or
-// punctuation) extracts ONLY that name and keeps the remaining words
-// intact. Aliases may be arrays or JSON strings (D1 stores aliases as
-// JSON text). Pure and side-effect free; daily.js stays agnostic of
-// where the project list came from — resolveFolderTag in everyday.js
-// passes the real D1 rows.
-const FOLDER_INTRO_RE = /(?:توی|تو|در|برای|بابت)\s+(?:پروژه(?:\s+ی(?=[\s:：؟?!.،,]|$))?|پوشه(?:\s+ی(?=[\s:：؟?!.،,]|$))?)\s*/gu;
-const PROJECT_BOUNDARY_RE = /[\s؟?!.،,:：]/u;
-function projectCandidates(projects) {
-  const out = [];
-  const push = (n) => {
-    const v = normalizeText(n ?? "").trim();
-    if (v && !out.includes(v)) out.push(v);
-  };
-  for (const p of projects ?? []) {
-    if (typeof p === "string") { push(p); continue; }
-    if (!p) continue;
-    push(p.name);
-    let aliases = p.aliases;
-    if (typeof aliases === "string") { try { aliases = JSON.parse(aliases); } catch { aliases = []; } }
-    if (Array.isArray(aliases)) for (const a of aliases) push(a);
-  }
-  out.sort((a, b) => b.length - a.length);
-  return out;
-}
-// Returns { name, rest } when `afterText` starts with a known project
-// name/alias at that exact position (boundary-delimited), else null.
-// `rest` is the remaining text with one immediately adjacent colon
-// stripped — the trailing words are never swallowed into the name.
-export function matchKnownProjectAt(afterText, projects) {
-  const after = normalizeText(afterText ?? "");
-  for (const c of projectCandidates(projects)) {
-    if (after === c) return { name: c, rest: "" };
-    if (after.startsWith(c)) {
-      const next = after[c.length];
-      if (next === undefined || PROJECT_BOUNDARY_RE.test(next)) {
-        let rest = after.slice(c.length).replace(/^[\s:：]+/u, "");
-        // A remainder of pure punctuation ("گلبهار.") is no remainder.
-        if (/^[\s؟?!.،,:：]+$/u.test(rest)) rest = "";
-        return { name: c, rest };
-      }
-    }
-  }
-  return null;
-}
-// Phase 2-b upgrade of the old "resolveProjectMatch": a raw candidate
-// that still has trailing words ("گلبهار برسه") resolves to the known
-// project it starts with (longest first, boundary-delimited), or null.
-export function resolveProjectName(rawCandidate, projects) {
-  const hit = matchKnownProjectAt(rawCandidate, projects);
-  return hit ? hit.name : null;
-}
-export function extractFolderTag(text, projects = null) {
-  const raw = normalizeText(text);
-  const orig = String(text ?? "");
-  const s = FOLDER_START_RE.exec(raw);
-  // normalisation is one-to-one, so raw spans map onto orig spans of
-  // the same length: the start rest is the tail of orig, the end body
-  // is the head of orig — ZWNJ survives in the returned body/rest.
-  if (s) { const rest = orig.slice(orig.length - s[1].length).trim(); if (rest) return { at: "start", rest }; }
-  // Middle before end: the end regex would otherwise swallow a middle
-  // tag whole (name = "گلبهار: <body>"), which never resolves exactly.
-  const mid = stripMiddleFolderTag(text);
-  if (mid) {
-    const name = orig.slice(mid.nameSpan[0], mid.nameSpan[1]).trim();
-    const rest = orig.slice(mid.restSpan[0], mid.restSpan[1]).trim();
-    if (name && rest) return { at: "middle", body: middleTagBody(mid.keyword, rest), name };
-  }
-  // Phase 2-b: known-name scan for mid-sentence phrases ("... برای
-  // پروژه گلبهار برسه"). Runs before the end form so a trailing-word
-  // name never falls through to an exact-match failure. The start
-  // form above already handled a leading introducer; a known hit here
-  // covers every other position, including a leading introducer that
-  // the start regex missed (leading whitespace).
-  if (Array.isArray(projects) && projects.length) {
-    FOLDER_INTRO_RE.lastIndex = 0;
-    let m;
-    while ((m = FOLDER_INTRO_RE.exec(raw)) !== null) {
-      const afterIdx = m.index + m[0].length;
-      const hit = matchKnownProjectAt(raw.slice(afterIdx), projects);
-      if (!hit) continue;
-      // raw indices map 1:1 onto orig (see the comment above).
-      const restClean = orig.slice(afterIdx + hit.name.length).replace(/^[\s:：]+/u, "").trim();
-      const before = orig.slice(0, m.index).trim();
-      const clean = /^[\s؟?!.،,:：]+$/u.test(restClean) ? "" : restClean;
-      const body = before ? (clean ? `${before} ${clean}` : before) : clean;
-      if (body) return { at: "known", name: hit.name, body };
-    }
-  }
-  const e = FOLDER_END_RE.exec(raw);
-  if (e) { const body = orig.slice(0, e[1].length).trim(); const name = e[2].trim(); if (body && name) return { at: "end", body, name }; }
-  return null;
 }
