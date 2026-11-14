@@ -1,7 +1,7 @@
 // Step 1b-2: everyday wiring (money, notes, reminders, translate,
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
-import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, IRAN_OFFSET_MIN } from "./daily.js";
+import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, IRAN_OFFSET_MIN } from "./daily.js";
 import { isRecallQuestionReminder } from "./domain/reminders/parse.js";
 export { isRecallQuestionReminder };
 import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO, resolveInterpreterModel, recoverFullNoteBody } from "./intent.js";
@@ -21,7 +21,9 @@ import { renderTaskList, resolveTaskCallback as resolveTaskCallbackCore, sendLis
 export { SEED_PROJECTS, resolveProjects, renderTaskList, TASK_LIST_FAILED_TEXT };
 import { renderNoteList, stripLeadingNotePunct, tehranParts, NOTE_LIST_FAILED_TEXT } from "./domain/notes/render.js";
 import { resolveNoteCallback as resolveNoteCallbackCore, noteCardKeyboard, insertNoteRow } from "./domain/notes/service.js";
+import { startConfirm, confirmExpenseDraft, rangeForPeriod, queryExpenseSums } from "./domain/expenses/service.js";
 export { renderNoteList, stripLeadingNotePunct, deriveNoteTitle } from "./domain/notes/render.js";
+export { startConfirm, confirmExpenseDraft, rangeForPeriod, queryExpenseSums } from "./domain/expenses/service.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
 export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی مثل /یادداشت، /تسکم، یا /اضافه کردن هزینه به کاربر پیشنهاد نده. کاربر برای ثبت موارد فقط کافی است با زبان طبیعی بنویسد یا ویس بدهد (مثلاً: «یادداشت کن فردا جلسه دارم» یا «امروز ۲۰۰ تومن نون خریدم» یا «خرجای امروز»).";
@@ -77,7 +79,7 @@ async function runDb(env, sql, params) { const db = dbOf(env); if (!db) return {
 async function allDb(env, sql, params) { const db = dbOf(env); if (!db) return []; try { const res = await db.prepare(sql).bind(...params).all(); return Array.isArray(res?.results) ? res.results : []; } catch { return []; } }
 // Single-row read that distinguishes "no row" from "query failed".
 async function firstDb(env, sql, params) { const db = dbOf(env); if (!db) return { ok: false, row: null }; try { const res = await db.prepare(sql).bind(...params).first(); return { ok: true, row: res ?? null }; } catch { return { ok: false, row: null }; } }
-async function queryExpenseSums(env, userId, range) { return sumByCurrency(await allDb(env, "SELECT amount, currency_code FROM expenses WHERE user_id = ? AND type = 'expense' AND date BETWEEN ? AND ?", [userId, range.start, range.end])); }
+
 async function recentMessages(env, userId, limit = 10) { return allDb(env, "SELECT role, content, kind, tg_file_id, file_name, file_mime FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?", [userId, limit]); }
 
 // User row: allow-list FIRST (callers guarantee it), then INSERT OR IGNORE.
@@ -132,107 +134,7 @@ async function putKv(env, key, value) { if (!env.STATE) return; try { await env.
 async function getKv(env, key) { if (!env.STATE) return null; try { const raw = await env.STATE.get(key, "json"); return raw && typeof raw === "object" ? raw : null; } catch { return null; } }
 async function delKv(env, key) { if (!env.STATE) return; try { await env.STATE.delete(key); } catch {} }
 
-// Money always needs confirmation: draft in KV, buttons carry only the short draft id (< 64 bytes).
-export async function startConfirm(env, o, type, ex) {
-  const id = newId();
-  await putKv(env, draftKey(id), { owner: o.userId, type, ...ex });
-  const jalali = formatJalali(ex.date) || ex.date;
-  await o.send(`💰 ${type === "income" ? "درآمد" : "خرج"}: ${ex.amount} ${ex.currency}${ex.item ? ` — ${ex.item}` : ""} — ${jalali}\nتأیید می‌کنی؟`, { replyMarkup: { inline_keyboard: [[{ text: "✅ تأیید", callback_data: `daily:confirm:${id}` }, { text: "❌ لغو", callback_data: `daily:cancel:${id}` }]] } });
-  return id;
-}
 
-// Confirm: insert FIRST, delete the KV draft ONLY after success. A draft
-// carrying corrects:{table,id} (0-b3 correction) is strictly an UPDATE: a
-// missing target returns "missing" and a read/update failure "failed" —
-// it must never fall through to INSERT (a deleted target must not
-// silently become a new expense). A draft carrying noteId (change-type)
-// deletes that note row after the expense insert, and reports failure
-// (draft kept for retry) if the delete fails. Returns the expense row id
-// for the correction pointer.
-// Phase 1-b-3 (amendment 6): task -> expense Confirm. Pre-check first
-// (D1 failure -> failed, draft kept; foreign/missing/not-open -> missing,
-// draft kept, NOTHING inserted), then ONE db.batch() unit: expense INSERT
-// OR IGNORE on draft_id first, conditional task delete second. Batch
-// success alone proves nothing about the second write (a zero-row
-// conditional UPDATE is not a batch error), so post-batch reading is
-// mandatory on every path, including a thrown batch (assume nothing
-// landed, re-read, apply the same branches):
-//  - stmt2 changes===1 -> full success (draft deleted, expense id found
-//    by draft_id; a retry no-op INSERT still counts as success here; a
-//    failed id lookup degrades to ok with a null id, never to "failed" —
-//    the retry would otherwise hit the missing pre-check and misreport a
-//    completed conversion as expired).
-//  - task done/deleted by another path AND expense exists -> COMPENSATE:
-//    finalize as converted-with-task-already-done (draft dropped, honest
-//    message via "converted-done"; the done task is NEVER silently
-//    deleted, the expense is NEVER duplicated, never called "missing").
-//  - task still open AND expense exists -> removal itself failed (draft
-//    kept, failed; the next Confirm re-runs the batch).
-//  - task still open AND no expense -> nothing landed (draft kept, failed).
-//  - task missing/foreign AND expense exists -> "expense-exists" (draft
-//    kept, failure reply noting the existing expense row; retry re-checks
-//    in the same order, never re-inserts).
-//  - task missing/foreign AND no expense -> missing (draft kept).
-//  - any read failure while re-reading -> failed (draft kept).
-async function confirmTaskExpense(env, userId, draftId, draft) {
-  const pre = await getTask(env, userId, draft.taskId);
-  if (!pre.ok) return { status: "failed" };
-  if (!pre.task || pre.task.status !== "open") return { status: "missing" };
-  const batch = await runDbBatch(env, [
-    { sql: "INSERT OR IGNORE INTO expenses (user_id, type, amount, currency_code, item, category, date, draft_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [userId, draft.type, draft.amount, draft.currency, draft.item || null, null, draft.date, draftId, new Date().toISOString()] },
-    { sql: "UPDATE tasks SET status = 'deleted' WHERE id = ? AND user_id = ? AND status = 'open'", params: [draft.taskId, userId] },
-  ]);
-  const stmt2Changes = batch.ok ? batch.results[1]?.meta?.changes ?? null : null;
-  if (stmt2Changes === 1) {
-    const row = await firstDb(env, "SELECT id FROM expenses WHERE draft_id = ? AND user_id = ?", [draftId, userId]);
-    await delKv(env, draftKey(draftId));
-    return { status: "ok", draft, id: row.ok && row.row ? row.row.id : null };
-  }
-  const expense = await firstDb(env, "SELECT id FROM expenses WHERE draft_id = ? AND user_id = ?", [draftId, userId]);
-  const task = await getTask(env, userId, draft.taskId);
-  if (!expense.ok || !task.ok) return { status: "failed" };
-  if (task.task && task.task.status === "open") return { status: "failed" };
-  if (task.task && expense.row) { await delKv(env, draftKey(draftId)); return { status: "converted-done", draft, id: expense.row.id }; }
-  if (!task.task && expense.row) return { status: "expense-exists" };
-  return { status: "missing" };
-}
-
-export async function confirmExpenseDraft(env, userId, id) {
-  const draft = await getKv(env, draftKey(id));
-  if (!draft) return { status: "missing" };
-  if (Number(draft.owner) !== Number(userId)) return { status: "forbidden" };
-  // 1-b-3: a task conversion draft runs its own batch + compensation
-  // chain and ALWAYS returns here — it must never fall through to the
-  // generic insert/noteId path below.
-  if (draft.taskId) return confirmTaskExpense(env, userId, id, draft);
-  let expenseId = null;
-  if (draft.corrects?.table === "expenses") {
-    // Strict correction contract: a corrects table without a valid id
-    // returns "missing" — it must never fall through to INSERT.
-    if (!Number.isInteger(draft.corrects.id) || draft.corrects.id <= 0) return { status: "missing" };
-    const old = await firstDb(env, "SELECT id FROM expenses WHERE id = ? AND user_id = ?", [draft.corrects.id, userId]);
-    if (!old.ok) return { status: "failed" };
-    if (!old.row) return { status: "missing" };
-    const r = await runDb(env, "UPDATE expenses SET type = ?, amount = ?, currency_code = ?, item = ?, date = ? WHERE id = ? AND user_id = ?", [draft.type, draft.amount, draft.currency, draft.item || null, draft.date, draft.corrects.id, userId]);
-    if (!r.ok) return { status: "failed" };
-    expenseId = draft.corrects.id;
-  }
-  if (expenseId === null) {
-    const r = await runDb(env, "INSERT OR IGNORE INTO expenses (user_id, type, amount, currency_code, item, category, date, draft_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [userId, draft.type, draft.amount, draft.currency, draft.item || null, null, draft.date, id, new Date().toISOString()]);
-    if (!r.ok) return { status: "failed" };
-    const row = await firstDb(env, "SELECT id FROM expenses WHERE draft_id = ?", [id]);
-    expenseId = row.ok && row.row ? row.row.id : null;
-  }
-  if (draft.noteId) {
-    // Change-type replaces the note: if its delete fails, do not report
-    // success — keep the draft so Confirm can be retried (INSERT OR IGNORE
-    // on draft_id makes the retry a no-op for the expense row).
-    const d = await runDb(env, "DELETE FROM notes WHERE id = ? AND user_id = ?", [draft.noteId, userId]);
-    if (!d.ok) return { status: "failed" };
-  }
-  await delKv(env, draftKey(id));
-  return { status: "ok", draft, id: expenseId };
-}
 
 // Save-first reconciliation (Phase 0-b fix): when handleDailyText saved an
 // entry row for this message, everyday branches finalise it instead of
@@ -850,13 +752,7 @@ function interpTypeKeyboard(id) {
   return [[{ text: "📋 تسک", callback_data: `interp:type:task:${id}` }, { text: "📝 یادداشت", callback_data: `interp:type:note:${id}` }], [{ text: "💰 خرج", callback_data: `interp:type:expense:${id}` }, { text: "💬 چت", callback_data: `interp:type:chat:${id}` }]];
 }
 async function newInterpRecord(env, userId, value) { const id = newId(); await putKv(env, interpKey(id), { owner: userId, ...value }); return id; }
-function rangeForPeriod(periodText, nowMs) {
-  const t = normalizeText(periodText ?? ""), today = iranDate(nowMs);
-  if (/دیروز/.test(t)) { const d = new Date(Date.parse(today) - 86400000).toISOString().slice(0, 10); return { start: d, end: d }; }
-  if (/هفته/.test(t)) return weekRange(today);
-  if (/ماه/.test(t)) return monthRange(today);
-  return { start: today, end: today };
-}
+
 // Execute ONE validated interpreter action. Money/query/translate/setting/
 // dev/chat send their own reply (direct: true); note/task/query return data
 // for the caller to present. Money always re-derives from rule code and
