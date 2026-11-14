@@ -1,7 +1,7 @@
 # STATE (update in every PR)
 
 ## Current phase
-R0.8 shrink `src/everyday.js` below 300 lines (R0.8a pipeline branches extracted)
+R0 COMPLETE (Ready for R1 Core Hardening)
 
 ## Done
 - R0.1 governance (`chore/r0-1-governance`) — ADR index (`0000`, `0001`), `docs/STATE.md`, `scripts/check-structure.mjs` + `scripts/legacy-sizes.json`, CI structure lint step.
@@ -16,16 +16,17 @@ R0.8 shrink `src/everyday.js` below 300 lines (R0.8a pipeline branches extracted
 - R0.7d domain expenses (`refactor/r0-7d-domain-expenses`) — extracted `src/domain/expenses/` modules (< 250 lines each); shrank `src/daily.js` below 300 lines and removed it from `scripts/legacy-sizes.json`; shrank `src/everyday.js` further; added `scripts/tests/13-domain-expenses.test.mjs`.
 - R0.7e platform vault & admin setup (`refactor/r0-7e-platform-vault`) — extracted `src/platform/vault/` modules and `src/admin/setup.js` (< 250 lines each); shrank `src/vault.js` and `src/connectors.js` to shims and removed both from `scripts/legacy-sizes.json`; shrank `src/everyday.js` further; added `scripts/tests/14-platform-vault.test.mjs`.
 - R0.7f skills media, pdf & voice (`refactor/r0-7f-skills-media-pdf`) — extracted `src/skills/media/*` and `src/skills/pdf/*` (< 250 lines each); shrank `src/media.js`, `src/pdf.js`, and `src/voice.js` to shims and removed all three from `scripts/legacy-sizes.json`; shrank `src/everyday.js` further; added `scripts/tests/15-skills-media-pdf.test.mjs` (2,870 checks).
-- R0.8a pipeline branches (`refactor/r0-8a-pipeline-branches`) — extracted chat context, model-slot branch, interpreter policy/runner, and NLU branch out of `src/everyday.js` into `< 250`-line modules under `src/pipeline/*`; tightened `scripts/legacy-sizes.json` (`src/everyday.js` 2,354→1,139); added `scripts/tests/16-pipeline-branches.test.mjs`.
+- R0.8a pipeline branches (`refactor/r0-8a-pipeline-branches`) — extracted chat context, model-slot branch, interpreter policy/runner, and NLU branch out of `src/everyday.js` into `< 250`-line modules under `src/pipeline/*`; added `scripts/tests/16-pipeline-branches.test.mjs`.
+- R0.8b final `src/everyday.js` reduction (`refactor/r0-8b-everyday-under-300`) — extracted `runDailyBranch`, `runSummary`, vault/file handlers, and `handleDailyText`/`resolveDailyCallback` into `< 250`-line `src/pipeline/*` modules; shrank `src/everyday.js` below 200 lines and removed it from `scripts/legacy-sizes.json` (6 legacy exceptions remain).
 
 ## In progress
-- R0.8b final `src/everyday.js` shell reduction below 300 lines
+- None — Phase R0 complete; ready to start Phase R1 Core Hardening
 
 ## Decisions
 - ADR index: `docs/adr/` (`0001-initial-decisions.md` D1–D21, `0002-offline-d1-test-harness.md`).
 
 ## Known issues / risks
-- Remaining legacy modules above 300 lines are recorded in `scripts/legacy-sizes.json` (7 files); they may only shrink.
+- Remaining legacy modules above 300 lines are recorded in `scripts/legacy-sizes.json` (6 files: `admin-page.js`, `combos.js`, `db.js`, `dev.js`, `index.js`, `router.js`); they may only shrink.
 - `src/domain/expenses/` does not yet parse `درهم`/`AED` (pinned as a documented known gap in `eval/golden-persian.json`; scheduled for R3 multi-currency accounting per Contract v3 §7.1 & §11.3).
 - `wrangler.jsonc` still defines 4 cron triggers; consolidation to a single `* * * * *` cron + `schedules` table is scheduled for R1 per Contract v3 §5 & §8.
 
@@ -36,4 +37,4 @@ R0.8 shrink `src/everyday.js` below 300 lines (R0.8a pipeline branches extracted
 - Actions minutes per month: 
 
 ## Next step
-- R0.8b extract remaining `runDailyBranch`, `handleDailyText`, `resolveDailyCallback`, `handleIncomingFile`, and `/backup` out of `src/everyday.js` so `src/everyday.js` drops below 300 lines and is removed from `scripts/legacy-sizes.json` (completing Phase R0).
+- R1.1 core schema & ingress hardening: numbered migration `0004` (`provenance` & `data_class` on `messages`, `schedules`, `approvals`, `audit_events`, `quota_usage`, `provider_state`) and `src/ingress/` (`auth.js`, `dedup.js`, `classify.js`, `provenance.js`).
