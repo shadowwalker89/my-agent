@@ -1,7 +1,7 @@
 # STATE (update in every PR)
 
 ## Current phase
-R0.7 domain extraction (R0.7c notes)
+R0.7 domain extraction (R0.7d expenses)
 
 ## Done
 - R0.1 governance (`chore/r0-1-governance`) — ADR index (`0000`, `0001`), `docs/STATE.md`, `scripts/check-structure.mjs` + `scripts/legacy-sizes.json`, CI structure lint step.
@@ -12,17 +12,18 @@ R0.7 domain extraction (R0.7c notes)
 - R0.6 pipeline extraction (`refactor/r0-6-pipeline`) — extracted `src/pipeline/validate.js` (235), `src/pipeline/route.js` (233), and `src/pipeline/interpret.js` (248); shrank `src/interpreter.js` and `src/task-route.js` to shims; shrank `src/intent.js` (240 lines) and removed it from `scripts/legacy-sizes.json` (13 legacy exceptions); shrank `src/everyday.js` (3010→2914); added `scripts/tests/09-pipeline.test.mjs`.
 - R0.7a domain reminders (`refactor/r0-7a-domain-reminders`) — extracted `src/domain/reminders/time.js` and `src/domain/reminders/parse.js`; shrank `src/daily.js` (967→670) and `src/everyday.js` (2914→2910); added `scripts/tests/10-domain-reminders.test.mjs`.
 - R0.7b domain tasks & projects (`refactor/r0-7b-domain-tasks`) — extracted `src/domain/tasks/parse.js`, `projects.js`, and `service.js` (< 250 lines each); shrank `src/daily.js` (670→508) and `src/everyday.js` (2910→2649); added `scripts/tests/11-domain-tasks.test.mjs`.
-- R0.7c domain notes (`refactor/r0-7c-domain-notes`) — extracted `src/domain/notes/` modules (< 250 lines each) from `src/daily.js` and `src/everyday.js`; tightened `scripts/legacy-sizes.json`; added `scripts/tests/12-domain-notes.test.mjs`.
+- R0.7c domain notes (`refactor/r0-7c-domain-notes`) — extracted `src/domain/notes/` modules (< 250 lines each) from `src/daily.js` and `src/everyday.js`; tightened `scripts/legacy-sizes.json`; added `scripts/tests/12-domain-notes.test.mjs` (2,827 checks).
+- R0.7d domain expenses (`refactor/r0-7d-domain-expenses`) — extracted `src/domain/expenses/` modules (< 250 lines each) from `src/daily.js` and `src/everyday.js`; shrank `src/daily.js` below 300 lines and removed it from `scripts/legacy-sizes.json` (12 legacy exceptions remain); shrank `src/everyday.js` further; added `scripts/tests/13-domain-expenses.test.mjs`.
 
 ## In progress
-- R0.7 incremental domain/skill extraction (`expenses` -> `vault` -> `media`)
+- R0.7 incremental domain/skill extraction (`vault` -> `media`)
 
 ## Decisions
 - ADR index: `docs/adr/` (`0001-initial-decisions.md` D1–D21, `0002-offline-d1-test-harness.md`).
 
 ## Known issues / risks
-- Legacy modules above 300 lines are recorded in `scripts/legacy-sizes.json`; they may only shrink.
-- `src/daily.js` does not yet parse `درهم`/`AED` (pinned as a documented known gap in `eval/golden-persian.json`; scheduled for R3 multi-currency accounting per Contract v3 §7.1 & §11.3).
+- Legacy modules above 300 lines are recorded in `scripts/legacy-sizes.json` (12 files); they may only shrink.
+- `src/daily.js` / `src/domain/expenses/` does not yet parse `درهم`/`AED` (pinned as a documented known gap in `eval/golden-persian.json`; scheduled for R3 multi-currency accounting per Contract v3 §7.1 & §11.3).
 - `wrangler.jsonc` still defines 4 cron triggers; consolidation to a single `* * * * *` cron + `schedules` table is scheduled for R1 per Contract v3 §5 & §8.
 
 ## Measurements (fill during R1)
@@ -32,4 +33,4 @@ R0.7 domain extraction (R0.7c notes)
 - Actions minutes per month: 
 
 ## Next step
-- R0.7d domain expenses extraction: extract `src/domain/expenses/` from `src/everyday.js` and `src/daily.js`.
+- R0.7e platform vault & connectors extraction: extract `src/platform/vault/` and `src/admin/setup.js` from `src/everyday.js`, `src/vault.js`, and `src/connectors.js`.
