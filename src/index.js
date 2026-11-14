@@ -28,7 +28,8 @@ import { recordVerifiedModel, recordProviderCircuitSuccess } from "./circuit.js"
 import { ADMIN_HTML } from "./admin-page.js";
 import { classifyIntent, needsConfirmation } from "./intent.js";
 import { getChatContext, buildUserMemoryHeader } from "./memory.js";
-import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, handleVaultFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, resolveVaultCallback, chatFailureNotice, formatFailureDetail, runReminderTick, quickConvertKeyboard } from "./everyday.js";
+import { buildChatContext, handleDailyText, resolveDailyCallback, ensureUserRow, dailySenders, handleDailyFile, handleVaultFile, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, resolveVaultCallback, chatFailureNotice, formatFailureDetail, quickConvertKeyboard } from "./everyday.js";
+import { runScheduledTick, makeTelegramSendMessage } from "./platform/scheduler/index.js";
 import { handleVoice, handleVoiceRetry } from "./voice.js";
 import { saveMessage, saveVaultItem, listVaultItems, getVaultItem, deleteVaultItem, setVaultSyncStatus, claimTelegramUpdateId } from "./db.js";
 import { encryptVaultValue, decryptVaultValue, getGoogleVaultConfig, googleVaultStatus, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
@@ -56,13 +57,6 @@ export const CHAT_SYSTEM_PROMPT =
 
 // kind هر combo داخلی برای «ساخت نسخه‌ی دستی» در پنل
 const AUTO_KINDS = { chat: "text", code: "code", vision: "vision", fast: "fast" };
-
-// هر cron به یک provider: 0 → openrouter، 10 → nvidia، 20 → xkiro
-const CRON_PROVIDER = {
-  "0 */6 * * *": "openrouter",
-  "10 */6 * * *": "nvidia",
-  "20 */6 * * *": "xkiro",
-};
 
 function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
@@ -2338,33 +2332,10 @@ export default {
     }
   },
   async scheduled(event, env, ctx) {
-    const provider = CRON_PROVIDER[event.cron];
-    if (provider) {
-      ctx.waitUntil(
-        (async () => {
-          try {
-            await syncProvider(env, provider);
-          } catch (err) {
-            console.error(`syncProvider(${provider}) failed:`, err && err.message);
-          }
-        })(),
-      );
-      return;
-    }
-    // 1-c-2: any non-catalog cron is the reminder tick (Siem adds the
-    // per-minute trigger to wrangler.jsonc manually at Level 3; this
-    // code never assumes a cron line it cannot see). The tick is
-    // idempotent (atomic claims), so an unexpected cron firing it is
-    // harmless; the daily purge inside runs only on the 00:00 UTC tick.
-    ctx.waitUntil(
-      (async () => {
-        try {
-          await runReminderTick(env, { scheduledTime: event.scheduledTime });
-        } catch (err) {
-          console.error("reminder tick failed:", err && err.message);
-        }
-      })(),
-    );
+    await runScheduledTick(event, env, ctx, {
+      syncProvider,
+      sendMessage: makeTelegramSendMessage(tgApi, env),
+    });
   },
 };
 // deploy-v2
