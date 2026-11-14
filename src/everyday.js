@@ -2,6 +2,8 @@
 // remember, queries, file reference + file branch). Pure classifier in
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, extractFolderTag, matchKnownProjectAt, IRAN_OFFSET_MIN } from "./daily.js";
+import { isRecallQuestionReminder } from "./domain/reminders/parse.js";
+export { isRecallQuestionReminder };
 import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO, resolveInterpreterModel, recoverFullNoteBody } from "./intent.js";
 import { saveMessage, finalizeMessageKind, redactMessageContent, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, snoozeTaskReminder, saveVaultItem, listVaultItems, getVaultItem, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, setVaultSyncStatus, upsertUserFact, exportUserBackupSnapshot } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
@@ -2156,12 +2158,6 @@ export async function resolveVaultCallback(env, o) {
 const NLU_SKIP_QUESTION_PREFIXES = ["تفاوت ", "چرا ", "چطور ", "چگونه ", "چیست", "چیه"];
 const NLU_SKIP_KEYWORDS = ["یادداشت", "تسک", "یادآوری", "یادم بنداز", "زنگ", "هزینه", "خرج", "پروژه", "پوشه", "خلاصه", "جدول"];
 export const REF_RE = /(?:^|[\s،,.:؛!؟])(همونو|همون|اونو|اینو)(?=[\s،,.:؛!؟]|$)/u;
-const RECALL_REMINDER_RE = /^(?:یادم\s+بنداز|یادت\s+باشه)(?=[\s،,.:؛!؟?]|$)/u;
-const RECALL_QUESTION_RE = /(?:چی\s*بود|چیه|کی\s*بود|کجا\s*بود|چند\s*بود|[?؟])/u;
-export function isRecallQuestionReminder(text) {
-  const t = String(text ?? "").trim();
-  return RECALL_REMINDER_RE.test(t) && RECALL_QUESTION_RE.test(t);
-}
 export function isUnambiguousQuestion(text) {
   const t = String(text ?? "").trim();
   if (!t) return false;
