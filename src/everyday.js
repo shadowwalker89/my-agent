@@ -12,6 +12,8 @@ import { parseImageGenCommand, generateFreeImage, editImage, analyzeImage, isVis
 import { CONNECTORS, getConnectorStatuses, setConnectorSecret, getConnectorSecret, renderSetupStatusText, sweepConnectorSecrets, isConnectorSecretError } from "./connectors.js";
 import { isPdfAnalysisRequest, analyzePdfDocument, buildImageToPdfBytes, buildTextPdfOrHtmlReport, parsePdfCreateCommand } from "./pdf.js";
 import { runReminderTick as runSchedulerReminderTick, makeTelegramSendMessage } from "./platform/scheduler/index.js";
+import { mapQuestion, askText, setPendingAsk, parseLanguageAnswer, slotKind, isBodySlot, kindForAskKey, getPendingAsk, clearPendingAsk, askKeyboard, hourAmbiguousKeyboard, sendHourAmbiguousAsk, reaskPending, deriveTranslateBody } from "./pipeline/route.js";
+import { maskSensitive, unmaskAction } from "./pipeline/interpret.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
 export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی مثل /یادداشت، /تسکم، یا /اضافه کردن هزینه به کاربر پیشنهاد نده. کاربر برای ثبت موارد فقط کافی است با زبان طبیعی بنویسد یا ویس بدهد (مثلاً: «یادداشت کن فردا جلسه دارم» یا «امروز ۲۰۰ تومن نون خریدم» یا «خرجای امروز»).";
@@ -24,10 +26,8 @@ const MEMORY_SAVED_TEXT = "🧠 به خاطر سپرده شد";
 const UNSUPPORTED_ACTION_TEXT = "در حال حاضر ابزار اتصال و ارسال مستقیم ایمیل فعال نیست؛ چیزی ارسال نشد. اگر بخواهی می‌توانم متنش را به‌عنوان یادداشت یا کار ذخیره کنم.";
 const iranIso = (ms) => new Date((ms ?? Date.now()) + IRAN_OFFSET_MIN * 60000).toISOString().replace(/Z$/, "+03:30");
 
-export function mapQuestion(q) { return q === "ambiguous" ? "amount" : q; } // TODO from 1b-1, resolved here
-export function askText(q) {
-  return { amount: "مبلغ چقدر بود؟", decimal: "مبلغ اعشاری در این قدم پذیرفته نیست؛ مبلغ را به عدد صحیح بگو.", period: "برای کدام دوره؟ امروز، دیروز، این هفته یا این ماه؟", date: "تاریخ را درست بگو؛ آن تاریخ معتبر نیست.", "hour-ambiguous": "ساعت را با صبح یا عصر مشخص کن.", "no-time": "ساعت یادآوری را بگو.", past: "آن زمان گذشته است؛ زمان آینده را بگو.", empty: "یادآوری برای چه کاری؟", text: "چه متنی را ترجمه کنم؟", "expense-or-chat": "این خرج است یا چت؟", "expense-or-income": "این خرج است یا درآمد؟", "note-text": "چه چیزی را یادداشت کنم؟", language: "به چه زبانی؟" }[q] ?? "دوباره بگو؟";
-}
+// Re-exported for back-compat (R0.6): definitions moved to ./pipeline/route.js.
+export { mapQuestion, askText, hourAmbiguousKeyboard };
 
 // Chat context: last 50 rows plus the 8,000-char cap, oldest dropped first.
 // Phase 1-e Pillar 3: anti-hallucination filter — historical assistant
@@ -87,56 +87,6 @@ function pendingKey(id) { return `daily:pending-ask:${id}`; }
 // Correction pointer (0-b3): last created item, 10-minute TTL via putKv.
 // {table: "notes"|"expenses", id}: only tables that exist pre-0003.
 function correctionKey(id) { return `interp:last-item:${id}`; }
-async function setPendingAsk(env, userId, question, askId, kind, pendingBody) {
-  const value = { question };
-  if (askId) value.askId = askId;
-  if (kind) value.kind = kind;
-  if (pendingBody) value.pendingBody = pendingBody;
-  await putKv(env, pendingKey(userId), value);
-}
-// Language-name mapper for deterministic language-slot answers (en/fa/ar
-// only, the pre-existing everyday target restriction — "German" re-asks).
-function parseLanguageAnswer(text) {
-  const t = String(text ?? "").trim().toLowerCase().replace(/^به\s+/u, "").replace(/[؟?!.،,:：\s]+$/u, "");
-  if (["en", "english", "انگلیسی", "انگليسي"].includes(t)) return "en";
-  if (["fa", "persian", "farsi", "فارسی", "فارسي"].includes(t)) return "fa";
-  if (["ar", "arabic", "عربی", "عربي"].includes(t)) return "ar";
-  return null;
-}
-
-// Slot kind, with a defensive fallback for slots built without one (Part 3
-// slots): button slots by askId, otherwise reverse the ask text to its key.
-function slotKind(slot) {
-  if (!slot || typeof slot !== "object") return "other";
-  if (slot.kind) return slot.kind;
-  if (slot.askId) return "button";
-  for (const key of ["amount", "decimal", "period", "date", "hour-ambiguous", "no-time", "past", "empty", "text", "expense-or-chat", "expense-or-income", "note-text", "language"]) {
-    if (slot.question === askText(key)) return key === "text" ? "translate-text" : key;
-  }
-  return "other";
-}
-// Slots whose question must survive a skipped/failed model call: dropping
-// them would lose the question (Part 3b deviation from the generic skip rule).
-function isBodySlot(slot) { return ["note-text", "translate-text", "language"].includes(slotKind(slot)); }
-// Rule ask key -> slot kind ("text" is the translate-body ask).
-function kindForAskKey(key) { return key === "text" ? "translate-text" : key; }
-async function getPendingAsk(env, userId) { return getKv(env, pendingKey(userId)); }
-async function clearPendingAsk(env, userId) { await delKv(env, pendingKey(userId)); }
-function askKeyboard(question, id) {
-  return question === "expense-or-chat"
-    ? [[{ text: "💰 خرج", callback_data: `daily:ask:${id}:expense` }, { text: "💬 چت", callback_data: `daily:ask:${id}:chat` }]]
-    : [[{ text: "💸 خرج", callback_data: `money:dir:spend:${id}` }, { text: "💰 درآمد", callback_data: `money:dir:income:${id}` }]];
-}
-// Phase 1-e Pillar 3: 1-tap disambiguation for hour-ambiguous asks.
-// Attached EVERY time the bot sends "ساعت را با صبح یا عصر مشخص کن."
-// (rule ask, discharge re-ask, NLU reminder ask, short-token hold), so
-// the user never has to type a daypart. Handled by resolveAskCallback.
-export function hourAmbiguousKeyboard() {
-  return [[{ text: "☀️ صبح", callback_data: "ask:dp:صبح" }, { text: "🌇 عصر", callback_data: "ask:dp:عصر" }], [{ text: "❌ انصراف", callback_data: "ask:cancel" }]];
-}
-async function sendHourAmbiguousAsk(o) {
-  await o.send(askText("hour-ambiguous"), { replyMarkup: { inline_keyboard: hourAmbiguousKeyboard() } });
-}
 // 1-d-1: 1-tap quick-convert buttons for chat replies. The callback
 // handlers (qconv:note:<msgId> / qconv:task:<msgId>) land in 1-d-5;
 // messageId is the saved user message row id (o.entryMessageId), never
@@ -625,19 +575,6 @@ async function runDailyBranch(env, o, c, ctx) {
   return "chat";
 }
 
-// Re-ask the pending question after a model failure (Part 3); button asks reuse the SAME ask id.
-async function reaskPending(env, o, slot) {
-  if (slot.askId) {
-    const ask = await getKv(env, askKey(slot.askId));
-    if (!ask || Number(ask.owner) !== Number(o.userId) || (ask.question !== "expense-or-chat" && ask.question !== "expense-or-income")) { await o.send(EXPIRED_TEXT); return; }
-    await o.send(askText(ask.question), { replyMarkup: { inline_keyboard: askKeyboard(ask.question, slot.askId) } });
-    await setPendingAsk(env, o.userId, askText(ask.question), slot.askId, "button", slot.pendingBody);
-    return;
-  }
-  await o.send(slot.question);
-  await setPendingAsk(env, o.userId, slot.question, undefined, slotKind(slot), slot.pendingBody);
-}
-
 // Follow-up resolution (Part 3): only with a slot AND a model followup.
 // Returns {ret, outcome}, or null to fall through to the normal switch.
 // Money safety is unchanged: rule extraction + confirm flow, no record without Confirm.
@@ -673,15 +610,6 @@ async function resolveFollowup(env, o, slot, m, ctx) {
   // the same question is re-asked instead of dumping "yes" into chat.
   if (m.intent !== "chat") return null;
   await o.send(slot.question); await setPendingAsk(env, o.userId, slot.question, undefined, slotKind(slot), slot.pendingBody); return { ret: "handled", outcome: "asked" };
-}
-
-// Translate body derivation, shared by the translate case and the
-// invalid-target ask: rule body first, then a "text: body" colon fallback.
-function deriveTranslateBody(text, ctx) {
-  const c2 = classifyDaily(text, { nowMs: ctx.now, rememberedCurrency: ctx.remembered });
-  let body = c2.intent === "translate" ? c2.text : null;
-  if (!body) { const colon = /[:：]\s*([\s\S]+)/.exec(text); body = colon ? colon[1].trim() : null; }
-  return body || null;
 }
 
 // Model step (Part 3): the model only picks the branch; every branch below
@@ -1551,31 +1479,7 @@ async function recordInterpError(env, reason) {
   await putKvTtl(env, BREAKER_ERRORS_KEY, { list }, Math.round(BREAKER_WINDOW_MS / 1000));
   if (list.length >= BREAKER_MAX_ERRORS) await putKvTtl(env, BREAKER_FLAG_KEY, { until: now + BREAKER_TTL_SEC * 1000 }, BREAKER_TTL_SEC);
 }
-// Backup masking: only the message itself goes out — no history, no
-// project list. Phones -> {P1}, links -> {U1}, amounts -> {A1}, in ONE
-// replace pass (so a later class can never re-mask the digit inside an
-// inserted placeholder); every placeholder is restored locally in all
-// text-like action fields BEFORE validation/policy, so validators still
-// see the real values and a dropped placeholder degrades to an ask,
-// never a wrong number.
-const SENSITIVE_RE = /https?:\/\/\S+|www\.\S+|(\+98|0098|0)?9\d{9}|[۰-۹0-9]+(?:[٬,،][۰-۹0-9]+)*/g;
-function maskSensitive(text) {
-  const table = {}; let nP = 0, nU = 0, nA = 0;
-  const masked = String(text ?? "").replace(SENSITIVE_RE, (m) => {
-    let k;
-    if (/^https?:\/\/|^www\./.test(m)) k = `{U${++nU}}`;
-    else if (/^(\+98|0098|0)?9\d{9}$/.test(m)) k = `{P${++nP}}`;
-    else k = `{A${++nA}}`;
-    table[k] = m; return k;
-  });
-  return { masked, table };
-}
-function unmaskAction(action, table) {
-  const fix = (v) => typeof v === "string" ? v.replace(/\{(?:P|U|A)\d+\}/g, (k) => table[k] ?? k) : v;
-  const out = { ...action, text: fix(action.text), due_text: fix(action.due_text), remind_text: fix(action.remind_text), amount_text: fix(action.amount_text) };
-  if (action.query) out.query = { ...action.query, periodText: fix(action.query.periodText), project: fix(action.query.project) };
-  return out;
-}
+// Backup masking (R0.6) lives in ./pipeline/interpret.js.
 // Backup call seam: tests inject o.backupCallFn (masked text -> raw JSON
 // string), mirroring interpreterCallFn. No provider endpoint is guessed:
 // the backup provider is still unchosen (the 3.7 human step), so without
