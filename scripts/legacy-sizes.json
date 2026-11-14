@@ -1,14 +1,12 @@
 {
   "src/admin-page.js": 2710,
   "src/combos.js": 392,
-  "src/connectors.js": 384,
   "src/db.js": 1160,
   "src/dev.js": 863,
-  "src/everyday.js": 2397,
+  "src/everyday.js": 2354,
   "src/index.js": 2341,
   "src/media.js": 848,
   "src/pdf.js": 370,
   "src/router.js": 1066,
-  "src/vault.js": 396,
   "src/voice.js": 333
 }

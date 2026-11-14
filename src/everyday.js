@@ -11,8 +11,9 @@ import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadData } from "./channels/telegram.js"; import { escapeHtml, formatTelegramHtml } from "./pipeline/respond.js";
 import { encryptVaultValue, decryptVaultValue, syncVaultItemToGoogle, syncVaultFileToGoogle } from "./vault.js";
 import { parseImageGenCommand, generateFreeImage, editImage, analyzeImage, isVisionQuestionCaption, isImageEditCaption } from "./media.js";
-import { CONNECTORS, getConnectorStatuses, setConnectorSecret, getConnectorSecret, renderSetupStatusText, sweepConnectorSecrets, isConnectorSecretError } from "./connectors.js";
-import { isPdfAnalysisRequest, analyzePdfDocument, buildImageToPdfBytes, buildTextPdfOrHtmlReport, parsePdfCreateCommand } from "./pdf.js";
+import { CONNECTORS, getConnectorStatuses, setConnectorSecret, getConnectorSecret, isConnectorSecretError } from "./connectors.js";
+import { renderSetupStatusText, sweepConnectorSecrets } from "./platform/vault/sweep.js";
+import { handleSetupCommand } from "./admin/setup.js"; import { isPdfAnalysisRequest, analyzePdfDocument, buildImageToPdfBytes, buildTextPdfOrHtmlReport, parsePdfCreateCommand } from "./pdf.js";
 import { runReminderTick as runSchedulerReminderTick, makeTelegramSendMessage } from "./platform/scheduler/index.js";
 import { mapQuestion, askText, setPendingAsk, parseLanguageAnswer, slotKind, isBodySlot, kindForAskKey, getPendingAsk, clearPendingAsk, askKeyboard, hourAmbiguousKeyboard, sendHourAmbiguousAsk, reaskPending, deriveTranslateBody } from "./pipeline/route.js";
 import { maskSensitive, unmaskAction } from "./pipeline/interpret.js";
@@ -1887,53 +1888,9 @@ export async function handleDailyText(env, o) {
   if (!dbOf(env)) { await clearPendingAsk(env, userId); return "chat"; } // D1 unavailable: everyday off, chat keeps working
   {
     const raw = String(text ?? "").trim();
-    const isSetupList = raw === "/setup" || raw === "تنظیمات کانکتورها" || raw === "وضعیت کانکتورها";
-    const setupSet = raw.match(/^\/(?:setup)\s+([A-Za-z0-9_]+)\s+(.+)$/) || raw.match(/^تنظیم کانکتور\s+([A-Za-z0-9_]+)\s+(.+)$/);
     const isBackup = raw === "/backup" || raw === "بکاپ اطلاعات" || raw === "پشتیبان‌گیری";
-    const isConnectorSweep = raw === "/setup sweep" || raw === "رمزنگاری مجدد کانکتورها";
-    if (isConnectorSweep) {
-      if (o.chatType !== "private") {
-        if (typeof o.send === "function") await o.send("❌ این دستور فقط برای مالک در چت خصوصی مجاز است.");
-        return "handled";
-      }
-      const r = await sweepConnectorSecrets(env, { limit: 100, callerId: o.userId });
-      if (typeof o.send === "function") {
-        if (r.ok) await o.send(`✅ مهاجرت کلیدها: بررسی ${r.scanned}، رمزنگاری ${r.encrypted}، از پیش رمزنگاری ${r.alreadyEncrypted}، ناموفق ${r.decryptFailed + r.failed}، نامعتبر ${r.invalid}، باقی‌مانده ${r.remaining}${r.complete ? " (کامل)" : ""}.`);
-        else await o.send(`❌ مهاجرت کلیدها انجام نشد: ${r.error || (r.changed ? "تغییر همزمان" : "خطا")} (باقی‌مانده ${r.remaining}).`);
-      }
-      return "handled";
-    }
-    if (isSetupList) {
-      const statuses = await getConnectorStatuses(env, {}, userId);
-      if (typeof o.send === "function") await o.send(renderSetupStatusText(statuses));
-      return "handled";
-    }
-    if (setupSet) {
-      // Raw connector credentials are accepted only in a private chat for
-      // every supported alias (/setup and تنظیم کانکتور).
-      if (o.chatType !== "private") {
-        const existing = o.messageRowId ?? o.msgId ?? o.entryMessageId ?? null;
-        if (existing) { try { await redactMessageContent(env, userId, existing, CONNECTOR_PRIVATE_ONLY_TEXT); } catch {} }
-        if (typeof o.send === "function") await o.send(CONNECTOR_PRIVATE_ONLY_TEXT);
-        return "handled";
-      }
-      const cid = setupSet[1].trim().toLowerCase();
-      const value = setupSet[2].trim().split(/\s+/)[0];
-      if (!CONNECTORS.some((c) => c.id === cid) || !value) {
-        if (typeof o.send === "function") await o.send(`⚙️ کانکتور نامعتبر است. کانکتورهای مجاز: ${CONNECTORS.map((c) => c.id).join("، ")}`);
-        return "handled";
-      }
-      const r = await setConnectorSecret(env, userId, cid, value);
-      try {
-        const saved = await saveMessage(env, { userId, role: "user", content: "[🔒 کلید کانکتور]", kind: "daily" });
-        if (saved.ok && saved.id) { o.entryMessageId = saved.id; await redactMessageContent(env, userId, saved.id, "[🔒 کلید کانکتور]"); }
-        const existing = o.messageRowId ?? o.msgId ?? null;
-        if (existing && Number(existing) !== Number(saved.id)) await redactMessageContent(env, userId, existing, "[🔒 کلید کانکتور]");
-      } catch {}
-      if (r && r.ok === false) { if (typeof o.send === "function") await o.send("❌ ذخیره کلید کانکتور ناموفق بود."); return "handled"; }
-      if (typeof o.send === "function") await o.send(`✅ کانکتور **${cid}** با موفقیت تنظیم و فعال شد.`);
-      return "handled";
-    }
+    const handled = await handleSetupCommand(env, o);
+    if (handled === "handled") return "handled";
     if (isBackup) {
       const snap = await exportUserBackupSnapshot(env, userId, { nowMs: now });
       const json = JSON.stringify(snap, null, 2);
