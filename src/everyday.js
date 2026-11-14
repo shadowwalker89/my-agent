@@ -33,6 +33,8 @@ import { REF_RE, isUnambiguousQuestion } from "./pipeline/nlu-skip.js";
 import { runDailyBranch as runDailyBranchCore } from "./pipeline/daily-branch.js";
 import { runSummary as runSummaryCore, SUMMARY_SYSTEM } from "./pipeline/summary.js";
 import { VAULT_REDACTED_TEXT } from "./pipeline/daily-helpers.js";
+import { handleIncomingFile as handleIncomingFileCore, handleVaultFile as handleVaultFileCore, namePendingVaultFile as namePendingVaultFileCore, fileBytesFromTelegram as fileBytesFromTelegramCore, analyzeVaultImage as analyzeVaultImageCore } from "./pipeline/vault-files.js";
+import { resolveVaultCallback as resolveVaultCallbackCore } from "./pipeline/vault-callbacks.js";
 export { SUMMARY_SYSTEM };
 
 export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی مثل /یادداشت، /تسکم، یا /اضافه کردن هزینه به کاربر پیشنهاد نده. کاربر برای ثبت موارد فقط کافی است با زبان طبیعی بنویسد یا ویس بدهد (مثلاً: «یادداشت کن فردا جلسه دارم» یا «امروز ۲۰۰ تومن نون خریدم» یا «خرجای امروز»).";
@@ -82,314 +84,34 @@ export async function runReminderTick(env, opts = {}) {
     sendMessage: opts.sendMessage ?? makeTelegramSendMessage(tgApi, env),
   });
 }
-// Phase 3-A: secure file/archive vault helpers.
-
-function stripCaptionPrefix(caption) {
-  return String(caption ?? "").replace(/^(?:ذخیره\s*[-:]\s*|ثبت\s*[-:]\s*|ذخیره‌اش\s*کن\s*|ثبت‌اش\s*کن\s*|بذر\s*)/u, "").trim() || null;
-}
-
-// Strips a conversational naming prefix ("بذار آخرین آزمایش" -> "آخرین آزمایش").
-// Returns null unless an actual naming prefix was present, so a pending
-// upload is never renamed by an unrelated message.
-function stripNamingPrefix(text) {
-  const t = String(text ?? "");
-      const m = /^(?:بذار\s+|اسمش\s+رو\s+بذار\s+|عنوانش\s+رو\s+بذار\s+|ذخیره\s*[-:]\s*کن\s*به\s*اسم\s*|ثبت\s*[-:]\s*کن\s+|ذخیره\s+به\s*اسم\s*|ثبت\s+به\s*اسم\s*)\s*([\s\S]+)$/u.exec(t);
-  return m ? m[1].trim() || null : null;
-}
-
-// Escapes Telegram markdown metacharacters so user content stays literal.
-function mdEscape(s) { return String(s ?? "").replace(/\*\*/g, "* *").replace(/`/g, "\\`"); }
-
-function csvField(v) {
-  const s = String(v ?? "");
-  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
-function csvRow(...fields) { return fields.map(csvField).join(","); }
 
 async function fileBytesFromTelegram(env, tgFileId) {
-  const data = await getFileDownloadData(env, tgFileId);
-  if (!data) return null;
-  // getFileDownloadData returns { data: ArrayBuffer, filePath, contentType };
-  // accept { bytes } / { ok, bytes } too so callers never silently drop a
-  // photo because of a shape mismatch.
-  const raw = data.bytes ?? data.data ?? data.arrayBuffer ?? data.body ?? null;
-  if (raw == null) return null;
-  if (raw instanceof Uint8Array) return raw;
-  if (typeof raw === "string") {
-    try { return raw ? new Uint8Array([...raw].map((c) => c.charCodeAt(0))) : new Uint8Array(0); } catch { return null; }
-  }
-  try { return new Uint8Array(raw); } catch { return null; }
+  return fileBytesFromTelegramCore(env, tgFileId, { tgApi, getFileDownloadData, sendDocument, sendPhoto });
 }
 
-const VAULT_CAPTION_RE = /(?:ذخیره|آرشیو|گاوصندوق|ثبت)\s*(?:کن)?|(?:کارت\s*ملی|شناسنامه|پاسپورت|گواهینامه|بیمه\s*نامه|بیمه‌نامه|آزمایش|سند|مدرک|قرارداد)/i;
-const VISION_CAPTION_RE = /(?:تحلیل|بررسی|بخون|بخوان|ترجمه|توضیح|چیه|چیست|خلاصه|OCR)/i;
-
 async function analyzeVaultImage(env, file, prompt, userId = null) {
-  const arr = await fileBytesFromTelegram(env, file.tg_file_id);
-  let key = null;
-  try { key = await getConnectorSecret(env, userId ?? file.user_id ?? null, "gemini"); } catch (e) { if (isConnectorSecretError(e)) throw e; }
-  if (!arr || !arr.length || !key) return null;
-  let bin = "";
-  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
-  const b64 = btoa(bin);
-  const mime = file.mime_type || "image/jpeg";
-  const userPrompt = prompt ? `${prompt}\\n` : "";
-  const fullPrompt = `${userPrompt}لطفاً این تصویر/فایل را تحلیل کن، متن آن را استخراج کن و به فارسی پاسخ بده.`;
-  for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) {
-    try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: fullPrompt }, { inline_data: { mime_type: mime, data: b64 } }] }] }) });
-      const json = await res.json().catch(() => null);
-      const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
-      if (res.ok && text) return text;
-    } catch {}
-  }
-  return null;
+  return analyzeVaultImageCore(env, file, prompt, userId, { tgApi, getFileDownloadData, sendDocument, sendPhoto });
 }
 
 export async function handleIncomingFile(env, o) {
-  return handleVaultFile(env, o);
+  return handleIncomingFileCore(env, o, { tgApi, getFileDownloadData, sendDocument, sendPhoto });
 }
 
-// Case A (caption) / Case B (no caption) for incoming document/photo uploads.
 export async function handleVaultFile(env, o) {
-  try {
-  const { userId, chatId, tgFileId, fileType, mimeType, fileName, caption, send } = o;
-  if (!dbOf(env)) return false;
-  const cap = typeof caption === "string" ? caption.trim() : "";
-  const kind = o.kind || fileType;
-  const isPhoto = kind === "photo" || fileType === "photo" || (typeof mimeType === "string" && mimeType.startsWith("image/"));
-  if (cap && isPdfAnalysisRequest(cap, mimeType, fileName)) {
-    const pdfBytesPdf = await fileBytesFromTelegram(env, tgFileId);
-    if (!pdfBytesPdf || !pdfBytesPdf.length) { await send("تحلیل ممکن نشد."); return true; }
-    const chatFn = typeof o.chatFn === "function" ? o.chatFn : null;
-    const resultPdf = await analyzePdfDocument(env, { pdfBytes: pdfBytesPdf, prompt: cap, userId, fetchFn: o.fetchFn, chatFn, routerCallFn: o.routerCallFn });
-    if (resultPdf && resultPdf.ok && resultPdf.text) await send(resultPdf.text);
-    else await send(resultPdf?.text || resultPdf?.error || "تحلیل ممکن نشد.");
-    return true;
-  }
-  const mentionsPdf = isPhoto && cap && /(?:\bpdf\b|پی‌دی‌اف|پی\s*دی\s*اف)/i.test(cap);
-  const wantsPdf = mentionsPdf && (/^\s*pdf\s*$/i.test(cap) || /(?:تبدیل|ساخت|درست|کن|بساز|بده|برام|برایم|convert|make)/i.test(cap));
-  if (wantsPdf) {
-    const photoBytesPdf = await fileBytesFromTelegram(env, tgFileId);
-    if (!photoBytesPdf || !photoBytesPdf.length) { await send("تبدیل به PDF ممکن نشد."); return true; }
-    const pdfBytesOut = buildImageToPdfBytes(photoBytesPdf);
-    let pdfSent = false;
-    if (typeof o.sendDocument === "function") {
-      try { const r = await o.sendDocument(pdfBytesOut, { filename: "photo.pdf", contentType: "application/pdf" }); pdfSent = !(r && r.ok === false); } catch {}
-    }
-    if (!pdfSent && (env?.TELEGRAM_BOT_TOKEN || env?.TG_TOKEN) && chatId) {
-      try { const r = await sendDocument({ ...env, TG_TOKEN: env.TG_TOKEN || env.TELEGRAM_BOT_TOKEN }, chatId, "photo.pdf", pdfBytesOut, { contentType: "application/pdf" }); pdfSent = !(r && r.ok === false); } catch {}
-    }
-    if (!pdfSent && typeof send === "function") await send("تبدیل به PDF ممکن نشد.");
-    return true;
-  }
-  if (isPhoto && cap && isImageEditCaption(cap)) {
-    const bytes = await fileBytesFromTelegram(env, tgFileId);
-    if (!bytes || !bytes.length) { await send("ویرایش تصویر ممکن نشد."); return true; }
-    const edited = await editImage(env, { imageBytes: bytes, mimeType: mimeType || "image/jpeg", instruction: cap, userId, fetchFn: o.fetchFn });
-    if (edited && edited.ok) {
-      let photoSent = false;
-      if (typeof o.sendPhoto === "function") { await o.sendPhoto(edited.bytes, { caption: "🖼️ تصویر ویرایش‌شده", mimeType: edited.mimeType }); photoSent = true; }
-      else if (env?.TELEGRAM_BOT_TOKEN && chatId) { await sendPhoto(env, chatId, "edited.jpg", edited.bytes, { caption: "🖼️ تصویر ویرایش‌شده", contentType: edited.mimeType }); photoSent = true; }
-      else if (env?.TG_TOKEN && chatId) { await sendPhoto({ ...env, TELEGRAM_BOT_TOKEN: env.TG_TOKEN }, chatId, "edited.jpg", edited.bytes, { caption: "🖼️ تصویر ویرایش‌شده", contentType: edited.mimeType }); photoSent = true; }
-      if (!photoSent && typeof send === "function") await send("🖼️ تصویر ویرایش‌شده آماده شد.");
-    } else {
-      if (typeof send === "function") await send(edited?.reason || "ویرایش تصویر ممکن نشد.");
-    }
-    return true;
-  }
-  if (isPhoto && cap && !VAULT_CAPTION_RE.test(cap)) {
-    try {
-      const bytes = await fileBytesFromTelegram(env, tgFileId);
-      if (!bytes || !bytes.length) { await send("تحلیل ممکن نشد."); return true; }
-      const result = await analyzeImage(env, { imageBytes: bytes, mimeType: mimeType || "image/jpeg", prompt: cap, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
-      if (result && result.ok && result.text) await send(result.text);
-      else await send("❌ خطا در تحلیل تصویر: " + (result?.error || result?.text || "vision_unavailable"));
-    } catch (e) {
-      await send("❌ خطا در تحلیل تصویر: " + (e?.message || "vision_unavailable"));
-    }
-    return true;
-  }
-  // Case 1: explicit vault caption
-  if (cap && VAULT_CAPTION_RE.test(cap)) {
-    const title = stripCaptionPrefix(cap) || stripNamingPrefix(cap) || cap;
-    const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title, fileName, caption: cap, syncStatus: "local" });
-    if (!saved || !saved.ok) { await send(NOT_SAVED_TEXT); return true; }
-    let syncInfo = "";
-    if (saved.ok) {
-      const bytes = await fileBytesFromTelegram(env, tgFileId);
-      const sync = await syncVaultFileToGoogle(env, { id: saved.id, userId, label: title, fileName, mimeType, data: bytes ?? new Uint8Array(0), createdAt: new Date().toISOString() });
-      await setFileSyncStatus(env, userId, saved.id, sync.ok ? "synced" : "pending_google", sync.googleId ?? null, null);
-      syncInfo = sync.ok ? `\\n✅ گوگل Docs/Drive${sync.googleId ? ` (${sync.googleId})` : ""}: ذخیره شد` : "\\n⏳ در انتظار همگام‌سازی گوگل";
-    }
-    await send(`🔒📁 مدرک «**${mdEscape(title)}**» در آرشیو امن ذخیره شد.${syncInfo}`);
-    return true;
-  }
-  // Case 2: explicit vision/analysis caption
-  if (cap && VISION_CAPTION_RE.test(cap)) {
-    const bytes2 = await fileBytesFromTelegram(env, tgFileId);
-    let visionError = null;
-    if (bytes2 && bytes2.length) {
-      const r2 = await analyzeImage(env, { imageBytes: bytes2, mimeType: mimeType || "image/jpeg", prompt: cap, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
-      if (r2 && r2.ok && r2.text) { await send(r2.text); return true; }
-      visionError = r2?.error || r2?.text || null;
-    }
-    const f = { tg_file_id: tgFileId, mime_type: mimeType, file_type: fileType };
-    const text = await analyzeVaultImage(env, f, cap, userId);
-    await send(text || ("❌ خطا در تحلیل تصویر: " + (visionError || "vision_unavailable")));
-    return true;
-  }
-  // Case 3: no caption / general caption -> choice buttons
-  const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title: "__choice__", fileName, caption: cap || null, syncStatus: "local" });
-  if (!saved.ok) { await send(NOT_SAVED_TEXT); return true; }
-  await send("📎 <b>تصویر/فایل دریافت شد. چه کاری انجام دهم؟</b>", { replyMarkup: { inline_keyboard: [
-    [{ text: "🔍 تحلیل تصویر / استخراج متن", callback_data: `vault:analyze:${saved.id}` }],
-    [{ text: "🔒 ذخیره در گاوصندوق امن", callback_data: `vault:askname:${saved.id}` }],
-    [{ text: "❌ انصراف", callback_data: `vault:cancel:${saved.id}` }],
-  ] } });
-  return true;
-  } catch (e) {
-    if (isConnectorSecretError(e)) {
-      if (typeof o.send === "function") await o.send("❌ کلید کانکتور قابل خواندن نیست؛ لطفاً دوباره تنظیم کنید.");
-      return true;
-    }
-    throw e;
-  }
+  return handleVaultFileCore(env, o, { tgApi, getFileDownloadData, sendDocument, sendPhoto });
 }
 
-// Next-turn naming for a pending __pending__ vault upload. Returns true when
-// the incoming text/voice named the file.
 async function namePendingVaultFile(env, o) {
-  const { userId, text, send } = o;
-  if (!text || /^\s*\//.test(text)) return false;
-  // A07 escape hatch: never consume the user's next turn as a pending-file
-  // name when the turn is actually an actionable message or a command.
-  const trimmed = String(text).trim();
-  const cg = classifyDaily(trimmed, { nowMs: o.nowMs ?? Date.now() });
-  if (["note", "task", "task-create", "task-delete", "reminder", "expense", "income", "memory_save", "unsupported_action", "vault_save", "vault_get", "vault_list", "vault_file_get", "command"].includes(cg.intent)) return false;
-  if (/(?:یادداشت|تسک|یادآوری)\s*کن/u.test(trimmed) || /یادداشت[^\n]{0,24}(?:ثبت|ذخیره)\s*کن/u.test(trimmed) || /^ثبت\s*کن(?:\s|$)/u.test(trimmed)) return false;
-  if (/لغو|انصراف/.test(trimmed)) return false;
-  const cleanTitle = stripNamingPrefix(text) || trimmed;
-  if (!cleanTitle) return false;
-  let pend = await resolvePendingVaultFile(env, Number(userId), cleanTitle);
-  if (!pend.ok || !pend.file) {
-    pend = await resolvePendingVaultFile(env, userId, cleanTitle);
-  }
-  if (!pend.ok || !pend.file) return false;
-  const f = pend.file;
-  const bytes = await fileBytesFromTelegram(env, f.tg_file_id);
-  const sync = await syncVaultFileToGoogle(env, { id: f.id, userId, label: f.title, fileName: f.fileName, mimeType: f.mimeType, data: bytes ?? new Uint8Array(0), createdAt: f.created_at });
-  await setFileSyncStatus(env, userId, f.id, sync.ok ? "synced" : "pending_google", sync.googleId ?? null, null);
-  // A15 honesty: claim Google Docs only when Google actually synced with an id.
-  if (sync.ok && sync.googleId) {
-    await send(`🔒📁 مدرک «<b>${cleanTitle}</b>» در آرشیو امن و Google Docs ثبت شد.`);
-  } else {
-    await send(`✅ نام فایل ثبت شد: **${cleanTitle}**${sync.ok ? "" : "\n⏳ در انتظار همگام‌سازی گوگل"}`);
-  }
-  return true;
+  return namePendingVaultFileCore(env, o, { tgApi, getFileDownloadData, sendDocument, sendPhoto });
 }
 
-// Vault callbacks: vault:csv, vault:sync, vault:file:<id>.
 export async function resolveVaultCallback(env, o) {
-  try {
-  const analyze = /^vault:analyze:(\d+)$/.exec(o.data);
-  if (analyze) {
-    const id = Number(analyze[1]);
-    const f = await getVaultFile(env, o.fromId, id);
-    if (!f) { await o.send("مدرکی پیدا نشد."); return true; }
-    const text = await analyzeVaultImage(env, f, null, o.fromId);
-    await o.send(text || "تحلیل ممکن نشد.");
-    return true;
-  }
-  const askname = /^vault:askname:(\d+)$/.exec(o.data);
-  if (askname) {
-    const id = Number(askname[1]);
-    const f = await getVaultFile(env, o.fromId, id);
-    if (!f) { await o.send("مدرکی پیدا نشد."); return true; }
-    const cap = typeof f.caption === "string" ? f.caption.trim() : "";
-    if (cap) {
-      await runDb(env, "UPDATE vault_files SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?", [cap, new Date().toISOString(), id, o.fromId]);
-      const row = await getVaultFile(env, o.fromId, id);
-      const bytes = await fileBytesFromTelegram(env, f.tg_file_id);
-      const sync = await syncVaultFileToGoogle(env, { id, userId: o.fromId, label: cap, fileName: f.file_name, mimeType: f.mime_type, data: bytes ?? new Uint8Array(0), createdAt: f.created_at });
-      await setFileSyncStatus(env, o.fromId, id, sync.ok ? "synced" : "pending_google", sync.googleId ?? null, null);
-      await o.send(`🔒📁 مدرک «<b>${cap}</b>» در گاوصندوق امن ذخیره شد.`);
-      return true;
-    }
-    await runDb(env, "UPDATE vault_files SET title = '__pending__', updated_at = ? WHERE id = ? AND user_id = ?", [new Date().toISOString(), id, o.fromId]);
-    await o.send("🔒 با چه عنوانی در گاوصندوق امن ذخیره شود؟ (مثلاً بنویسید یا ویس بدهید: «بیمه نامه ۲۰۶» یا «آخرین آزمایش»)");
-    return true;
-  }
-  const cancel = /^vault:cancel:(\d+)$/.exec(o.data);
-  if (cancel) {
-    const id = Number(cancel[1]);
-    await runDb(env, "DELETE FROM vault_files WHERE id = ? AND user_id = ?", [id, o.fromId]);
-    if (typeof o.editText === "function") { try { const r = await o.editText("❌ لغو شد."); if (r && r.ok !== false) return true; } catch {} }
-    await o.send("❌ لغو شد.");
-    return true;
-  }
-  const csv = /^vault:csv$/.exec(o.data);
-  if (csv) {
-    const items = (await listVaultItems(env, o.fromId)).items || [];
-    const lines = ["ID,Category,Title,Value,Extra,UpdatedAt"];
-    for (const it of items) {
-      const row = await getVaultItem(env, o.fromId, it.id);
-      let value = "";
-      try { if (row) value = await decryptVaultValue(env, row.value_enc); } catch {}
-      lines.push(csvRow(it.id, it.category ?? "", it.label ?? "", value, it.extra ?? "", it.updated_at ?? ""));
-    }
-    const body = "\uFEFF" + lines.join("\r\n") + "\r\n";
-    await sendDocument(env, o.chatId, "personal-vault.csv", body, { contentType: "text/csv" });
-    return true;
-  }
-  const sync = /^vault:sync$/.exec(o.data);
-  if (sync) {
-    let done = 0, failed = 0;
-    const items = (await listVaultItems(env, o.fromId)).items || [];
-    for (const it of items) {
-      if (it.sync_status === "synced") continue;
-      let value = "";
-      try { value = await decryptVaultValue(env, it.value_enc); } catch {}
-      const r = await syncVaultItemToGoogle(env, { id: it.id, userId: o.fromId, label: it.label, value, kind: "text", createdAt: it.created_at });
-      await setVaultSyncStatus(env, o.fromId, it.id, r.ok ? "synced" : "pending_google", r.googleId ?? null);
-      r.ok ? done++ : failed++;
-    }
-    const files = (await listVaultFiles(env, o.fromId)).files || [];
-    for (const f of files) {
-      if (f.sync_status === "synced") continue;
-      const bytes = await fileBytesFromTelegram(env, f.tg_file_id);
-      const r = await syncVaultFileToGoogle(env, { id: f.id, userId: o.fromId, label: f.title, fileName: f.fileName, mimeType: f.mimeType, data: bytes ?? new Uint8Array(0), createdAt: f.created_at });
-      await setFileSyncStatus(env, o.fromId, f.id, r.ok ? "synced" : "pending_google", r.googleId ?? null, null);
-      r.ok ? done++ : failed++;
-    }
-    await o.send(`✅ همگام‌سازی گوگل تمام شد: ${done} موفق، ${failed} ناموفق.`);
-    return true;
-  }
-  const file = /^vault:file:(\d+)$/.exec(o.data);
-  if (file) {
-    const fid = Number(file[1]);
-    if (!Number.isSafeInteger(fid) || fid <= 0) return true;
-    const f = await getVaultFile(env, o.fromId, fid);
-    if (!f) { await o.send("مدرکی پیدا نشد."); return true; }
-    const tp = tehranParts(f.created_at);
-    const when = tp ? `${formatJalali(tp.date) || tp.date} ${tp.hhmm}` : "";
-    const caption = `🔒📁 **${f.title ?? ""}**${when ? `\n🗓 ${when}` : ""}${f.doc_url ? `\n${f.doc_url}` : ""}`;
-    const formatted = formatTelegramHtml(caption);
-    const payload = { chat_id: o.chatId, caption: formatted, ...(formatted !== caption ? { parse_mode: "HTML" } : {}) };
-    if (f.file_type === "photo") await tgApi(env, "sendPhoto", { ...payload, photo: f.tg_file_id });
-    else await tgApi(env, "sendDocument", { ...payload, document: f.tg_file_id });
-    return true;
-  }
-  return false;
-  } catch (e) {
-    if (isConnectorSecretError(e)) {
-      if (typeof o.send === "function") await o.send("❌ کلید کانکتور قابل خواندن نیست؛ لطفاً دوباره تنظیم کنید.");
-      return true;
-    }
-    throw e;
-  }
+  return resolveVaultCallbackCore(env, o, { tgApi, getFileDownloadData, handleDailyText, sendDocument, sendPhoto });
 }
+
+
+
+
 
 export async function handleDailyText(env, o) {
   try {
