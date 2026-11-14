@@ -3,7 +3,7 @@
 // daily.js; side effects here. D1 failures never throw.
 import { classifyDaily, parseExpense, parseReminder, normalizeText, formatJalali, sumByCurrency, iranDate, weekRange, monthRange, resolveHourAmbiguousFollowup, mergeHourAmbiguousFollowup, hasDaypartReply, normalizeDaypartToken, extractFolderTag, matchKnownProjectAt, IRAN_OFFSET_MIN } from "./daily.js";
 import { classifyDailyWithModel, classifyIntent, freeTextDevSuggestion, MODEL_INTENT_COMBO, resolveInterpreterModel, recoverFullNoteBody } from "./intent.js";
-import { saveMessage, finalizeMessageKind, redactMessageContent, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, claimDueReminders, releaseReminderClaim, snoozeTaskReminder, purgeOldClosedTasks, saveVaultItem, listVaultItems, getVaultItem, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, setVaultSyncStatus, upsertUserFact, exportUserBackupSnapshot } from "./db.js";
+import { saveMessage, finalizeMessageKind, redactMessageContent, listProjectsResult, listOpenTasksResult, listDoneTasksResult, getTask, getProject, getMessageRow, insertTask, insertProject, listNotesResult, deleteNote, setTaskStatus, updateTaskFields, addProjectAlias, insertIntentFeedback, runDbBatch, snoozeTaskReminder, saveVaultItem, listVaultItems, getVaultItem, saveVaultFile, listVaultFiles, getVaultFile, resolvePendingVaultFile, setFileSyncStatus, setVaultSyncStatus, upsertUserFact, exportUserBackupSnapshot } from "./db.js";
 import { buildInterpreterPrompt, interpretText, parseInterpreterOutput, validateInterpreterAction } from "./interpreter.js";
 import { getDefaultCurrency, setSetting } from "./memory.js";
 import { tgApi, sendProgressMessage, sendDocument, sendPhoto, getFileDownloadData } from "./channels/telegram.js"; import { escapeHtml, formatTelegramHtml } from "./pipeline/respond.js";
@@ -11,6 +11,7 @@ import { encryptVaultValue, decryptVaultValue, syncVaultItemToGoogle, syncVaultF
 import { parseImageGenCommand, generateFreeImage, editImage, analyzeImage, isVisionQuestionCaption, isImageEditCaption } from "./media.js";
 import { CONNECTORS, getConnectorStatuses, setConnectorSecret, getConnectorSecret, renderSetupStatusText, sweepConnectorSecrets, isConnectorSecretError } from "./connectors.js";
 import { isPdfAnalysisRequest, analyzePdfDocument, buildImageToPdfBytes, buildTextPdfOrHtmlReport, parsePdfCreateCommand } from "./pdf.js";
+import { runReminderTick as runSchedulerReminderTick, makeTelegramSendMessage } from "./platform/scheduler/index.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
 export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی مثل /یادداشت، /تسکم، یا /اضافه کردن هزینه به کاربر پیشنهاد نده. کاربر برای ثبت موارد فقط کافی است با زبان طبیعی بنویسد یا ویس بدهد (مثلاً: «یادداشت کن فردا جلسه دارم» یا «امروز ۲۰۰ تومن نون خریدم» یا «خرجای امروز»).";
@@ -1307,46 +1308,11 @@ export async function resolveTaskCallback(env, o) {
   return false;
 }
 
-// Phase 1-c-2: scheduled reminder delivery, called from scheduled() in
-// index.js. Claim limit 20 bounds the sends; worst-case subrequests per
-// tick under the most conservative counting: 2 claim reads + 20 sends +
-// 20 failure releases + 1 purge = 43, under the 50 ceiling (catalog
-// crons never run in the same invocation — scheduled() dispatches
-// exclusively). The daily purge runs on the 00:00 UTC tick only, derived
-// from event.scheduledTime with ZERO KV writes: a per-minute cron fires
-// exactly one 00:00 tick per day, so the purge runs at most once daily
-// (a missed 00:00 tick simply skips that day's purge). Delivery failure
-// releases the claim and logs only the error reason + task id, never
-// user text. sendMessage is injectable for offline tests; the default
-// sends via tgApi.
 export async function runReminderTick(env, opts = {}) {
-  const nowMs = opts.nowMs ?? Date.now();
-  const nowIso = opts.nowIso ?? new Date(nowMs).toISOString();
-  const send = opts.sendMessage ?? ((chatId, text, replyMarkup) => tgApi(env, "sendMessage", { chat_id: chatId, text, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) }));
-  const claim = await claimDueReminders(env, nowIso, 20);
-  if (!claim.ok) return { ok: false, sent: 0, failed: 0, purged: null };
-  let sent = 0, failed = 0;
-  for (const r of claim.reminders) {
-    const delayed = Date.parse(nowIso) - Date.parse(r.remind_at) > 5 * 60 * 1000;
-    const text = `${delayed ? "⏰ یادآوری (با تاخیر):" : "⏰ یادآوری:"} ${r.title}`;
-    const replyMarkup = { inline_keyboard: [[{ text: "✅", callback_data: `task:done:${r.id}` }, { text: "💤 ۱۰ دقیقه‌ی دیگر", callback_data: `task:snooze:${r.id}` }]] };
-    try {
-      const res = await send(r.telegram_id, text, replyMarkup);
-      if (res && res.ok === false) throw new Error(`telegram_send_failed: ${res.error_code ?? ""} ${res.description ?? ""}`);
-      sent++;
-    } catch (err) {
-      failed++;
-      await releaseReminderClaim(env, r.id);
-      console.error(`reminder send failed: task ${r.id}:`, err && err.message);
-    }
-  }
-  let purged = null;
-  const d = new Date(opts.scheduledTime ?? nowMs);
-  if (d.getUTCHours() === 0 && d.getUTCMinutes() === 0) {
-    const p = await purgeOldClosedTasks(env, new Date(Date.parse(nowIso) - 30 * 86400000).toISOString());
-    purged = p.ok ? p.deleted : null;
-  }
-  return { ok: true, sent, failed, purged };
+  return runSchedulerReminderTick(env, {
+    ...opts,
+    sendMessage: opts.sendMessage ?? makeTelegramSendMessage(tgApi, env),
+  });
 }
 const INTERP_UNAVAILABLE_TEXT = "تفسیر خودکار الان در دسترس نیست؛ خودت نوعش را بگو:";
 function interpKey(id) { return `interp:${id}`; }

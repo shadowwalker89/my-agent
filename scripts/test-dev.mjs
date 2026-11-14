@@ -10,6 +10,7 @@ const suites = [
   "./tests/05-hotfix-vault.test.mjs",
   "./tests/06-memory-graph-media.test.mjs",
   "./tests/07-channel-telegram.test.mjs",
+  "./tests/08-platform-scheduler.test.mjs",
 ];
 
 for (const suite of suites) {
