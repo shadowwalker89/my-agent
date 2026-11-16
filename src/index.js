@@ -22,7 +22,7 @@ import {
   setPrefer,
   validatePattern,
 } from "./overrides.js";
-import { tgApi, tgSend, tgBroadcast, sendProgressMessage, finalizeProgressMessage, sendPhoto, sendDocument } from "./channels/telegram.js";
+import { tgApi, tgSend, tgBroadcast, sendProgressMessage, finalizeProgressMessage, sendPhoto, sendDocument, downloadTelegramVoice } from "./channels/telegram.js";
 import { healthCounts, getMedianLatency, getHealthEntry, markFailure, recordLatency } from "./health.js";
 import { recordVerifiedModel, recordProviderCircuitSuccess } from "./circuit.js";
 import { ADMIN_HTML } from "./admin-page.js";
@@ -897,7 +897,7 @@ async function handleCallbackQuery(env, cb) {
   if (!fromId || !chatId || !isAllowed(env.ALLOWED_TG_IDS, fromId)) return;
 
   if (data.startsWith("vault:")) {
-    await resolveVaultCallback(env, { fromId, chatId, data, ...dailySenders(env, chatId, cb?.message?.message_id),
+    await resolveVaultCallback(env, { fromId, chatId, chatType: cb?.message?.chat?.type, data, ...dailySenders(env, chatId, cb?.message?.message_id),
       chat: (modelText, copts) => answerChatText(env, chatId, fromId, modelText, false, copts) });
     return;
   }
@@ -956,7 +956,7 @@ async function handleCallbackQuery(env, cb) {
     return;
   }
   if (data.startsWith("voice:retry:")) {
-    await handleVoiceRetry(env, { userId: fromId, stashId: data.slice("voice:retry:".length),
+    await handleVoiceRetry(env, { userId: fromId, stashId: data.slice("voice:retry:".length), downloadTelegramVoice,
       send: (t, opts) => tgSend(env, chatId, t, opts),
       route: (transcript) => handlePlainText(env, { chat: { id: chatId, type: cb?.message?.chat?.type }, from: { id: fromId } }, transcript, { source: "voice" }),
       editMarkup: dailySenders(env, chatId, cb?.message?.message_id).editMarkup });
@@ -1105,7 +1105,7 @@ async function handleUpdate(env, update) {
   const voice = msg.voice && typeof msg.voice === "object" ? msg.voice : null;
   if (voice) {
     await ensureUserRow(env, msg.from.id);
-    await handleVoice(env, { userId: msg.from.id, chatId: msg.chat.id, voice, send: (t, opts) => tgSend(env, msg.chat.id, t, opts), route: (transcript) => handlePlainText(env, msg, transcript, { source: "voice" }) });
+    await handleVoice(env, { userId: msg.from.id, chatId: msg.chat.id, voice, downloadTelegramVoice, send: (t, opts) => tgSend(env, msg.chat.id, t, opts), route: (transcript) => handlePlainText(env, msg, transcript, { source: "voice" }) });
     return;
   }
 

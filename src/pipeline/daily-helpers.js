@@ -11,13 +11,16 @@ export const VAULT_REDACTED_TEXT = "[🔒 محتوای حساس گاوصندوق
 export async function runVaultAndFileBranch(env, o, c, ctx, deps = {}) {
   const { userId } = o;
   const tg = deps.tgApi || o.tgApi;
+  if (["vault_save", "vault_get", "vault_list", "vault_file_get"].includes(c.intent) && o.chatType !== "private") {
+    if (c.intent === "vault_save") {
+      const rowId = o.messageRowId ?? o.msgId ?? o.entryMessageId ?? null;
+      if (rowId) await redactMessageContent(env, userId, rowId, VAULT_REDACTED_TEXT);
+    }
+    await o.send(VAULT_PRIVATE_ONLY_TEXT);
+    return "handled";
+  }
   if (c.intent === "vault_save") {
     const rowId = o.messageRowId ?? o.msgId ?? o.entryMessageId ?? null;
-    if (o.chatType && o.chatType !== "private") {
-      if (rowId) await redactMessageContent(env, userId, rowId, VAULT_REDACTED_TEXT);
-      await o.send(VAULT_PRIVATE_ONLY_TEXT);
-      return "handled";
-    }
     if (!c.title || !String(c.title).trim() || !c.value || !String(c.value).trim() || String(c.value).trim().length < 4) { await o.send("برای ثبت در گاوصندوق، عنوان و مقدار را مشخص کن؛ هنوز چیزی ذخیره نشده است."); return "handled"; }
     await markDaily(env, o);
     if (rowId) await redactMessageContent(env, userId, rowId, VAULT_REDACTED_TEXT);

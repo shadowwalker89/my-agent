@@ -57,6 +57,7 @@ import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText,
 import { markFailure, isModelHealthy } from "../../src/health.js";
 import { handleDailyFile } from "../../src/everyday.js";
 import { classifyVoiceQuota, transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT, VOICE_TOO_LONG_TEXT } from "../../src/voice.js";
+import { downloadTelegramVoice } from "../../src/channels/telegram.js";
 
 import { check, fakeKV, mockWorld, workerDefault, ctxNull, sendTg, msgUpdate, cbUpdate, newEnv, DatabaseSync } from "./harness.mjs";
 

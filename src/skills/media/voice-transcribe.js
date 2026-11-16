@@ -45,30 +45,6 @@ function interactionTranscript(data) {
   return "";
 }
 
-export async function downloadTelegramVoice(env, fileId) {
-  let stage = "telegram-info";
-  const failed = (status, kind) => {
-    const failure = { stage, status, apiStatus: null, kind };
-    console.warn("voice_stage_fail", failure);
-    return { ok: false, failure };
-  };
-  try {
-    const infoRes = await fetch(`https://api.telegram.org/bot${env.TG_TOKEN}/getFile`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ file_id: fileId }),
-      signal: AbortSignal.timeout(10000),
-    });
-    const info = await infoRes.json().catch(() => ({ ok: false }));
-    const path = info?.result?.file_path;
-    if (!info?.ok || !path) return failed(Number.isInteger(info?.error_code) ? info.error_code : null, "telegram");
-    stage = "telegram-download";
-    const res = await fetch(`${"https://api.telegram.org"}/file/bot${env.TG_TOKEN}/${path}`, { signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) });
-    if (!res.ok) return failed(res.status, "http");
-    return { ok: true, bytes: await res.arrayBuffer() };
-  } catch { return failed(null, "network"); }
-}
-
 export async function transcribeWithGemini(env, audioBytes, mimeType, opts = {}) {
   const started = Date.now();
   const key = env?.GEMINI_API_KEY;

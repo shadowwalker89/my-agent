@@ -56,7 +56,10 @@ import { scoreEvalResults, mapOutcome, scoreSlots, runCaseEvaluation, iranNowIso
 import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText, resolveDailyCallback, resolveInterpCallback, resolveTaskCallback, resolveNoteCallback, resolveQuickConvertCallback, resolveChatRetryCallback, resolveAskCallback, hourAmbiguousKeyboard, chatFailureNotice, formatFailureDetail, stripLeadingNotePunct, deriveNoteTitle, renderNoteList, renderTaskList, confirmExpenseDraft, runModelBranch, resolveProjects, CHAT_CONTEXT_CHAR_LIMIT, runReminderTick, quickConvertKeyboard, isUnambiguousQuestion, SUMMARY_SYSTEM, handleVaultFile, resolveVaultCallback, runNluBranch, REF_RE } from "../../src/everyday.js";
 import { markFailure, isModelHealthy } from "../../src/health.js";
 import { handleDailyFile } from "../../src/everyday.js";
+import { resolveVaultCallback as resolveVaultCallbackCore } from "../../src/pipeline/vault-callbacks.js";
+import { runVaultAndFileBranch, VAULT_PRIVATE_ONLY_TEXT, VAULT_REDACTED_TEXT } from "../../src/pipeline/daily-helpers.js";
 import { classifyVoiceQuota, transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT, VOICE_TOO_LONG_TEXT } from "../../src/voice.js";
+import { downloadTelegramVoice } from "../../src/channels/telegram.js";
 
 import { check, failures, fakeKV, mockWorld, workerDefault, ctxNull, sendTg, msgUpdate, cbUpdate, newEnv, DatabaseSync } from "./harness.mjs";
 
@@ -1285,7 +1288,7 @@ if (DatabaseSync) {
       const rows = (sql, params = []) => sqlite.prepare(sql).all(...params);
       const mkEnv = (extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", VAULT_SECRET: "s1", DB: d1, ...extra });
       const fakeSend = () => { const sent = []; return { sent, send: async (text, opts) => { sent.push({ text, replyMarkup: opts?.replyMarkup }); } }; };
-      const o = (env, userId, text, extra = {}) => ({ chatId: userId, userId, text, send: extra.send, chat: extra.chat ?? (async () => {}), nowMs: extra.nowMs });
+      const o = (env, userId, text, extra = {}) => ({ chatId: userId, userId, chatType: extra.chatType ?? "private", text, send: extra.send, chat: extra.chat ?? (async () => {}), nowMs: extra.nowMs });
       const NOW = Date.UTC(2026, 9, 28, 12, 0, 0);
       const cl = (s) => classifyDaily(s, { nowMs: NOW });
 
@@ -1396,7 +1399,7 @@ if (DatabaseSync) {
         // Next-turn naming: tap vault:askname first
         {
           const env = mkEnv(), s = fakeSend();
-          await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, data: "vault:askname:3", send: s.send, editMarkup: async () => {} });
+          await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, chatType: "private", data: "vault:askname:3", send: s.send, editMarkup: async () => {} });
           const handled = await handleDailyText(env, o(env, 4242, "\\u0628\\u06cc\\u0645\\u0647\\u0020\\u0646\\u0627\\u0645\\u0647\\u0020\\u06f2\\u06f0\\u06f6", { ...s, nowMs: NOW }));
           check(handled === "handled", "next-turn naming handled");
           const text = String(s.sent.at(-1)?.text ?? "");
@@ -1415,7 +1418,7 @@ if (DatabaseSync) {
         // vault:file:<id> callback
         {
           const env = mkEnv();
-          check(await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, data: "vault:file:1" }) === true, "vault:file handled");
+          check(await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, chatType: "private", data: "vault:file:1" }) === true, "vault:file handled");
           const cbSend = tgCalls.find((c) => c.method === "sendDocument" && c.payload.document === "file-1");
           check(Boolean(cbSend), `vault:file callback re-sends document: ${JSON.stringify(cbSend)}`);
         }
@@ -1431,7 +1434,7 @@ if (DatabaseSync) {
         {
           tgCalls.length = 0;
           const env = mkEnv();
-          check(await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, data: "vault:csv" }) === true, "vault:csv handled");
+          check(await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, chatType: "private", data: "vault:csv" }) === true, "vault:csv handled");
           const docs = tgCalls.filter((c) => c.method === "sendDocument");
           const doc = docs[docs.length - 1];
           check(Boolean(doc) && doc.payload.document.name === "personal-vault.csv", `sendDocument for csv: ${JSON.stringify(docs.map((d) => ({ name: d.payload.document?.name })))}`);
@@ -1443,9 +1446,28 @@ if (DatabaseSync) {
         // vault:sync via Google Sheets
         {
           const env = mkEnv({ GOOGLE_VAULT_SHEET_ID: "sheet1", GOOGLE_VAULT_ACCESS_TOKEN: "tok" }), s = fakeSend();
-          check(await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, data: "vault:sync", send: s.send }) === true, "vault:sync handled");
+          check(await resolveVaultCallback(env, { fromId: 4242, chatId: 4242, chatType: "private", data: "vault:sync", send: s.send }) === true, "vault:sync handled");
           const item = await getVaultItem(env, 4242, 1);
           check(item.sync_status === "synced", `item synced: ${item.sync_status}`);
+        }
+        for (const chatType of [undefined, "group", "supergroup"]) {
+          let dbCalls = 0, secretReads = 0, fetchCalls = 0, telegramCalls = 0, documentCalls = 0, messageCalls = 0;
+          const env = { STATE: fakeKV(), DB: { prepare() { dbCalls++; throw new Error("unexpected Vault access"); } }, get VAULT_SECRET() { secretReads++; return "s1"; } };
+          const callbacks = ["vault:askname:3", "vault:cancel:3", "vault:csv", "vault:sync", "vault:file:1", "vault:analyze:3"];
+          const prevFetch = global.fetch;
+          global.fetch = async () => { fetchCalls++; return Response.json({ ok: true }); };
+          try {
+            for (const data of callbacks) {
+              const handled = await resolveVaultCallbackCore(env, { fromId: 4242, chatId: 4242, ...(chatType === undefined ? {} : { chatType }), data, send: async () => { messageCalls++; }, editText: async () => { messageCalls++; } }, {
+                tgApi: async () => { telegramCalls++; },
+                sendDocument: async () => { documentCalls++; },
+                getFileDownloadData: async () => { fetchCalls++; },
+              });
+              check(handled === true, `vault callback rejected outside private chat: ${chatType ?? "missing"} ${data}`);
+            }
+          } finally { global.fetch = prevFetch; }
+          check(dbCalls === 0 && secretReads === 0 && fetchCalls === 0 && telegramCalls === 0 && documentCalls === 0 && messageCalls === 0,
+            `vault callbacks outside private chat perform no reads, decryption, sync, delivery, cancellation, or replies: ${chatType ?? "missing"}`);
         }
       } finally {
         global.fetch = origFetch;
@@ -1561,11 +1583,11 @@ if (DatabaseSync) {
   };
   const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", VAULT_SECRET: "s1", DB: d1 };
   const sent0 = [];
-  await handleDailyText(env, { chatId: 4242, userId: 4242, text: "شماره کارت بانک رسالت من ۶۰۳۷۹۹۷۵۱۲۳۴۵۶۷۸ است ثبتش کن", send: async (t, o) => { sent0.push({ text: t, replyMarkup: o?.replyMarkup }); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+  await handleDailyText(env, { chatId: 4242, userId: 4242, chatType: "private", text: "شماره کارت بانک رسالت من ۶۰۳۷۹۹۷۵۱۲۳۴۵۶۷۸ است ثبتش کن", send: async (t, o) => { sent0.push({ text: t, replyMarkup: o?.replyMarkup }); }, chat: async () => {}, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
   const sent = [];
   const s = { send: async (t, o) => { sent.push({ text: t, replyMarkup: o?.replyMarkup }); } };
   let chats = 0;
-  const ret = await handleDailyText(env, { chatId: 4242, userId: 4242, text: "شماره کارت رسالت", send: s.send, chat: async () => { chats++; }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
+  const ret = await handleDailyText(env, { chatId: 4242, userId: 4242, chatType: "private", text: "شماره کارت رسالت", send: s.send, chat: async () => { chats++; }, nowMs: Date.UTC(2026, 9, 28, 12, 0, 0) });
   check(ret !== "chat", `vault lookup must not fall to chat (got ${ret})`);
   check(chats === 0, "vault lookup must not call o.chat");
   check(sent.some((x) => String(x.text).includes("6037997512345678")), `vault lookup returns card: ${JSON.stringify(sent)}`);
@@ -1623,7 +1645,7 @@ if (DatabaseSync) {
     const env = { STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", GEMINI_API_KEY: "k" };
     const sent = [];
     const s = { send: async (t, opts) => { sent.push({ text: t, replyMarkup: opts?.replyMarkup }); } };
-    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: { file_id: "v", duration: 5, mime_type: "audio/ogg; codecs=opus" }, send: s.send, route: async () => {} });
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: { file_id: "v", duration: 5, mime_type: "audio/ogg; codecs=opus" }, downloadTelegramVoice, send: s.send, route: async () => {} });
     check(r === "failed", "voice failed");
     check(sent.length <= 1, `voice at most one error message: ${sent.length}`);
   } finally {
@@ -1750,7 +1772,7 @@ if (DatabaseSync) {
     {
       const { sq, env, s0 } = mkPending();
       await handleVaultFile(env, { userId: 999, chatId: 999, tgFileId: "file-9", fileType: "photo", mimeType: "image/jpeg", fileName: null, caption: null, send: s0.send });
-      await resolveVaultCallback(env, { fromId: 999, chatId: 999, data: "vault:askname:1", send: s0.send });
+      await resolveVaultCallback(env, { fromId: 999, chatId: 999, chatType: "private", data: "vault:askname:1", send: s0.send });
       const titleAfterAsk = sq.prepare("SELECT title FROM vault_files WHERE id = 1").get().title;
       check(titleAfterAsk === "__pending__", `A07: askname sets __pending__: ${JSON.stringify(titleAfterAsk)}`);
       const s = mkS2();
@@ -1765,7 +1787,7 @@ if (DatabaseSync) {
       const { sq, env } = mkPending();
       const s0 = mkS2();
       await handleVaultFile(env, { userId: 999, chatId: 999, tgFileId: "file-9", fileType: "photo", mimeType: "image/jpeg", fileName: null, caption: null, send: s0.send });
-      await resolveVaultCallback(env, { fromId: 999, chatId: 999, data: "vault:askname:1", send: s0.send });
+      await resolveVaultCallback(env, { fromId: 999, chatId: 999, chatType: "private", data: "vault:askname:1", send: s0.send });
       const s = mkS2();
       await handleDailyText(env, { chatId: 999, userId: 999, text: "\u0628\u06cc\u0645\u0647 \u0646\u0627\u0645\u0647 \u06f2\u06f0\u06f6", send: s.send, chat: async () => {}, nowMs: NOWA07 });
       const reply = String(s.sent.at(-1)?.text ?? "");
@@ -1865,6 +1887,133 @@ if (DatabaseSync) {
     check(r === "handled" && rows.length > 0, `A08: vault save handled and a message row exists: ${JSON.stringify({ r, rows })}`);
     check(rows.every((row) => !String(row.content).includes(card)), `A08: raw card number never persists in messages.content: ${JSON.stringify(rows)}`);
     check(rows.some((row) => row.content === "[🔒 محتوای حساس گاوصندوق]"), `A08: vault save stores the redaction placeholder: ${JSON.stringify(rows)}`);
+  }
+  {
+    const freshTrackedF01 = () => {
+      const { sq, env } = freshA08();
+      env.GOOGLE_VAULT_WEBHOOK_URL = "https://f01.invalid/google-sync";
+      const operations = [];
+      const baseDb = env.DB;
+      env.DB = {
+        prepare(sql) {
+          const statement = baseDb.prepare(sql);
+          const operation = { sql: String(sql).replace(/\s+/g, " ").trim().toLowerCase(), params: [], method: null };
+          operations.push(operation);
+          return {
+            bind(...params) {
+              const bound = statement.bind(...params);
+              operation.params = params;
+              return {
+                run: async () => { operation.method = "run"; return bound.run(); },
+                all: async () => { operation.method = "all"; return bound.all(); },
+                first: async () => { operation.method = "first"; return bound.first(); },
+              };
+            },
+          };
+        },
+      };
+      let keyReads = 0;
+      Object.defineProperty(env, "VAULT_MASTER_KEY", { configurable: true, get() { keyReads++; return "master-f01"; } });
+      return { sq, env, operations, keyReads: () => keyReads, resetKeyReads: () => { keyReads = 0; } };
+    };
+    const intents = [
+      ["vault_save", { title: "F01 test card", value: "f01-nonsecret-test-value" }],
+      ["vault_get", { keywords: ["F01"] }],
+      ["vault_list", {}],
+      ["vault_list", { fileList: true }],
+      ["vault_file_get", { keywords: ["F01"] }],
+    ];
+    const chatTypes = [undefined, null, "group", "supergroup", "channel"];
+    const originalFetch = global.fetch;
+    let googleRequests = 0;
+    global.fetch = async (...args) => { googleRequests++; return originalFetch(...args); };
+    try {
+      for (const [intent, fields] of intents) {
+        for (const chatType of chatTypes) {
+          const { sq, env, operations, keyReads } = freshTrackedF01();
+          sq.prepare("INSERT INTO messages (id, user_id, role, content, created_at) VALUES (101, 1, 'user', 'F01 owner row', '2026-11-08T12:00:00.000Z'), (202, 2, 'user', 'F01 other owner row', '2026-11-08T12:00:00.000Z')").run();
+          let telegramCalls = 0;
+          const sent = [];
+          const o = {
+            userId: 1,
+            chatId: 1,
+            ...(chatType === undefined ? {} : { chatType }),
+            ...(intent === "vault_save" ? { messageRowId: 101 } : {}),
+            send: async (text) => { sent.push(String(text)); },
+          };
+          const fetchBefore = googleRequests;
+          const result = await runVaultAndFileBranch(env, o, { intent, ...fields }, {}, {
+            tgApi: async () => { telegramCalls++; },
+          });
+          check(result === "handled" && sent.length === 1 && sent[0] === VAULT_PRIVATE_ONLY_TEXT,
+            `F-01: blocked ${intent} returns only the private-chat refusal (${chatType ?? "missing"})`);
+          check(telegramCalls === 0 && googleRequests === fetchBefore && keyReads() === 0,
+            `F-01: blocked ${intent} does not access crypto, Google sync, or Telegram delivery (${chatType ?? "missing"})`);
+          if (intent === "vault_save") {
+            check(operations.length === 1 && operations[0].sql === "update messages set content = ?1 where id = ?2 and user_id = ?3" && operations[0].method === "run" && operations[0].params[0] === VAULT_REDACTED_TEXT && operations[0].params[1] === 101 && operations[0].params[2] === 1,
+              `F-01: blocked vault_save issues only owner-scoped messages.content redaction (${chatType ?? "missing"})`);
+            const ownerContent = sq.prepare("SELECT content FROM messages WHERE id = 101 AND user_id = 1").get()?.content;
+            const otherContent = sq.prepare("SELECT content FROM messages WHERE id = 202 AND user_id = 2").get()?.content;
+            check(ownerContent === VAULT_REDACTED_TEXT && otherContent === "F01 other owner row",
+              `F-01: save redacts the owned row and preserves the other owner's row (${chatType ?? "missing"})`);
+          } else {
+            check(operations.length === 0,
+              `F-01: blocked ${intent} performs no database access, including vault_items/vault_files (${chatType ?? "missing"})`);
+          }
+        }
+      }
+    } finally { global.fetch = originalFetch; }
+
+    {
+      const { env, operations, keyReads, resetKeyReads } = freshTrackedF01();
+      const saved = await saveVaultItem(env, { userId: 1, label: "F01 private get", kind: "text", valueEnc: await encryptVaultValue(env, "f01-private-get-value"), category: "test", syncStatus: "local" });
+      check(saved.ok === true, "F-01: private get fixture is saved");
+      operations.length = 0;
+      resetKeyReads();
+      const sent = [];
+      const result = await runVaultAndFileBranch(env, { userId: 1, chatId: 1, chatType: "private", send: async (text) => sent.push(String(text)) }, { intent: "vault_get", keywords: ["F01 private get"] }, {}, { tgApi: async () => {} });
+      check(result === "handled" && sent.length === 1 && sent[0].includes("f01-private-get-value") && keyReads() > 0,
+        "F-01: private vault_get decrypts and returns the matching saved item");
+      check(operations.some((op) => op.sql.includes("from vault_items") && op.method === "all") && operations.some((op) => op.sql.includes("from vault_items") && op.method === "first"),
+        "F-01: private vault_get queries the item list and selected encrypted row");
+    }
+    {
+      const { env, operations, keyReads, resetKeyReads } = freshTrackedF01();
+      const saved = await saveVaultItem(env, { userId: 1, label: "F01 private list", kind: "text", valueEnc: await encryptVaultValue(env, "f01-private-list-value"), category: "test", syncStatus: "local" });
+      check(saved.ok === true, "F-01: private text-list fixture is saved");
+      operations.length = 0;
+      resetKeyReads();
+      const sent = [];
+      const result = await runVaultAndFileBranch(env, { userId: 1, chatId: 1, chatType: "private", send: async (text, opts) => sent.push({ text: String(text), opts }) }, { intent: "vault_list" }, {}, { tgApi: async () => {} });
+      check(result === "handled" && sent.length === 1 && sent[0].text.includes("F01 private list") && sent[0].text.includes("f01-private-list-value") && keyReads() > 0,
+        "F-01: private vault_list returns the decrypted text-item listing");
+      check(operations.some((op) => op.sql.includes("from vault_items") && op.method === "all") && operations.some((op) => op.sql.includes("from vault_items") && op.method === "first"),
+        "F-01: private text-item listing reads vault_items");
+    }
+    {
+      const { env, operations } = freshTrackedF01();
+      const saved = await saveVaultFile(env, { userId: 1, tgFileId: "f01-archive-list-file", fileType: "document", mimeType: "application/pdf", title: "F01 private archive listing", fileName: "f01-archive.pdf", caption: null });
+      check(saved.ok === true, "F-01: private archive-list fixture is saved");
+      operations.length = 0;
+      const sent = [];
+      const result = await runVaultAndFileBranch(env, { userId: 1, chatId: 1, chatType: "private", send: async (text, opts) => sent.push({ text: String(text), opts }) }, { intent: "vault_list", fileList: true }, {}, { tgApi: async () => {} });
+      check(result === "handled" && sent.length === 1 && sent[0].text.includes("F01 private archive listing") && sent[0].opts?.replyMarkup?.inline_keyboard?.[0]?.[0]?.callback_data === `vault:file:${saved.id}`,
+        "F-01: private archived-file listing returns the file title and matching callback");
+      check(operations.some((op) => op.sql.includes("from vault_files") && op.method === "all"),
+        "F-01: private archive listing reads vault_files");
+    }
+    {
+      const { env, operations } = freshTrackedF01();
+      const saved = await saveVaultFile(env, { userId: 1, tgFileId: "f01-archive-delivery-file", fileType: "document", mimeType: "application/pdf", title: "F01 private archive delivery", fileName: "f01-delivery.pdf", caption: null });
+      check(saved.ok === true, "F-01: private file-delivery fixture is saved");
+      operations.length = 0;
+      const telegram = [];
+      const result = await runVaultAndFileBranch(env, { userId: 1, chatId: 1, chatType: "private", send: async () => {} }, { intent: "vault_file_get", keywords: ["F01 private archive delivery"] }, {}, { tgApi: async (_env, method, payload) => telegram.push({ method, payload }) });
+      check(result === "handled" && telegram.length === 1 && telegram[0].method === "sendDocument" && telegram[0].payload.chat_id === 1 && telegram[0].payload.document === "f01-archive-delivery-file" && telegram[0].payload.caption.includes("F01 private archive delivery"),
+        "F-01: private vault_file_get delivers the matching archived document through Telegram");
+      check(operations.some((op) => op.sql.includes("from vault_files") && op.method === "all"),
+        "F-01: private file retrieval searches vault_files");
+    }
   }
   // A19: group vault_get refuses to decrypt/leak.
   {

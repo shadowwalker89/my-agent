@@ -8,6 +8,7 @@ import { isConnectorSecretError } from "../connectors.js";
 import { csvRow, fileBytesFromTelegram, analyzeVaultImage } from "./vault-files.js";
 
 export async function resolveVaultCallback(env, o, deps = {}) {
+  if (o.chatType !== "private") return true;
   try {
   const tg = deps.tgApi || o.tgApi;
   const sendDocument = deps.sendDocument || o.sendDocument;

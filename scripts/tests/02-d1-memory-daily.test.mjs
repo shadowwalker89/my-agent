@@ -58,6 +58,7 @@ import { buildChatContext, mapQuestion, askText, ensureUserRow, handleDailyText,
 import { markFailure, isModelHealthy } from "../../src/health.js";
 import { handleDailyFile } from "../../src/everyday.js";
 import { classifyVoiceQuota, transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT, VOICE_TOO_LONG_TEXT } from "../../src/voice.js";
+import { downloadTelegramVoice } from "../../src/channels/telegram.js";
 import { check, fakeKV, mockWorld, workerDefault, ctxNull, sendTg, msgUpdate, cbUpdate, newEnv, DatabaseSync } from "./harness.mjs";
 
 export async function run() {
@@ -614,6 +615,7 @@ if (DatabaseSync) {
       const sent = [], routed = [];
       const result = await handleVoice(env, { userId: 42, chatId: 42,
         voice: { file_id: "private-file", duration: 2 }, transcribeOpts: { pollIntervalMs: 0 },
+        downloadTelegramVoice,
         send: async (text, opts) => sent.push({ text, opts }), route: async (text) => routed.push(text),
       });
       check(generations === scenario[2], `voice quota: ${target}/${scope} generation count respects proven scope`);
@@ -837,6 +839,7 @@ if (DatabaseSync) {
     const sent = [], routed = [];
     return handleVoice(env, { userId: 42, chatId: 42, transcribeOpts,
       voice: { file_id: "same-file-id", duration: 2, mime_type: "audio/ogg" },
+      downloadTelegramVoice,
       send: async (text, opts) => sent.push({ text, opts }), route: async (text) => routed.push(text),
     }).then((result) => ({ result, sent, routed }));
   };
@@ -916,32 +919,32 @@ if (DatabaseSync) {
   }
   {
     const env = mkEnv(), s = fakeSend(); const m = mockVoiceFetch("یادداشت کن فردا جلسه دارم");
-    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); } });
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice, send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); } });
     check(r === "routed" && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4242")[0].n === 1 && rows("SELECT text, source FROM notes WHERE user_id = 4242")[0].text === "فردا جلسه دارم" && rows("SELECT source FROM notes WHERE user_id = 4242")[0].source === "voice", "voice: transcript -> note stored with voice source");
   }
   {
     const env = mkEnv(), s = fakeSend(); mockVoiceFetch("خرج کردم ۵۰۰ تومان نان");
-    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); } });
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice, send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); } });
     check(r === "routed" && lastText(s).includes("تأیید می‌کنی؟") && rows("SELECT COUNT(*) AS n FROM expenses")[0].n === 0, "voice: transcript -> expense confirm, no row before Confirm");
   }
   {
     const env = mkEnv(), s = fakeSend(); let routed = false; mockVoiceFetch("");
-    const r = await handleVoice(env, { userId: 4243, chatId: 4243, voice: voice(), send: s.send, route: async () => { routed = true; } });
+    const r = await handleVoice(env, { userId: 4243, chatId: 4243, voice: voice(), downloadTelegramVoice, send: s.send, route: async () => { routed = true; } });
     check(r === "failed" && routed === false && lastText(s) === VOICE_FAILED_TEXT && rows("SELECT COUNT(*) AS n FROM notes WHERE user_id = 4243")[0].n === 0, "voice: empty transcript -> resend reply, nothing stored");
   }
   {
     const env = mkEnv(), s = fakeSend(); let routed = false; mockVoiceFetch("سلام", { failGeneration: true });
-    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async () => { routed = true; } });
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice, send: s.send, route: async () => { routed = true; } });
     check(r === "failed" && routed === false && lastText(s) === VOICE_FAILED_TEXT, "voice: google failure -> fallback reply, nothing routed");
   }
   {
     const env = mkEnv({ GEMINI_API_KEY: undefined }), s = fakeSend(); let routed = false; const m = mockVoiceFetch("سلام");
-    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async () => { routed = true; } });
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice, send: s.send, route: async () => { routed = true; } });
     check(r === "failed" && routed === false && m.googleCalls() === 0 && lastText(s) === VOICE_FAILED_TEXT, "voice: missing key -> fallback reply, zero google fetches");
   }
   {
     const env = mkEnv(), s = fakeSend(); let routed = false; const m = mockVoiceFetch("سلام");
-    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(601), send: s.send, route: async () => { routed = true; } });
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(601), downloadTelegramVoice, send: s.send, route: async () => { routed = true; } });
     check(r === "too-long" && routed === false && m.googleCalls() === 0 && lastText(s) === VOICE_TOO_LONG_TEXT, "voice: over-cap duration -> short-voice reply, zero google fetches");
   }
   {
@@ -952,44 +955,110 @@ if (DatabaseSync) {
   // 0-b3 voice Retry: file id stashed at receipt (1h TTL, owner-scoped).
   {
     const env = mkEnv(), s = fakeSend(); mockVoiceFetch("سلام", { failGeneration: true });
-    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async () => {} });
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice, send: s.send, route: async () => {} });
     const retryBtn = (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
     check(r === "failed" && !!retryBtn, "0-b3 voice: failure message carries a Retry button");
     const stashId = retryBtn.slice("voice:retry:".length);
     const sF = fakeSend();
-    const rF = await handleVoiceRetry(env, { userId: 4243, stashId, send: sF.send, route: async () => {}, editMarkup: async () => {} });
+    const rF = await handleVoiceRetry(env, { userId: 4243, stashId, downloadTelegramVoice, send: sF.send, route: async () => {}, editMarkup: async () => {} });
     check(rF === "forbidden" && sF.sent.length === 0, "0-b3 voice: Retry by another user is silent");
     mockVoiceFetch("یادداشت کن جلسه تازه");
-    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); }, editMarkup: async () => {} });
+    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, downloadTelegramVoice, send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); }, editMarkup: async () => {} });
     check(r2 === "routed" && rows("SELECT COUNT(*) AS n FROM notes WHERE text = 'جلسه تازه' AND source = 'voice'")[0].n === 1, "0-b3 voice: Retry re-transcribes and enters the normal path");
     const s2 = fakeSend();
-    const r3 = await handleVoiceRetry(env, { userId: 4242, stashId, send: s2.send, route: async () => {}, editMarkup: async () => {} });
+    const r3 = await handleVoiceRetry(env, { userId: 4242, stashId, downloadTelegramVoice, send: s2.send, route: async () => {}, editMarkup: async () => {} });
     check(r3 === "missing" && s2.sent.length === 1 && s2.sent[0].text === VOICE_FAILED_TEXT, "0-b3 voice: consumed stash yields the clear resend message");
   }
   // 0-b3 fix: a retry that fails again still offers a usable Retry button.
   {
     const env = mkEnv(), s = fakeSend(); mockVoiceFetch("سلام", { failGeneration: true });
-    await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async () => {} });
+    await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice, send: s.send, route: async () => {} });
     const retryBtn = (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
     const stashId = retryBtn.slice("voice:retry:".length);
     const s2 = fakeSend();
-    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, send: s2.send, route: async () => {}, editMarkup: async () => {} });
+    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, downloadTelegramVoice, send: s2.send, route: async () => {}, editMarkup: async () => {} });
     const retryBtn2 = (s2.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
     check(r2 === "failed" && retryBtn2 === `voice:retry:${stashId}` && (await env.STATE.get(`voice:stash:${stashId}`, "json")) !== null, "0-b3 fix: transcription-failing retry yields a usable Retry button, stash kept");
     mockVoiceFetch("یادداشت کن جلسه دوباره");
-    const r3 = await handleVoiceRetry(env, { userId: 4242, stashId, send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); }, editMarkup: async () => {} });
+    const r3 = await handleVoiceRetry(env, { userId: 4242, stashId, downloadTelegramVoice, send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); }, editMarkup: async () => {} });
     check(r3 === "routed" && rows("SELECT COUNT(*) AS n FROM notes WHERE text = 'جلسه دوباره' AND source = 'voice'")[0].n === 1, "0-b3 fix: retry succeeds after a failed retry");
   }
   {
     // Same for a download-failing retry.
     const env = mkEnv(), s = fakeSend(); mockVoiceFetch("سلام", { failGetFile: true });
-    await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), send: s.send, route: async () => {} });
+    await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice, send: s.send, route: async () => {} });
     const retryBtn = (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
     const stashId = retryBtn.slice("voice:retry:".length);
     const s2 = fakeSend();
-    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, send: s2.send, route: async () => {}, editMarkup: async () => {} });
+    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, downloadTelegramVoice, send: s2.send, route: async () => {}, editMarkup: async () => {} });
     const retryBtn2 = (s2.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
     check(r2 === "failed" && retryBtn2 === `voice:retry:${stashId}` && (await env.STATE.get(`voice:stash:${stashId}`, "json")) !== null, "0-b3 fix: download-failing retry yields a usable Retry button, stash kept");
+  }
+  {
+    const env = mkEnv(), s = fakeSend(); const m = mockVoiceFetch("سلام"); const v = voice();
+    const calls = [];
+    const fakeDownload = async (...args) => { calls.push(args); return { ok: false, failure: { stage: "telegram-download", status: 500, apiStatus: null, kind: "http" } }; };
+    const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: v, downloadTelegramVoice: fakeDownload, send: s.send, route: async () => {} });
+    check(r === "failed" && calls.length === 1 && calls[0][0] === env && calls[0][1] === v.file_id && m.googleCalls() === 0 && lastText(s).includes("VOICE-DOWNLOAD"), "F1 voice: injected downloader is used once, skill never touches Telegram");
+  }
+  {
+    const env = mkEnv(), initial = fakeSend(), m = mockVoiceFetch("سلام"); let routed = 0, downloadCalls = 0;
+    const downloadFailure = async () => { downloadCalls++; return { ok: false, failure: { stage: "telegram-download", status: 503, apiStatus: null, kind: "http" } }; };
+    await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice: downloadFailure, send: initial.send, route: async () => { routed++; } });
+    const retryButton = initial.sent[0]?.replyMarkup?.inline_keyboard?.[0]?.[0]?.callback_data;
+    const stashId = retryButton?.slice("voice:retry:".length), retry = fakeSend();
+    const result = await handleVoiceRetry(env, { userId: 4242, stashId, downloadTelegramVoice: downloadFailure, send: retry.send, route: async () => { routed++; }, editMarkup: async () => {} });
+    check(result === "failed" && downloadCalls === 2 && routed === 0 && m.googleCalls() === 0 && retry.sent[0]?.text.includes("VOICE-DOWNLOAD") && !retry.sent[0]?.text.includes(env.TG_TOKEN) && retry.sent[0]?.replyMarkup?.inline_keyboard?.[0]?.[0]?.callback_data === `voice:retry:${stashId}` && await env.STATE.get(`voice:stash:${stashId}`, "json") !== null, "F1 voice retry: injected download failure stays retryable, hides token, and never transcribes or routes");
+  }
+  {
+    const oldFetch = global.fetch, oldWarn = console.warn, warnings = [];
+    const runDownload = async (fetchImpl) => {
+      global.fetch = fetchImpl;
+      console.warn = (...args) => warnings.push(args);
+      try { return await downloadTelegramVoice({ TG_TOKEN: "private-bot-token" }, "private-file-id"); }
+      finally { global.fetch = oldFetch; console.warn = oldWarn; }
+    };
+    for (const fetchImpl of [
+      async () => Response.json({ ok: true, result: {} }),
+      async () => Response.json({ ok: true, result: { file_path: "" } }),
+      async () => ({ json: async () => { throw new Error("invalid response body"); } }),
+    ]) {
+      const result = await runDownload(fetchImpl);
+      check(result.ok === false && result.failure.stage === "telegram-info" && result.failure.kind === "telegram" && result.failure.status === null, "F1 transport: missing or malformed getFile response fails at telegram-info");
+      check(warnings.at(-1)?.[0] === "voice_stage_fail" && JSON.stringify(warnings.at(-1)?.[1]) === JSON.stringify(result.failure), "F1 transport: Telegram-info failure preserves the warning structure");
+    }
+    const httpFailure = await runDownload(async (url) => String(url).includes("/getFile") ? Response.json({ ok: true, result: { file_path: "voice/file.ogg" } }) : new Response("failed", { status: 503 }));
+    check(httpFailure.ok === false && JSON.stringify(httpFailure.failure) === JSON.stringify({ stage: "telegram-download", status: 503, apiStatus: null, kind: "http" }) && warnings.at(-1)?.[0] === "voice_stage_fail" && JSON.stringify(warnings.at(-1)?.[1]) === JSON.stringify(httpFailure.failure), "F1 transport: download HTTP failure preserves stage, status, kind, and warning structure");
+    const networkFailure = await runDownload(async (url) => { throw new Error(`request failed for ${url}`); });
+    const downloadNetworkFailure = await runDownload(async (url) => String(url).includes("/getFile") ? Response.json({ ok: true, result: { file_path: "voice/file.ogg" } }) : Promise.reject(new Error(`request failed for ${url}`)));
+    check(networkFailure.ok === false && networkFailure.failure.stage === "telegram-info" && networkFailure.failure.status === null && networkFailure.failure.kind === "network" && downloadNetworkFailure.failure.stage === "telegram-download" && downloadNetworkFailure.failure.kind === "network", "F1 transport: rejected getFile and download fetches are classified as network failures");
+    const warning = warnings.at(-1);
+    check(warning?.[0] === "voice_stage_fail" && JSON.stringify(warning?.[1]) === JSON.stringify(downloadNetworkFailure.failure) && !JSON.stringify(warnings).includes("private-bot-token") && !JSON.stringify(warnings).includes("private-file-id") && !JSON.stringify(warnings).includes("request failed"), "F1 transport: warning contract is structured and excludes token, file id, and raw transport details");
+  }
+  {
+    const oldTimeout = AbortSignal.timeout, oldFetch = global.fetch, oldWarn = console.warn, timeouts = [];
+    const warnings = [];
+    try {
+      AbortSignal.timeout = (ms) => { timeouts.push(ms); return { timeoutMs: ms }; };
+      console.warn = (...args) => warnings.push(args);
+      global.fetch = async (_url, init) => { throw new Error(`timeout ${init.signal.timeoutMs}`); };
+      const infoTimeout = await downloadTelegramVoice({ TG_TOKEN: "private-bot-token" }, "private-file-id");
+      global.fetch = async (url, init) => String(url).includes("/getFile")
+        ? Response.json({ ok: true, result: { file_path: "voice/file.ogg" } })
+        : Promise.reject(new Error(`timeout ${init.signal.timeoutMs}`));
+      const fileTimeout = await downloadTelegramVoice({ TG_TOKEN: "private-bot-token" }, "private-file-id");
+      check(JSON.stringify(timeouts) === JSON.stringify([10000, 10000, 20000]) && infoTimeout.failure.stage === "telegram-info" && fileTimeout.failure.stage === "telegram-download" && infoTimeout.failure.kind === "network" && fileTimeout.failure.kind === "network", "F1 transport: deterministic timeout mocks preserve 10s getFile and 20s download timeouts and failure stages");
+      check(!JSON.stringify(warnings).includes("private-bot-token") && !JSON.stringify(warnings).includes("timeout 10000") && !JSON.stringify(warnings).includes("timeout 20000"), "F1 transport: timeout warnings omit credentials and raw transport errors");
+    } finally { AbortSignal.timeout = oldTimeout; global.fetch = oldFetch; console.warn = oldWarn; }
+  }
+  {
+    const readDir = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const item = new URL(`${entry.name}${entry.isDirectory() ? "/" : ""}`, dir);
+      return entry.isDirectory() ? readDir(item) : [item];
+    });
+    const mediaFiles = readDir(new URL("../../src/skills/media/", import.meta.url));
+    const transportPattern = /api\.telegram\.org|\/file\/bot|TG_TOKEN/;
+    check(mediaFiles.length > 0 && mediaFiles.every((file) => !transportPattern.test(fs.readFileSync(file, "utf8"))), "F1 boundary: entire media skills scope contains no Telegram transport or TG_TOKEN access");
   }
   global.fetch = origFetch;
 }

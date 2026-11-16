@@ -205,7 +205,7 @@ if (DatabaseSync) {
     sc.sq.prepare("INSERT INTO tasks (user_id, title, status, source, created_at) VALUES (1, 'خرید نان', 'open', 'text', '2026-10-28T00:00:00.000Z')").run();
     const capture = {}; const sent = [];
     const env = { STATE: fakeKV(), DB: sc.db, VAULT_SECRET: "s1", AI: ai23({ intent: "vault_list", confidence: 0.9 }, capture) };
-    const o = { chatId: 1, userId: 1, text: "کارت‌هام رو نشون بده", replyToText: "کارت‌هام رو نشون بده", send: async (t) => { sent.push(t); }, chat: async () => {}, nowMs: MORNING23 };
+    const o = { chatId: 1, userId: 1, chatType: "private", text: "کارت‌هام رو نشون بده", replyToText: "کارت‌هام رو نشون بده", send: async (t) => { sent.push(t); }, chat: async () => {}, nowMs: MORNING23 };
     const r = await runNluBranch(env, o, { now: MORNING23, remembered: "TOMAN" });
     const promptText = String(capture.body?.messages?.[0]?.content ?? "");
     check(r === "handled" && sent.some((t) => String(t).includes("گاوصندوق خالی")), `2.3: NLU vault_list executes instead of chat: ${JSON.stringify(sent)}`);
@@ -257,7 +257,7 @@ if (DatabaseSync) {
     const send = async (t, opts) => { sent.push({ text: t, opts }); };
     const chat = async (t, copts) => { chats.push({ text: t, opts: copts }); };
     const env = { STATE: fakeKV(), DB: sc.db, VAULT_SECRET: "s1", ...extraEnv };
-    const say = async (text, nowMs = NOW_LIVE) => handleDailyText(env, { chatId: 1, userId: 1, text, send, chat, nowMs });
+    const say = async (text, nowMs = NOW_LIVE) => handleDailyText(env, { chatId: 1, userId: 1, chatType: "private", text, send, chat, nowMs });
     return { env, sent, chats, say };
   };
   {

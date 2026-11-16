@@ -5,7 +5,7 @@ import {
   VOICE_TOO_LONG_TEXT,
   VOICE_FAILED_TEXT,
 } from "./voice-constants.js";
-import { downloadTelegramVoice, transcribeWithGemini } from "./voice-transcribe.js";
+import { transcribeWithGemini } from "./voice-transcribe.js";
 
 const VOICE_STASH_TTL_SEC = 3600;
 function voiceStashKey(id) { return `voice:stash:${id}`; }
@@ -44,7 +44,7 @@ export async function handleVoiceRetry(env, o) {
   if (!rec) { await o.send(VOICE_FAILED_TEXT); return "missing"; }
   if (Number(rec.owner) !== Number(o.userId)) return "forbidden";
   if (o.editMarkup) await o.editMarkup();
-  const dl = await downloadTelegramVoice(env, rec.file_id);
+  const dl = await o.downloadTelegramVoice(env, rec.file_id);
   if (!dl.ok) { await sendVoiceFailure(o, o.stashId, dl); return "failed"; }
   const tr = await transcribeWithGemini(env, dl.bytes, rec.mime_type, o.transcribeOpts ?? {});
   if (!tr.ok) { await sendVoiceFailure(o, o.stashId, tr); return "failed"; }
@@ -57,7 +57,7 @@ export async function handleVoice(env, o) {
   const duration = Number(voice.duration);
   if (Number.isFinite(duration) && duration > VOICE_MAX_DURATION_SEC) { await o.send(VOICE_TOO_LONG_TEXT); return "too-long"; }
   const stashId = await stashVoice(env, o.userId, voice.file_id, voice.mime_type);
-  const dl = await downloadTelegramVoice(env, voice.file_id);
+  const dl = await o.downloadTelegramVoice(env, voice.file_id);
   if (!dl.ok) { await sendVoiceFailure(o, stashId, dl); return "failed"; }
   const tr = await transcribeWithGemini(env, dl.bytes, voice.mime_type || "audio/ogg", o.transcribeOpts ?? {});
   if (!tr.ok) { await sendVoiceFailure(o, stashId, tr); return "failed"; }
