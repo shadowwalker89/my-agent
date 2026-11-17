@@ -23,14 +23,15 @@ const expectedSuites = [
   { id: "14-platform-vault", path: "./tests/14-platform-vault.test.mjs" },
   { id: "15-skills-media-pdf", path: "./tests/15-skills-media-pdf.test.mjs" },
   { id: "16-pipeline-branches", path: "./tests/16-pipeline-branches.test.mjs" },
+  { id: "17-secret-to-llm", path: "./tests/17-secret-to-llm.test.mjs" },
 ];
 
 const plannedIds = expectedSuites.map((suite) => suite.id);
 const plannedPaths = expectedSuites.map((suite) => suite.path);
 const duplicateIds = plannedIds.filter((id, index) => plannedIds.indexOf(id) !== index);
 const duplicatePaths = plannedPaths.filter((path, index) => plannedPaths.indexOf(path) !== index);
-if (expectedSuites.length !== 16 || duplicateIds.length || duplicatePaths.length) {
-  console.error("Invalid suite plan: expected 16 unique suite ids and paths.");
+if (expectedSuites.length !== 17 || duplicateIds.length || duplicatePaths.length) {
+  console.error("Invalid suite plan: expected 17 unique suite ids and paths.");
   if (duplicateIds.length) console.error("  duplicated ids: " + [...new Set(duplicateIds)].join(", "));
   if (duplicatePaths.length) console.error("  duplicated paths: " + [...new Set(duplicatePaths)].join(", "));
   process.exit(1);

@@ -47,7 +47,8 @@ export async function handleDailyText(env, o, deps = {}) {
   const hasFactMarker = /(اسم\s*من|اسمم|نام\s*من|نامم|شهر\s*من|شهرم|ماشین\s*من|ماشینم|تولدم|تولد\s*من|سنم|شغلم)/u.test(String(text ?? ""));
   const greedyShouldDeferToAi = Boolean(aiAvailableForNlu) && (
     (c.intent === "reminder" && c.ask && c.ask !== "hour-ambiguous" && hasFactMarker) ||
-    ((c.intent === "reminder" || c.intent === "vault_save") && isMultiClause) ||
+    // D5: vault_save never defers to the LLM (its plaintext is secret).
+    (c.intent === "reminder" && isMultiClause) ||
     (c.confidence < 1 && c.intent === "reminder" && hasFactMarker)
   );
   if (!greedyShouldDeferToAi && c.intent !== "chat" && c.intent !== "ask") { await clearPendingAsk(env, userId); return viaBranch(c); }

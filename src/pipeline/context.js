@@ -3,6 +3,7 @@
 import { saveMessage, finalizeMessageKind, getMessageRow, insertTask } from "../db.js";
 import { defaultProjectId } from "../domain/tasks/projects.js";
 import { IRAN_OFFSET_MIN } from "../daily.js";
+import { looksSecret } from "./secret-shape.js";
 
 export const CHAT_CONTEXT_CHAR_LIMIT = 8000;
 const DRAFT_TTL_SEC = 600;
@@ -23,7 +24,8 @@ export const iranIso = (ms) => new Date((ms ?? Date.now()) + IRAN_OFFSET_MIN * 6
 export function buildChatContext(rows, opts = {}) {
   const headerRaw = typeof opts === "string" ? opts : opts && typeof opts === "object" ? (opts.memoryHeader ?? opts.userMemoryHeader ?? opts.header ?? opts.memory ?? null) : null;
   const memoryHeader = typeof headerRaw === "string" && headerRaw.trim() ? headerRaw.trim() : "";
-  const replyToText = opts && typeof opts === "object" && typeof opts.replyToText === "string" ? opts.replyToText.trim().slice(0, 1200) : "";
+  const replyRaw = opts && typeof opts === "object" && typeof opts.replyToText === "string" ? opts.replyToText.trim().slice(0, 1200) : "";
+  const replyToText = replyRaw && !looksSecret(replyRaw) ? replyRaw : "";
   const excludeId = opts && opts.excludeMessageId != null ? Number(opts.excludeMessageId) : null;
   const msgs = (rows || []).filter((r) => r && typeof r.content === "string" && r.content && (excludeId === null || Number(r.id) !== excludeId)).slice(-50);
   const kept = []; let total = 0;

@@ -19,6 +19,7 @@ import { startConfirm } from "../domain/expenses/service.js";
 import { setPendingAsk, askText, sendHourAmbiguousAsk } from "./route.js";
 import { REF_RE, isUnambiguousQuestion } from "./nlu-skip.js";
 import { iranIso, runDb, markDaily, NOT_SAVED_TEXT, UNSUPPORTED_ACTION_TEXT } from "./context.js";
+import { looksSecret } from "./secret-shape.js";
 
 const dailyRunner = (deps) => {
   const fn = deps?.runDailyBranch;
@@ -42,7 +43,8 @@ export async function runNluBranch(env, o, ctx, deps = {}) {
   const nluT0 = Date.now();
   const nowIso = iranIso(now);
   const source = o.source || "text";
-  const replyContext = typeof o.replyToText === "string" && o.replyToText.trim() ? `[در پاسخ به پیام قبلی: «${o.replyToText.trim().slice(0, 1200)}»]` : "";
+  const replyRaw = typeof o.replyToText === "string" && o.replyToText.trim() ? o.replyToText.trim().slice(0, 1200) : "";
+  const replyContext = replyRaw && !looksSecret(replyRaw) ? `[در پاسخ به پیام قبلی: «${replyRaw}»]` : "";
   const needsRefTargets = REF_RE.test(text) || Boolean(replyContext);
   let openTasks = [], recentNotes = [], lastAction = ctx.lastAction ?? null;
   if (needsRefTargets) {
