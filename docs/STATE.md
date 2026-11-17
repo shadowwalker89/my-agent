@@ -1,7 +1,7 @@
 # STATE (update in every PR)
 
 ## Current phase
-R0 CLOSURE IN PROGRESS — acceptance **OPEN / NOT CLOSED**. Step 5 is done on code SHA acc649c; code is frozen there, and any later commit before closure must be docs-only (verified with git diff --stat acc649c HEAD). Step 6 Telegram manual smoke test (14 scenarios), Step 7 independent read-only re-audit, the clean-worktree re-check at closure, and owner approval remain open.
+R0 CLOSURE IN PROGRESS — acceptance **OPEN / NOT CLOSED**. Step 5 is done on code SHA acc649c; code is frozen there, and any later commit before closure must be docs-only (verified with `git diff --name-only acc649c HEAD -- src scripts`, which must be empty). Step 6 manual smoke test (14 scenarios) is closed with one conditional pass (scenario 3; see the Step 6 table). Step 7 independent read-only re-audit, the clean-worktree re-check at closure, and owner approval remain open.
 
 ## Done
 - R0.1 governance (`chore/r0-1-governance`) — ADR index (`0000`, `0001`), `docs/STATE.md`, `scripts/check-structure.mjs` + `scripts/legacy-sizes.json`, CI structure lint step.
@@ -27,9 +27,33 @@ R0 CLOSURE IN PROGRESS — acceptance **OPEN / NOT CLOSED**. Step 5 is done on c
 - R0 PR-B: secret-input guard (R-2d) — `handleDailyText` now runs a fail-closed `looksSecret` check before any DB/LLM work: secret-shaped input whose deterministic intent is neither `vault_save` nor `command` gets a static Persian guidance reply (`SECRET_INPUT_GUIDANCE`), returns `handled`, and writes no `messages` row; `secret-shape.js` strips more dash/underscore separators; `markDaily` redacts secret-shaped text when no entry row exists. Added `scripts/tests/18-secret-input-guard.test.mjs`; `scripts/test-dev.mjs` plan is now 18 suites (`checks=3162`).
 - Offline test evidence (run in normal PowerShell, not the sandbox) — `npm run test:offline` passed: `test-combos` passed; `test-dev` passed with `checks=2938` (this combined wrapper run predates the latest `test-dev` runner changes and was not rerun after them); `test-golden` passed with 70 synthetic + 113 golden = 183 unique Persian utterances, 660 deterministic checks passed with 0 failed and 1 documented known gap; D1 migrations 0001–0003 schema and T0 table round-trip passed.
 - R0 Step 5 evidence — code SHA `acc649c3cbed0289e9b601e6266e4264d5d33253`; branch `fix/r0-pr-b-secret-input-guard`; `docs/_pack/audit-r0.mjs` SHA256 `81EA6A62C5C09679B71871E52D7293C885AFD5D56F902EF6F86B69D9033158DD`; `npm run check`: 89 modules, layer direction OK; `lint:structure`: 89 files, 6 legacy exceptions; `test:offline` checks=3162, golden 660 passed / 0 failed / 1 documented known gap, 183 utterances; D1 migrations 0001–0003 OK; audit summary PASS=21 FAIL=0 WARN=5 UNVERIFIED=0 INFO=1; WARNs C2c, C2d, C2e, C4c, C6b are structural R1 carryovers; wrangler dry-run bundle 791.13 KiB / gzip 184.55 KiB; raw outputs are kept outside the repository. The code SHA is the evidence SHA; a following docs-only commit cannot contain its own SHA and is verified by `git diff --stat acc649c HEAD`.
+- R0 deploy evidence (deploy run on docs commit `fb9ac92`) — code evidence SHA `acc649c`; docs-only commits after it are verified with a `git diff` over `src` and `scripts` (must be empty). The deploy workflow was run manually (`workflow_dispatch`) on this branch at `fb9ac92` and finished successfully, including the post-deploy smoke test (health and models checks). A live-code probe passed: a message shaped like a card number received the security guidance instead of an AI answer, which proves the new code is live. A rollback point exists (the previous production version is kept by Cloudflare; no version ids recorded). `main` is untouched (still at the pre-R0 commit); the PR is open and not merged; CI checks on the PR are green.
+
+### R0 Step 6 results (manual smoke test, owner-run, private chat)
+
+This section records Step 6 as closed with one conditional pass. "pre-existing" below was concluded from an offline comparison of the old and new code and from code reading, not from running the old version live.
+
+| # | scenario | result | note |
+|---|----------|--------|------|
+| 1 | /start and /help | pass | |
+| 2 | reminder in 2 minutes | pass | delivered about 2 minutes later, exactly once |
+| 3 | reminder tomorrow at 09:00 | CONDITIONAL PASS | stored `remind_at` is the correct next-day 09:00 Tehran time (read from the database); the delivery mechanism with the same time format was verified by scenario 2; actual delivery at 09:00 not yet observed. If it does not arrive, open a new R1 finding; this does not reopen R0. |
+| 4 | task for a project | pre-existing | classifier result is identical in pre-R0 and current code (offline comparison); Workers AI intent-NLU timeouts / bad JSON cause fallback to chat |
+| 5 | expense | pre-existing defect B-1 | see B-1 |
+| 6 | meeting note mentioning expenses | pre-existing behavior | classified as an expense query in both versions; contract section 7.1 acceptance test 4 passes (no false vault entry) |
+| 7 | fact save and recall | pass | |
+| 8 | three-line card note | pre-existing limitation G-1 | no raw card stored; see G-1 |
+| 9 | photo | pass | |
+| 10 | image generation | pass | cosmetic: provider error debug text shows "[object Object]" |
+| 11 | PDF | pass | |
+| 12 | voice | pass | |
+| 13 | /backup | pass | fake test card text not present in the backup file |
+| 14 | /setup | pass | keys shown masked |
+
+Extras: Test 0 (card-shaped message) pass; S17 acceptable (no AI answer, card not echoed, nothing stored); stored-message check on the production database: the latest 40 user messages contain no raw test card (the check searched only for the fake card digits), and card-shaped messages sent after the deploy are stored as the redacted placeholder.
 
 ## In progress
-- R0 closure gates (R0 is **not** complete): Step 5 done on acc649c; remaining gates are Step 6, Step 7, clean-worktree re-check at closure, owner approval. Do not mark R0 complete until all gates pass.
+- R0 closure gates (R0 is **not** complete): Step 5 done on acc649c; Step 6 closed with one conditional pass (scenario 3), so remaining gates are Step 7, the clean-worktree re-check at closure, and owner approval. Do not mark R0 complete until all gates pass.
 
 ## Decisions
 - ADR index: `docs/adr/` (`0001-initial-decisions.md` D1–D21, `0002-offline-d1-test-harness.md`, `0003-channel-transport-boundary.md`).
@@ -37,7 +61,7 @@ R0 CLOSURE IN PROGRESS — acceptance **OPEN / NOT CLOSED**. Step 5 is done on c
 
 ## Known issues / risks
 - R0 acceptance remains **OPEN / NOT CLOSED**. `git status --short` was empty at Step 5; re-verify the clean-worktree gate at closure. `.audit-dist/` is generated Wrangler output and is not intended as source documentation.
-- F1 is implemented; Step 5 is done on code SHA acc649c. Step 6 Telegram manual smoke test (14 scenarios), Step 7 independent read-only re-audit, the clean-worktree re-check at closure, and owner approval are still pending. Step 5 reran the combined npm run test:offline on acc649c (checks=3162); see the R0 Step 5 evidence entry.
+- F1 is implemented; Step 5 is done on code SHA acc649c. Step 6 is closed with one conditional pass (scenario 3; see the Step 6 table); Step 7 independent read-only re-audit, the clean-worktree re-check at closure, and owner approval are still pending. Step 5 reran the combined npm run test:offline on acc649c (checks=3162); see the R0 Step 5 evidence entry.
 - F6 Vault callback private-chat gate is committed in 503d73f: `resolveVaultCallback` rejects non-private or missing chat types before sensitive operations, the production callback passes the actual Telegram chat type, and positive/negative tests cover `private`, missing, `group`, and `supergroup`. It is not an unfixed R1 security carryover; final evidence: Step 5 on acc649c; final acceptance still depends on independent review.
 - Security exceptions to "behavior unchanged" in R0: F6, F-01, PR-A (multi-item Vault saves in one message no longer use the LLM); reply-to text that looks like a card/Sheba/Vault output is dropped from LLM prompts (context loss by design); secret-shaped input (card/Sheba shape, or containing 🔒) outside vault_save/command is answered with static guidance, never sent to an LLM, never stored; false positives: any >= 13-digit run (tracking codes, barcodes) and any text containing 🔒.
 - `looksSecret` is shape-only and fail-closed; digit groups separated only by spaces can merge and cause false positives.
@@ -46,6 +70,12 @@ R0 CLOSURE IN PROGRESS — acceptance **OPEN / NOT CLOSED**. Step 5 is done on c
 - R1 carryover: `src/providers.js` is 295 lines (near the 300 cap).
 - R1 carryover: 13 `tgApi` call sites outside `src/channels/` (C6b), related to F7; includes one call site inside `src/platform/scheduler/index.js` (a platform-layer file calling the Telegram API directly).
 - R1 carryover: test log line `getFile failed: Cannot read properties of undefined (reading 'get')` appears in `test:offline` output; origin not yet identified; check in Step 7.
+- B-1 (**Medium**, pre-existing, first R1 task): after choosing the expense option on the "expense or chat?" question, the confirm and cancel buttons do nothing. Cause (code reading plus offline mock): the expense draft is created with `owner = userId`, but the callback path supplies only `fromId`, so the later confirm returns "forbidden" and the handler returns silently. Likely a one-line fix (use `userId`, falling back to `fromId`). Workaround until fixed (untested): write expenses with a verb, e.g. "spent 50k on lunch". Not verified on the live server.
+- G-1 (**Low**, R1): the card/Sheba guidance text is misleading. Real constraints: a card/Sheba/account/national-id keyword must appear, the number must be contiguous (no dashes or spaces), the message must be at most 160 characters, and it must not be multi-clause. Fix: accept dashes/spaces and make the guidance accurate.
+- N-5 (**Medium-High**, R1): the personal-memory block is sent to free chat models (OpenRouter/xkiro), which conflicts with contract decision D5 (personal data only to Workers AI/Gemini). Pre-existing; R0 did not change it.
+- N-6 (**Low** for R0, R1): Workers AI intent-NLU calls time out or return bad JSON, so messages fall back to chat. Quota is not the cause.
+- N-7 (**post-R0**): chat model ranking/selection quality is poor (owner observation).
+- Minor R1: `[object Object]` in image-generation error debug text; `npm audit` reports 3 vulnerabilities (2 moderate, 1 high), not triaged.
 - Remaining legacy modules above 300 lines are recorded in `scripts/legacy-sizes.json` (6 files: `admin-page.js`, `combos.js`, `db.js`, `dev.js`, `index.js`, `router.js`); they may only shrink.
 - `src/domain/expenses/` does not yet parse `درهم`/`AED` (pinned as a documented known gap in `eval/golden-persian.json`; scheduled for R3 multi-currency accounting per Contract v3 §7.1 & §11.3).
 - `wrangler.jsonc` still defines 4 cron triggers; consolidation to a single `* * * * *` cron + `schedules` table is scheduled for R1 per Contract v3 §5 & §8.
@@ -57,5 +87,5 @@ R0 CLOSURE IN PROGRESS — acceptance **OPEN / NOT CLOSED**. Step 5 is done on c
 - Actions minutes per month: 
 
 ## Next step
-- Close the R0 gates in order: docs-only commit, then owner-approved push/PR/deploy-path, then Step 6 Telegram manual smoke test (14 scenarios), then Step 7 independent read-only re-audit. Do not mark R0 complete before these pass, and do no R1 work until R0 is accepted.
+- Remaining before R0 closure, in order: (1) docs-only commit with these records (needs owner approval); (2) fast-forward of `main` requires separate explicit owner approval (the merge triggers an automatic production deploy; fast-forward only, no squash); (3) Step 7: independent re-audit (fresh read-only session plus a second model), then the clean-worktree gate, then owner approval of closure. Do not mark R0 complete before these pass, and do no R1 work until R0 is accepted.
 - After R0 acceptance, start R1.1 core schema & ingress hardening: numbered migration `0004` (`provenance` & `data_class` on `messages`, `schedules`, `approvals`, `audit_events`, `quota_usage`, `provider_state`) and `src/ingress/` (`auth.js`, `dedup.js`, `classify.js`, `provenance.js`).
