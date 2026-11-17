@@ -11,7 +11,7 @@ export function looksSecret(text) {
     const normalized = text
       .replace(/[۰-۹]/g, (d) => String(FA_DIGITS.indexOf(d)))
       .replace(/[٠-٩]/g, (d) => String(AR_DIGITS.indexOf(d)));
-    const compact = normalized.replace(/[\s\u00A0\u200c\u200d\u200e\u200f._-]/g, "");
+    const compact = normalized.replace(/[\s\u00A0\u200c\u200d\u200e\u200f._\-\u2013\u2014\u2212\u0640]/g, "");
     return /(?:\d{13,})/.test(compact);
   } catch {
     return false;

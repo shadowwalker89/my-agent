@@ -116,7 +116,7 @@ export async function delKv(env, key) { if (!env.STATE) return; try { await env.
 // otherwise save their user row through answerChatText as before).
 export async function markDaily(env, o) {
   if (o.entryMessageId) { if (!o._entryFinalised) { o._entryFinalised = true; await finalizeMessageKind(env, o.entryMessageId, o.userId, "daily"); } return; }
-  await saveMessage(env, { userId: o.userId, role: "user", content: o.text, kind: "daily" });
+  await saveMessage(env, { userId: o.userId, role: "user", content: looksSecret(o.text) ? "[🔒 محتوای حساس گاوصندوق]" : o.text, kind: "daily" });
 }
 export async function markChat(env, o) {
   if (o.entryMessageId && !o._entryFinalised) { o._entryFinalised = true; await finalizeMessageKind(env, o.entryMessageId, o.userId, "chat"); }

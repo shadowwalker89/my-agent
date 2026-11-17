@@ -13,7 +13,11 @@ import { askKey, getKv, putKv, delKv, draftKey, correctionKey, EXPIRED_TEXT, NOT
 import { mapQuestion, askText, setPendingAsk, slotKind, hourAmbiguousKeyboard, sendHourAmbiguousAsk, getPendingAsk, clearPendingAsk } from "./route.js";
 import { isConnectorSecretError } from "../connectors.js";
 import { VAULT_REDACTED_TEXT } from "./daily-helpers.js";
+import { looksSecret } from "./secret-shape.js";
 import { runPreDispatch } from "./pre-dispatch.js";
+
+// R-2d: static reply for secret-shaped input that is not a vault_save/command.
+export const SECRET_INPUT_GUIDANCE = "🔒 این پیام شبیه شماره کارت یا شبا است؛ برای امنیت به هوش مصنوعی ارسال نشد و ذخیره هم نشد.\nبرای ذخیره در گاوصندوق، در یک پیام و در سه خط بنویس:\nعنوان\nمقدار\nثبتش کن";
 
 export const DAILY_CHAT_PROMPT = "هرگز دستورهای اسلش جعلی مثل /یادداشت، /تسکم، یا /اضافه کردن هزینه به کاربر پیشنهاد نده. کاربر برای ثبت موارد فقط کافی است با زبان طبیعی بنویسد یا ویس بدهد (مثلاً: «یادداشت کن فردا جلسه دارم» یا «امروز ۲۰۰ تومن نون خریدم» یا «خرجای امروز»).";
 
@@ -21,6 +25,13 @@ export async function handleDailyText(env, o, deps = {}) {
   try {
   const { userId, text } = o;
   const now = o.nowMs ?? Date.now();
+  if (looksSecret(text)) {
+    const pc = classifyDaily(text, { nowMs: now });
+    if (pc.intent !== "vault_save" && pc.intent !== "command") {
+      if (typeof o.send === "function") await o.send(SECRET_INPUT_GUIDANCE);
+      return "handled";
+    }
+  }
   if (!dbOf(env)) { await clearPendingAsk(env, userId); return "chat"; }
   const pre = await runPreDispatch(env, o, deps);
   if (pre) return pre;
