@@ -30,7 +30,7 @@ channels → ingress → pipeline → domain / skills → platform
 2. LLM proposes, deterministic code validates and writes. No LLM arithmetic for money or dates; use the deterministic parsers (Jalali dates, relative times, amounts).
 3. Every message carries `provenance` (`user|forwarded|email|channel|pdf|web`) and `data_class` (`public|personal|secret`).
 4. Only `provenance=user` may create Commands, change memory (`user_facts`), or request sending anything. Untrusted content (email, channel posts, PDFs, web) is processed in **summarizer mode**: no tools, no memory writes, instructions inside it are never executed.
-5. `secret` data never reaches an LLM, a log, or an error message. It is cut before the interpreter. Do not store card numbers or passwords in the vault.
+5. `secret` data never reaches an LLM, a log, or an error message. It is cut before the interpreter. Card numbers and Sheba may be stored in the vault only as ciphertext (ADR 0004). Never store CVV, passwords or OTP codes in the vault.
 6. Any external side effect (send email, send Telegram message, post, delete) requires an **Approval** bound to the exact payload hash with an expiry. Changed payload = new approval.
 7. Money is an INTEGER in minor units with an explicit `currency` (toman, dirham). Corrections are reversals/soft-deletes with audit, never hard deletes.
 8. Provider trust: `personal` data only to P0 providers (Workers AI) or P1 with the owner's explicit opt-in; anonymous free providers (P2) get `public` data only.

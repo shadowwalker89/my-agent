@@ -276,6 +276,8 @@ src/admin/      setup.js backup.js dev.js
 | D19 ✅ | **OTP = داده‌ی `secret`** | هرگز به LLM یا log نمی‌رود؛ در D1 ذخیره نمی‌شود (فقط `message_id` برای جلوگیری از تکرار)؛ پیام ربات بعد از N دقیقه (پیش‌فرض ۱۰) حذف می‌شود 🔎 |
 | D20 ✅ | اتصال Gmail: OAuth شخصی با scope `gmail.readonly` و **polling** (`history.list`) در تیک واحد؛ بدون Pub/Sub | بدون نیاز به Google Cloud Billing؛ تأخیر ≤ ۱ دقیقه. Pub/Sub بعداً در صورت نیاز |
 | D21 ✅ | **روش توسعه:** Gemini (Google AI Studio) = معمار و بازبین؛ OpenCode روی لپ‌تاپ = پیاده‌ساز؛ حافظه‌ی پروژه = `docs/STATE.md` در مخزن | Gemini مستقیماً در مخزن کد نمی‌نویسد |
+| D22 ✅ | Vault may store card numbers and Sheba as ciphertext only; CVV, passwords, OTP stay forbidden; see ADR 0004 | Clarifies D5: card numbers and Sheba are allowed encrypted at rest; ADR 0004 |
+| D23 ✅ | `vault:analyze` may send the owner's image to Gemini as an owner-initiated D5 exception; see ADR 0004 | Documented exception to D5; ADR 0004 |
 
 ### ۱۱.۱ مشخصات Skill اول: «OTP فوری از Gmail» (T1)
 
