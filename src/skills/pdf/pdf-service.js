@@ -11,8 +11,5 @@ export async function analyzePdfDocument(env, opts = {}) {
   }
   const ext = await extractTextFromPdfBytes(pdfBytes); if (!ext) return { ok: false, error: "متن قابل استخراج نیست" };
   if (ext === SCANNED_PDF_MESSAGE) return { ok: true, text: SCANNED_PDF_MESSAGE };
-  const chatFn = opts.chatFn || opts.chat || null; const router = opts.routerCallFn || null; const full2 = prompt + "\n\nمتن استخراج‌شده از PDF:\n" + ext.slice(0, 8000) + "\n\nپاسخ را به فارسی روان، خلاصه و دقیق بده.";
-  if (typeof chatFn === "function") { try { const out = await chatFn(full2, { saveText: "", noHistory: true }); const t = chatText(out); if (t) return { ok: true, text: t }; } catch {} }
-  if (typeof router === "function") { try { const out3 = await router({ model: "chat", messages: [{ role: "user", content: full2 }] }); const t3 = chatText(out3); if (t3) return { ok: true, text: t3 }; } catch {} }
-  return { ok: true, text: ext.slice(0, 8000) };
+  return { ok: true, text: ext.slice(0, 3500) };
 }

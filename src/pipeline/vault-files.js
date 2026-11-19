@@ -4,7 +4,7 @@ import { saveVaultFile, setFileSyncStatus, resolvePendingVaultFile } from "../db
 import { syncVaultFileToGoogle } from "../vault.js";
 import { getConnectorSecret, isConnectorSecretError } from "../connectors.js";
 import { isPdfAnalysisRequest, analyzePdfDocument, buildImageToPdfBytes } from "../pdf.js";
-import { analyzeImage, editImage, isImageEditCaption } from "../media.js";
+import { analyzeImage, editImage, isImageEditCaption, VISION_UNAVAILABLE_TEXT } from "../media.js";
 import { looksSecret } from "./secret-shape.js";
 import { GEMINI_VISION_MODELS } from "../platform/gemini-models.js";
 
@@ -152,9 +152,9 @@ export async function handleVaultFile(env, o, deps = {}) {
       if (!bytes || !bytes.length) { await send("تحلیل ممکن نشد."); return true; }
       const result = await analyzeImage(env, { imageBytes: bytes, mimeType: mimeType || "image/jpeg", prompt: cap, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
       if (result && result.ok && result.text) await send(result.text);
-      else await send("❌ خطا در تحلیل تصویر: " + (result?.error || result?.text || "vision_unavailable"));
-    } catch (e) {
-      await send("❌ خطا در تحلیل تصویر: " + (e?.message || "vision_unavailable"));
+      else await send(result?.userText || result?.text || VISION_UNAVAILABLE_TEXT);
+    } catch {
+      await send(VISION_UNAVAILABLE_TEXT);
     }
     return true;
   }
@@ -174,16 +174,14 @@ export async function handleVaultFile(env, o, deps = {}) {
   }
   if (cap && VISION_CAPTION_RE.test(cap)) {
     const bytes2 = await fileBytesFromTelegram(env, tgFileId, deps);
-    let visionError = null;
     if (bytes2 && bytes2.length) {
       const r2 = await analyzeImage(env, { imageBytes: bytes2, mimeType: mimeType || "image/jpeg", prompt: cap, userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
       if (r2 && r2.ok && r2.text) { await send(r2.text); return true; }
-      visionError = r2?.error || r2?.text || null;
     }
     const f = { tg_file_id: tgFileId, mime_type: mimeType, file_type: fileType };
     const detailed = await analyzeVaultImageDetailed(env, f, cap, userId, deps);
     const text = detailed.ok ? detailed.text : null;
-    await send(text || ("❌ خطا در تحلیل تصویر: " + (visionError || "vision_unavailable")));
+    await send(text || vaultAnalyzeFailureText(detailed.reason));
     return true;
   }
   const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title: "__choice__", fileName: safeFileName, caption: cap || null, syncStatus: "local" });

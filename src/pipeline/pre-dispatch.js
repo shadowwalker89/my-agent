@@ -1,4 +1,4 @@
-import { parseImageGenCommand, generateFreeImage, editImage, analyzeImage, isImageEditCaption, isVisionQuestionCaption } from "../media.js";
+import { parseImageGenCommand, generateFreeImage, editImage, analyzeImage, isImageEditCaption, isVisionQuestionCaption, VISION_UNAVAILABLE_TEXT } from "../media.js";
 import { buildTextPdfOrHtmlReport, parsePdfCreateCommand } from "../pdf.js";
 import { fileBytesFromTelegram, namePendingVaultFile } from "./vault-files.js";
 import { exportUserBackupSnapshot } from "../db.js";
@@ -105,7 +105,7 @@ export async function runPreDispatch(env, o, deps = {}) {
     }
     const result = await analyzeImage(env, { imageBytes, mimeType: "image/jpeg", prompt: userText, userId: o.userId ?? userId, fetchFn: o.fetchFn, routerCallFn: o.routerCallFn });
     if (typeof o.send === "function") {
-      await o.send(result && result.ok && result.text ? result.text : "❌ خطا در تحلیل تصویر: " + (result?.error || result?.text || "vision_unavailable"));
+      await o.send(result && result.ok && result.text ? result.text : (result?.userText || result?.text || VISION_UNAVAILABLE_TEXT));
     }
     return "handled";
   }

@@ -1,4 +1,4 @@
-import { resolveKey, safeJson, PERSIAN_RE, b64ToBytes, bytesToBase64, connectorDiag, resolveFetch } from "./helpers.js";
+import { resolveKey, safeJson, PERSIAN_RE, b64ToBytes, bytesToBase64, resolveFetch } from "./helpers.js";
 import { createDeadline } from "./deadline-translate.js";
 import { GEMINI_VISION_MODELS } from "../../platform/gemini-models.js";
 
@@ -16,6 +16,11 @@ export function cleanVisionPersianText(raw) {
   return s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").replace(/[ \t]{2,}/g, " ").trim();
 }
 
+export const VISION_UNAVAILABLE_TEXT = "❌ تحلیل تصویر الان ممکن نشد. کمی بعد دوباره امتحان کن.";
+
+const GEMINI_ATTEMPT_MS = 12000;
+const VISION_TOTAL_MS = 25000;
+
 export async function analyzeImage(env, opts = {}) {
   const imageBytes = opts.imageBytes ?? opts.bytes ?? null;
   const mimeType = opts.mimeType || "image/jpeg";
@@ -23,97 +28,60 @@ export async function analyzeImage(env, opts = {}) {
   const visionPrompt = `${VISION_PERSIAN_INSTRUCTION}\n${prompt}`;
   const userId = opts.userId ?? null;
   const fn = resolveFetch(opts);
-  const routerCallFn = opts.routerCallFn ?? null;
   const errors = [];
-  if (!imageBytes) return { ok: false, error: "no_image", text: "تحلیل تصویر ممکن نشد؛ هیچ تصویری دریافت نشد." };
+  if (!imageBytes) {
+    const text = "تحلیل تصویر ممکن نشد؛ هیچ تصویری دریافت نشد.";
+    return { ok: false, error: "no_image", text, userText: text };
+  }
   const b64 = bytesToBase64(imageBytes);
-  const dataUri = `data:${mimeType || "image/jpeg"};base64,${b64}`;
-  const budget = createDeadline();
+  const budget = createDeadline(VISION_TOTAL_MS);
 
-  if (typeof routerCallFn === "function") {
-    try {
-      const body = {
-        model: "vision",
-        messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUri } }, { type: "text", text: visionPrompt }] }],
-      };
-      const out = await routerCallFn(body);
-      let text = "";
-      if (typeof out === "string") text = out.trim();
-      else if (out && typeof out === "object") {
-        text = out.text || out.finalText || out.answer || out?.data?.choices?.[0]?.message?.content || out?.data?.message?.content || "";
-        if (typeof text !== "string") text = String(text ?? "").trim();
-      }
-      const cleaned = cleanVisionPersianText(text);
-      if (cleaned) return { ok: true, text: cleaned };
-      errors.push("router:empty");
-    } catch (e) { errors.push("router:" + (e?.message || "error")); }
+  let geminiKey = null;
+  try {
+    geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
+  } catch {
+    geminiKey = null;
+  }
+  if (!geminiKey) {
+    const text = "تحلیل تصویر ممکن نشد؛ کلید GEMINI_API_KEY تنظیم نشده و مدل vision هم در دسترس نیست.";
+    return { ok: false, error: "vision_unavailable: no_key", text, userText: text };
   }
 
   if (typeof fn === "function") {
-    try {
-      const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
-      if (geminiKey) {
-        for (const model of GEMINI_VISION_MODELS) {
-          try {
-            const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json", "x-goog-api-key": geminiKey },
-              body: JSON.stringify({
-                contents: [{ role: "user", parts: [{ text: visionPrompt }, { inlineData: { mimeType, data: b64 } }] }],
-              }),
-              signal: budget.signal(8000),
-            });
-            if (res?.ok) {
-              const json = await safeJson(res);
-              const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
-              const cleaned = cleanVisionPersianText(text);
-              if (cleaned) return { ok: true, text: cleaned };
-              errors.push(`gemini-${model}:empty`);
-            } else {
-              errors.push(`gemini-${model}:${res?.status || "not_ok"}`);
-            }
-          } catch (e) { errors.push(`gemini-${model}:` + (e?.message || "error")); }
+    for (const model of GEMINI_VISION_MODELS) {
+      try {
+        const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": geminiKey },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: visionPrompt }, { inlineData: { mimeType, data: b64 } }] }],
+          }),
+          signal: budget.signal(GEMINI_ATTEMPT_MS),
+        });
+        if (res?.ok) {
+          const json = await safeJson(res);
+          const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+          const cleaned = cleanVisionPersianText(text);
+          if (cleaned) return { ok: true, text: cleaned };
+          errors.push(`${model}:empty`);
+        } else {
+          errors.push(`${model}:${res?.status || "not_ok"}`);
         }
+      } catch (e) {
+        const code = e?.name === "TimeoutError" || e?.name === "AbortError" ? "timeout" : "error";
+        errors.push(`${model}:${code}`);
       }
-    } catch (e) { errors.push(connectorDiag("gemini", e)); }
-
-    try {
-      const nvidiaKey = await resolveKey(env, userId, "nvidia", "NVIDIA_API_KEY");
-      if (nvidiaKey) {
-        for (const model of ["meta/llama-3.2-90b-vision-instruct", "meta/llama-3.2-11b-vision-instruct", "nvidia/nemotron-3.5-super-vl-120b-a12b"]) {
-          try {
-            const res = await fn("https://integrate.api.nvidia.com/v1/chat/completions", {
-              method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${nvidiaKey}` },
-              body: JSON.stringify({
-                model,
-                messages: [{ role: "user", content: [
-                  { type: "text", text: visionPrompt },
-                  { type: "image_url", image_url: { url: dataUri } },
-                ] }],
-                max_tokens: 600,
-              }),
-              signal: budget.signal(12000),
-            });
-            if (res?.ok) {
-              const json = await safeJson(res);
-              const text = json?.choices?.[0]?.message?.content;
-              const cleaned = cleanVisionPersianText(text);
-              if (cleaned) return { ok: true, text: cleaned };
-              errors.push(`nvidia-${model}:empty`);
-            } else {
-              errors.push(`nvidia-${model}:${res?.status || "not_ok"}`);
-            }
-          } catch (e) { errors.push(`nvidia-${model}:` + (e?.message || "error")); }
-        }
-      }
-    } catch (e) { errors.push(connectorDiag("nvidia", e)); }
+    }
+  } else {
+    errors.push("no_fetch");
   }
 
+  console.warn("vision_failed", { reasons: errors });
   return {
     ok: false,
-    text: "تحلیل تصویر ممکن نشد؛ کلید GEMINI_API_KEY تنظیم نشده و مدل vision هم در دسترس نیست.",
-    error: errors.length ? "vision_unavailable: " + errors.join("; ") : "vision_unavailable",
+    error: "vision_unavailable: " + errors.join("; "),
+    text: VISION_UNAVAILABLE_TEXT,
+    userText: VISION_UNAVAILABLE_TEXT,
   };
 }
 

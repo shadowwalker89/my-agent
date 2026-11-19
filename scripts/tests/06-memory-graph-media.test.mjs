@@ -717,12 +717,13 @@ if (DatabaseSync) {
     } });
     check(gen.ok === true && gen.provider === "nvidia", `M2: corrupt gemini does not abort nvidia image generation: ${JSON.stringify(gen).slice(0, 200)}`);
 
+    const anUrls = [];
     const an = await analyzeImage(envL, { imageBytes: new Uint8Array([1, 2, 3]), mimeType: "image/jpeg", prompt: "تحلیل", userId: 1, fetchFn: async (url) => {
-      const u = String(url);
-      if (u.includes("integrate.api.nvidia.com")) return { ok: true, json: async () => ({ choices: [{ message: { content: "سلام دنیا" } }] }) };
+      anUrls.push(String(url));
+      if (String(url).includes("integrate.api.nvidia.com")) return { ok: true, json: async () => ({ choices: [{ message: { content: "سلام دنیا" } }] }) };
       return { ok: false, status: 404, json: async () => ({}) };
     } });
-    check(an.ok === true && an.text.includes("سلام"), `M2: corrupt gemini does not abort nvidia vision: ${JSON.stringify(an).slice(0, 200)}`);
+    check(an.ok === false && anUrls.length === 0 && String(an.userText).includes("GEMINI_API_KEY"), `M2: corrupt gemini never falls back to NVIDIA vision (D5): ${JSON.stringify(an).slice(0, 200)} urls=${JSON.stringify(anUrls)}`);
 
     const ed = await editImage(envL, { imageBytes: new Uint8Array([1, 2, 3]), mimeType: "image/jpeg", instruction: "edit", userId: 1, fetchFn: async (url) => {
       if (String(url).includes("router.huggingface.co")) return { ok: true, arrayBuffer: async () => new Uint8Array([9, 8, 7]).buffer };
@@ -789,9 +790,10 @@ if (DatabaseSync) {
   };
   const ana = await analyzeImage({ GEMINI_API_KEY: "gkey" }, { imageBytes: new Uint8Array([1,2,3]), mimeType: "image/jpeg", prompt: "این عکس رو تحلیل کن", fetchFn: geminiVisionFn });
   check(ana.ok === true && String(ana.text).includes("فاکتور"), `3.4: analyzeImage gemini Persian analysis: ${JSON.stringify(ana)}`);
-  let routerSeen = null;
-  const anaRouter = await analyzeImage({ STATE: fakeKV() }, { imageBytes: new Uint8Array([1,2,3]), mimeType: "image/jpeg", prompt: "متن داخل عکس رو بخون", fetchFn: poll34, routerCallFn: async (body) => { routerSeen = body; return { text: "متن داخل عکس: سلام" }; } });
-  check(anaRouter.ok === true && String(anaRouter.text).includes("سلام") && routerSeen && String(routerSeen.messages?.[0]?.content?.[0]?.image_url?.url || "").startsWith("data:image/jpeg;base64,"), `3.4: analyzeImage router fallback with data URI: ok=${anaRouter.ok} seen=${JSON.stringify(routerSeen).slice(0,200)}`);
+  let routerCalls34 = 0;
+  const seenUrls34 = [];
+  const anaRouter = await analyzeImage({ GEMINI_API_KEY: "gkey-34r", STATE: fakeKV() }, { imageBytes: new Uint8Array([1,2,3]), mimeType: "image/jpeg", prompt: "متن داخل عکس رو بخون", userId: 1, fetchFn: async (url) => { seenUrls34.push(String(url)); return { ok: false, status: 500, json: async () => ({}) }; }, routerCallFn: async () => { routerCalls34++; return { text: "متن داخل عکس: سلام" }; } });
+  check(anaRouter.ok === false && routerCalls34 === 0 && seenUrls34.length > 0 && seenUrls34.every((u) => new URL(u).host === "generativelanguage.googleapis.com"), `3.4: analyzeImage never uses router fallback with image bytes (D5): ok=${anaRouter.ok} router=${routerCalls34} urls=${JSON.stringify(seenUrls34)}`);
   check(isVisionQuestionCaption("این عکس رو تحلیل کن و بگو چیه؟") === true, "3.4: isVisionQuestionCaption detects تحلیل + چیه؟");
   check(isImageEditCaption("ویرایش: پس‌زمینه عکس رو حذف کن") === true, "3.4: isImageEditCaption detects ویرایش:");
   if (DatabaseSync) {
@@ -855,8 +857,9 @@ if (DatabaseSync) {
   check(repStr35.startsWith("%PDF-1.4") && repStr35.includes("%%EOF") && rep35.html.includes('dir="rtl"') && rep35.html.includes('lang="fa"') && rep35.html.includes("@media print"), `3.5: buildTextPdfOrHtmlReport pdf+rtl html: html=${String(rep35.html).slice(0,120)}`);
   check(parsePdfCreateCommand("این متن رو PDF کن: سلام").isPdfCreate === true && parsePdfCreateCommand("تبدیل به PDF: سلام").isPdfCreate === true && parsePdfCreateCommand("/pdf سلام").text === "سلام" && parsePdfCreateCommand("سلام").isPdfCreate === false, "3.5: parsePdfCreateCommand matches 3 forms");
   const fakePdf35 = new TextEncoder().encode("%PDF-1.4\n1 0 obj\n<<>>\nstream\nBT /F1 12 Tf (Hello World) Tj ET\nendstream\n%%EOF");
-  const ana35 = await analyzePdfDocument({ STATE: fakeKV() }, { pdfBytes: fakePdf35, prompt: "این پی‌دی‌اف درباره چیه؟", userId: 1, fetchFn: async () => ({ ok: false, json: async () => ({}) }), chatFn: async (t) => { check(String(t).includes("Hello World"), "3.5: extractor passes Hello World to chatFn"); return "خلاصه فارسی: سلام دنیا"; } });
-  check(ana35.ok === true && String(ana35.text).includes("خلاصه فارسی"), `3.5: analyzePdfDocument extractor fallback: ${JSON.stringify(ana35).slice(0,200)}`);
+  let chatCalls35 = 0;
+  const ana35 = await analyzePdfDocument({ STATE: fakeKV() }, { pdfBytes: fakePdf35, prompt: "این پی‌دی‌اف درباره چیه؟", userId: 1, fetchFn: async () => ({ ok: false, json: async () => ({}) }), chatFn: async () => { chatCalls35++; return "خلاصه فارسی: سلام دنیا"; } });
+  check(ana35.ok === true && chatCalls35 === 0 && String(ana35.text).includes("Hello World"), `3.5: analyzePdfDocument extractor fallback returns local text, no chatFn (D5): ${JSON.stringify(ana35).slice(0,200)} chat=${chatCalls35}`);
   if (DatabaseSync) {
     const sq35 = new DatabaseSync(":memory:");
     sq35.exec(fs.readFileSync(new URL("../../migrations/0001_init.sql", import.meta.url), "utf8"));
@@ -1023,31 +1026,29 @@ if (DatabaseSync) {
   try {
     const envR = { STATE: fakeKV(), DB: dbR, TG_TOKEN: "fake-token" };
     const sentR = [];
+    let chatCallsR = 0;
     const handledR = await handleIncomingFile(envR, {
       userId: 4242, chatId: 4242, tgFileId: "pdf-r", fileType: "document", mimeType: "application/pdf", fileName: "scan.pdf",
-      caption: "این پی‌دی‌اف رو خلاصه کن",
+      caption: "این پیـدیـاف رو خلاصه کن",
       send: async (t) => { sentR.push(String(t)); },
-      chatFn: async (t) => { check(String(t).includes("Hello World"), "fix1: pure chatFn receives extracted PDF text"); return "خلاصه فارسی: یک بار"; },
+      chatFn: async () => { chatCallsR++; return "خلاصه فارسی: یک بار"; },
       routerCallFn: null,
     });
-    check(handledR === true && sentR.length === 1 && sentR[0].includes("خلاصه فارسی"), `fix1: PDF summary sends exactly ONE reply: count=${sentR.length} ${JSON.stringify(sentR)}`);
+    check(handledR === true && chatCallsR === 0 && sentR.length === 1 && sentR[0].includes("Hello World"), `fix1: PDF summary sends exactly ONE local-text reply, no chatFn (D5): count=${sentR.length} chat=${chatCallsR} ${JSON.stringify(sentR)}`);
   } finally {
     global.fetch = origFetchR;
   }
 
-  let nvSeen = null;
-  const nvFn = async (url, init = {}) => {
-    const u = String(url);
-    if (u.includes("integrate.api.nvidia.com/v1/chat/completions")) {
-      nvSeen = { url: u, init };
-      return { ok: true, json: async () => ({ choices: [{ message: { content: "روی لباسش دو شخصیت کارتونی است." } }] }) };
-    }
+  const nvUrls = [];
+  const nvFn = async (url) => {
+    nvUrls.push(String(url));
+    if (String(url).includes("generativelanguage.googleapis.com")) return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: "روی لباسش دو شخصیت کارتونی است." }] } }] }) };
     return { ok: false, json: async () => ({}) };
   };
   const anaNv = await analyzeImage({ STATE: fakeKV(), GEMINI_API_KEY: "AQ.not-a-rest-key", NVIDIA_API_KEY: "nvap-test" }, {
     imageBytes: new Uint8Array([1, 2, 3]), mimeType: "image/jpeg", prompt: "اون ها چیه روی لباسش", fetchFn: nvFn,
   });
-  check(anaNv.ok === true && String(anaNv.text).includes("شخصیت کارتونی") && nvSeen && nvSeen.url.includes("integrate.api.nvidia.com") && String(nvSeen.init?.headers?.Authorization || "").startsWith("Bearer nvap-"), `fix2: analyzeImage uses NVIDIA vision key: ${JSON.stringify(anaNv)} seen=${nvSeen && nvSeen.url}`);
+  check(anaNv.ok === true && String(anaNv.text).includes("شخصیت کارتونی") && nvUrls.length > 0 && nvUrls.every((u) => new URL(u).host === "generativelanguage.googleapis.com"), `fix2: analyzeImage never uses NVIDIA vision key (D5): ${JSON.stringify(anaNv)} urls=${JSON.stringify(nvUrls)}`);
 
   const sentI = [];
   const photosI = [];
@@ -1331,6 +1332,156 @@ if (DatabaseSync) {
   const r = await generateViaHfFluxSpace("a red fox in the snow", fn, 7);
   check(r.ok === true && r.provider === "hf-flux-space" && r.mimeType === "image/webp" && r.bytes.length === 4, `hf-space: parses event_id + SSE complete: ${JSON.stringify({ ok: r.ok, provider: r.provider, mimeType: r.mimeType, len: r.bytes?.length, diag: r.diagErrors })}`);
   check(calls.some((c) => c.method === "POST" && c.url.endsWith("/gradio_api/call/infer")) && calls.some((c) => c.method === "GET" && c.url.endsWith("/gradio_api/call/infer/evt-42")), `hf-space: uses Gradio POST + SSE GET: ${JSON.stringify(calls)}`);
+}
+
+// N-12: D5 personal-media isolation — Gemini-only transport and safe user text.
+{
+  const { analyzeImage } = await import("../../src/media.js");
+  const { analyzePdfDocument } = await import("../../src/pdf.js");
+  const { handleVaultFile: handleVaultFileCore, vaultAnalyzeFailureText } = await import("../../src/pipeline/vault-files.js");
+  const { runPreDispatch } = await import("../../src/pipeline/pre-dispatch.js");
+  const SAFE_TEXT = "❌ تحلیل تصویر الان ممکن نشد. کمی بعد دوباره امتحان کن.";
+  const NO_KEY_TEXT = "تحلیل تصویر ممکن نشد؛ کلید GEMINI_API_KEY تنظیم نشده و مدل vision هم در دسترس نیست.";
+  const CANARY = "TESTKEY-FAKE-CANARY-123";
+  const bytes = () => new Uint8Array([1, 2, 3, 4]);
+  const forbiddenHost = (u) => /nvidia|openrouter|xkiro|huggingface/i.test(String(u));
+  const goodGemini = (text) => ({ ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text }] } }] }) });
+  const dbStub = () => ({ prepare: () => ({ bind: () => ({ first: async () => null }) }) });
+
+  // A1: total Gemini failure never invokes router and never leaves the Gemini host.
+  {
+    const urls = [];
+    let routerCalls = 0;
+    const r = await analyzeImage({ GEMINI_API_KEY: "gkey-a1", STATE: fakeKV() }, {
+      imageBytes: bytes(), mimeType: "image/jpeg", prompt: "تحلیل", userId: 1,
+      fetchFn: async (url) => { urls.push(String(url)); return { ok: false, status: 500, json: async () => ({}) }; },
+      routerCallFn: async () => { routerCalls++; return { text: "bad" }; },
+    });
+    check(routerCalls === 0, `N12-A1: routerCallFn never invoked (calls=${routerCalls})`);
+    check(urls.length > 0 && urls.every((u) => new URL(u).host === "generativelanguage.googleapis.com") && urls.every((u) => !forbiddenHost(u)), `N12-A1: only Gemini host fetched: ${JSON.stringify(urls)}`);
+    check(r.ok === false, `N12-A1: ok=false on total Gemini failure: ${JSON.stringify(r)}`);
+  }
+
+  // A2: no key => zero transports and the existing no-key user text.
+  {
+    let fetchCalls = 0, routerCalls = 0;
+    const r = await analyzeImage({ STATE: fakeKV() }, {
+      imageBytes: bytes(), mimeType: "image/jpeg", prompt: "تحلیل", userId: 1,
+      fetchFn: async () => { fetchCalls++; return { ok: false, status: 500 }; },
+      routerCallFn: async () => { routerCalls++; return { text: "bad" }; },
+    });
+    check(fetchCalls === 0 && routerCalls === 0 && r.ok === false && r.userText === NO_KEY_TEXT, `N12-A2: no key => zero calls + existing no-key text: ${JSON.stringify(r)} fetch=${fetchCalls} router=${routerCalls}`);
+  }
+
+  // A3: second Gemini model can rescue; labels use the model name exactly once.
+  {
+    const ok1 = await analyzeImage({ GEMINI_API_KEY: "gkey-a3", STATE: fakeKV() }, {
+      imageBytes: bytes(), prompt: "تحلیل", userId: 1,
+      fetchFn: async (url) => String(url).includes("gemini-3.5-flash-lite") ? { ok: false, status: 500 } : goodGemini("دومین مدل جواب داد."),
+    });
+    check(ok1.ok === true && String(ok1.text).includes("دومین مدل"), `N12-A3: second Gemini model succeeds: ${JSON.stringify(ok1)}`);
+    const bad = await analyzeImage({ GEMINI_API_KEY: "gkey-a3", STATE: fakeKV() }, {
+      imageBytes: bytes(), prompt: "تحلیل", userId: 1,
+      fetchFn: async () => ({ ok: false, status: 500 }),
+    });
+    check(String(bad.error).includes("gemini-3.5-flash-lite:500") && !String(bad.error).includes("gemini-gemini-"), `N12-A3: label uses model name once: ${JSON.stringify(bad)}`);
+  }
+
+  // A4: a thrown canary in e.message never reaches error, userText or warnings.
+  {
+    const origWarn = console.warn;
+    const warnings = [];
+    console.warn = (...a) => { warnings.push(a); };
+    try {
+      const r = await analyzeImage({ GEMINI_API_KEY: "gkey-a4", STATE: fakeKV() }, {
+        imageBytes: bytes(), prompt: "تحلیل", userId: 1,
+        fetchFn: async () => { throw new Error("boom " + CANARY); },
+      });
+      const all = JSON.stringify({ error: r.error, userText: r.userText, warnings });
+      check(!all.includes(CANARY), `N12-A4: error.message canary never leaks: ${all.slice(0, 200)}`);
+    } finally { console.warn = origWarn; }
+  }
+
+  // A5: canary-bearing image bytes travel only to the Gemini host.
+  {
+    const canaryBytes = new TextEncoder().encode("image-" + CANARY);
+    const canaryB64 = Buffer.from(canaryBytes).toString("base64");
+    const calls = [];
+    const r = await analyzeImage({ GEMINI_API_KEY: "gkey-a5", STATE: fakeKV() }, {
+      imageBytes: canaryBytes, prompt: "تحلیل", userId: 1,
+      fetchFn: async (url, init) => { calls.push({ url: String(url), body: String(init?.body || "") }); return goodGemini("خوب است"); },
+    });
+    check(r.ok === true && calls.length > 0 && calls.every((c) => new URL(c.url).host === "generativelanguage.googleapis.com" && !forbiddenHost(c.url)) && calls.some((c) => c.body.includes(canaryB64)), `N12-A5: canary image bytes only to Gemini: ${JSON.stringify(calls.map((c) => c.url))}`);
+  }
+
+  // A6: vault photo failure shows only the safe fixed text.
+  {
+    const sent = [];
+    let routerCalls = 0;
+    const handled = await handleVaultFileCore({ STATE: fakeKV(), DB: dbStub(), GEMINI_API_KEY: "gkey-a6" }, {
+      userId: 1, chatId: 1, tgFileId: "p-a6", fileType: "photo", kind: "photo", mimeType: "image/jpeg",
+      caption: "analyze this photo", send: async (t) => sent.push(String(t)),
+      fetchFn: async () => ({ ok: false, status: 500 }),
+      routerCallFn: async () => { routerCalls++; return { text: "bad" }; },
+    }, { getFileDownloadData: async () => ({ bytes: bytes() }) });
+    check(handled === true && sent.length === 1 && sent[0] === SAFE_TEXT && !/gemini|nvidia|router|410|vision_unavailable/i.test(sent[0]) && routerCalls === 0, `N12-A6: vault photo failure shows safe text only: ${JSON.stringify(sent)} router=${routerCalls}`);
+  }
+
+  // A7: two-stage path uses the detailed stage-2 reason for the user text.
+  {
+    const sent = [];
+    const origFetch = global.fetch;
+    global.fetch = async (url) => String(url).includes("generativelanguage.googleapis.com") ? new Response("", { status: 404 }) : new Response(JSON.stringify({ ok: true }), { status: 200 });
+    try {
+      const handled = await handleVaultFileCore({ STATE: fakeKV(), DB: dbStub(), GEMINI_API_KEY: "gkey-a7" }, {
+        userId: 1, chatId: 1, tgFileId: "p-a7", fileType: "document", mimeType: "application/octet-stream",
+        caption: "تحلیل کن", send: async (t) => sent.push(String(t)),
+        fetchFn: async () => ({ ok: false, status: 500 }),
+      }, { getFileDownloadData: async () => ({ bytes: bytes() }) });
+      check(handled === true && sent.length === 1 && sent[0] === vaultAnalyzeFailureText("http_404"), `N12-A7: two-stage failure uses detailed.reason: ${JSON.stringify(sent)}`);
+    } finally { global.fetch = origFetch; }
+  }
+
+  // A8: reply-to-photo question shows only safe text with zero router calls.
+  {
+    const sent = [];
+    let routerCalls = 0;
+    const res = await runPreDispatch({ STATE: fakeKV(), DB: dbStub(), GEMINI_API_KEY: "gkey-a8" }, {
+      userId: 1, chatId: 1, text: "چیه این؟",
+      replyToPhoto: { fileId: "p-a8", caption: "" },
+      send: async (t) => sent.push(String(t)),
+      fetchFn: async () => ({ ok: false, status: 500 }),
+      routerCallFn: async () => { routerCalls++; return { text: "bad" }; },
+    }, { getFileDownloadData: async () => ({ bytes: bytes() }), tgApi: async () => ({}) });
+    check(res === "handled" && sent.length === 1 && sent[0] === SAFE_TEXT && routerCalls === 0, `N12-A8: reply-photo failure safe + no router: ${JSON.stringify(sent)} router=${routerCalls}`);
+  }
+
+  // A9: PDF Gemini failure falls back to locally extracted text only.
+  {
+    let chatCalls = 0, routerCalls = 0;
+    const pdf = new TextEncoder().encode("%PDF-1.4\nBT (Hello World) Tj ET\n%%EOF");
+    const r = await analyzePdfDocument({ GEMINI_API_KEY: "gkey-a9", STATE: fakeKV() }, {
+      pdfBytes: pdf, prompt: "خلاصه کن", userId: 1,
+      fetchFn: async () => ({ ok: false, status: 500 }),
+      chatFn: async () => { chatCalls++; return "bad"; },
+      routerCallFn: async () => { routerCalls++; return "bad"; },
+    });
+    check(r.ok === true && chatCalls === 0 && routerCalls === 0 && String(r.text).includes("Hello World") && String(r.text).length <= 4096, `N12-A9: PDF falls back to local text only: ${JSON.stringify(r).slice(0, 200)} chat=${chatCalls} router=${routerCalls}`);
+  }
+
+  // A10: existing Gemini success paths still work.
+  {
+    const img = await analyzeImage({ GEMINI_API_KEY: "gkey-a10", STATE: fakeKV() }, {
+      imageBytes: bytes(), prompt: "تحلیل", userId: 1,
+      fetchFn: async () => goodGemini("تصویر برق است."),
+    });
+    const pdf = new TextEncoder().encode("%PDF-1.4\nBT (Hello World) Tj ET\n%%EOF");
+    const doc = await analyzePdfDocument({ GEMINI_API_KEY: "gkey-a10", STATE: fakeKV() }, {
+      pdfBytes: pdf, prompt: "خلاصه کن", userId: 1,
+      fetchFn: async () => goodGemini("خلاصه فارسی PDF"),
+    });
+    check(img.ok === true && String(img.text).includes("برق") && doc.ok === true && String(doc.text).includes("خلاصه فارسی PDF"), `N12-A10: Gemini success paths unchanged: ${JSON.stringify({ img, doc }).slice(0, 200)}`);
+  }
 }
 
 }
