@@ -7,6 +7,7 @@ import { markDaily } from "../../src/pipeline/context.js";
 import { looksSecret } from "../../src/pipeline/secret-shape.js";
 import { classifyDaily } from "../../src/daily.js";
 import { VAULT_REDACTED_TEXT } from "../../src/pipeline/daily-helpers.js";
+import { decryptVaultValue } from "../../src/vault.js";
 
 const NOW = Date.UTC(2026, 10, 16, 12, 0, 0);
 const CARD = "9999-8888-7777-6666";
@@ -87,6 +88,7 @@ export async function run() {
     ["T1e Sheba with Persian digits", toFa("شبای من\nIR062960000000100324200001\nذخیره کن\nممنون")],
     ["T1f card split by newlines", `این شماره کارت منه\n9999\n8888\n7777\n6666`],
     ["T1f card split by U+2013", `این شماره کارت منه 9999\u20138888\u20137777\u20136666`],
+    ["T1g bare dashed card", CARD],
   ];
   for (const [label, text] of cases) {
     check(classifyDaily(text, { nowMs: NOW }).intent !== "vault_save", `${label}: deterministic intent is not vault_save`);
@@ -184,5 +186,54 @@ export async function run() {
     const rows = sq.prepare("SELECT content, kind FROM messages ORDER BY id DESC LIMIT 1").all();
     check(rows.length === 1 && rows[0].kind === "daily" && rows[0].content === VAULT_REDACTED_TEXT, `T5: markDaily saves redacted text (got ${JSON.stringify(rows[0]?.content)})`);
     check(!digitsOnly(rows[0]?.content ?? "").includes(CARD_DIGITS), "T5: fake card digits never stored by markDaily");
+  }
+
+  // G-1: dashed/spaced card and three-line guidance save the full value.
+  for (const [label, text, expected] of [
+    ["G1a contiguous card", `کارت رسالت ${CARD_DIGITS} ثبتش کن`, CARD_DIGITS],
+    ["G1b dashed card", `کارت رسالت ${CARD} ثبتش کن`, CARD_DIGITS],
+    ["G1c spaced card", "کارت رسالت 9999 8888 7777 6666 ثبتش کن", CARD_DIGITS],
+    ["G1d three-line card", `کارت رسالت\n${CARD}\nثبتش کن`, CARD_DIGITS],
+    ["G1e Sheba", `شبا من ${SHEBA} ثبتش کن`, SHEBA],
+  ]) {
+    const c = classifyDaily(text, { nowMs: NOW });
+    check(c.intent === "vault_save", `${label}: classifies as vault_save (got ${c.intent})`);
+    check(c.value === expected, `${label}: extracted value is ${expected} (got ${JSON.stringify(c.value)})`);
+    const expectedDigits = digitsOnly(expected);
+    const { sq, db } = freshDb(); db.__sq = sq;
+    const env = baseEnv(db);
+    const rec = installRecorders(env, { response: "{}" });
+    const send = async (t) => { rec.sent.push(String(t)); };
+    try {
+      const ret = await handleDailyText(env, { chatId: 1, userId: 1, chatType: "private", text, send, chat: async () => {}, nowMs: NOW });
+      check(ret === "handled", `${label}: returns handled (got ${JSON.stringify(ret)})`);
+      check(!rec.sent.includes(SECRET_INPUT_GUIDANCE), `${label}: guard does not fire for vault_save`);
+      check(rec.records.filter((r) => r.kind === "ai").length === 0, `${label}: zero AI.run calls`);
+      const outbound = rec.records.map((r) => r.kind === "ai" ? JSON.stringify(r.body) : r.url + "\n" + r.body).join("\n");
+      check(!digitsOnly(outbound + "\n" + rec.logs.join("\n")).includes(expectedDigits), `${label}: fake value never reaches a mocked LLM request or log`);
+      const rows = rowContents(sq);
+      check(!digitsOnly(rows.join("\n")).includes(expectedDigits), `${label}: no fake digits in messages rows`);
+      check(rows.some((r) => r === VAULT_REDACTED_TEXT), `${label}: pending message row is redacted`);
+      const item = sq.prepare("SELECT label, category, value_enc FROM vault_items ORDER BY id DESC LIMIT 1").all()[0];
+      check(Boolean(item) && !String(item.value_enc).includes(expectedDigits), `${label}: vault stores ciphertext, never plaintext`);
+      check(Boolean(item) && (await decryptVaultValue(env, item.value_enc)) === expected, `${label}: decrypted vault value is complete`);
+    } finally { rec.restore(); }
+  }
+
+  // G-1: a CVV/OTP-sized value is still rejected and never stored.
+  {
+    const text = "کارت رسالت 1234 رو ثبت کن";
+    check(classifyDaily(text, { nowMs: NOW }).value === "", "G1-CVV: no 8+ digit value is extracted");
+    const { sq, db } = freshDb(); db.__sq = sq;
+    const env = baseEnv(db);
+    const rec = installRecorders(env, { response: "{}" }, { withAi: false });
+    const send = async (t) => { rec.sent.push(String(t)); };
+    try {
+      await handleDailyText(env, { chatId: 1, userId: 1, chatType: "private", text, send, chat: async () => {}, nowMs: NOW });
+      const table = sq.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'vault_items'").all();
+      const items = table.length ? sq.prepare("SELECT id FROM vault_items").all() : [];
+      check(items.length === 0, "G1-CVV: CVV/OTP-sized value is not stored in the vault");
+      check(rec.sent.some((t) => String(t).includes("عنوان و مقدار")) && !rec.sent.some((t) => String(t).includes("ذخیره شد")), "G1-CVV: user is told title/value are missing, nothing saved");
+    } finally { rec.restore(); }
   }
 }

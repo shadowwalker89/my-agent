@@ -273,9 +273,9 @@ export function classifyDaily(text, opts = {}, projectsArg = null) {
   const vk = /کارت|شبا|حساب|کد\s*ملی|اطلاعات\s*شخصی|گاوصندوق/u.test(raw);
   if (vk && !keywordInLongDiscussion && !raw.includes("یادداشت") && raw.length <= 160) {
     const cat = /شبا/u.test(raw) ? "sheba" : /کد\s*ملی/u.test(raw) ? "national_id" : /حساب/u.test(raw) ? "account" : /اطلاعات\s*شخصی/u.test(raw) ? "personal_info" : /کارت/u.test(raw) ? "bank_card" : null;
-    const vDigits = raw ? normalizeDigits(raw).match(/\d+/g) : null;
-    const longDigits = vDigits ? vDigits.filter((d) => d.length >= 8) : [];
-    const value = longDigits.length ? longDigits.join("") : "";
+    const vCompact = normalizeDigits(raw).replace(/[\s\u00A0\u200C\u200D\u200E\u200F._\-\u2013\u2014\u2212\u0640]/g, "");
+    const vIban = vCompact.match(/IR\d{24}/i);
+    const value = vIban ? vIban[0].toUpperCase() : (vCompact.match(/\d{8,}/g) || []).join("");
     let title = null;
     if (cat) {
       if (cat === "bank_card") { const m = /کارت\s+(بانک\s+)?([^\s\d،,؛:؛؟!.]{2,})/u.exec(raw); title = m ? `کارت ${m[1] ?? ""}${m[2]}`.replace(/\s+/g, " ").trim() : "کارت بانکی"; }
