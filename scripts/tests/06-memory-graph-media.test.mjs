@@ -1484,4 +1484,82 @@ if (DatabaseSync) {
   }
 }
 
+  const { analyzePdfDocument: analyzePdfN10c } = await import("../../src/pdf.js");
+  const { toEnglishImagePrompt: toEnglishN10c } = await import("../../src/skills/media/deadline-translate.js");
+  const geminiModelsN10c = await import("../../src/platform/gemini-models.js");
+  const PRIMARY_N10C = "gemini-3.5-flash-lite";
+  const FALLBACK_N10C = "gemini-3.1-flash-lite";
+  const STALE_N10C = ["gemini-2.5-flash", "gemini-2.0-flash"];
+  const pdfN10c = () => new TextEncoder().encode("%PDF-1.4\nBT (Hello World) Tj ET\n%%EOF");
+  const goodN10c = (text) => ({ ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text }] } }] }) });
+  const geminiOnly = (urls) => urls.filter((u) => u.includes("generativelanguage.googleapis.com"));
+  const noStale = (urls) => !urls.some((u) => STALE_N10C.some((m) => u.includes(m)));
+
+  {
+    const urls = [];
+    const r = await analyzePdfN10c({ GEMINI_API_KEY: "gkey-p1", STATE: fakeKV() }, {
+      pdfBytes: pdfN10c(), prompt: "خلاصه کن", userId: 1,
+      fetchFn: async (url) => { urls.push(String(url)); return goodN10c("خلاصه فارسی PDF"); },
+    });
+    const g = geminiOnly(urls);
+    check(g.length > 0 && new URL(g[0]).host === "generativelanguage.googleapis.com" && g[0].includes("/models/" + PRIMARY_N10C + ":") && noStale(g) && r.ok === true, `N10c-P1: first PDF fetch uses ${PRIMARY_N10C} on Gemini host, no stale names: ${JSON.stringify({ urls: g, ok: r.ok })}`);
+  }
+
+  {
+    const urls = [];
+    const r = await analyzePdfN10c({ GEMINI_API_KEY: "gkey-p2", STATE: fakeKV() }, {
+      pdfBytes: pdfN10c(), prompt: "خلاصه کن", userId: 1,
+      fetchFn: async (url) => {
+        const u = String(url); urls.push(u);
+        if (u.includes(PRIMARY_N10C)) return { ok: false, status: 500, json: async () => ({}) };
+        if (u.includes(FALLBACK_N10C)) return goodN10c("دومین مدل pdf را خلاصه کرد.");
+        return { ok: false, status: 404, json: async () => ({}) };
+      },
+    });
+    const g = geminiOnly(urls);
+    check(g.length >= 2 && g[0].includes(PRIMARY_N10C) && g[1].includes(FALLBACK_N10C) && r.ok === true && String(r.text).includes("دومین مدل"), `N10c-P2: primary 500 then fallback PDF text wins in order: ${JSON.stringify({ urls: g, text: r.text })}`);
+  }
+
+  {
+    const CANARY = "TESTKEY-FAKE-CANARY-123";
+    const urls = [];
+    const warnings = [];
+    const origWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args); };
+    let r;
+    try {
+      r = await analyzePdfN10c({ GEMINI_API_KEY: "gkey-p3", STATE: fakeKV() }, {
+        pdfBytes: pdfN10c(), prompt: "خلاصه کن", userId: 1,
+        fetchFn: async (url) => { urls.push(String(url)); throw new Error("boom " + CANARY); },
+      });
+    } finally { console.warn = origWarn; }
+    const nonGemini = urls.filter((u) => !u.includes("generativelanguage.googleapis.com"));
+    check(r?.ok === true && String(r.text).includes("Hello World") && String(r.text).length <= 3500 && nonGemini.length === 0 && !JSON.stringify(r).includes(CANARY) && !JSON.stringify(warnings).includes(CANARY), `N10c-P3: thrown canary never reaches local text or warnings, no non-Gemini URL: ${JSON.stringify({ result: r, urls, warnings }).slice(0, 240)}`);
+    check(warnings.length === 2 && warnings.every((w) => w[0] === "pdf_analyze_failed" && w[1]?.reason === "error" && typeof w[1]?.model === "string"), `N10c-P3b: two safe failure warnings with reason error: ${JSON.stringify(warnings)}`);
+  }
+
+  {
+    const urls = [];
+    const fn = async (url) => {
+      const u = String(url); urls.push(u);
+      if (u.includes("translate.googleapis.com")) return { ok: false, status: 500, json: async () => ({}) };
+      if (u.includes(PRIMARY_N10C)) return { ok: false, status: 500, json: async () => ({}) };
+      if (u.includes(FALLBACK_N10C)) return goodN10c("A futuristic car on the streets of Tehran");
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const out = await toEnglishN10c({ GEMINI_API_KEY: "gkey-p4", STATE: fakeKV() }, 1, "یک خودروی آینده نگر در خیابانهای تهران", fn);
+    const g = geminiOnly(urls);
+    check(g.length >= 2 && g[0].includes(PRIMARY_N10C) && g[1].includes(FALLBACK_N10C) && noStale(g) && out === "A futuristic car on the streets of Tehran", `N10c-P4: translate models 3.5 then 3.1, English prompt returned: ${JSON.stringify({ urls: g, out })}`);
+  }
+
+  {
+    const want = JSON.stringify([PRIMARY_N10C, FALLBACK_N10C]);
+    const pdfModels = geminiModelsN10c.GEMINI_PDF_MODELS;
+    const translateModels = geminiModelsN10c.GEMINI_TRANSLATE_MODELS;
+    const visionModels = geminiModelsN10c.GEMINI_VISION_MODELS;
+    check(Array.isArray(pdfModels) && JSON.stringify(pdfModels) === want && Object.isFrozen(pdfModels), `N10c-P5: GEMINI_PDF_MODELS frozen shared list: ${JSON.stringify(pdfModels)}`);
+    check(Array.isArray(translateModels) && JSON.stringify(translateModels) === want && Object.isFrozen(translateModels), `N10c-P5: GEMINI_TRANSLATE_MODELS frozen shared list: ${JSON.stringify(translateModels)}`);
+    check(JSON.stringify(visionModels) === want && Object.isFrozen(visionModels), `N10c-P5: GEMINI_VISION_MODELS unchanged: ${JSON.stringify(visionModels)}`);
+  }
+
 }

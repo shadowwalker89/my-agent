@@ -1,4 +1,5 @@
 import { resolveKey, safeJson, PERSIAN_RE, timeoutSignal, connectorDiag, resolveFetch, IMAGE_USER_AGENT } from "./helpers.js";
+import { GEMINI_TRANSLATE_MODELS } from "../../platform/gemini-models.js";
 
 export function createDeadline(budgetMs = 22000) {
   const end = Date.now() + budgetMs;
@@ -100,22 +101,24 @@ export async function toEnglishImagePrompt(env, userId, prompt, fn, opts = {}, b
     try {
       const key = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
       if (key) {
-        try {
-          const res = await fn("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-            body: JSON.stringify({
-              contents: [{ role: "user", parts: [{ text: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }] }],
-              generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
-            }),
-            signal: budget.signal(4000),
-          });
-          if (res?.ok) {
-            const json = await safeJson(res);
-            const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join(" ").trim();
-            if (text && !PERSIAN_RE.test(text)) return text;
-          }
-        } catch {}
+        for (const model of GEMINI_TRANSLATE_MODELS) {
+          try {
+            const res = await fn("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+              body: JSON.stringify({
+                contents: [{ role: "user", parts: [{ text: `Translate this image prompt into concise English for an image model. Return only the English prompt, no quotes:\n${prompt}` }] }],
+                generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
+              }),
+              signal: budget.signal(4000),
+            });
+            if (res?.ok) {
+              const json = await safeJson(res);
+              const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join(" ").trim();
+              if (text && !PERSIAN_RE.test(text)) return text;
+            }
+          } catch {}
+        }
       }
     } catch {}
   }

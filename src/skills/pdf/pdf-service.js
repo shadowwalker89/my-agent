@@ -1,5 +1,6 @@
-import { resolveKey, safeJson, chatText, bytesToB64, SCANNED_PDF_MESSAGE } from "./pdf-helpers.js";
+import { resolveKey, safeJson, bytesToB64, SCANNED_PDF_MESSAGE } from "./pdf-helpers.js";
 import { extractTextFromPdfBytes } from "./pdf-extract-text.js";
+import { GEMINI_PDF_MODELS } from "../../platform/gemini-models.js";
 
 export async function analyzePdfDocument(env, opts = {}) {
   const pdfBytes = opts.pdfBytes instanceof Uint8Array ? opts.pdfBytes : new Uint8Array(opts.pdfBytes || []); const prompt = String(opts.prompt ?? "").trim() || "این پی‌دی‌اف را به فارسی خلاصه و معرفی کن.";
@@ -7,7 +8,21 @@ export async function analyzePdfDocument(env, opts = {}) {
   if (!pdfBytes?.length) return { ok: false, error: "متن قابل استخراج نیست" };
   const key = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
   if (key && typeof fn === "function") { const b64 = bytesToB64(pdfBytes); const full = prompt + "\nلطفاً این PDF را به فارسی خلاصه/ترجمه کن، سؤال کاربر را دقیق پاسخ بده و خلاصه فارسی روان تحویل بده.";
-    for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) { try { const res = await fn("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + key, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: full }, { inlineData: { mimeType: "application/pdf", data: b64 } }] }] }) }); if (res?.ok) { const js = await safeJson(res); const text = (js?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim(); if (text) return { ok: true, text }; } } catch {} }
+    for (const model of GEMINI_PDF_MODELS) {
+      try {
+        const res = await fn("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + key, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: full }, { inlineData: { mimeType: "application/pdf", data: b64 } }] }] }) });
+        if (res?.ok) {
+          const js = await safeJson(res);
+          const text = (js?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+          if (text) return { ok: true, text };
+          console.warn("pdf_analyze_failed", { model, reason: "empty" });
+        } else {
+          console.warn("pdf_analyze_failed", { model, reason: "http_" + (res?.status || "not_ok") });
+        }
+      } catch {
+        console.warn("pdf_analyze_failed", { model, reason: "error" });
+      }
+    }
   }
   const ext = await extractTextFromPdfBytes(pdfBytes); if (!ext) return { ok: false, error: "متن قابل استخراج نیست" };
   if (ext === SCANNED_PDF_MESSAGE) return { ok: true, text: SCANNED_PDF_MESSAGE };
