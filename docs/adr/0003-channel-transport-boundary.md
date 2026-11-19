@@ -33,4 +33,4 @@ This ADR applies the existing layer rule to media downloads. It does not change 
 
 ## Status
 
-Accepted as the durable transport-boundary decision. R0 acceptance remains **OPEN / NOT CLOSED** until the closure gates in `docs/audits/r0-audit.md` are satisfied.
+Accepted as the durable transport-boundary decision. R0 was closed by owner decision (conditional closure); see docs/STATE.md.
