@@ -587,7 +587,7 @@ if (DatabaseSync) {
 // Quota response handling across upload, file readiness, create, and result GET.
 {
   const originalFetch = global.fetch, originalLog = console.log, originalWarn = console.warn;
-  const env = { GEMINI_API_KEY: "quota-secret", TG_TOKEN: "bot-secret", STATE: fakeKV() };
+  const env = { GEMINI_API_KEY: "quota-secret", TG_TOKEN: "bot-secret", STATE: fakeKV(), GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" };
   let target, scope, generations, deletes, logs;
   console.log = console.warn = (...args) => logs.push(JSON.stringify(args));
   const limited = () => Response.json({ error: { status: "RESOURCE_EXHAUSTED", message: env.GEMINI_API_KEY, details: [
@@ -610,7 +610,7 @@ if (DatabaseSync) {
     return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: "successful fallback" }] } }] });
   };
   try {
-    for (const scenario of [["upload", "project", 0, "UPLOAD"], ["file", "project", 0, "FILE"], ["create", "project", 1, "INTERACTION"], ["result", "project", 1, "INTERACTION"], ["create", "model", 2], ["create", "unknown", 2], ["allfail", "model", 3, "INTERACTION"]]) {
+    for (const scenario of [["upload", "project", 0, "UPLOAD"], ["file", "project", 0, "FILE"], ["create", "project", 1, "INTERACTION"], ["result", "project", 1, "INTERACTION"], ["create", "model", 2], ["create", "unknown", 2], ["allfail", "model", 4, "INTERACTION"]]) {
       [target, scope] = scenario; generations = 0; deletes = 0; logs = [];
       const sent = [], routed = [];
       const result = await handleVoice(env, { userId: 42, chatId: 42,
@@ -703,7 +703,7 @@ if (DatabaseSync) {
 
     reset("404");
     const fallback = await transcribeWithGemini(env, new ArrayBuffer(8), "audio/ogg");
-    check(fallback.ok && calls.length === 2 && calls[1].path.includes("gemini-3.8-flash:"), "voice contract: unavailable custom model falls back to default");
+    check(fallback.ok && calls.length === 2 && calls[1].path.includes("gemini-3.5-flash-lite:"), "voice contract: unavailable custom model falls back to first flash-lite");
     check(deleted === 1 && !logs.join("").includes(env.GEMINI_API_KEY), "voice contract: fallback cleans up and does not log error bodies or keys");
 
     for (const failure of ["empty", "legacy", "malformed", "blocked", "truncated", "throw"]) {
@@ -716,23 +716,23 @@ if (DatabaseSync) {
 
     reset("empty");
     await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.8-flash" }, new ArrayBuffer(8), "audio/ogg");
-    check(calls.length === 2 && new Set(calls.map((c) => c.path)).size === 2, "voice contract: default model is not retried twice");
+    check(calls.length === 4 && new Set(calls.map((c) => c.path)).size === 4, "voice contract: each model in the chain is tried at most once");
 
     reset("success");
-    const current = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
-    check(current.ok && calls.length === 1 && calls[0].path === "/v1beta/interactions" && calls[0].body.model === "gemini-3.5-transcribe", "voice contract: default restores dedicated 3.5 transcription through Interactions");
+    const current = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg");
+    check(current.ok && calls.length === 1 && calls[0].path === "/v1beta/interactions" && calls[0].body.model === "gemini-3.5-transcribe", "voice contract: override of 3.5 transcribe uses the Interactions contract");
 
     const transcriptionBody = calls[0].body;
     check(transcriptionBody.input[0].uri.endsWith("files/contract") && transcriptionBody.input[0].mime_type === "audio/ogg", "voice contract: Interactions references uploaded audio");
     check(transcriptionBody.generation_config.transcription_config.language_codes[0] === "fa-IR" && transcriptionBody.generation_config.transcription_config.custom_vocabulary.includes("Cloudflare Workers"), "voice contract: original transcription language and vocabulary restored");
     for (const format of ["output-text", "output-object", "output-array", "blank-top", "nested-content", "segments", "steps", "steps-blank-legacy"]) {
       reset(format);
-      const result = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
+      const result = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg");
       check(result.ok && result.text === "سلام دنیا" && calls.length === 1 && deleted === 1, `voice contract: Interactions ${format} parsed and cleaned up`);
     }
     for (const failure of ["pending", "nested-error", "reasoning-only", "steps-incomplete", "steps-error", "steps-thought", "steps-malformed"]) {
       reset(failure);
-      await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
+      await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg");
       check(calls.length > 1, `voice contract: ${failure} not accepted as a transcript`);
       if (failure.startsWith("steps-")) {
         check(logs.some((line) => line.includes('"responseShape"') && line.includes('"hasSteps":true')), "voice schema: unparsed/unsafe steps get content-free response-shape diagnostics");
@@ -740,15 +740,15 @@ if (DatabaseSync) {
       }
     }
     reset("async");
-    const completed = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0 });
+    const completed = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0 });
     check(completed.ok && completed.text === "سلام دنیا" && calls.length === 1 && interactionPolls === 1 && deleted === 1, "voice regression: pending interaction is polled, not discarded or re-generated");
 
     reset("queued");
-    const queued = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0 });
+    const queued = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0 });
     check(queued.ok && queued.text === "سلام دنیا" && calls.length === 1 && interactionPolls === 1, "voice schema: queued interaction is retrieved by GET and completed steps are parsed without another generation");
 
     reset("async-stuck");
-    const pendingLimit = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0, maxPolls: 2 });
+    const pendingLimit = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg", { pollIntervalMs: 0, maxPolls: 2 });
     check(pendingLimit.ok && interactionPolls === 2 && calls.length === 2 && deleted === 1, "voice regression: polling cap is preserved and releases time to Flash fallback");
 
     reset("cleanup-hang");
@@ -767,30 +767,30 @@ if (DatabaseSync) {
     for (const hang of ["headers-hang", "body-hang"]) {
       reset(hang);
       const budgetStart = Date.now();
-      const limited = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { totalTimeoutMs: 600, attemptTimeoutMs: 1000, cleanupTimeoutMs: 5 });
+      const limited = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg", { totalTimeoutMs: 600, attemptTimeoutMs: 1000, cleanupTimeoutMs: 5 });
       check(!limited.ok && limited.reason === "timeout" && calls.length === 1 && Date.now() - budgetStart < 2500, `voice regression: shared deadline bounds ${hang}, with no post-deadline fallback`);
     }
     reset("headers-hang");
     const attemptStart = Date.now();
-    const attempts = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg", { totalTimeoutMs: 200, attemptTimeoutMs: 10, cleanupTimeoutMs: 5 });
-    check(!attempts.ok && calls.length === 3 && deleted === 1 && Date.now() - attemptStart < 1000, "voice regression: hung per-model attempts release time for fallback within shared budget");
+    const attempts = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg", { totalTimeoutMs: 200, attemptTimeoutMs: 10, cleanupTimeoutMs: 5 });
+    check(!attempts.ok && calls.length === 4 && deleted === 1 && Date.now() - attemptStart < 1000, "voice regression: hung per-model attempts release time for fallback within shared budget");
 
     reset("503");
-    const unavailable = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
+    const unavailable = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg");
     check(unavailable.ok && calls.length === 2 && logs.join("").includes("UNAVAILABLE") && !logs.join("").includes(env.GEMINI_API_KEY), "voice contract: 503 uses fallback and logs only safe API status");
 
     reset("404");
-    const alias = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
-    check(alias.ok && calls.length === 2 && calls[1].path === "/v1beta/models/gemini-3.8-flash:generateContent", "voice contract: unavailable transcription model uses Flash generateContent fallback");
+    const alias = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg");
+    check(alias.ok && calls.length === 2 && calls[1].path === "/v1beta/models/gemini-3.5-flash-lite:generateContent", "voice contract: unavailable transcription model uses first flash-lite fallback");
     check(!calls.some((c) => /gemini-(1\.5|2\.0|2\.5)-/.test(c.path)) && deleted === 1, "voice contract: no old built-in fallbacks; uploaded file cleaned up");
 
     reset("fallback404");
-    const rolling = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: undefined }, new ArrayBuffer(8), "audio/ogg");
-    check(rolling.ok && calls.length === 3 && calls[2].path.includes("gemini-flash-latest:"), "voice contract: rolling alias remains final fallback");
+    const rolling = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg");
+    check(rolling.ok && calls.length === 3 && calls[2].path.includes("gemini-3.1-flash-lite:"), "voice contract: second flash-lite is tried before reserve models");
 
     reset("404");
     const retiredOverride = await transcribeWithGemini({ ...env, GEMINI_VOICE_MODEL: "gemini-2.5-flash" }, new ArrayBuffer(8), "audio/ogg");
-    check(retiredOverride.ok && calls.length === 2 && calls[1].path.includes("gemini-3.8-flash:"), "voice contract: stale custom 2.5 model recovers using recommended replacement");
+    check(retiredOverride.ok && calls.length === 2 && calls[1].path.includes("gemini-3.5-flash-lite:"), "voice contract: stale custom 2.5 model recovers using flash-lite fallback");
   } finally {
     global.fetch = originalFetch;
     console.log = originalLog;
@@ -801,7 +801,7 @@ if (DatabaseSync) {
 // Repeated/simultaneous identical audio must not share file lifecycle or state.
 {
   const originalFetch = global.fetch, originalLog = console.log, originalWarn = console.warn;
-  const env = { GEMINI_API_KEY: "private-repeat-key", TG_TOKEN: "private-repeat-token", STATE: fakeKV() };
+  const env = { GEMINI_API_KEY: "private-repeat-key", TG_TOKEN: "private-repeat-token", STATE: fakeKV(), GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" };
   const active = new Set(), removed = new Set(), logs = [];
   let mode = "success", uploaded = 0;
   console.log = console.warn = (...args) => logs.push(JSON.stringify(args));
@@ -913,7 +913,7 @@ if (DatabaseSync) {
   const voice = (duration = 42) => ({ file_id: "voice-1", duration, mime_type: "audio/ogg" });
   {
     const m = mockVoiceFetch("سلام دنیا");
-    const r = await transcribeWithGemini(mkEnv(), new ArrayBuffer(8), "audio/ogg");
+    const r = await transcribeWithGemini({ ...mkEnv(), GEMINI_VOICE_MODEL: "gemini-3.5-transcribe" }, new ArrayBuffer(8), "audio/ogg");
     const body = m.generationBody();
     check(r.ok === true && r.text === "سلام دنیا" && body?.model === "gemini-3.5-transcribe" && body?.generation_config?.transcription_config?.language_codes?.[0] === "fa-IR" && body?.generation_config?.transcription_config?.custom_vocabulary?.includes("Cloudflare Workers") && body?.input?.[0]?.mime_type === "audio/ogg" && m.deleted() === true, "voice: dedicated transcribe returns text, Persian + vocab, uploaded file deleted");
   }
@@ -958,7 +958,7 @@ if (DatabaseSync) {
     const r = await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice, send: s.send, route: async () => {} });
     const retryBtn = (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
     check(r === "failed" && !!retryBtn, "0-b3 voice: failure message carries a Retry button");
-    const stashId = retryBtn.slice("voice:retry:".length);
+    const stashId = retryBtn.slice("voice:retry:".length).split(":")[0];
     const sF = fakeSend();
     const rF = await handleVoiceRetry(env, { userId: 4243, stashId, downloadTelegramVoice, send: sF.send, route: async () => {}, editMarkup: async () => {} });
     check(rF === "forbidden" && sF.sent.length === 0, "0-b3 voice: Retry by another user is silent");
@@ -974,11 +974,11 @@ if (DatabaseSync) {
     const env = mkEnv(), s = fakeSend(); mockVoiceFetch("سلام", { failGeneration: true });
     await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice, send: s.send, route: async () => {} });
     const retryBtn = (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
-    const stashId = retryBtn.slice("voice:retry:".length);
+    const stashId = retryBtn.slice("voice:retry:".length).split(":")[0];
     const s2 = fakeSend();
-    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, downloadTelegramVoice, send: s2.send, route: async () => {}, editMarkup: async () => {} });
+    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, retryCount: 1, downloadTelegramVoice, send: s2.send, route: async () => {}, editMarkup: async () => {} });
     const retryBtn2 = (s2.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
-    check(r2 === "failed" && retryBtn2 === `voice:retry:${stashId}` && (await env.STATE.get(`voice:stash:${stashId}`, "json")) !== null, "0-b3 fix: transcription-failing retry yields a usable Retry button, stash kept");
+    check(r2 === "failed" && retryBtn2 === `voice:retry:${stashId}:2` && (await env.STATE.get(`voice:stash:${stashId}`, "json")) !== null, "0-b3 fix: transcription-failing retry yields a usable Retry button, stash kept");
     mockVoiceFetch("یادداشت کن جلسه دوباره");
     const r3 = await handleVoiceRetry(env, { userId: 4242, stashId, downloadTelegramVoice, send: s.send, route: async (t) => { await handleDailyText(env, o(env, 4242, t, { ...s, nowMs: NOW, source: "voice" })); }, editMarkup: async () => {} });
     check(r3 === "routed" && rows("SELECT COUNT(*) AS n FROM notes WHERE text = 'جلسه دوباره' AND source = 'voice'")[0].n === 1, "0-b3 fix: retry succeeds after a failed retry");
@@ -988,11 +988,11 @@ if (DatabaseSync) {
     const env = mkEnv(), s = fakeSend(); mockVoiceFetch("سلام", { failGetFile: true });
     await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice, send: s.send, route: async () => {} });
     const retryBtn = (s.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
-    const stashId = retryBtn.slice("voice:retry:".length);
+    const stashId = retryBtn.slice("voice:retry:".length).split(":")[0];
     const s2 = fakeSend();
-    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, downloadTelegramVoice, send: s2.send, route: async () => {}, editMarkup: async () => {} });
+    const r2 = await handleVoiceRetry(env, { userId: 4242, stashId, retryCount: 1, downloadTelegramVoice, send: s2.send, route: async () => {}, editMarkup: async () => {} });
     const retryBtn2 = (s2.sent.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((b) => b.callback_data) ?? []).find((d) => d.startsWith("voice:retry:"));
-    check(r2 === "failed" && retryBtn2 === `voice:retry:${stashId}` && (await env.STATE.get(`voice:stash:${stashId}`, "json")) !== null, "0-b3 fix: download-failing retry yields a usable Retry button, stash kept");
+    check(r2 === "failed" && retryBtn2 === `voice:retry:${stashId}:2` && (await env.STATE.get(`voice:stash:${stashId}`, "json")) !== null, "0-b3 fix: download-failing retry yields a usable Retry button, stash kept");
   }
   {
     const env = mkEnv(), s = fakeSend(); const m = mockVoiceFetch("سلام"); const v = voice();
@@ -1006,9 +1006,9 @@ if (DatabaseSync) {
     const downloadFailure = async () => { downloadCalls++; return { ok: false, failure: { stage: "telegram-download", status: 503, apiStatus: null, kind: "http" } }; };
     await handleVoice(env, { userId: 4242, chatId: 4242, voice: voice(), downloadTelegramVoice: downloadFailure, send: initial.send, route: async () => { routed++; } });
     const retryButton = initial.sent[0]?.replyMarkup?.inline_keyboard?.[0]?.[0]?.callback_data;
-    const stashId = retryButton?.slice("voice:retry:".length), retry = fakeSend();
-    const result = await handleVoiceRetry(env, { userId: 4242, stashId, downloadTelegramVoice: downloadFailure, send: retry.send, route: async () => { routed++; }, editMarkup: async () => {} });
-    check(result === "failed" && downloadCalls === 2 && routed === 0 && m.googleCalls() === 0 && retry.sent[0]?.text.includes("VOICE-DOWNLOAD") && !retry.sent[0]?.text.includes(env.TG_TOKEN) && retry.sent[0]?.replyMarkup?.inline_keyboard?.[0]?.[0]?.callback_data === `voice:retry:${stashId}` && await env.STATE.get(`voice:stash:${stashId}`, "json") !== null, "F1 voice retry: injected download failure stays retryable, hides token, and never transcribes or routes");
+    const stashId = retryButton?.slice("voice:retry:".length).split(":")[0], retry = fakeSend();
+    const result = await handleVoiceRetry(env, { userId: 4242, stashId, retryCount: 1, downloadTelegramVoice: downloadFailure, send: retry.send, route: async () => { routed++; }, editMarkup: async () => {} });
+    check(result === "failed" && downloadCalls === 2 && routed === 0 && m.googleCalls() === 0 && retry.sent[0]?.text.includes("VOICE-DOWNLOAD") && !retry.sent[0]?.text.includes(env.TG_TOKEN) && retry.sent[0]?.replyMarkup?.inline_keyboard?.[0]?.[0]?.callback_data === `voice:retry:${stashId}:2` && await env.STATE.get(`voice:stash:${stashId}`, "json") !== null, "F1 voice retry: injected download failure stays retryable, hides token, and never transcribes or routes");
   }
   {
     const oldFetch = global.fetch, oldWarn = console.warn, warnings = [];
@@ -1061,6 +1061,100 @@ if (DatabaseSync) {
     check(mediaFiles.length > 0 && mediaFiles.every((file) => !transportPattern.test(fs.readFileSync(file, "utf8"))), "F1 boundary: entire media skills scope contains no Telegram transport or TG_TOKEN access");
   }
   global.fetch = origFetch;
+}
+
+{
+  const { GEMINI_VOICE_MODELS = [] } = await import("../../src/platform/gemini-models.js");
+  const { VOICE_RETRY_EXHAUSTED_TEXT, TRANSCRIPTION_ATTEMPT_MS, TRANSCRIPTION_TOTAL_MS } = await import("../../src/voice.js");
+  const originalFetch = global.fetch, originalLog = console.log, originalWarn = console.warn;
+  const canary = "TESTKEY-FAKE-CANARY-123";
+  const quota429 = (scope) => Response.json({ error: { status: "RESOURCE_EXHAUSTED", message: canary + " raw quota", details: [{ "@type": "type.googleapis.com/google.rpc.QuotaFailure", violations: scope === "project" ? [{ quotaId: "RequestsPerDayPerProject" }] : [{ quotaId: "RequestsPerDayPerModel", quotaDimensions: { model: "private-model" } }] }] } }, { status: 429 });
+  const env = { GEMINI_API_KEY: canary, STATE: fakeKV() };
+  let logs = [], calls = [], mode = "success", sent = [];
+  console.log = console.warn = (...args) => logs.push(JSON.stringify(args));
+  global.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes("/file/bot")) return { ok: true, arrayBuffer: async () => new ArrayBuffer(8) };
+    if (u.includes("api.telegram.org")) return Response.json({ ok: true, result: { file_path: "voice/n11a.ogg" } });
+    if (init?.method === "DELETE") return Response.json({});
+    if (u.includes("/upload/")) return Response.json({ file: { name: "files/n11a" } });
+    if (u.includes("/v1beta/files/n11a")) return Response.json({ state: "ACTIVE", uri: "https://generativelanguage.googleapis.com/v1beta/files/n11a" });
+    let model = "unknown";
+    if (u.includes("/v1beta/interactions")) model = JSON.parse(init.body).model;
+    else { const match = /models\/([^:]+):generateContent/.exec(u); if (match) model = decodeURIComponent(match[1]); }
+    calls.push({ model });
+    if (mode === "first500" && calls.length === 1) return Response.json({ error: { message: canary + " raw 500" } }, { status: 500 });
+    if (mode === "model429" && calls.length === 1) return quota429("model");
+    if (mode === "project429" && calls.length === 1) return quota429("project");
+    if (mode === "timeout" && calls.length === 1) throw new Error("voice-timeout");
+    if (mode === "empty") return Response.json({ candidates: [{ content: { parts: [{ text: "  " }] } }] });
+    if (mode === "all500") return Response.json({ error: { message: canary + " raw 500" } }, { status: 500 });
+    if (mode === "boom") throw new Error("raw boom " + canary);
+    return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: "سلام دنیا" }] } }] });
+  };
+  const reset = (next) => { mode = next; calls = []; logs = []; sent = []; };
+  const transcribe = (extra) => transcribeWithGemini(env, new ArrayBuffer(8), "audio/ogg", extra ?? {});
+  const send = async (text, opts) => { sent.push({ text, opts }); };
+  const button = (messages) => String(messages.at(-1)?.opts?.replyMarkup?.inline_keyboard?.[0]?.[0]?.callback_data ?? "");
+  const voice = { file_id: "voice-n11a", duration: 3, mime_type: "audio/ogg" };
+  const retry = (n, stashId, target = send) => handleVoiceRetry(env, { userId: 4242, stashId, retryCount: n, downloadTelegramVoice, send: target, route: async () => {}, editMarkup: async () => {} });
+  try {
+    reset("success");
+    const first = await transcribe();
+    check(first.ok && first.text === "سلام دنیا" && calls.length === 1 && calls[0].model === "gemini-3.5-flash-lite", "V1 first model answers: exactly one transcription request and text returned");
+
+    reset("first500");
+    const second = await transcribe();
+    check(second.ok && calls.length === 2 && calls[0].model === GEMINI_VOICE_MODELS[0] && calls[1].model === GEMINI_VOICE_MODELS[1] && !calls.some((c) => /transcribe|gemini-3.8-flash/.test(c.model)), "V2 first model 500: second model only, no reserve");
+
+    reset("model429");
+    await transcribe();
+    check(calls.length === 2 && calls[1].model === GEMINI_VOICE_MODELS[1], "V3 429 model scope: next model is called");
+
+    reset("project429");
+    const project = await transcribe();
+    check(!project.ok && calls.length === 1, "V4 429 project scope: no further model is called");
+
+    reset("timeout");
+    await transcribe({ attemptTimeoutMs: 50, totalTimeoutMs: 300 });
+    check(calls.length === 2 && calls.filter((c) => c.model === GEMINI_VOICE_MODELS[0]).length === 1, "V5 first model times out: not called twice, next model called");
+
+    reset("all500");
+    const allFail = await transcribe();
+    check(!allFail.ok && allFail.reason === "transcription" && calls.length === 4, "V6 all models fail: one request per model across the four-model chain");
+
+    check(TRANSCRIPTION_ATTEMPT_MS >= 12000 && TRANSCRIPTION_TOTAL_MS >= 30000, "V7 per-attempt cap >= 12000 and total cap >= 30000");
+    check(JSON.stringify(GEMINI_VOICE_MODELS) === JSON.stringify(["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]), "V8 GEMINI_VOICE_MODELS equals the two flash-lite models");
+    check(JSON.stringify(calls.map((c) => c.model)) === JSON.stringify([...GEMINI_VOICE_MODELS, "gemini-3.5-transcribe", "gemini-3.8-flash"]), "V8 real chain starts with flash-lite models then reserve models");
+
+    reset("all500");
+    await handleVoice(env, { userId: 4242, chatId: 4242, voice, downloadTelegramVoice, send, route: async () => {} });
+    const initialButton = button(sent);
+    const stashId = initialButton.split(":")[2];
+    check(sent.length === 1 && initialButton === `voice:retry:${stashId}:1`, "V9 initial failure shows safe text and retry counter 1");
+    check(Buffer.byteLength(initialButton, "utf8") <= 64 && Buffer.byteLength(`voice:retry:${stashId}:3`, "utf8") <= 64, "V10 callback_data is at most 64 bytes");
+    await retry(1, stashId);
+    const secondButton = button(sent);
+    await retry(2, stashId);
+    const thirdButton = button(sent);
+    check(secondButton === `voice:retry:${stashId}:2` && thirdButton === `voice:retry:${stashId}:3`, "V9 failed retries 1 and 2 offer incrementing counters");
+
+    reset("all500");
+    await handleVoice(env, { userId: 4242, chatId: 4242, voice, downloadTelegramVoice, send, route: async () => {} });
+    const exhaustedStash = button(sent).split(":")[2];
+    const exhausted = [];
+    const third = await retry(3, exhaustedStash, async (text, opts) => exhausted.push({ text, opts }));
+    check(third === "failed" && exhausted.length === 1 && exhausted[0].text === VOICE_RETRY_EXHAUSTED_TEXT && !exhausted[0].opts?.replyMarkup, "V9 third failed retry shows fixed text and stops offering the button");
+
+    reset("boom");
+    await handleVoice(env, { userId: 4242, chatId: 4242, voice, downloadTelegramVoice, send, route: async () => {} });
+    const report = logs.join("") + JSON.stringify(sent);
+    const safeLine = logs.map((line) => JSON.parse(line)).find((args) => args[0] === "voice_transcribe_failed");
+    check(!report.includes(canary) && !report.includes("raw boom") && !report.includes("raw 500"), "V11 canary key and raw error messages never reach logs or user text");
+    check(safeLine && JSON.stringify(Object.keys(safeLine[1]).sort()) === JSON.stringify(["model", "reason"]) && ["http_500", "timeout", "empty", "error"].includes(safeLine[1].reason), "V11 safe voice_transcribe_failed line has only model and reason");
+  } finally {
+    global.fetch = originalFetch; console.log = originalLog; console.warn = originalWarn;
+  }
 }
 
 }

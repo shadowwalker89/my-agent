@@ -3,19 +3,20 @@ export const VOICE_LANGUAGE = "fa-IR";
 export const VOICE_CUSTOM_VOCABULARY = ["Next.js", "JavaScript", "Cloudflare Workers", "Telegram"];
 export const VOICE_TOO_LONG_TEXT = "صدایت طولانی‌تر از ۱۰ دقیقه است؛ لطفاً کوتاه‌تر بفرست 🙏";
 export const VOICE_FAILED_TEXT = "صدا را نفهمیدم یا رونویسی نشد؛ دوباره بفرست یا تایپ کن 🙏";
+export const VOICE_RETRY_EXHAUSTED_TEXT = "تعداد تلاش‌های مجدد تمام شد؛ لطفاً پیام صوتی را کمی بعد دوباره بفرست.";
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com";
 const GEMINI_TIMEOUT_MS = 20000; // Existing Telegram download timeout, unchanged.
 // Voice-only limits; do not reuse/mutate chat-router settings.
-// One 20s envelope replaces up to three sequential 20s model waits. It is a
+// One 30s envelope bounds the sequential model attempts. It is a
 // transcription-phase budget, NOT a guarantee for download + downstream chat.
-const TRANSCRIPTION_TOTAL_MS = 20000;
-// Match the router's established 7.5s attempt policy locally: two stalled
-// requests cannot consume all 20s, leaving a chance for the final fallback.
-const TRANSCRIPTION_ATTEMPT_MS = 7500;
+export const TRANSCRIPTION_TOTAL_MS = 30000;
+// A 12s per-attempt cap prevents two stalled requests from consuming the
+// whole budget while still giving completed answers time to arrive.
+export const TRANSCRIPTION_ATTEMPT_MS = 12000;
 // Deletion is best-effort privacy cleanup, not part of transcription success.
-// Allow a short 500ms attempt without holding a ready transcript for 20s.
-const TRANSCRIPTION_CLEANUP_MS = 500;
+// Allow a short 500ms attempt without holding a ready transcript for 30s.
+export const TRANSCRIPTION_CLEANUP_MS = 500;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function transcriptText(data) {

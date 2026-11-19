@@ -4,6 +4,7 @@ import {
   VOICE_CUSTOM_VOCABULARY,
   VOICE_TOO_LONG_TEXT,
   VOICE_FAILED_TEXT,
+  VOICE_RETRY_EXHAUSTED_TEXT,
 } from "./voice-constants.js";
 import { transcribeWithGemini } from "./voice-transcribe.js";
 
@@ -15,7 +16,7 @@ async function stashVoice(env, userId, fileId, mimeType) {
   const mime = String(mimeType || "audio/ogg").split(";")[0].trim();
   try { await env.STATE.put(voiceStashKey(id), JSON.stringify({ owner: userId, file_id: fileId, mime_type: mime }), { expirationTtl: VOICE_STASH_TTL_SEC }); return id; } catch { return null; }
 }
-async function sendVoiceFailure(o, stashId, result) {
+async function sendVoiceFailure(o, stashId, result, press = 0) {
   // Fixed messages/codes only: a phone user can report the failure without logs.
   const status = result?.failure?.status;
   let text = VOICE_FAILED_TEXT;
@@ -35,7 +36,8 @@ async function sendVoiceFailure(o, stashId, result) {
   else if ([500, 502, 503, 504].includes(status)) text = "سرویس رونویسی پاسخ موفق نداد؛ مشکل از نامفهوم بودن صدایت نیست. کمی بعد دوباره تلاش کن. [VOICE-SERVICE]";
   else if ([401, 403].includes(status)) text = "سرویس رونویسی اجازهٔ دسترسی نداد؛ تنظیمات اتصال باید بررسی شود. [VOICE-AUTH]";
   else if (result?.reason === "timeout" || result?.failure?.kind === "timeout") text = "مهلت پردازش صدا تمام شد؛ این به معنی نامفهوم بودن صدایت نیست. دوباره تلاش کن. [VOICE-TIMEOUT]";
-  if (stashId) await o.send(text, { replyMarkup: { inline_keyboard: [[{ text: "🔄 ارسال مجدد", callback_data: `voice:retry:${stashId}` }]] } });
+  if (stashId && press >= 3) { await o.send(VOICE_RETRY_EXHAUSTED_TEXT); return; }
+  if (stashId) await o.send(text, { replyMarkup: { inline_keyboard: [[{ text: "🔄 ارسال مجدد", callback_data: `voice:retry:${stashId}:${press + 1}` }]] } });
   else await o.send(text);
 }
 export async function handleVoiceRetry(env, o) {
@@ -43,11 +45,13 @@ export async function handleVoiceRetry(env, o) {
   try { rec = env.STATE ? await env.STATE.get(voiceStashKey(o.stashId), "json") : null; } catch { rec = null; }
   if (!rec) { await o.send(VOICE_FAILED_TEXT); return "missing"; }
   if (Number(rec.owner) !== Number(o.userId)) return "forbidden";
+  const press = Math.max(0, Number(o.retryCount) || 0);
+  if (press > 3) { await o.send(VOICE_RETRY_EXHAUSTED_TEXT); return "exhausted"; }
   if (o.editMarkup) await o.editMarkup();
   const dl = await o.downloadTelegramVoice(env, rec.file_id);
-  if (!dl.ok) { await sendVoiceFailure(o, o.stashId, dl); return "failed"; }
+  if (!dl.ok) { await sendVoiceFailure(o, o.stashId, dl, press); return "failed"; }
   const tr = await transcribeWithGemini(env, dl.bytes, rec.mime_type, o.transcribeOpts ?? {});
-  if (!tr.ok) { await sendVoiceFailure(o, o.stashId, tr); return "failed"; }
+  if (!tr.ok) { await sendVoiceFailure(o, o.stashId, tr, press); return "failed"; }
   try { if (env.STATE) await env.STATE.delete(voiceStashKey(o.stashId)); } catch {}
   await o.route(tr.text);
   return "routed";

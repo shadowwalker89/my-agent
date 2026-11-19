@@ -956,7 +956,7 @@ async function handleCallbackQuery(env, cb) {
     return;
   }
   if (data.startsWith("voice:retry:")) {
-    await handleVoiceRetry(env, { userId: fromId, stashId: data.slice("voice:retry:".length), downloadTelegramVoice,
+    await handleVoiceRetry(env, { userId: fromId, stashId: data.split(":")[2], retryCount: Number(data.split(":")[3]) || 0, downloadTelegramVoice,
       send: (t, opts) => tgSend(env, chatId, t, opts),
       route: (transcript) => handlePlainText(env, { chat: { id: chatId, type: cb?.message?.chat?.type }, from: { id: fromId } }, transcript, { source: "voice" }),
       editMarkup: dailySenders(env, chatId, cb?.message?.message_id).editMarkup });
