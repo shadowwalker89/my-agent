@@ -1,5 +1,6 @@
 import { resolveKey, safeJson, PERSIAN_RE, b64ToBytes, bytesToBase64, connectorDiag, resolveFetch } from "./helpers.js";
 import { createDeadline } from "./deadline-translate.js";
+import { GEMINI_VISION_MODELS } from "../../platform/gemini-models.js";
 
 export const VISION_PERSIAN_INSTRUCTION =
   "فقط پاسخ نهایی را به زبان فارسی روان و طبیعی بنویس. هرگز به انگلیسی فکر نکن، عبارت _IMAGE_ یا wait ننویس و از کلمات فرانسوی/انگلیسی وسط فارسی استفاده نکن.";
@@ -52,7 +53,7 @@ export async function analyzeImage(env, opts = {}) {
     try {
       const geminiKey = await resolveKey(env, userId, "gemini", "GEMINI_API_KEY");
       if (geminiKey) {
-        for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) {
+        for (const model of GEMINI_VISION_MODELS) {
           try {
             const res = await fn(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
               method: "POST",

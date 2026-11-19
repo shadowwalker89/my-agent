@@ -6,6 +6,7 @@ import { getConnectorSecret, isConnectorSecretError } from "../connectors.js";
 import { isPdfAnalysisRequest, analyzePdfDocument, buildImageToPdfBytes } from "../pdf.js";
 import { analyzeImage, editImage, isImageEditCaption } from "../media.js";
 import { looksSecret } from "./secret-shape.js";
+import { GEMINI_VISION_MODELS } from "../platform/gemini-models.js";
 
 export const SECRET_CAPTION_NOTICE = "🔒 کپشن شبیه شماره کارت یا شبا بود؛ برای امنیت نادیده گرفته شد و ذخیره نشد. فایل بدون کپشن بایگانی شد.";
 
@@ -59,7 +60,7 @@ export async function analyzeVaultImageDetailed(env, file, prompt, userId = null
   const userPrompt = prompt ? `${prompt}\n` : "";
   const fullPrompt = `${userPrompt}لطفاً این تصویر/فایل را تحلیل کن، متن آن را استخراج کن و به فارسی پاسخ بده.`;
   let primaryReason = null;
-  for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) {
+  for (const model of GEMINI_VISION_MODELS) {
     let reason = null;
     try {
       const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: fullPrompt }, { inline_data: { mime_type: mime, data: b64 } }] }] }) });

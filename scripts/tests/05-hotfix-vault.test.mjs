@@ -2108,6 +2108,9 @@ if (DatabaseSync) {
       return { text, ...rec };
     });
     const never = async () => { throw new Error("fetch must not be called"); };
+    const n10bUrls = [];
+    const n10bBlobParts = [];
+    const safeUrls = (urls) => JSON.stringify(urls.map((u) => String(u).split("?")[0]));
 
     // T1 no_download
     {
@@ -2129,6 +2132,8 @@ if (DatabaseSync) {
       const { db } = freshN10(); const env = mkN10Env(db, { GEMINI_API_KEY: CANARY });
       const r = await runCallbackN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: async () => new Response(JSON.stringify({ error: { code: 429 } }), { status: 429, headers: { "content-type": "application/json" } }) });
       check(r.sent.length === 1 && r.sent[0] === N10.http429 && r.sent[0].includes("429"), `N-10 T3 http_429 message: ${JSON.stringify(r.sent)}`);
+      n10bUrls.push(...r.urls);
+      n10bBlobParts.push(r.sent.join("\n") + "\n" + r.logs.join("\n"));
       const blob = r.sent.join("\n") + "\n" + r.logs.join("\n");
       check(!blob.includes(CANARY) && !blob.includes("generativelanguage") && !blob.includes("key="), "N-10 T3 key/URL absent from sent texts and logs");
     }
@@ -2176,8 +2181,66 @@ if (DatabaseSync) {
       let n = 0;
       const r = await runCallbackN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: async () => { n++; return n === 1 ? new Response("", { status: 429 }) : new Response("", { status: 404 }); } });
       check(r.sent.length === 1 && r.sent[0].includes("429") && !r.sent[0].includes("404"), `N-10 T8 primary reason 429 only: ${JSON.stringify(r.sent)}`);
+      n10bUrls.push(...r.urls);
+      n10bBlobParts.push(r.sent.join("\n") + "\n" + r.logs.join("\n"));
       const logs = r.logs.join("\n");
       check(logs.includes("http_429") && logs.includes("http_404"), `N-10 T8 both per-model reasons logged: ${JSON.stringify(r.logs)}`);
+    }
+
+    // ── N-10b: one shared Gemini vision model list (vault analyze + vision-core) ──
+    const OLD_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"];
+    const NEW_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
+    const successBody = () => Response.json({ candidates: [{ content: { parts: [{ text: "RESULT-OK" }] } }] });
+    const downloadOk = async () => ({ data: new Uint8Array([1, 2, 3]) });
+
+    // M1: first attempted URL uses the new primary model.
+    {
+      const { db } = freshN10(); const env = mkN10Env(db, { GEMINI_API_KEY: CANARY });
+      const r = await runCallbackN10({ env, download: downloadOk, fetchImpl: async () => successBody() });
+      n10bUrls.push(...r.urls);
+      n10bBlobParts.push(r.sent.join("\n") + "\n" + r.logs.join("\n"));
+      check(r.urls.length > 0 && r.urls[0].includes(NEW_MODELS[0]), `N-10b M1 first vault analyze URL uses ${NEW_MODELS[0]}: ${safeUrls(r.urls)}`);
+      check(r.sent.length === 1 && r.sent[0] === "RESULT-OK", `N-10b M1 success text unchanged: ${JSON.stringify(r.sent)}`);
+    }
+    // M2: 404 then success -> fallback model used, final text is the success text.
+    {
+      const { db } = freshN10(); const env = mkN10Env(db, { GEMINI_API_KEY: CANARY });
+      let n = 0;
+      const r = await runCallbackN10({ env, download: downloadOk, fetchImpl: async () => (++n === 1 ? new Response("", { status: 404 }) : successBody()) });
+      n10bUrls.push(...r.urls);
+      n10bBlobParts.push(r.sent.join("\n") + "\n" + r.logs.join("\n"));
+      check(r.sent.length === 1 && r.sent[0] === "RESULT-OK", `N-10b M2 fallback success text: ${JSON.stringify(r.sent)}`);
+      check(r.urls.length === 2 && r.urls[1].includes(NEW_MODELS[1]), `N-10b M2 second vault analyze URL uses ${NEW_MODELS[1]}: ${safeUrls(r.urls)}`);
+    }
+    // M3: no old model name in any recorded vault analyze URL (M1/M2/T3/T8).
+    {
+      check(n10bUrls.length >= 6 && OLD_MODELS.every((m) => n10bUrls.every((u) => !u.includes(m))), `N-10b M3 no stale model in vault analyze URLs: count=${n10bUrls.length}`);
+    }
+    // M4: vision-core analyzeImage uses the same list, in the same order.
+    {
+      const { analyzeImage } = await import("../../src/skills/media/vision-core.js");
+      let n = 0;
+      const r = await withRec(async () => (++n === 1 ? new Response("", { status: 404 }) : successBody()), async (rec) => {
+        const out = await analyzeImage({ GEMINI_API_KEY: CANARY }, { imageBytes: new Uint8Array([1, 2, 3]), mimeType: "image/jpeg", prompt: "تحلیل", fetchFn: (url, init) => global.fetch(url, init) });
+        return { out, ...rec };
+      });
+      n10bUrls.push(...r.urls);
+      n10bBlobParts.push(r.sent.join("\n") + "\n" + r.logs.join("\n"));
+      check(r.urls.length === 2 && r.urls[0].includes(NEW_MODELS[0]) && r.urls[1].includes(NEW_MODELS[1]), `N-10b M4 vision model order: ${safeUrls(r.urls)}`);
+      check(r.out.ok === true && String(r.out.text).includes("RESULT-OK") && OLD_MODELS.every((m) => r.urls.every((u) => !u.includes(m))), `N-10b M4 vision success, no stale model: ${JSON.stringify({ ok: r.out.ok, text: r.out.text })}`);
+    }
+    // M5: the shared export is the single source of truth.
+    {
+      let shared = null;
+      try { ({ GEMINI_VISION_MODELS: shared } = await import("../../src/platform/gemini-models.js")); } catch {}
+      check(JSON.stringify(shared) === JSON.stringify(NEW_MODELS), `N-10b M5 shared constant is the ordered pair: ${JSON.stringify(shared)}`);
+      const contents = ["src/pipeline/vault-files.js", "src/skills/media/vision-core.js"].map((p) => fs.readFileSync(new URL("../../" + p, import.meta.url), "utf8"));
+      check(contents.every((s) => !s.includes("gemini-2.")), "N-10b M5 no hard-coded old model in vault-files.js or vision-core.js");
+    }
+    // M6: the canary key and its URL never appear in any sent text or log line.
+    {
+      const blob = n10bBlobParts.join("\n");
+      check(!blob.includes(CANARY) && !blob.includes("generativelanguage") && !blob.includes("key="), "N-10b M6 canary key/URL absent from sent texts and logs");
     }
   }
 
