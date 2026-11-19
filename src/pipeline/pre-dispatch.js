@@ -2,6 +2,7 @@ import { parseImageGenCommand, generateFreeImage, editImage, analyzeImage, isIma
 import { buildTextPdfOrHtmlReport, parsePdfCreateCommand } from "../pdf.js";
 import { fileBytesFromTelegram, namePendingVaultFile } from "./vault-files.js";
 import { exportUserBackupSnapshot } from "../db.js";
+import { looksSecret } from "./secret-shape.js";
 
 export async function runPreDispatch(env, o, deps = {}) {
   const { userId, text } = o;
@@ -37,7 +38,8 @@ export async function runPreDispatch(env, o, deps = {}) {
   const replyUserText = String(text ?? "").trim();
   if (replyPhoto && !replyUserText.startsWith("/")) {
     const rpFileId = replyPhoto.fileId || replyPhoto.file_id;
-    const rpCaption = String(replyPhoto.caption ?? "");
+    const rpCaptionRaw = String(replyPhoto.caption ?? "");
+    const rpCaption = looksSecret(rpCaptionRaw) ? "" : rpCaptionRaw;
     const userText = replyUserText;
     const targetChatId = o.chatId ?? o.userId ?? userId;
     const isGeneratedCaption = /🎨 تصویر (?:ساخته|ویرایش) شد/.test(rpCaption);

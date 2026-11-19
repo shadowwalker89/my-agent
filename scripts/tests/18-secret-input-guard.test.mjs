@@ -8,12 +8,15 @@ import { looksSecret } from "../../src/pipeline/secret-shape.js";
 import { classifyDaily } from "../../src/daily.js";
 import { VAULT_REDACTED_TEXT } from "../../src/pipeline/daily-helpers.js";
 import { decryptVaultValue } from "../../src/vault.js";
+import { handleVaultFile } from "../../src/everyday.js";
+import { runPreDispatch } from "../../src/pipeline/pre-dispatch.js";
 
 const NOW = Date.UTC(2026, 10, 16, 12, 0, 0);
 const CARD = "9999-8888-7777-6666";
 const SHEBA = "IR062960000000100324200001";
 const CARD_DIGITS = "9999888877776666";
 const SHEBA_DIGITS = "062960000000100324200001";
+const SECRET_CAPTION_NOTICE = "🔒 کپشن شبیه شماره کارت یا شبا بود؛ برای امنیت نادیده گرفته شد و ذخیره نشد. فایل بدون کپشن بایگانی شد.";
 const FA = "۰۱۲۳۴۵۶۷۸۹";
 const AR = "٠١٢٣٤٥٦٧٨٩";
 const toLatin = (s) => String(s).replace(/[۰-۹]/g, (d) => String(FA.indexOf(d))).replace(/[٠-٩]/g, (d) => String(AR.indexOf(d)));
@@ -234,6 +237,139 @@ export async function run() {
       const items = table.length ? sq.prepare("SELECT id FROM vault_items").all() : [];
       check(items.length === 0, "G1-CVV: CVV/OTP-sized value is not stored in the vault");
       check(rec.sent.some((t) => String(t).includes("عنوان و مقدار")) && !rec.sent.some((t) => String(t).includes("ذخیره شد")), "G1-CVV: user is told title/value are missing, nothing saved");
+    } finally { rec.restore(); }
+  }
+
+  // S7-H1: file/photo captions, reply-to-photo captions and file names are
+  // secret-shaped; they must never reach an LLM/provider or vault_files.
+  const outboundText = (rec) => digitsOnly(rec.records.map((r) => r.kind === "ai" ? JSON.stringify(r.body) : r.url + "\n" + r.body).join("\n") + "\n" + rec.logs.join("\n") + "\n" + rec.sent.join("\n"));
+  const vaultFileRow = (sq) => {
+    const t = sq.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'vault_files'").all();
+    return t.length ? sq.prepare("SELECT title, caption, file_name FROM vault_files ORDER BY id DESC LIMIT 1").get() : null;
+  };
+
+  // C1: photo caption with an analysis keyword + fake card.
+  {
+    const { sq, db } = freshDb(); db.__sq = sq;
+    const env = baseEnv(db); env.GEMINI_API_KEY = "k";
+    const rec = installRecorders(env, { response: "{}" });
+    const sent = [];
+    const send = async (t) => { sent.push(String(t)); rec.sent.push(String(t)); };
+    try {
+      const handled = await handleVaultFile(env, { userId: 1, chatId: 1, tgFileId: "secret-cap-photo", fileType: "photo", mimeType: "image/jpeg", fileName: null, caption: `این عکس رو تحلیل کن ${CARD}`, send }, { getFileDownloadData: async () => new Uint8Array([1, 2, 3]) });
+      check(handled === true, "S7H1-C1: secret photo caption is handled (file archived)");
+      check(rec.records.filter((r) => r.kind === "fetch").length === 0, "S7H1-C1: zero provider fetch calls because of the caption");
+      check(rec.records.filter((r) => r.kind === "ai").length === 0, "S7H1-C1: zero AI.run calls because of the caption");
+      check(sent.some((t) => t.includes(SECRET_CAPTION_NOTICE)), "S7H1-C1: fixed Persian notice is sent");
+      const row = vaultFileRow(sq);
+      check(Boolean(row), "S7H1-C1: file is archived in vault_files");
+      check(row?.caption == null && !digitsOnly(JSON.stringify(row)).includes(CARD_DIGITS), "S7H1-C1: vault_files stores no secret caption/digits");
+      check(!outboundText(rec).includes(CARD_DIGITS), "S7H1-C1: fake card never appears in a provider request, log or reply");
+    } finally { rec.restore(); }
+  }
+
+  // C2: PDF caption with an analysis keyword + fake Sheba.
+  {
+    const { sq, db } = freshDb(); db.__sq = sq;
+    const env = baseEnv(db); env.GEMINI_API_KEY = "k";
+    const rec = installRecorders(env, { response: "{}" });
+    const sent = [];
+    const send = async (t) => { sent.push(String(t)); rec.sent.push(String(t)); };
+    try {
+      const handled = await handleVaultFile(env, { userId: 1, chatId: 1, tgFileId: "secret-cap-pdf", fileType: "document", mimeType: "application/pdf", fileName: "scan.pdf", caption: `این پی‌دی‌اف رو تحلیل کن ${SHEBA}`, fetchFn: globalThis.fetch, send }, { getFileDownloadData: async () => new Uint8Array([1, 2, 3]) });
+      check(handled === true, "S7H1-C2: secret PDF caption is handled (file archived)");
+      check(rec.records.filter((r) => r.kind === "fetch").length === 0, "S7H1-C2: zero provider fetch calls because of the caption");
+      check(sent.some((t) => t.includes(SECRET_CAPTION_NOTICE)), "S7H1-C2: fixed Persian notice is sent");
+      const row = vaultFileRow(sq);
+      check(Boolean(row), "S7H1-C2: file is archived in vault_files");
+      check(row?.caption == null && !digitsOnly(JSON.stringify(row)).includes(SHEBA_DIGITS), "S7H1-C2: vault_files stores no secret caption/digits");
+      check(!outboundText(rec).includes(SHEBA_DIGITS), "S7H1-C2: fake Sheba never appears in a provider request, log or reply");
+    } finally { rec.restore(); }
+  }
+
+  // C3: document file name with a fake Sheba is never stored or forwarded.
+  {
+    const { sq, db } = freshDb(); db.__sq = sq;
+    const env = baseEnv(db); env.GOOGLE_VAULT_DRIVE_FOLDER_ID = "folder"; env.GOOGLE_VAULT_ACCESS_TOKEN = "tok";
+    const rec = installRecorders(env, { response: "{}" });
+    const sent = [];
+    const send = async (t) => { sent.push(String(t)); rec.sent.push(String(t)); };
+    try {
+      const handled = await handleVaultFile(env, { userId: 1, chatId: 1, tgFileId: "secret-name-doc", fileType: "document", mimeType: "application/pdf", fileName: `scan-${SHEBA}.pdf`, caption: "ذخیره کن آزمایش خون", send }, { getFileDownloadData: async () => new Uint8Array([1, 2, 3]) });
+      check(handled === true, "S7H1-C3: secret file name upload still works");
+      const row = vaultFileRow(sq);
+      check(Boolean(row) && row.file_name == null, "S7H1-C3: vault_files.file_name does not store the secret name");
+      check(Boolean(row) && !digitsOnly(JSON.stringify(row)).includes(SHEBA_DIGITS), "S7H1-C3: vault_files keeps no secret file-name digits");
+      check(!outboundText(rec).includes(SHEBA_DIGITS), "S7H1-C3: fake Sheba from the file name is never forwarded");
+      check(sent.some((t) => t.includes("آرشیو امن")), "S7H1-C3: normal archive reply is still sent");
+    } finally { rec.restore(); }
+  }
+
+  // C4: reply-to-photo caption with a fake card + an edit request.
+  {
+    const env = baseEnv(); env.GEMINI_API_KEY = "k";
+    const rec = installRecorders(env, { response: "{}" });
+    const sent = [];
+    const send = async (t) => { sent.push(String(t)); rec.sent.push(String(t)); };
+    try {
+      const ret = await runPreDispatch(env, {
+        userId: 1,
+        chatId: 1,
+        text: "این عکس رو ویرایش کن و رنگش رو قرمز کن",
+        replyToPhoto: { fileId: "reply-photo", caption: `تصویر قبلی ${CARD}` },
+        fetchFn: globalThis.fetch,
+        send,
+      }, { getFileDownloadData: async () => new Uint8Array([1, 2, 3]), tgApi: async () => ({ ok: true }) });
+      check(ret === "handled", "S7H1-C4: reply-to-photo edit is handled");
+      check(!outboundText(rec).includes(CARD_DIGITS), "S7H1-C4: reply caption fake card never reaches the image provider, log or echo");
+    } finally { rec.restore(); }
+  }
+
+  // C5: save-keyword photo caption (matches VAULT_CAPTION_RE) + fake card.
+  // Before the fix this caption was stored as vault_files.title/caption and
+  // the title was synced to Google.
+  {
+    const { sq, db } = freshDb(); db.__sq = sq;
+    const env = baseEnv(db); env.GEMINI_API_KEY = "k"; env.GOOGLE_VAULT_DRIVE_FOLDER_ID = "folder"; env.GOOGLE_VAULT_ACCESS_TOKEN = "tok";
+    const rec = installRecorders(env, { response: "{}" });
+    const sent = [];
+    const send = async (t) => { sent.push(String(t)); rec.sent.push(String(t)); };
+    const caption = `ذخیره کن کارت ${CARD}`;
+    try {
+      const handled = await handleVaultFile(env, { userId: 1, chatId: 1, tgFileId: "secret-save-cap-photo", fileType: "photo", mimeType: "image/jpeg", fileName: null, caption, send }, { getFileDownloadData: async () => new Uint8Array([1, 2, 3]) });
+      check(handled === true, "S7H1-C5: save-keyword secret photo caption is handled (file archived)");
+      check(rec.records.filter((r) => r.kind === "fetch").length === 0, "S7H1-C5: zero provider fetch calls (no Google sync of the secret title either)");
+      check(rec.records.filter((r) => r.kind === "ai").length === 0, "S7H1-C5: zero AI.run calls because of the caption");
+      check(sent.some((t) => t.includes(SECRET_CAPTION_NOTICE)), "S7H1-C5: fixed Persian notice is sent");
+      const row = vaultFileRow(sq);
+      check(Boolean(row), "S7H1-C5: file is archived in vault_files");
+      check(row?.caption == null, "S7H1-C5: vault_files.caption is NULL");
+      check(Boolean(row) && !String(row.title ?? "").includes(caption) && !digitsOnly(String(row.title ?? "")).includes(CARD_DIGITS), "S7H1-C5: title does not contain the caption or fake digits");
+      check(Boolean(row) && !digitsOnly(JSON.stringify(row)).includes(CARD_DIGITS), "S7H1-C5: no fake digits anywhere in the vault_files row");
+      check(!outboundText(rec).includes(CARD_DIGITS), "S7H1-C5: fake card never appears in a provider request, log or reply");
+    } finally { rec.restore(); }
+  }
+
+  // C6: save-keyword PDF caption (matches VAULT_CAPTION_RE) + fake Sheba.
+  {
+    const { sq, db } = freshDb(); db.__sq = sq;
+    const env = baseEnv(db); env.GEMINI_API_KEY = "k"; env.GOOGLE_VAULT_DRIVE_FOLDER_ID = "folder"; env.GOOGLE_VAULT_ACCESS_TOKEN = "tok";
+    const rec = installRecorders(env, { response: "{}" });
+    const sent = [];
+    const send = async (t) => { sent.push(String(t)); rec.sent.push(String(t)); };
+    const caption = `ثبت - شبا ${SHEBA}`;
+    try {
+      const handled = await handleVaultFile(env, { userId: 1, chatId: 1, tgFileId: "secret-save-cap-pdf", fileType: "document", mimeType: "application/pdf", fileName: "scan.pdf", caption, fetchFn: globalThis.fetch, send }, { getFileDownloadData: async () => new Uint8Array([1, 2, 3]) });
+      check(handled === true, "S7H1-C6: save-keyword secret PDF caption is handled (file archived)");
+      check(rec.records.filter((r) => r.kind === "fetch").length === 0, "S7H1-C6: zero provider fetch calls (no Google sync of the secret title either)");
+      check(rec.records.filter((r) => r.kind === "ai").length === 0, "S7H1-C6: zero AI.run calls because of the caption");
+      check(sent.some((t) => t.includes(SECRET_CAPTION_NOTICE)), "S7H1-C6: fixed Persian notice is sent");
+      const row = vaultFileRow(sq);
+      check(Boolean(row), "S7H1-C6: file is archived in vault_files");
+      check(row?.caption == null, "S7H1-C6: vault_files.caption is NULL");
+      check(Boolean(row) && !String(row.title ?? "").includes(caption) && !digitsOnly(String(row.title ?? "")).includes(SHEBA_DIGITS), "S7H1-C6: title does not contain the caption or fake digits");
+      check(Boolean(row) && !digitsOnly(JSON.stringify(row)).includes(SHEBA_DIGITS), "S7H1-C6: no fake digits anywhere in the vault_files row");
+      check(!outboundText(rec).includes(SHEBA_DIGITS), "S7H1-C6: fake Sheba never appears in a provider request, log or reply");
     } finally { rec.restore(); }
   }
 }

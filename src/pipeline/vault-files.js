@@ -5,6 +5,9 @@ import { syncVaultFileToGoogle } from "../vault.js";
 import { getConnectorSecret, isConnectorSecretError } from "../connectors.js";
 import { isPdfAnalysisRequest, analyzePdfDocument, buildImageToPdfBytes } from "../pdf.js";
 import { analyzeImage, editImage, isImageEditCaption } from "../media.js";
+import { looksSecret } from "./secret-shape.js";
+
+export const SECRET_CAPTION_NOTICE = "🔒 کپشن شبیه شماره کارت یا شبا بود؛ برای امنیت نادیده گرفته شد و ذخیره نشد. فایل بدون کپشن بایگانی شد.";
 
 export function stripCaptionPrefix(caption) {
   return String(caption ?? "").replace(/^(?:ذخیره\s*[-:]\s*|ثبت\s*[-:]\s*|ذخیره‌اش\s*کن\s*|ثبت‌اش\s*کن\s*|بذر\s*)/u, "").trim() || null;
@@ -73,10 +76,14 @@ export async function handleVaultFile(env, o, deps = {}) {
   try {
   const { userId, chatId, tgFileId, fileType, mimeType, fileName, caption, send } = o;
   if (!dbOf(env)) return false;
-  const cap = typeof caption === "string" ? caption.trim() : "";
+  const rawFileName = fileName ?? null;
+  const safeFileName = looksSecret(rawFileName) ? null : rawFileName;
+  const rawCaption = typeof caption === "string" ? caption.trim() : "";
+  const secretCaption = looksSecret(rawCaption);
+  const cap = secretCaption ? "" : rawCaption;
   const kind = o.kind || fileType;
   const isPhoto = kind === "photo" || fileType === "photo" || (typeof mimeType === "string" && mimeType.startsWith("image/"));
-  if (cap && isPdfAnalysisRequest(cap, mimeType, fileName)) {
+  if (cap && isPdfAnalysisRequest(cap, mimeType, rawFileName)) {
     const pdfBytesPdf = await fileBytesFromTelegram(env, tgFileId, deps);
     if (!pdfBytesPdf || !pdfBytesPdf.length) { await send("تحلیل ممکن نشد."); return true; }
     const chatFn = typeof o.chatFn === "function" ? o.chatFn : null;
@@ -129,12 +136,12 @@ export async function handleVaultFile(env, o, deps = {}) {
   }
   if (cap && VAULT_CAPTION_RE.test(cap)) {
     const title = stripCaptionPrefix(cap) || stripNamingPrefix(cap) || cap;
-    const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title, fileName, caption: cap, syncStatus: "local" });
+    const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title, fileName: safeFileName, caption: cap, syncStatus: "local" });
     if (!saved || !saved.ok) { await send(NOT_SAVED_TEXT); return true; }
     let syncInfo = "";
     if (saved.ok) {
       const bytes = await fileBytesFromTelegram(env, tgFileId, deps);
-      const sync = await syncVaultFileToGoogle(env, { id: saved.id, userId, label: title, fileName, mimeType, data: bytes ?? new Uint8Array(0), createdAt: new Date().toISOString() });
+      const sync = await syncVaultFileToGoogle(env, { id: saved.id, userId, label: title, fileName: safeFileName, mimeType, data: bytes ?? new Uint8Array(0), createdAt: new Date().toISOString() });
       await setFileSyncStatus(env, userId, saved.id, sync.ok ? "synced" : "pending_google", sync.googleId ?? null, null);
       syncInfo = sync.ok ? `\n✅ گوگل Docs/Drive${sync.googleId ? ` (${sync.googleId})` : ""}: ذخیره شد` : "\n⏳ در انتظار همگام‌سازی گوگل";
     }
@@ -154,9 +161,9 @@ export async function handleVaultFile(env, o, deps = {}) {
     await send(text || ("❌ خطا در تحلیل تصویر: " + (visionError || "vision_unavailable")));
     return true;
   }
-  const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title: "__choice__", fileName, caption: cap || null, syncStatus: "local" });
+  const saved = await saveVaultFile(env, { userId, tgFileId, fileType, mimeType, title: "__choice__", fileName: safeFileName, caption: cap || null, syncStatus: "local" });
   if (!saved.ok) { await send(NOT_SAVED_TEXT); return true; }
-  await send("📎 <b>تصویر/فایل دریافت شد. چه کاری انجام دهم؟</b>", { replyMarkup: { inline_keyboard: [
+  await send("📎 <b>تصویر/فایل دریافت شد. چه کاری انجام دهم؟</b>" + (secretCaption ? `\n${SECRET_CAPTION_NOTICE}` : ""), { replyMarkup: { inline_keyboard: [
     [{ text: "🔍 تحلیل تصویر / استخراج متن", callback_data: `vault:analyze:${saved.id}` }],
     [{ text: "🔒 ذخیره در گاوصندوق امن", callback_data: `vault:askname:${saved.id}` }],
     [{ text: "❌ انصراف", callback_data: `vault:cancel:${saved.id}` }],
