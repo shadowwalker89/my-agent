@@ -5,7 +5,7 @@ import { formatJalali } from "../daily.js";
 import { tehranParts } from "../domain/notes/render.js";
 import { formatTelegramHtml } from "./respond.js";
 import { isConnectorSecretError } from "../connectors.js";
-import { csvRow, fileBytesFromTelegram, analyzeVaultImage } from "./vault-files.js";
+import { csvRow, fileBytesFromTelegram, analyzeVaultImageDetailed, vaultAnalyzeFailureText } from "./vault-files.js";
 
 export async function resolveVaultCallback(env, o, deps = {}) {
   if (o.chatType !== "private") return true;
@@ -17,8 +17,8 @@ export async function resolveVaultCallback(env, o, deps = {}) {
     const id = Number(analyze[1]);
     const f = await getVaultFile(env, o.fromId, id);
     if (!f) { await o.send("مدرکی پیدا نشد."); return true; }
-    const text = await analyzeVaultImage(env, f, null, o.fromId, deps);
-    await o.send(text || "تحلیل ممکن نشد.");
+    const result = await analyzeVaultImageDetailed(env, f, null, o.fromId, deps);
+    await o.send(result.ok ? result.text : vaultAnalyzeFailureText(result.reason));
     return true;
   }
   const askname = /^vault:askname:(\d+)$/.exec(o.data);

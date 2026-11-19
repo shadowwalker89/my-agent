@@ -46,26 +46,49 @@ export async function fileBytesFromTelegram(env, tgFileId, deps = {}) {
 const VAULT_CAPTION_RE = /(?:ذخیره|آرشیو|گاوصندوق|ثبت)\s*(?:کن)?|(?:کارت\s*ملی|شناسنامه|پاسپورت|گواهینامه|بیمه\s*نامه|بیمه‌نامه|آزمایش|سند|مدرک|قرارداد)/i;
 const VISION_CAPTION_RE = /(?:تحلیل|بررسی|بخون|بخوان|ترجمه|توضیح|چیه|چیست|خلاصه|OCR)/i;
 
-export async function analyzeVaultImage(env, file, prompt, userId = null, deps = {}) {
+export async function analyzeVaultImageDetailed(env, file, prompt, userId = null, deps = {}) {
   const arr = await fileBytesFromTelegram(env, file.tg_file_id, deps);
+  if (!arr || !arr.length) return { ok: false, reason: "no_download" };
   let key = null;
   try { key = await getConnectorSecret(env, userId ?? file.user_id ?? null, "gemini"); } catch (e) { if (isConnectorSecretError(e)) throw e; }
-  if (!arr || !arr.length || !key) return null;
+  if (!key) return { ok: false, reason: "no_key" };
   let bin = "";
   for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
   const b64 = btoa(bin);
   const mime = file.mime_type || "image/jpeg";
   const userPrompt = prompt ? `${prompt}\n` : "";
   const fullPrompt = `${userPrompt}لطفاً این تصویر/فایل را تحلیل کن، متن آن را استخراج کن و به فارسی پاسخ بده.`;
+  let primaryReason = null;
   for (const model of ["gemini-2.5-flash", "gemini-2.0-flash"]) {
+    let reason = null;
     try {
       const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: fullPrompt }, { inline_data: { mime_type: mime, data: b64 } }] }] }) });
       const json = await res.json().catch(() => null);
       const text = (json?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
-      if (res.ok && text) return text;
-    } catch {}
+      if (res.ok && text) return { ok: true, text };
+      const status = Number(res.status);
+      reason = res.ok ? "empty_response" : (Number.isInteger(status) && status > 0 ? `http_${status}` : "network_error");
+    } catch { reason = "network_error"; }
+    if (primaryReason === null) primaryReason = reason;
+    console.warn("vault_analyze_failed", { model, reason });
   }
-  return null;
+  return { ok: false, reason: primaryReason };
+}
+
+export async function analyzeVaultImage(env, file, prompt, userId = null, deps = {}) {
+  const r = await analyzeVaultImageDetailed(env, file, prompt, userId, deps);
+  return r.ok ? r.text : null;
+}
+
+export function vaultAnalyzeFailureText(reason) {
+  const r = String(reason ?? "");
+  if (r === "no_download") return "تحلیل ممکن نشد: دانلود فایل از تلگرام انجام نشد.";
+  if (r === "no_key") return "تحلیل ممکن نشد: کلید Gemini تنظیم نشده است.";
+  if (r === "empty_response") return "تحلیل ممکن نشد: Gemini متنی برنگرداند.";
+  if (r === "network_error") return "تحلیل ممکن نشد: ارتباط با Gemini برقرار نشد.";
+  const m = /^http_(\d+)$/.exec(r);
+  if (m) return `تحلیل ممکن نشد: Gemini خطا داد (کد ${m[1]}).`;
+  return "تحلیل ممکن نشد.";
 }
 
 export async function handleIncomingFile(env, o, deps = {}) {
@@ -157,7 +180,8 @@ export async function handleVaultFile(env, o, deps = {}) {
       visionError = r2?.error || r2?.text || null;
     }
     const f = { tg_file_id: tgFileId, mime_type: mimeType, file_type: fileType };
-    const text = await analyzeVaultImage(env, f, cap, userId, deps);
+    const detailed = await analyzeVaultImageDetailed(env, f, cap, userId, deps);
+    const text = detailed.ok ? detailed.text : null;
     await send(text || ("❌ خطا در تحلیل تصویر: " + (visionError || "vision_unavailable")));
     return true;
   }

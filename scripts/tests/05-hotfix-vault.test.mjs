@@ -60,6 +60,7 @@ import { resolveVaultCallback as resolveVaultCallbackCore } from "../../src/pipe
 import { runVaultAndFileBranch, VAULT_PRIVATE_ONLY_TEXT, VAULT_REDACTED_TEXT } from "../../src/pipeline/daily-helpers.js";
 import { classifyVoiceQuota, transcribeWithGemini, handleVoice, handleVoiceRetry, VOICE_FAILED_TEXT, VOICE_TOO_LONG_TEXT } from "../../src/voice.js";
 import { downloadTelegramVoice } from "../../src/channels/telegram.js";
+import { analyzeVaultImage as analyzeVaultImageRaw } from "../../src/pipeline/vault-files.js";
 
 import { check, failures, fakeKV, mockWorld, workerDefault, ctxNull, sendTg, msgUpdate, cbUpdate, newEnv, DatabaseSync } from "./harness.mjs";
 
@@ -2066,5 +2067,118 @@ if (DatabaseSync) {
     }
   }
 }
+
+  // ── N-10: vault:analyze distinct, safe failure reasons (Gemini only) ──
+  if (DatabaseSync) {
+    const CANARY = "TESTKEY-FAKE-CANARY-123";
+    const N10 = {
+      noDownload: "تحلیل ممکن نشد: دانلود فایل از تلگرام انجام نشد.",
+      noKey: "تحلیل ممکن نشد: کلید Gemini تنظیم نشده است.",
+      http429: "تحلیل ممکن نشد: Gemini خطا داد (کد 429).",
+      empty: "تحلیل ممکن نشد: Gemini متنی برنگرداند.",
+      network: "تحلیل ممکن نشد: ارتباط با Gemini برقرار نشد.",
+    };
+    const freshN10 = () => {
+      const sq = new DatabaseSync(":memory:");
+      for (const file of ["0001_init.sql", "0002_step1_columns.sql", "0003_tasks_projects.sql"]) sq.exec(fs.readFileSync(new URL("../../migrations/" + file, import.meta.url), "utf8"));
+      sq.exec("INSERT INTO users (id, telegram_id) VALUES (4242, '4242')");
+      const db = { prepare(sql) { const st = sq.prepare(sql); return { bind(...p) { return { run: async () => { const r = st.run(...p); return { success: true, meta: { changes: r.changes, lastInsertRowid: r.lastInsertRowid } }; }, all: async () => ({ results: st.all(...p) }), first: async () => st.get(...p) ?? null }; } }; } };
+      return { sq, db };
+    };
+    const mkN10Env = (db, extra = {}) => ({ STATE: fakeKV(), TG_TOKEN: "fake-token", TG_SECRET: "fake-tg-secret", ALLOWED_TG_IDS: "4242", VAULT_SECRET: "s1", DB: db, ...extra });
+    const fmtArg = (x) => { try { return typeof x === "string" ? x : JSON.stringify(x); } catch { return String(x); } };
+    const withRec = async (fetchImpl, fn) => {
+      const urls = [], logs = [], sent = [];
+      const origFetch = global.fetch;
+      const orig = { log: console.log, warn: console.warn, error: console.error };
+      global.fetch = async (url, init) => { urls.push(String(url)); return fetchImpl(String(url), init); };
+      for (const k of ["log", "warn", "error"]) console[k] = (...a) => { logs.push(a.map(fmtArg).join(" ")); };
+      try { return await fn({ urls, logs, sent, send: async (t) => { sent.push(String(t)); } }); }
+      finally { global.fetch = origFetch; console.log = orig.log; console.warn = orig.warn; console.error = orig.error; }
+    };
+    const runCallbackN10 = async ({ env, download, fetchImpl }) => {
+      const saved = await saveVaultFile(env, { userId: 4242, tgFileId: "tg-n10", fileType: "photo", mimeType: "image/jpeg", title: "__choice__", caption: null });
+      return withRec(fetchImpl, async (rec) => {
+        await resolveVaultCallbackCore(env, { fromId: 4242, chatId: 4242, chatType: "private", data: `vault:analyze:${saved.id}`, send: rec.send }, { getFileDownloadData: download });
+        return rec;
+      });
+    };
+    const rawN10 = async ({ env, download, fetchImpl }) => withRec(fetchImpl, async (rec) => {
+      const text = await analyzeVaultImageRaw(env, { tg_file_id: "tg-n10", mime_type: "image/jpeg", file_type: "photo" }, null, 4242, { getFileDownloadData: download });
+      return { text, ...rec };
+    });
+    const never = async () => { throw new Error("fetch must not be called"); };
+
+    // T1 no_download
+    {
+      const { db } = freshN10(); const env = mkN10Env(db);
+      const r = await runCallbackN10({ env, download: async () => null, fetchImpl: never });
+      check(r.sent.length === 1 && r.sent[0] === N10.noDownload, `N-10 T1 no_download message: ${JSON.stringify(r.sent)}`);
+      check(r.urls.length === 0, `N-10 T1 no_download zero fetch calls (got ${r.urls.length})`);
+      check(!r.sent.join("\n").includes(CANARY) && !r.logs.join("\n").includes(CANARY), "N-10 T1 canary absent from sent texts and logs");
+    }
+    // T2 no_key
+    {
+      const { db } = freshN10(); const env = mkN10Env(db);
+      const r = await runCallbackN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: never });
+      check(r.sent.length === 1 && r.sent[0] === N10.noKey, `N-10 T2 no_key message: ${JSON.stringify(r.sent)}`);
+      check(r.urls.length === 0, `N-10 T2 no_key zero fetch calls (got ${r.urls.length})`);
+    }
+    // T3 http error 429
+    {
+      const { db } = freshN10(); const env = mkN10Env(db, { GEMINI_API_KEY: CANARY });
+      const r = await runCallbackN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: async () => new Response(JSON.stringify({ error: { code: 429 } }), { status: 429, headers: { "content-type": "application/json" } }) });
+      check(r.sent.length === 1 && r.sent[0] === N10.http429 && r.sent[0].includes("429"), `N-10 T3 http_429 message: ${JSON.stringify(r.sent)}`);
+      const blob = r.sent.join("\n") + "\n" + r.logs.join("\n");
+      check(!blob.includes(CANARY) && !blob.includes("generativelanguage") && !blob.includes("key="), "N-10 T3 key/URL absent from sent texts and logs");
+    }
+    // T4 empty response
+    {
+      const { db } = freshN10(); const env = mkN10Env(db, { GEMINI_API_KEY: CANARY });
+      const r = await runCallbackN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: async () => Response.json({}) });
+      check(r.sent.length === 1 && r.sent[0] === N10.empty, `N-10 T4 empty_response message: ${JSON.stringify(r.sent)}`);
+    }
+    // T5 network error
+    {
+      const { db } = freshN10(); const env = mkN10Env(db, { GEMINI_API_KEY: CANARY });
+      const r = await runCallbackN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: async () => { throw new Error("boom https://x.example/?key=" + CANARY); } });
+      check(r.sent.length === 1 && r.sent[0] === N10.network, `N-10 T5 network_error message: ${JSON.stringify(r.sent)}`);
+      const blob = r.sent.join("\n") + "\n" + r.logs.join("\n");
+      check(!blob.includes(CANARY) && !blob.includes("key=") && !blob.includes("boom"), "N-10 T5 exception/canary/key absent from sent texts and logs");
+    }
+    // T6 success
+    {
+      const { db } = freshN10(); const env = mkN10Env(db, { GEMINI_API_KEY: CANARY });
+      const r = await runCallbackN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: async () => Response.json({ candidates: [{ content: { parts: [{ text: "RESULT-OK" }] } }] }) });
+      check(r.sent.length === 1 && r.sent[0] === "RESULT-OK", `N-10 T6 success text unchanged: ${JSON.stringify(r.sent)}`);
+      const hosts = r.urls.map((u) => { try { return new URL(u).host; } catch { return "?"; } });
+      check(r.urls.length > 0 && hosts.every((h) => h === "generativelanguage.googleapis.com"), `N-10 T6 only Gemini hosts contacted: ${JSON.stringify(hosts)}`);
+    }
+    // T7 compatibility: old analyzeVaultImage text-or-null
+    {
+      const { db } = freshN10(); const env = mkN10Env(db, { GEMINI_API_KEY: CANARY });
+      const ok = await rawN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: async () => Response.json({ candidates: [{ content: { parts: [{ text: "RESULT-OK" }] } }] }) });
+      check(ok.text === "RESULT-OK", `N-10 T7 legacy success returns text: ${JSON.stringify(ok.text)}`);
+      const noDownload = await rawN10({ env: mkN10Env(freshN10().db), download: async () => null, fetchImpl: never });
+      check(noDownload.text === null, `N-10 T7 legacy no_download returns null: ${JSON.stringify(noDownload.text)}`);
+      const noKey = await rawN10({ env: mkN10Env(freshN10().db), download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: never });
+      check(noKey.text === null, `N-10 T7 legacy no_key returns null: ${JSON.stringify(noKey.text)}`);
+      const http = await rawN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: async () => new Response("", { status: 429 }) });
+      check(http.text === null, `N-10 T7 legacy http failure returns null: ${JSON.stringify(http.text)}`);
+      const empty = await rawN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: async () => Response.json({}) });
+      check(empty.text === null, `N-10 T7 legacy empty response returns null: ${JSON.stringify(empty.text)}`);
+      const net = await rawN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: async () => { throw new Error("boom"); } });
+      check(net.text === null, `N-10 T7 legacy network failure returns null: ${JSON.stringify(net.text)}`);
+    }
+    // T8 primary reason: model 1 429, model 2 404
+    {
+      const { db } = freshN10(); const env = mkN10Env(db, { GEMINI_API_KEY: CANARY });
+      let n = 0;
+      const r = await runCallbackN10({ env, download: async () => ({ data: new Uint8Array([1, 2, 3]) }), fetchImpl: async () => { n++; return n === 1 ? new Response("", { status: 429 }) : new Response("", { status: 404 }); } });
+      check(r.sent.length === 1 && r.sent[0].includes("429") && !r.sent[0].includes("404"), `N-10 T8 primary reason 429 only: ${JSON.stringify(r.sent)}`);
+      const logs = r.logs.join("\n");
+      check(logs.includes("http_429") && logs.includes("http_404"), `N-10 T8 both per-model reasons logged: ${JSON.stringify(r.logs)}`);
+    }
+  }
 
 }
