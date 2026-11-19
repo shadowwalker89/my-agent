@@ -4,7 +4,7 @@ import fs from "node:fs";
 import { check, fakeKV, DatabaseSync } from "./harness.mjs";
 import { normalizeText } from "../../src/domain/reminders/time.js";
 import { DEFAULT_CURRENCY, normalizeText as expNormalize, parseNumberPhrase, resolveDefaultCurrency, sumByCurrency, parseAmount, bareDigits, parseExpense, parseSummaryQuery, EXPENSE_VERBS, INCOME_VERBS, NEGATED_RE } from "../../src/domain/expenses/parse.js";
-import { rangeForPeriod, queryExpenseSums, confirmExpenseDraft } from "../../src/domain/expenses/service.js";
+import { rangeForPeriod, queryExpenseSums, startConfirm, confirmExpenseDraft } from "../../src/domain/expenses/service.js";
 import { normalizeText as dailyNormalize, parseAmount as dailyAmount, parseExpense as dailyExpense, parseSummaryQuery as dailySummary, classifyDaily } from "../../src/daily.js";
 import { rangeForPeriod as everydayRange, confirmExpenseDraft as everydayConfirm } from "../../src/everyday.js";
 
@@ -72,9 +72,33 @@ export async function run() {
   const sums = await queryExpenseSums(env, 1, r);
   check(sums?.TOMAN === 150, "R0.7d: queryExpenseSums totals from D1");
   // draft callback round-trip
-  const draftId = await (await import("../../src/domain/expenses/service.js")).startConfirm(env, { userId: 1, send: async () => {} }, "expense", { amount: 10, currency: "TOMAN", date: today, item: "چای" });
+  const draftId = await startConfirm(env, { userId: 1, send: async () => {} }, "expense", { amount: 10, currency: "TOMAN", date: today, item: "چای" });
   // emulate confirm via KV draft -> already stored? call confirmExpenseDraft
   const res = await confirmExpenseDraft(env, 1, draftId);
   check(res?.status === "ok", "R0.7d: confirmExpenseDraft stores the expense");
   check(everydayConfirm === confirmExpenseDraft, "R0.7d: everyday.js re-exports confirmExpenseDraft");
+
+  // ── B-1: callback-style identity (fromId) vs message-style (userId) ──
+  {
+    const send = async () => {};
+    const exB1 = { amount: 20, currency: "TOMAN", date: today, item: "نان" };
+    const cbDraft = await startConfirm(env, { fromId: 1, send }, "expense", exB1);
+    const cbOk = await confirmExpenseDraft(env, 1, cbDraft);
+    check(cbOk?.status === "ok", "B-1: callback-style draft (fromId) is confirmable by the same user");
+
+    const otherDraft = await startConfirm(env, { fromId: 1, send }, "expense", exB1);
+    const otherTry = await confirmExpenseDraft(env, 2, otherDraft);
+    check(otherTry?.status === "forbidden", "B-1: another user cannot confirm a fromId draft");
+    const ownerAfter = await confirmExpenseDraft(env, 1, otherDraft);
+    check(ownerAfter?.status === "ok", "B-1: a rejected attempt leaves the draft confirmable by its owner");
+
+    const msgDraft = await startConfirm(env, { userId: 1, send }, "expense", exB1);
+    const msgOk = await confirmExpenseDraft(env, 1, msgDraft);
+    check(msgOk?.status === "ok", "B-1: message-style draft (userId) still confirms");
+
+    const anonDraft = await startConfirm(env, { send }, "expense", exB1);
+    const anonByAnon = await confirmExpenseDraft(env, undefined, anonDraft);
+    const anonByUser = await confirmExpenseDraft(env, 1, anonDraft);
+    check(anonByAnon?.status === "forbidden" && anonByUser?.status === "forbidden", "B-1: a draft with no identity is not confirmable");
+  }
 }

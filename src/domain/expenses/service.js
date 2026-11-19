@@ -35,7 +35,7 @@ export async function queryExpenseSums(env, userId, range) {
 
 export async function startConfirm(env, o, type, ex) {
   const id = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-  await putKv(env, draftKey(id), { owner: o.userId, type, ...ex });
+  await putKv(env, draftKey(id), { owner: o.userId ?? o.fromId, type, ...ex });
   const jalali = formatJalali(ex.date) || ex.date;
   await o.send(`💰 ${type === "income" ? "درآمد" : "خرج"}: ${ex.amount} ${ex.currency}${ex.item ? ` — ${ex.item}` : ""} — ${jalali}\nتأیید می‌کنی؟`, { replyMarkup: { inline_keyboard: [[{ text: "✅ تأیید", callback_data: `daily:confirm:${id}` }, { text: "❌ لغو", callback_data: `daily:cancel:${id}` }]] } });
   return id;

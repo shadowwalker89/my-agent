@@ -29,7 +29,7 @@ This ADR applies the existing layer rule to media downloads. It does not change 
 - Voice tests inject a fake downloader, so the skill boundary is testable without network access.
 - Any future media skill that needs a channel file must use the same injection pattern; adding a direct channel import is a contract violation.
 - Wiring responsibility stays in `src/index.js` (the composition root) until the R1 ingress/channel wiring refactor.
-- Implementation is committed in 503d73f. This ADR does not close R0 by itself: Steps 5–7 of the R0 closure (final evidence, 14-scenario manual Telegram smoke test, independent read-only re-audit) and a clean worktree gate remain required.
+- Implementation is committed in 503d73f. These gates were completed or accepted by owner decision when R0 was closed; see docs/STATE.md.
 
 ## Status
 
