@@ -61,7 +61,7 @@ export async function runNluBranch(env, o, ctx, deps = {}) {
   const emitNluDiag = (fallbackReason) => {
     if (!nluModel) return;
     const parts = String(nlu.intent || "").split("_");
-    console.log(JSON.stringify({ event: "intent_nlu_diag", models: [nluModel], perModel: [{ model: nluModel, status: nlu.ok ? "ok" : nlu.reason }], parseOk: nlu.ok || nlu.reason === "bad-intent", finalDomain: nlu.ok ? parts[0] : null, finalAction: nlu.ok ? (parts.slice(1).join("_") || null) : null, confidence: nlu.ok ? nlu.confidence : null, routedTo: nluRoutedTo, elapsedMs: Date.now() - nluT0, fallbackReason }));
+    console.log(JSON.stringify({ event: "intent_nlu_diag", models: [nluModel], perModel: [{ model: nluModel, status: nlu.ok ? "ok" : nlu.reason }], parseOk: nlu.ok || nlu.reason === "bad-intent", finalDomain: nlu.ok ? parts[0] : null, finalAction: nlu.ok ? (parts.slice(1).join("_") || null) : null, confidence: nlu.ok ? nlu.confidence : null, routedTo: nluRoutedTo, elapsedMs: Date.now() - nluT0, ...(nlu.shape ? { shape: nlu.shape } : {}), fallbackReason }));
   };
   if (!nlu.ok || nlu.confidence < 0.75 || nlu.intent === "chat") { emitNluDiag(!nlu.ok ? nlu.reason : nlu.confidence < 0.75 ? "low-confidence" : "chat-intent"); return null; }
   // A05/A13 reference resolution: «همونو برای فردا بذار» etc. resolve

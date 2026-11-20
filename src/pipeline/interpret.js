@@ -4,6 +4,7 @@
 // checking of that proposal lives in validate.js.
 import { DEFAULT_CURRENCY } from "../daily.js";
 import { INTERPRETER_TYPES, extractJsonObject } from "./validate.js";
+import { coerceNluRaw, describeNluResult } from "./nlu-shape.js";
 import { DEFAULT_INTERPRETER_MODEL, NLU_TIMEOUT_MS, NLU_MAX_TOKENS, NLU_VALID_INTENTS, resolveInterpreterModel } from "./route.js";
 
 export { INTERPRETER_TYPES };
@@ -194,7 +195,7 @@ function buildNluPrompt(text, context = {}) {
 // { ok: false } so the caller falls through to chat — never a guessed write.
 export async function classifyIntentNlu(env, text, context = {}, opts = {}) {
   const model = resolveInterpreterModel(env, opts);
-  if (!model) return { ok: false, reason: "no-model" };
+  if (!model) return { ok: false, reason: "no-model", shape: describeNluResult(null, "") };
   const timeoutMs = opts.timeoutMs || NLU_TIMEOUT_MS;
   const prompt = buildNluPrompt(text, context);
   const aiPayload = { messages: [{ role: "system", content: prompt.system }, { role: "user", content: prompt.user }], temperature: 0.1, max_tokens: NLU_MAX_TOKENS };
@@ -204,10 +205,10 @@ export async function classifyIntentNlu(env, text, context = {}, opts = {}) {
     try { return await Promise.race([Promise.resolve().then(fn), timeout]); } finally { if (timer) clearTimeout(timer); }
   };
   const parse = (res) => {
-    const raw = typeof res === "string" ? res : (res?.response ?? res?.text ?? "");
+    const raw = coerceNluRaw(res);
     const obj = extractJsonObject(raw);
-    if (!obj) return { error: "bad-json" };
-    if (!NLU_VALID_INTENTS.includes(obj.intent)) return { error: "bad-intent" };
+    if (!obj) return { error: "bad-json", shape: describeNluResult(res, raw) };
+    if (!NLU_VALID_INTENTS.includes(obj.intent)) return { error: "bad-intent", shape: describeNluResult(res, raw) };
     const conf = typeof obj.confidence === "number" ? obj.confidence : Number(obj.confidence);
     const str = (v) => (typeof v === "string" ? v : null);
     const result = {
@@ -224,25 +225,25 @@ export async function classifyIntentNlu(env, text, context = {}, opts = {}) {
       const raw = await runWithTimeout(() => (opts.callFn.length >= 2 ? opts.callFn(model, promptArg) : opts.callFn(promptArg)));
       const parsed = parse(raw);
       if (parsed.result) return parsed.result;
-      if (!hasAi) return { ok: false, reason: parsed.error };
+      if (!hasAi) return { ok: false, reason: parsed.error, shape: parsed.shape };
     } catch (err) {
-      if (!hasAi) return { ok: false, reason: err?.message === "nlu timeout" ? "timeout" : "error" };
+      if (!hasAi) return { ok: false, reason: err?.message === "nlu timeout" ? "timeout" : "error", shape: describeNluResult(null, "") };
     }
     try {
       const res = await runWithTimeout(() => env.AI.run(DEFAULT_INTERPRETER_MODEL, aiPayload));
       const parsed = parse(res);
       if (parsed.result) return parsed.result;
-      return { ok: false, reason: parsed.error };
+      return { ok: false, reason: parsed.error, shape: parsed.shape };
     } catch (err) {
-      return { ok: false, reason: err?.message === "nlu timeout" ? "timeout" : "error" };
+      return { ok: false, reason: err?.message === "nlu timeout" ? "timeout" : "error", shape: describeNluResult(null, "") };
     }
   }
   try {
     const res = await runWithTimeout(() => env.AI.run(model, aiPayload));
     const parsed = parse(res);
     if (parsed.result) return parsed.result;
-    return { ok: false, reason: parsed.error };
+    return { ok: false, reason: parsed.error, shape: parsed.shape };
   } catch (err) {
-    return { ok: false, reason: err?.message === "nlu timeout" ? "timeout" : "error" };
+    return { ok: false, reason: err?.message === "nlu timeout" ? "timeout" : "error", shape: describeNluResult(null, "") };
   }
 }

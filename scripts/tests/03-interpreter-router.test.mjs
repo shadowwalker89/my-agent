@@ -628,6 +628,86 @@ if (DatabaseSync) {
       check(prog?.payload?.text === "⏳ در حال آماده‌سازی خلاصه و جدول..." && c.s.chats.length === 1 && c.s.chats[0].opts.progressMsgId === 555 && c.s.chats[0].opts.maxTokens === 2200, "1-e: summary sends the ⏳ placeholder after D1 verification and plumbs its id + 2200 tokens to o.chat (Phase 2-f: 900 -> 2200)");
     } finally { global.fetch = prev; }
   }
+
+  // ── N-6b: safe NLU shape diagnostic + object-shaped model responses ──
+  {
+    const nluText = "فردا سیمان و گچ یادداشت کن";
+    const validNlu = {
+      intent: "note", confidence: 0.93, project: null, title: null, body: "سیمان و گچ",
+      date_ref: null, time_ref: null, daypart: null, summary_target: null,
+      leading_framing: null, trailing_framing: null,
+    };
+    const runNlu = (aiRun) => classifyIntentNlu({ AI: { run: aiRun } }, nluText, {}, {});
+
+    // N6b-1: object response goes through the same extract + validation path.
+    {
+      const obj = await runNlu(async () => ({ response: { ...validNlu } }));
+      const str = await runNlu(async () => ({ response: JSON.stringify(validNlu) }));
+      check(obj.ok === true && obj.intent === validNlu.intent && obj.body === validNlu.body && obj.confidence === str.confidence, "N6b-1: {response:<object>} is coerced and validated identically to the existing string mock");
+      check(obj.ok === true && !("shape" in obj), "N6b-1: a successful NLU never carries a shape");
+    }
+    // N6b-2: bad-json failure carries a safe, class-only shape.
+    {
+      const r = await runNlu(async () => ({ response: "this is not json" }));
+      const sh = r.shape ?? {};
+      check(r.ok === false && r.reason === "bad-json" && sh.resType === "object" && sh.responseType === "string" && sh.hasIntentToken === false && sh.extractOk === false, "N6b-2: bad-json failure reports resType/responseType/hasIntentToken/extractOk");
+      check(!JSON.stringify(sh).includes("this is not json") && !JSON.stringify(sh).includes("not json"), "N6b-2: shape contains no substring of the model text");
+    }
+    // N6b-3: object {} matches the string {} outcome; no new accepted path.
+    {
+      const obj = await runNlu(async () => ({ response: {} }));
+      const str = await runNlu(async () => ({ response: "{}" }));
+      const ok = await runNlu(async () => ({ response: JSON.stringify(validNlu) }));
+      check(obj.ok === str.ok && obj.reason === str.reason && obj.reason === "bad-intent", "N6b-3: object {} and string {} share the same failure outcome");
+      check(Boolean(obj.shape) && Boolean(str.shape) && !("shape" in ok), "N6b-3: shape appears on failures only");
+    }
+    // N6b-4: truncated JSON reports structural hints plus the token count.
+    {
+      const r = await runNlu(async () => ({ response: '{"intent":"chat","conf', usage: { completion_tokens: 512 } }));
+      const sh = r.shape ?? {};
+      check(r.ok === false && r.reason === "bad-json" && sh.braceDelta > 0 && sh.completionTokens === 512 && sh.hasIntentToken === true && sh.extractOk === false, "N6b-4: truncated JSON shape reports braceDelta, completionTokens, intent token and failed extraction");
+    }
+    // N6b-5: canary — user text and object key/value never leak into the diag.
+    {
+      const CAN = "TESTKEY-FAKE-CANARY-123";
+      const sc = fresh1e();
+      const env = { STATE: fakeKV(), DB: sc.db, AI: { run: async () => ({ response: { [CAN]: CAN }, usage: { completion_tokens: 7 } }) } };
+      const orig = console.log;
+      const captured = [];
+      console.log = (...a) => { captured.push(a.map(String).join(" ")); };
+      try {
+        await handleDailyText(env, { chatId: 1, userId: 1, text: `${CAN} لطفا تسک‌هایم را نشان بده`, send: async () => {}, chat: async () => {}, nowMs: MORNING });
+      } finally { console.log = orig; }
+      const diag = captured.filter((line) => line.includes("intent_nlu_diag"));
+      check(diag.length >= 1 && !diag.join("\n").includes(CAN), "N6b-5 canary: user text and object keys/values never appear in intent_nlu_diag");
+    }
+    // N6b-6: diag includes shape only when the NLU failed.
+    {
+      const sc = fresh1e();
+      const envOf = (aiRun) => ({ STATE: fakeKV(), DB: sc.db, AI: { run: aiRun } });
+      const callBranch = async (env, text) => {
+        const orig = console.log; const lines = [];
+        console.log = (...a) => { const s = a.map(String).join(" "); if (s.includes("intent_nlu_diag")) lines.push(s); };
+        try {
+          await runNluBranch(env, { userId: 1, chatId: 1, text, send: async () => {}, chat: async () => {} }, { now: MORNING }, { runDailyBranch: async () => null });
+        } finally { console.log = orig; }
+        return lines;
+      };
+      const badLines = await callBranch(envOf(async () => ({ response: "not json at all" })), "سلام");
+      const okLines = await callBranch(envOf(async () => ({ response: JSON.stringify({ intent: "chat", confidence: 0.9 }) })), "سلام");
+      check(badLines.length === 1 && badLines[0].includes('"shape"'), "N6b-6: failing NLU emits a diag line with a shape field");
+      check(okLines.length === 1 && !okLines[0].includes('"shape"'), "N6b-6: successful NLU emits a diag line without a shape field");
+    }
+    // N6b-7: timeout and low-confidence behaviour is unchanged.
+    {
+      const timedOut = await classifyIntentNlu({ AI: { run: () => new Promise(() => {}) } }, "hi", {}, { timeoutMs: 50 });
+      check(timedOut.ok === false && timedOut.reason === "timeout", "N6b-7: NLU timeout still returns { ok: false, reason: timeout }");
+      const sc = fresh1e(); seedProjE(sc.sq, 1, "عمومی", [], 1);
+      const c = convoE(sc, { AI: aiJson({ intent: "note", confidence: 0.4, body: "چیزی" }) });
+      const r = await c.say("فردا سیمان و گچ برای پروژه گلبهار تحویل گرفته میشه", MORNING);
+      check(r === "chat" && sc.rows("SELECT id FROM notes WHERE user_id = 1").length === 0, "N6b-7: low-confidence NLU still falls through to chat with no write");
+    }
+  }
 }
 
 if (failures.length) {
